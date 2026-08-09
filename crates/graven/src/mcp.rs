@@ -246,6 +246,12 @@ mod tests {
     }
 
     #[test]
+    fn search_params_default_limit_via_serde() {
+        let params: SearchParams = serde_json::from_str(r#"{"query":"x"}"#).unwrap();
+        assert_eq!(params.limit, 10);
+    }
+
+    #[test]
     fn get_record_returns_record_for_known_url() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(tmp.path());
