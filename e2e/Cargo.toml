@@ -1,0 +1,11 @@
+[package]
+name = "e2e"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+jiff = { workspace = true }

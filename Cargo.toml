@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/graven"]
+members = ["crates/graven", "e2e"]
 
 [workspace.dependencies]
 wist-core = { path = "../core/crates/wist-core" }
