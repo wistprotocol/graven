@@ -14,6 +14,8 @@ pub enum Error {
     Fetch(String),
     #[error("verify: {0}")]
     Verify(String),
+    #[error("no local index in {0}: run `graven sync` first")]
+    NotSynced(std::path::PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

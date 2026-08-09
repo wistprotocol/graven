@@ -1,5 +1,5 @@
-use crate::error::Result;
-use rusqlite::{Connection, OptionalExtension};
+use crate::error::{Error, Result};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 pub const CREATE_UNIQUE_INDEX: &str =
@@ -36,6 +36,15 @@ impl Store {
     pub fn open(dir: &Path) -> Result<Store> {
         let conn = Connection::open(dir.join("index.sqlite"))?;
         conn.execute(CREATE_UNIQUE_INDEX, [])?;
+        Ok(Store { conn })
+    }
+
+    pub fn open_read_only(dir: &Path) -> Result<Store> {
+        let path = dir.join("index.sqlite");
+        if !path.exists() {
+            return Err(Error::NotSynced(dir.to_path_buf()));
+        }
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Store { conn })
     }
 
@@ -124,5 +133,35 @@ mod tests {
         let hit = store.get("https://example.com/alpha").unwrap().unwrap();
         assert_eq!(hit.publisher, "example.com");
         assert_eq!(hit.weight, "full");
+    }
+
+    #[test]
+    fn search_with_fts5_operator_input_returns_empty_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path());
+        let store = Store::open(tmp.path()).unwrap();
+        let hits = store.search("alpha AND", 10).unwrap();
+        assert!(hits.is_empty());
+        let hits = store.search("title:foo OR bar*", 10).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn open_read_only_rejects_fresh_dir_with_clear_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Err(err) = Store::open_read_only(tmp.path()) else {
+            panic!("expected NotSynced error");
+        };
+        assert!(err.to_string().contains("run `graven sync` first"));
+    }
+
+    #[test]
+    fn open_read_only_serves_existing_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path());
+        let store = Store::open_read_only(tmp.path()).unwrap();
+        let hits = store.search("Alpha", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(store.get("https://example.com/alpha").unwrap().is_some());
     }
 }

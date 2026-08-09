@@ -22,9 +22,16 @@ enum Command {
         #[arg(long = "allow-http")]
         allow_http: bool,
     },
+    Serve {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long = "log-id")]
+        log_id: String,
+    },
 }
 
-fn main() -> Result<(), graven::Error> {
+#[tokio::main]
+async fn main() -> Result<(), graven::Error> {
     let cli = Cli::parse();
     match cli.command {
         Command::Sync {
@@ -38,6 +45,9 @@ fn main() -> Result<(), graven::Error> {
                 "synced to log_position {:?}, head block {}",
                 report.log_position_before, report.head
             );
+        }
+        Command::Serve { dir, log_id } => {
+            graven::mcp::serve_stdio(&dir, log_id).await?;
         }
     }
     Ok(())
