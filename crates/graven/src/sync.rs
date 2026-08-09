@@ -294,14 +294,16 @@ pub fn run(anchor: &str, log_base: &str, dir: &Path, allow_http: bool) -> Result
         }
     }
 
+    {
+        let conn = Connection::open(&tmp_sqlite_path)?;
+        conn.execute(CREATE_UNIQUE_INDEX, [])?;
+        apply_post_snapshot_deltas(&conn, &client, &base, delta_bodies)?;
+        conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
+    }
+
     guard.disarm();
     let index_sqlite_path = dir.join("index.sqlite");
     std::fs::rename(&tmp_sqlite_path, &index_sqlite_path)?;
-    let conn = Connection::open(&index_sqlite_path)?;
-    conn.execute(CREATE_UNIQUE_INDEX, [])?;
-    apply_post_snapshot_deltas(&conn, &client, &base, delta_bodies)?;
-    conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
-    drop(conn);
 
     let sync_state = SyncState {
         log_position: manifest.log_position,

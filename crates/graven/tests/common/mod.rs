@@ -404,7 +404,7 @@ impl Fixture {
     }
 }
 
-pub fn build_fixture(write_second_payload: bool) -> Fixture {
+pub fn build_fixture(write_second_payload: bool, duplicate_tier0_record: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let log = Signer::new([9u8; 32]);
     let other = Signer::new([3u8; 32]);
@@ -452,12 +452,16 @@ pub fn build_fixture(write_second_payload: bool) -> Fixture {
     };
 
     let snapdir = dir.path().join("snapshots").join(&snapshot_date);
-    let sqlite_bytes = write_tier0(
-        &snapdir.join("tier0/index.sqlite"),
-        std::slice::from_ref(&record1),
-    );
+    let tier0_records: Vec<RecordFixture> = if duplicate_tier0_record {
+        vec![record1.clone(), record1.clone()]
+    } else {
+        vec![record1.clone()]
+    };
+    let sqlite_bytes = write_tier0(&snapdir.join("tier0/index.sqlite"), &tier0_records);
+    let content_digest_projections: Vec<Value> =
+        tier0_records.iter().map(record_projection).collect();
     let content_digest_value =
-        wist_core::snapshot::content_digest(&[record_projection(&record1)]).unwrap();
+        wist_core::snapshot::content_digest(&content_digest_projections).unwrap();
 
     let (state_bytes, state_digest_value) = write_state(
         &snapdir.join("state.json"),
