@@ -137,11 +137,11 @@ pub async fn serve_stdio(dir: &Path, log_id: String) -> crate::error::Result<()>
     let running = server
         .serve(rmcp::transport::stdio())
         .await
-        .map_err(|e| Error::Verify(format!("mcp serve: {e}")))?;
+        .map_err(|e| Error::Mcp(format!("serve: {e}")))?;
     running
         .waiting()
         .await
-        .map_err(|e| Error::Verify(format!("mcp wait: {e}")))?;
+        .map_err(|e| Error::Mcp(format!("wait: {e}")))?;
     Ok(())
 }
 

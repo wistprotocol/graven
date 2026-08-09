@@ -16,6 +16,8 @@ pub enum Error {
     Verify(String),
     #[error("no local index in {0}: run `graven sync` first")]
     NotSynced(std::path::PathBuf),
+    #[error("mcp: {0}")]
+    Mcp(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
