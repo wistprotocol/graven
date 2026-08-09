@@ -1,0 +1,38 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: graven }
+      - uses: actions/checkout@v4
+        with: { repository: wistprotocol/core, path: core }
+      - uses: actions/checkout@v4
+        with: { repository: wistprotocol/spec, path: spec }
+      - uses: actions/checkout@v4
+        with: { repository: wistprotocol/spake, path: spake }
+      - uses: actions/checkout@v4
+        with: { repository: wistprotocol/clave, path: clave }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.x" }
+      - run: pip install jsonschema rfc8785 cryptography
+      - run: cargo fmt --all --check
+        working-directory: graven
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: graven
+      - run: cargo build
+        working-directory: spake
+      - run: cargo build
+        working-directory: clave
+      - run: cargo test --workspace
+        working-directory: graven
+        env:
+          SPAKE_BIN: "${{ github.workspace }}/spake/target/debug/spake"
+          CLAVE_BIN: "${{ github.workspace }}/clave/target/debug/clave"
+          WIST_SPEC_DIR: "${{ github.workspace }}/spec"
+          CI: "1"
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with: { manifest-path: graven/Cargo.toml }
