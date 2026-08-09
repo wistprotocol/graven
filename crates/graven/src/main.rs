@@ -30,8 +30,7 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<(), graven::Error> {
+fn main() -> Result<(), graven::Error> {
     let cli = Cli::parse();
     match cli.command {
         Command::Sync {
@@ -47,7 +46,8 @@ async fn main() -> Result<(), graven::Error> {
             );
         }
         Command::Serve { dir, log_id } => {
-            graven::mcp::serve_stdio(&dir, log_id).await?;
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(graven::mcp::serve_stdio(&dir, log_id))?;
         }
     }
     Ok(())
