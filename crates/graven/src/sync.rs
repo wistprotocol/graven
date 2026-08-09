@@ -116,6 +116,63 @@ fn fetch_payload(
     ))
 }
 
+struct BlockWalk {
+    delta_bodies: Vec<Value>,
+    last_block_value: Option<Value>,
+}
+
+fn walk_blocks(
+    client: &Client,
+    base: &Url,
+    trust_key: &PublicKey,
+    start_number: u64,
+    end_number: u64,
+    start_hash: &str,
+) -> Result<BlockWalk> {
+    let mut prev_hash = start_hash.to_string();
+    let mut last_block_value: Option<Value> = None;
+    let mut delta_bodies: Vec<Value> = Vec::new();
+    for n in start_number..=end_number {
+        let block_url = resolve(base, &format!("/log/blocks/{n:09}.json.zst"))?;
+        let compressed = client.get_bytes(&block_url)?;
+        let decompressed = zstd::decode_all(compressed.as_slice())
+            .map_err(|e| Error::Verify(format!("zstd decode of block {n}: {e}")))?;
+        let block_value: Value = serde_json::from_slice(&decompressed)?;
+        verify_block(&block_value, trust_key)?;
+        let header = block_value
+            .get("header")
+            .ok_or_else(|| Error::Verify(format!("block {n} missing header")))?;
+        verify_chain_link(header, &prev_hash)?;
+        prev_hash = block_hash(header)?;
+        for entry in block_value
+            .get("entries")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if entry.get("type").and_then(Value::as_str) == Some("publisher_delta") {
+                if let Some(delta_entry_body) = entry.get("body") {
+                    delta_bodies.push(delta_entry_body.clone());
+                }
+            }
+        }
+        last_block_value = Some(block_value);
+    }
+    Ok(BlockWalk {
+        delta_bodies,
+        last_block_value,
+    })
+}
+
+fn load_trust_key(anchor: &str, client: &Client) -> Result<PublicKey> {
+    let anchor_bytes = load_anchor_bytes(anchor, client)?;
+    let anchor_value: Value = serde_json::from_slice(&anchor_bytes)?;
+    let anchor_env: LogAnchorEnvelope = serde_json::from_value(anchor_value.clone())?;
+    let trust_key = PublicKey::from_b64u(&anchor_env.anchor.genesis_key.public_key)?;
+    verify_envelope(&anchor_value, "anchor", &trust_key)?;
+    Ok(trust_key)
+}
+
 fn apply_post_snapshot_deltas(
     conn: &Connection,
     client: &Client,
@@ -177,24 +234,98 @@ fn apply_post_snapshot_deltas(
 pub fn run(anchor: &str, log_base: &str, dir: &Path, allow_http: bool) -> Result<SyncReport> {
     std::fs::create_dir_all(dir)?;
     let sync_path = dir.join("sync.json");
-    if sync_path.exists() {
-        return Err(Error::Verify(
-            "incremental sync is not implemented yet: <dir>/sync.json already exists".into(),
-        ));
-    }
 
     let client = Client::new(allow_http);
     let base = crate::fetch::parse_base(log_base)?;
+    let trust_key = load_trust_key(anchor, &client)?;
 
-    let anchor_bytes = load_anchor_bytes(anchor, &client)?;
-    let anchor_value: Value = serde_json::from_slice(&anchor_bytes)?;
-    let anchor_env: LogAnchorEnvelope = serde_json::from_value(anchor_value.clone())?;
-    let trust_key = PublicKey::from_b64u(&anchor_env.anchor.genesis_key.public_key)?;
-    verify_envelope(&anchor_value, "anchor", &trust_key)?;
+    if sync_path.exists() {
+        run_incremental(&client, &base, &trust_key, dir, &sync_path)
+    } else {
+        run_cold_start(&client, &base, &trust_key, dir, &sync_path)
+    }
+}
 
-    let index_url = resolve(&base, "/snapshots/index.json")?;
+fn run_incremental(
+    client: &Client,
+    base: &Url,
+    trust_key: &PublicKey,
+    dir: &Path,
+    sync_path: &Path,
+) -> Result<SyncReport> {
+    let sync_bytes = std::fs::read(sync_path)?;
+    let local: SyncState = serde_json::from_slice(&sync_bytes)?;
+
+    let checkpoint_url = resolve(base, "/log/checkpoint.json")?;
+    let (_, checkpoint_value) = client.get_json(&checkpoint_url)?;
+    verify_envelope(&checkpoint_value, "checkpoint", trust_key)?;
+    let checkpoint_env: CheckpointEnvelope = serde_json::from_value(checkpoint_value.clone())?;
+    let checkpoint = checkpoint_env.checkpoint;
+
+    if checkpoint.block_number < local.head_number {
+        return Err(Error::Verify(format!(
+            "rollback rejected: remote checkpoint head {} is behind local head {}",
+            checkpoint.block_number, local.head_number
+        )));
+    }
+
+    if checkpoint.block_number == local.head_number {
+        if checkpoint.block_hash == local.head_hash {
+            return Ok(SyncReport {
+                log_position_before: Some(local.head_number),
+                head: local.head_number,
+            });
+        }
+        return Err(Error::Verify(format!(
+            "checkpoint equivocation: block {} has hash {} locally but remote reports {}",
+            local.head_number, local.head_hash, checkpoint.block_hash
+        )));
+    }
+
+    let walk = walk_blocks(
+        client,
+        base,
+        trust_key,
+        local.head_number + 1,
+        checkpoint.block_number,
+        &local.head_hash,
+    )?;
+    let last_block_value = walk.last_block_value.ok_or_else(|| {
+        Error::Verify("continuous sync produced no blocks despite checkpoint advancing".into())
+    })?;
+    verify_checkpoint_binding(&checkpoint_value, &last_block_value)?;
+
+    let index_sqlite_path = dir.join("index.sqlite");
+    {
+        let conn = Connection::open(&index_sqlite_path)?;
+        conn.execute(CREATE_UNIQUE_INDEX, [])?;
+        apply_post_snapshot_deltas(&conn, client, base, walk.delta_bodies)?;
+        conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
+    }
+
+    let sync_state = SyncState {
+        log_position: local.log_position,
+        head_number: checkpoint.block_number,
+        head_hash: checkpoint.block_hash.clone(),
+    };
+    std::fs::write(sync_path, serde_json::to_vec(&sync_state)?)?;
+
+    Ok(SyncReport {
+        log_position_before: Some(local.head_number),
+        head: checkpoint.block_number,
+    })
+}
+
+fn run_cold_start(
+    client: &Client,
+    base: &Url,
+    trust_key: &PublicKey,
+    dir: &Path,
+    sync_path: &Path,
+) -> Result<SyncReport> {
+    let index_url = resolve(base, "/snapshots/index.json")?;
     let (_, index_value) = client.get_json(&index_url)?;
-    verify_envelope(&index_value, "index", &trust_key)?;
+    verify_envelope(&index_value, "index", trust_key)?;
     let index_env: SnapshotIndexEnvelope = serde_json::from_value(index_value)?;
     let newest = index_env
         .index
@@ -203,14 +334,14 @@ pub fn run(anchor: &str, log_base: &str, dir: &Path, allow_http: bool) -> Result
         .next()
         .ok_or_else(|| Error::Verify("snapshot index is empty".into()))?;
 
-    let manifest_url = resolve(&base, &newest.manifest_url)?;
+    let manifest_url = resolve(base, &newest.manifest_url)?;
     let (_, manifest_value) = client.get_json(&manifest_url)?;
-    verify_envelope(&manifest_value, "manifest", &trust_key)?;
+    verify_envelope(&manifest_value, "manifest", trust_key)?;
     let manifest_env: SnapshotManifestEnvelope = serde_json::from_value(manifest_value)?;
     let manifest = manifest_env.manifest;
     let snapshot_base = format!("/snapshots/{}/", manifest.snapshot_date);
 
-    let state_url = resolve(&base, &format!("{snapshot_base}{}", manifest.state.path))?;
+    let state_url = resolve(base, &format!("{snapshot_base}{}", manifest.state.path))?;
     let state_bytes = client.get_bytes(&state_url)?;
     verify_file_integrity(&state_bytes, &manifest.state.sha256, manifest.state.bytes)?;
     let state_value: Value = serde_json::from_slice(&state_bytes)?;
@@ -218,7 +349,7 @@ pub fn run(anchor: &str, log_base: &str, dir: &Path, allow_http: bool) -> Result
 
     let mut tier0_bytes: Option<Vec<u8>> = None;
     for f in &manifest.files {
-        let file_url = resolve(&base, &format!("{snapshot_base}{}", f.path))?;
+        let file_url = resolve(base, &format!("{snapshot_base}{}", f.path))?;
         let bytes = client.get_bytes(&file_url)?;
         verify_file_integrity(&bytes, &f.sha256, f.bytes)?;
         if f.tier == 0 && f.path == "tier0/index.sqlite" {
@@ -239,9 +370,9 @@ pub fn run(anchor: &str, log_base: &str, dir: &Path, allow_http: bool) -> Result
         ));
     }
 
-    let checkpoint_url = resolve(&base, "/log/checkpoint.json")?;
+    let checkpoint_url = resolve(base, "/log/checkpoint.json")?;
     let (_, checkpoint_value) = client.get_json(&checkpoint_url)?;
-    verify_envelope(&checkpoint_value, "checkpoint", &trust_key)?;
+    verify_envelope(&checkpoint_value, "checkpoint", trust_key)?;
     let checkpoint_env: CheckpointEnvelope = serde_json::from_value(checkpoint_value.clone())?;
     let checkpoint = checkpoint_env.checkpoint;
 
@@ -251,37 +382,16 @@ pub fn run(anchor: &str, log_base: &str, dir: &Path, allow_http: bool) -> Result
         ));
     }
 
-    let mut prev_hash = manifest.anchor_block_hash.clone();
-    let mut last_block_value: Option<Value> = None;
-    let mut delta_bodies: Vec<Value> = Vec::new();
-    for n in (manifest.log_position + 1)..=checkpoint.block_number {
-        let block_url = resolve(&base, &format!("/log/blocks/{n:09}.json.zst"))?;
-        let compressed = client.get_bytes(&block_url)?;
-        let decompressed = zstd::decode_all(compressed.as_slice())
-            .map_err(|e| Error::Verify(format!("zstd decode of block {n}: {e}")))?;
-        let block_value: Value = serde_json::from_slice(&decompressed)?;
-        verify_block(&block_value, &trust_key)?;
-        let header = block_value
-            .get("header")
-            .ok_or_else(|| Error::Verify(format!("block {n} missing header")))?;
-        verify_chain_link(header, &prev_hash)?;
-        prev_hash = block_hash(header)?;
-        for entry in block_value
-            .get("entries")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if entry.get("type").and_then(Value::as_str) == Some("publisher_delta") {
-                if let Some(delta_entry_body) = entry.get("body") {
-                    delta_bodies.push(delta_entry_body.clone());
-                }
-            }
-        }
-        last_block_value = Some(block_value);
-    }
+    let walk = walk_blocks(
+        client,
+        base,
+        trust_key,
+        manifest.log_position + 1,
+        checkpoint.block_number,
+        &manifest.anchor_block_hash,
+    )?;
 
-    match &last_block_value {
+    match &walk.last_block_value {
         Some(block_value) => verify_checkpoint_binding(&checkpoint_value, block_value)?,
         None => {
             if checkpoint.block_number != manifest.log_position
@@ -297,7 +407,7 @@ pub fn run(anchor: &str, log_base: &str, dir: &Path, allow_http: bool) -> Result
     {
         let conn = Connection::open(&tmp_sqlite_path)?;
         conn.execute(CREATE_UNIQUE_INDEX, [])?;
-        apply_post_snapshot_deltas(&conn, &client, &base, delta_bodies)?;
+        apply_post_snapshot_deltas(&conn, client, base, walk.delta_bodies)?;
         conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
     }
 
@@ -310,7 +420,7 @@ pub fn run(anchor: &str, log_base: &str, dir: &Path, allow_http: bool) -> Result
         head_number: checkpoint.block_number,
         head_hash: checkpoint.block_hash.clone(),
     };
-    std::fs::write(&sync_path, serde_json::to_vec(&sync_state)?)?;
+    std::fs::write(sync_path, serde_json::to_vec(&sync_state)?)?;
 
     Ok(SyncReport {
         log_position_before: None,

@@ -370,6 +370,45 @@ pub fn resign_checkpoint_with_wrong_key(dir: &Path, other: &Signer) {
     std::fs::write(&path, serde_json::to_vec(&env).unwrap()).unwrap();
 }
 
+pub fn extend_fixture(fx: &Fixture) -> String {
+    let publisher = Signer::new([1u8; 32]);
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let next_number = prev_number + 1;
+
+    let url = format!("https://records.example/extra-{next_number}");
+    let (id, delta_env, payload) = build_delta(
+        &publisher,
+        "pk1",
+        &url,
+        "Extra Title",
+        Some("Extra abstract"),
+        "extra body",
+        None,
+    );
+    let hex = id.strip_prefix("sha256:").unwrap();
+    write_payload(fx.dir.path(), hex, &payload);
+    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
+
+    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
+    let (block, new_hash) = build_block(
+        &fx.log,
+        next_number,
+        &prev_hash,
+        &sealed_at,
+        &[wrapped_delta],
+    );
+    write_block(fx.dir.path(), next_number, &block);
+    write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+
+    url
+}
+
 pub fn serve_static(dir: PathBuf) -> String {
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

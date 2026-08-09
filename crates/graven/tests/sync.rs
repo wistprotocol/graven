@@ -152,6 +152,154 @@ fn cold_sync_leaves_no_partial_state_when_tier0_mutation_fails() {
 }
 
 #[test]
+fn continuous_sync_advances_head_and_applies_new_delta() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+
+    let report1 = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(report1.head, 1);
+
+    let new_url = common::extend_fixture(&fx);
+
+    let report2 = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(report2.head, 2);
+    assert_eq!(report2.log_position_before, Some(1));
+
+    let sync_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(target.path().join("sync.json")).unwrap()).unwrap();
+    assert_eq!(sync_json["log_position"], 0);
+    assert_eq!(sync_json["head_number"], 2);
+
+    let store = Store::open(target.path()).unwrap();
+    let extra = store.get(&new_url).unwrap().unwrap();
+    assert_eq!(extra.title, "Extra Title");
+    assert_eq!(extra.r#abstract.as_deref(), Some("Extra abstract"));
+
+    let alpha = store.get("https://records.example/alpha").unwrap();
+    assert!(alpha.is_some());
+}
+
+#[test]
+fn continuous_sync_is_noop_when_checkpoint_unchanged() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(report.head, 1);
+    assert_eq!(report.log_position_before, Some(1));
+}
+
+#[test]
+fn continuous_sync_rejects_rollback_checkpoint() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+
+    let old_checkpoint_bytes = std::fs::read(fx.dir.path().join("log/checkpoint.json")).unwrap();
+    common::extend_fixture(&fx);
+
+    let report2 = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(report2.head, 2);
+
+    std::fs::write(
+        fx.dir.path().join("log/checkpoint.json"),
+        &old_checkpoint_bytes,
+    )
+    .unwrap();
+
+    let result = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    );
+
+    let err = result.unwrap_err().to_string();
+    assert!(err.to_lowercase().contains("rollback"), "error was: {err}");
+}
+
+#[test]
+fn continuous_sync_rejects_same_height_different_hash_checkpoint() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+
+    common::extend_fixture(&fx);
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+
+    let forged_hash = format!("sha256:{}", "ab".repeat(32));
+    common::write_checkpoint(
+        fx.dir.path(),
+        &fx.log,
+        2,
+        &forged_hash,
+        "2026-08-09T20:00:00Z",
+    );
+
+    let result = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
 fn cold_sync_refuses_when_sync_json_already_exists() {
     let fx = common::build_fixture(true, false);
     let target = tempfile::tempdir().unwrap();
