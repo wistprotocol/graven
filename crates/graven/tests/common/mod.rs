@@ -362,6 +362,37 @@ pub fn corrupt_manifest_content_digest(dir: &Path, log: &Signer, snapshot_date: 
     std::fs::write(&path, serde_json::to_vec(&env).unwrap()).unwrap();
 }
 
+pub fn corrupt_state_digest(dir: &Path, log: &Signer, snapshot_date: &str) {
+    let path = dir
+        .join("snapshots")
+        .join(snapshot_date)
+        .join("manifest.json");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut manifest = doc["manifest"].clone();
+    manifest["state"]["state_digest"] = serde_json::json!(format!("sha256:{}", "0".repeat(64)));
+    let env = sign_envelope(&manifest, "manifest", "log1", &log.sk).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&env).unwrap()).unwrap();
+}
+
+pub fn resign_state_with_wrong_key(dir: &Path, log: &Signer, other: &Signer, snapshot_date: &str) {
+    let snapdir = dir.join("snapshots").join(snapshot_date);
+
+    let state_path = snapdir.join("state.json");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    let state = doc["state"].clone();
+    let env = sign_envelope(&state, "state", "log1", &other.sk).unwrap();
+    let new_state_bytes = serde_json::to_vec(&env).unwrap();
+    std::fs::write(&state_path, &new_state_bytes).unwrap();
+
+    let manifest_path = snapdir.join("manifest.json");
+    let mdoc: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let mut manifest = mdoc["manifest"].clone();
+    manifest["state"]["sha256"] = serde_json::json!(sha256_hex(&new_state_bytes));
+    manifest["state"]["bytes"] = serde_json::json!(new_state_bytes.len() as u64);
+    let menv = sign_envelope(&manifest, "manifest", "log1", &log.sk).unwrap();
+    std::fs::write(&manifest_path, serde_json::to_vec(&menv).unwrap()).unwrap();
+}
+
 pub fn resign_checkpoint_with_wrong_key(dir: &Path, other: &Signer) {
     let path = dir.join("log/checkpoint.json");
     let doc: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

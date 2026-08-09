@@ -15,7 +15,7 @@ use wist_core::objects::{
     ChangeType, CheckpointEnvelope, DeltaEnvelope, DeltaPayloadCommitment, LogAnchorEnvelope,
     Payload, SnapshotIndexEnvelope, SnapshotManifestEnvelope, SnapshotStateEnvelope,
 };
-use wist_core::snapshot::content_digest;
+use wist_core::snapshot::{content_digest, state_digest};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SyncReport {
@@ -350,7 +350,20 @@ fn run_cold_start(
     let state_bytes = client.get_bytes(&state_url)?;
     verify_file_integrity(&state_bytes, &manifest.state.sha256, manifest.state.bytes)?;
     let state_value: Value = serde_json::from_slice(&state_bytes)?;
-    let _state_env: SnapshotStateEnvelope = serde_json::from_value(state_value)?;
+    verify_envelope(&state_value, "state", trust_key)?;
+    let state_env: SnapshotStateEnvelope = serde_json::from_value(state_value)?;
+    let state_entry_values: Vec<Value> = state_env
+        .state
+        .entries
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<serde_json::Result<_>>()?;
+    let recomputed_state_digest = state_digest(&state_entry_values)?;
+    if recomputed_state_digest != manifest.state.state_digest {
+        return Err(Error::Verify(
+            "state_digest mismatch: recomputed state digest does not match manifest".into(),
+        ));
+    }
 
     let mut tier0_bytes: Option<Vec<u8>> = None;
     for f in &manifest.files {

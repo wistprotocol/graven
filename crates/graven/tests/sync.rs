@@ -118,6 +118,44 @@ fn cold_sync_rejects_wrong_manifest_content_digest() {
 }
 
 #[test]
+fn cold_sync_rejects_wrong_state_digest_in_manifest() {
+    let fx = common::build_fixture(true, false);
+    common::corrupt_state_digest(fx.dir.path(), &fx.log, &fx.snapshot_date);
+
+    let target = tempfile::tempdir().unwrap();
+    let result = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    );
+
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.to_lowercase().contains("state_digest"),
+        "error was: {err}"
+    );
+    assert!(!target.path().join("sync.json").exists());
+}
+
+#[test]
+fn cold_sync_rejects_state_signed_by_wrong_key() {
+    let fx = common::build_fixture(true, false);
+    common::resign_state_with_wrong_key(fx.dir.path(), &fx.log, &fx.other, &fx.snapshot_date);
+
+    let target = tempfile::tempdir().unwrap();
+    let result = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    );
+
+    assert!(result.is_err());
+    assert!(!target.path().join("sync.json").exists());
+}
+
+#[test]
 fn cold_sync_rejects_checkpoint_signed_by_wrong_key() {
     let fx = common::build_fixture(true, false);
     common::resign_checkpoint_with_wrong_key(fx.dir.path(), &fx.other);
