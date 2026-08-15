@@ -1,0 +1,3 @@
+- name: fetch wist-core sibling
+  shell: bash
+  run: git clone --depth 1 https://github.com/wistprotocol/core "$GITHUB_WORKSPACE/../core"

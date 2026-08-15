@@ -34,5 +34,7 @@ jobs:
           CLAVE_BIN: "${{ github.workspace }}/clave/target/debug/clave"
           WIST_SPEC_DIR: "${{ github.workspace }}/spec"
           CI: "1"
+      - run: node --test
+        working-directory: graven/npm
       - uses: EmbarkStudios/cargo-deny-action@v2
         with: { manifest-path: graven/Cargo.toml }
