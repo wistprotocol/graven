@@ -1395,3 +1395,209 @@ fn mid_migration_rename_failure_restores_first_file_via_public_api() {
     assert!(!target_dir.join("index.sqlite").exists());
     assert!(!dir.path().join("logs.json").exists());
 }
+
+#[test]
+fn incremental_sync_with_tier1_populates_extract_for_new_url() {
+    let fx = common::build_fixture_with_tier1();
+    let target = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        true,
+    )
+    .unwrap();
+
+    let new_url = common::extend_fixture(&fx);
+
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        true,
+    )
+    .unwrap();
+
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+    let extract: String = conn
+        .query_row(
+            "SELECT extract FROM extracts WHERE url = ?1",
+            [&new_url],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(extract, "extra body");
+}
+
+#[test]
+fn incremental_sync_with_tier1_replaces_links_and_extract_on_update() {
+    let fx = common::build_fixture_with_tier1();
+    let target = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        true,
+    )
+    .unwrap();
+
+    let publisher = common::Signer::new([1u8; 32]);
+    let (alpha_id, _, _) = common::build_delta(
+        &publisher,
+        "pk1",
+        "https://records.example/alpha",
+        "Alpha Title",
+        Some("Alpha abstract"),
+        "alpha body",
+        None,
+    );
+
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let next_number = prev_number + 1;
+
+    let (id2, delta2_env, payload2) = common::build_delta_with_links(
+        &publisher,
+        "pk1",
+        "https://records.example/alpha",
+        "Alpha Title",
+        Some("Alpha abstract"),
+        "alpha body v2",
+        &["https://records.example/second"],
+        Some(&alpha_id),
+    );
+    let hex2 = id2.strip_prefix("sha256:").unwrap();
+    common::write_payload(fx.dir.path(), hex2, &payload2);
+    let wrapped_delta2 = serde_json::json!({"type": "publisher_delta", "body": delta2_env});
+
+    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
+    let (block, new_hash) = common::build_block(
+        &fx.log,
+        next_number,
+        &prev_hash,
+        &sealed_at,
+        &[wrapped_delta2],
+    );
+    common::write_block(fx.dir.path(), next_number, &block);
+    common::write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        true,
+    )
+    .unwrap();
+
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+    let extract: String = conn
+        .query_row(
+            "SELECT extract FROM extracts WHERE url = ?1",
+            ["https://records.example/alpha"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(extract, "alpha body v2");
+
+    let mut stmt = conn
+        .prepare("SELECT target_url, position FROM links WHERE source_url = ?1 ORDER BY position")
+        .unwrap();
+    let rows: Vec<(String, i64)> = stmt
+        .query_map(["https://records.example/alpha"], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![("https://records.example/second".to_string(), 0)]
+    );
+}
+
+#[test]
+fn incremental_sync_leaves_tier1_absent_when_payload_fetch_fails() {
+    let fx = common::build_fixture_with_tier1();
+    let target = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        true,
+    )
+    .unwrap();
+
+    let publisher = common::Signer::new([1u8; 32]);
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let next_number = prev_number + 1;
+
+    let url = "https://records.example/no-payload".to_string();
+    let (_id, delta_env, _payload) = common::build_delta(
+        &publisher,
+        "pk1",
+        &url,
+        "No Payload Title",
+        None,
+        "unreachable extract",
+        None,
+    );
+    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
+
+    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
+    let (block, new_hash) = common::build_block(
+        &fx.log,
+        next_number,
+        &prev_hash,
+        &sealed_at,
+        &[wrapped_delta],
+    );
+    common::write_block(fx.dir.path(), next_number, &block);
+    common::write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        true,
+    )
+    .unwrap();
+
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+    let title: String = conn
+        .query_row("SELECT title FROM records WHERE url = ?1", [&url], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(title, "");
+
+    let extract_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM extracts WHERE url = ?1",
+            [&url],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(extract_count, 0);
+}

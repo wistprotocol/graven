@@ -118,12 +118,19 @@ fn recompute_content_digest(sqlite_path: &Path) -> Result<String> {
     Ok(content_digest(&records)?)
 }
 
+struct PayloadFields {
+    title: String,
+    abstract_text: Option<String>,
+    extract: Option<String>,
+    links: Vec<String>,
+}
+
 fn fetch_payload(
     client: &Client,
     base: &Url,
     hex: &str,
     commitment: &DeltaPayloadCommitment,
-) -> Result<(String, Option<String>)> {
+) -> Result<PayloadFields> {
     let url = resolve(base, &format!("/payloads/{hex}.json"))?;
     let (_, value) = client.get_json(&url)?;
     let payload: Payload = serde_json::from_value(value.clone())?;
@@ -131,10 +138,12 @@ fn fetch_payload(
     if content_bytes(&value["content"])? != commitment.bytes {
         return Err(Error::Verify("payload content bytes mismatch".into()));
     }
-    Ok((
-        payload.content.summary.title,
-        payload.content.summary.r#abstract,
-    ))
+    Ok(PayloadFields {
+        title: payload.content.summary.title,
+        abstract_text: payload.content.summary.r#abstract,
+        extract: Some(payload.content.extract),
+        links: payload.content.links.urls,
+    })
 }
 
 pub fn walk_blocks(
@@ -346,11 +355,15 @@ pub fn apply_events(
     base: &Url,
     history: &mut KeyHistory,
     events: &[BlockEvent],
+    tier1: bool,
 ) -> Result<ApplyStats> {
     let mut stats = ApplyStats {
         applied: 0,
         withdrawn: 0,
     };
+    if tier1 {
+        conn.execute_batch(CREATE_TIER1)?;
+    }
     for event in events {
         for declaration in &event.declarations {
             history.add_declaration(event.height, &event.sealed_at, declaration)?;
@@ -377,11 +390,12 @@ pub fn apply_events(
             match env.delta.change_type {
                 ChangeType::New | ChangeType::Update => {
                     let hex = id.trim_start_matches("sha256:");
-                    let (title, abstract_text) = match &env.delta.payload {
-                        Some(commitment) => fetch_payload(client, base, hex, commitment)
-                            .unwrap_or((String::new(), None)),
-                        None => (String::new(), None),
+                    let fields = match &env.delta.payload {
+                        Some(commitment) => fetch_payload(client, base, hex, commitment).ok(),
+                        None => None,
                     };
+                    let title = fields.as_ref().map(|f| f.title.clone()).unwrap_or_default();
+                    let abstract_text = fields.as_ref().and_then(|f| f.abstract_text.clone());
 
                     conn.execute(
                         "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang)
@@ -401,6 +415,29 @@ pub fn apply_events(
                         ),
                     )?;
                     stats.applied += 1;
+
+                    if tier1 {
+                        if let Some(f) = &fields {
+                            if let Some(extract) = &f.extract {
+                                conn.execute(
+                                    "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, ?2, ?3, ?4)
+                                     ON CONFLICT(url, publisher) DO UPDATE SET
+                                        delta_id = excluded.delta_id, extract = excluded.extract",
+                                    (&env.delta.url, &publisher, &id, extract),
+                                )?;
+                            }
+                            conn.execute(
+                                "DELETE FROM links WHERE source_url = ?1",
+                                [&env.delta.url],
+                            )?;
+                            for (position, target_url) in f.links.iter().enumerate() {
+                                conn.execute(
+                                    "INSERT INTO links(source_url, target_url, position) VALUES (?1, ?2, ?3)",
+                                    (&env.delta.url, target_url, position as i64),
+                                )?;
+                            }
+                        }
+                    }
                 }
                 ChangeType::Delete => {
                     remove_by_url(conn, &env.delta.url, &publisher)?;
@@ -496,7 +533,15 @@ fn run_registered(
     let sync_path = log_dir.join("sync.json");
 
     if sync_path.exists() {
-        run_incremental(client, base, trust_key, log_id, &log_dir, &sync_path)
+        run_incremental(
+            client,
+            base,
+            trust_key,
+            log_id,
+            &log_dir,
+            &sync_path,
+            effective_tier1,
+        )
     } else {
         run_cold_start(
             client,
@@ -585,6 +630,7 @@ fn rollback_migration(dir: &Path, log_id: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_incremental(
     client: &Client,
     base: &Url,
@@ -592,6 +638,7 @@ fn run_incremental(
     log_id: &str,
     dir: &Path,
     sync_path: &Path,
+    tier1: bool,
 ) -> Result<SyncReport> {
     let sync_bytes = std::fs::read(sync_path)?;
     let local: SyncState = serde_json::from_slice(&sync_bytes)?;
@@ -643,8 +690,14 @@ fn run_incremental(
     let tx = conn.unchecked_transaction()?;
     tx.execute(CREATE_UNIQUE_INDEX, [])?;
     tx.execute(CREATE_DECLARATIONS, [])?;
-    let stats = apply_events(&tx, client, base, &mut history, &events)?;
+    let stats = apply_events(&tx, client, base, &mut history, &events, tier1)?;
     tx.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
+    if tier1 {
+        tx.execute(
+            "INSERT INTO extracts_fts(extracts_fts) VALUES('rebuild')",
+            [],
+        )?;
+    }
     tx.commit()?;
 
     let sync_state = SyncState {
@@ -795,7 +848,7 @@ fn run_cold_start(
         }
     }
 
-    let stats = apply_events(&conn, client, base, &mut history, &events)?;
+    let stats = apply_events(&conn, client, base, &mut history, &events, tier1)?;
     conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
     if tier1 {
         conn.execute(

@@ -31,6 +31,19 @@ fn to_record_out(hit: MergedHit) -> RecordOut {
     }
 }
 
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct ExtractOut {
+    pub url: String,
+    pub extract: String,
+    pub provenance: Vec<ProvEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct LinkOut {
+    pub target_url: String,
+    pub position: i64,
+}
+
 fn default_limit() -> usize {
     10
 }
@@ -95,13 +108,52 @@ impl GravenServer {
             None => Err(ErrorData::resource_not_found("not found", None)),
         }
     }
+
+    #[tool(description = "Fetch the stored tier1 extract for a URL")]
+    fn get_extract(
+        &self,
+        Parameters(GetRecordParams { url }): Parameters<GetRecordParams>,
+    ) -> std::result::Result<Json<ExtractOut>, ErrorData> {
+        let result = self
+            .store()
+            .extract(&url)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        match result {
+            Some((extract, provenance)) => Ok(Json(ExtractOut {
+                url,
+                extract,
+                provenance,
+            })),
+            None => Err(ErrorData::resource_not_found("no extract for url", None)),
+        }
+    }
+
+    #[tool(description = "List outbound declared links for a URL")]
+    fn get_links(
+        &self,
+        Parameters(GetRecordParams { url }): Parameters<GetRecordParams>,
+    ) -> std::result::Result<Json<Vec<LinkOut>>, ErrorData> {
+        let rows = self
+            .store()
+            .links(&url)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(Json(
+            rows.into_iter()
+                .map(|(target_url, position)| LinkOut {
+                    target_url,
+                    position,
+                })
+                .collect(),
+        ))
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for GravenServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Graven: search and get_record over a local WIST index")
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Graven: search, get_record, get_extract and get_links over a local WIST index",
+        )
     }
 }
 
@@ -125,6 +177,7 @@ mod tests {
     use crate::registry::{self, LogEntry, Registry};
     use crate::sync::SyncState;
     use rusqlite::Connection;
+    use std::path::PathBuf;
 
     fn seed_two_records(log_dir: &Path) {
         std::fs::create_dir_all(log_dir).unwrap();
@@ -166,7 +219,45 @@ mod tests {
             .unwrap();
     }
 
-    fn test_server(dir: &Path) -> GravenServer {
+    fn seed_tier1(log_dir: &Path) {
+        let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+        conn.execute_batch(crate::store::CREATE_TIER1).unwrap();
+        conn.execute(
+            "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, ?2, ?3, ?4)",
+            (
+                "https://example.com/alpha",
+                "example.com",
+                "sha256:a",
+                "alpha body text",
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO links(source_url, target_url, position) VALUES (?1, ?2, ?3)",
+            (
+                "https://example.com/alpha",
+                "https://example.com/second",
+                1i64,
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO links(source_url, target_url, position) VALUES (?1, ?2, ?3)",
+            (
+                "https://example.com/alpha",
+                "https://example.com/first",
+                0i64,
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO extracts_fts(extracts_fts) VALUES('rebuild')",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn setup_server_dir(dir: &Path) -> PathBuf {
         let log_dir = registry::log_dir(dir, "test-log");
         seed_two_records(&log_dir);
         std::fs::write(
@@ -192,6 +283,18 @@ mod tests {
             },
         )
         .unwrap();
+        log_dir
+    }
+
+    fn test_server(dir: &Path) -> GravenServer {
+        setup_server_dir(dir);
+        let store = MultiStore::open_read_only(dir).unwrap();
+        GravenServer::new(store)
+    }
+
+    fn test_server_with_tier1(dir: &Path) -> GravenServer {
+        let log_dir = setup_server_dir(dir);
+        seed_tier1(&log_dir);
         let store = MultiStore::open_read_only(dir).unwrap();
         GravenServer::new(store)
     }
@@ -275,5 +378,95 @@ mod tests {
         };
         assert_eq!(err.message, "not found");
         assert_eq!(err.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+    }
+
+    #[test]
+    fn get_extract_returns_text_and_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server_with_tier1(tmp.path());
+        let Json(out) = server
+            .get_extract(Parameters(GetRecordParams {
+                url: "https://example.com/alpha".into(),
+            }))
+            .unwrap();
+        assert_eq!(out.url, "https://example.com/alpha");
+        assert_eq!(out.extract, "alpha body text");
+        assert_eq!(out.provenance.len(), 1);
+        assert_eq!(out.provenance[0].log_id, "test-log");
+        assert_eq!(out.provenance[0].synced_height, 7);
+    }
+
+    #[test]
+    fn get_extract_unknown_url_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server_with_tier1(tmp.path());
+        let Err(err) = server.get_extract(Parameters(GetRecordParams {
+            url: "https://example.com/nope".into(),
+        })) else {
+            panic!("expected resource_not_found error");
+        };
+        assert_eq!(err.message, "no extract for url");
+        assert_eq!(err.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+    }
+
+    #[test]
+    fn get_extract_without_tier1_data_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(tmp.path());
+        let Err(err) = server.get_extract(Parameters(GetRecordParams {
+            url: "https://example.com/alpha".into(),
+        })) else {
+            panic!("expected resource_not_found error");
+        };
+        assert_eq!(err.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+    }
+
+    #[test]
+    fn get_links_returns_rows_ordered_by_position() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server_with_tier1(tmp.path());
+        let Json(links) = server
+            .get_links(Parameters(GetRecordParams {
+                url: "https://example.com/alpha".into(),
+            }))
+            .unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].target_url, "https://example.com/first");
+        assert_eq!(links[0].position, 0);
+        assert_eq!(links[1].target_url, "https://example.com/second");
+        assert_eq!(links[1].position, 1);
+    }
+
+    #[test]
+    fn get_links_returns_empty_vec_not_error_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server_with_tier1(tmp.path());
+        let Json(links) = server
+            .get_links(Parameters(GetRecordParams {
+                url: "https://example.com/beta".into(),
+            }))
+            .unwrap();
+        assert!(links.is_empty());
+
+        let Json(links) = server
+            .get_links(Parameters(GetRecordParams {
+                url: "https://example.com/nope".into(),
+            }))
+            .unwrap();
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn search_matches_extract_only_phrase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server_with_tier1(tmp.path());
+        let Json(results) = server
+            .search(Parameters(SearchParams {
+                query: "alpha body".into(),
+                limit: 10,
+            }))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://example.com/alpha");
     }
 }

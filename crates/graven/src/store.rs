@@ -55,6 +55,64 @@ pub struct MergedHit {
     pub provenance: Vec<ProvEntry>,
 }
 
+#[derive(Debug, Clone)]
+struct ExtractRow {
+    extract: String,
+    delta_id: String,
+    observed_at: String,
+    weight: String,
+}
+
+fn merge_extract(rows: Vec<(String, u64, ExtractRow)>) -> Option<(String, Vec<ProvEntry>)> {
+    let mut by_delta: BTreeMap<String, (ExtractRow, Vec<ProvEntry>)> = BTreeMap::new();
+    for (log_id, synced_height, row) in rows {
+        let weight = row.weight.clone();
+        let entry = by_delta
+            .entry(row.delta_id.clone())
+            .or_insert_with(|| (row, Vec::new()));
+        entry.1.push(ProvEntry {
+            log_id,
+            synced_height,
+            weight,
+        });
+    }
+
+    let mut winner: Option<(String, String, String, Vec<ProvEntry>)> = None;
+    for (delta_id, (row, mut provenance)) in by_delta {
+        provenance.sort_by(|a, b| a.log_id.cmp(&b.log_id));
+        let is_better = match &winner {
+            Some((obs, did, _, _)) => {
+                (row.observed_at.as_str(), delta_id.as_str()) > (obs.as_str(), did.as_str())
+            }
+            None => true,
+        };
+        if is_better {
+            winner = Some((
+                row.observed_at.clone(),
+                delta_id,
+                row.extract.clone(),
+                provenance,
+            ));
+        }
+    }
+    winner.map(|(_, _, extract, provenance)| (extract, provenance))
+}
+
+fn quote_phrase(q: &str) -> String {
+    format!("\"{}\"", q.replace('"', "\"\""))
+}
+
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let hit: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(hit.is_some())
+}
+
 fn merge(rows: Vec<(String, u64, RecordHit)>) -> Vec<MergedHit> {
     let mut by_delta: BTreeMap<String, (RecordHit, Vec<ProvEntry>)> = BTreeMap::new();
     for (log_id, synced_height, hit) in rows {
@@ -158,6 +216,29 @@ impl MultiStore {
         }
         Ok(merge(rows).into_iter().next())
     }
+
+    pub fn extract(&self, url: &str) -> Result<Option<(String, Vec<ProvEntry>)>> {
+        let mut rows = Vec::new();
+        for handle in &self.logs {
+            if let Some(row) = handle.store.extract_row(url)? {
+                rows.push((handle.log_id.clone(), handle.synced_height, row));
+            }
+        }
+        Ok(merge_extract(rows))
+    }
+
+    pub fn links(&self, url: &str) -> Result<Vec<(String, i64)>> {
+        let Some((_, provenance)) = self.extract(url)? else {
+            return Ok(Vec::new());
+        };
+        let Some(winning_log_id) = provenance.first().map(|p| p.log_id.clone()) else {
+            return Ok(Vec::new());
+        };
+        match self.logs.iter().find(|h| h.log_id == winning_log_id) {
+            Some(handle) => handle.store.links_rows(url),
+            None => Ok(Vec::new()),
+        }
+    }
 }
 
 pub struct Store {
@@ -181,15 +262,34 @@ impl Store {
     }
 
     pub fn search(&self, q: &str, limit: usize) -> Result<Vec<RecordHit>> {
-        let phrase = format!("\"{}\"", q.replace('"', "\"\""));
+        let phrase = quote_phrase(q);
         let mut stmt = self.conn.prepare(
             "SELECT r.url, r.publisher, r.delta_id, r.observed_at, r.weight, r.title, r.abstract
              FROM records_fts f JOIN records r ON r.rowid = f.rowid
              WHERE records_fts MATCH ?1 LIMIT ?2",
         )?;
-        let rows = stmt
-            .query_map((phrase, limit as i64), row_to_hit)?
+        let mut rows = stmt
+            .query_map((phrase.as_str(), limit as i64), row_to_hit)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        if table_exists(&self.conn, "extracts")? {
+            let mut estmt = self.conn.prepare(
+                "SELECT r.url, r.publisher, r.delta_id, r.observed_at, r.weight, r.title, r.abstract
+                 FROM extracts_fts f JOIN extracts e ON e.rowid = f.rowid
+                 JOIN records r ON r.url = e.url AND r.publisher = e.publisher
+                 WHERE extracts_fts MATCH ?1 LIMIT ?2",
+            )?;
+            let mut seen: std::collections::HashSet<String> =
+                rows.iter().map(|h| h.delta_id.clone()).collect();
+            for hit in estmt
+                .query_map((phrase.as_str(), limit as i64), row_to_hit)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            {
+                if seen.insert(hit.delta_id.clone()) {
+                    rows.push(hit);
+                }
+            }
+        }
         Ok(rows)
     }
 
@@ -203,6 +303,42 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    fn extract_row(&self, url: &str) -> Result<Option<ExtractRow>> {
+        if !table_exists(&self.conn, "extracts")? {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(
+                "SELECT e.extract, e.delta_id, r.observed_at, r.weight
+                 FROM extracts e JOIN records r ON r.url = e.url AND r.publisher = e.publisher
+                 WHERE e.url = ?1 LIMIT 1",
+                [url],
+                |row| {
+                    Ok(ExtractRow {
+                        extract: row.get(0)?,
+                        delta_id: row.get(1)?,
+                        observed_at: row.get(2)?,
+                        weight: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn links_rows(&self, url: &str) -> Result<Vec<(String, i64)>> {
+        if !table_exists(&self.conn, "links")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT target_url, position FROM links WHERE source_url = ?1 ORDER BY position",
+        )?;
+        let rows = stmt
+            .query_map([url], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 }
 
@@ -430,6 +566,35 @@ mod tests {
             .unwrap();
     }
 
+    fn seed_tier1_row(
+        log_dir: &Path,
+        url: &str,
+        delta_id: &str,
+        extract: &str,
+        links: &[(&str, i64)],
+    ) {
+        std::fs::create_dir_all(log_dir).unwrap();
+        let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+        conn.execute_batch(CREATE_TIER1).unwrap();
+        conn.execute(
+            "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, 'example.com', ?2, ?3)",
+            (url, delta_id, extract),
+        )
+        .unwrap();
+        for (target, position) in links {
+            conn.execute(
+                "INSERT INTO links(source_url, target_url, position) VALUES (?1, ?2, ?3)",
+                (url, target, position),
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO extracts_fts(extracts_fts) VALUES('rebuild')",
+            [],
+        )
+        .unwrap();
+    }
+
     fn seed_sync(log_dir: &Path, height: u64) {
         std::fs::write(
             log_dir.join("sync.json"),
@@ -600,5 +765,120 @@ mod tests {
         assert_eq!(store.logs().len(), 1);
         assert_eq!(store.logs()[0].log_id, "log-a");
         assert_eq!(store.logs()[0].synced_height, 4);
+    }
+
+    #[test]
+    fn search_matches_extract_only_text_via_fts() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path());
+        seed_tier1_row(
+            tmp.path(),
+            "https://example.com/alpha",
+            "sha256:a",
+            "distinctive extract payload",
+            &[],
+        );
+        let store = Store::open(tmp.path()).unwrap();
+        let hits = store.search("distinctive extract", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://example.com/alpha");
+    }
+
+    #[test]
+    fn search_dedupes_records_and_extracts_fts_hit_for_same_delta() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed(tmp.path());
+        seed_tier1_row(
+            tmp.path(),
+            "https://example.com/alpha",
+            "sha256:a",
+            "the extract also mentions Alpha Title verbatim",
+            &[],
+        );
+        let store = Store::open(tmp.path()).unwrap();
+        let hits = store.search("Alpha Title", 10).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "a record matching both records_fts and extracts_fts must appear once"
+        );
+    }
+
+    #[test]
+    fn multi_store_extract_prefers_latest_delta_across_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_a = crate::registry::log_dir(tmp.path(), "log-a");
+        let log_b = crate::registry::log_dir(tmp.path(), "log-b");
+
+        seed_row(
+            &log_a,
+            "https://example.com/alpha",
+            "sha256:stale",
+            "2026-08-09T12:00:00Z",
+            "full",
+            "Alpha Title",
+        );
+        seed_tier1_row(
+            &log_a,
+            "https://example.com/alpha",
+            "sha256:stale",
+            "stale extract",
+            &[("https://example.com/stale-link", 0)],
+        );
+        seed_sync(&log_a, 3);
+
+        seed_row(
+            &log_b,
+            "https://example.com/alpha",
+            "sha256:fresh",
+            "2026-08-09T13:00:00Z",
+            "full",
+            "Alpha Title",
+        );
+        seed_tier1_row(
+            &log_b,
+            "https://example.com/alpha",
+            "sha256:fresh",
+            "fresh extract",
+            &[("https://example.com/fresh-link", 0)],
+        );
+        seed_sync(&log_b, 5);
+
+        seed_registry(tmp.path(), &["log-a", "log-b"]);
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        let (extract, provenance) = store.extract("https://example.com/alpha").unwrap().unwrap();
+        assert_eq!(extract, "fresh extract");
+        assert_eq!(provenance.len(), 1);
+        assert_eq!(provenance[0].log_id, "log-b");
+
+        let links = store.links("https://example.com/alpha").unwrap();
+        assert_eq!(
+            links,
+            vec![("https://example.com/fresh-link".to_string(), 0)]
+        );
+    }
+
+    #[test]
+    fn multi_store_extract_and_links_are_empty_when_no_tier1_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_a = crate::registry::log_dir(tmp.path(), "log-a");
+        seed_row(
+            &log_a,
+            "https://example.com/alpha",
+            "sha256:a",
+            "2026-08-09T00:00:00Z",
+            "full",
+            "Alpha Title",
+        );
+        seed_sync(&log_a, 1);
+        seed_registry(tmp.path(), &["log-a"]);
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        assert!(store
+            .extract("https://example.com/alpha")
+            .unwrap()
+            .is_none());
+        assert!(store.links("https://example.com/alpha").unwrap().is_empty());
     }
 }

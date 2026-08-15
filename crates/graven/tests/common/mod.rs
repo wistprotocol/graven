@@ -137,6 +137,29 @@ pub fn build_delta(
     extract: &str,
     prev: Option<&str>,
 ) -> (String, Value, Value) {
+    build_delta_with_links(
+        publisher,
+        key_id,
+        url,
+        title,
+        abstract_text,
+        extract,
+        &[],
+        prev,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_delta_with_links(
+    publisher: &Signer,
+    key_id: &str,
+    url: &str,
+    title: &str,
+    abstract_text: Option<&str>,
+    extract: &str,
+    links: &[&str],
+    prev: Option<&str>,
+) -> (String, Value, Value) {
     let salt = b64u_encode(&[5u8; 16]);
     let mut summary = serde_json::json!({"title": title});
     if let Some(a) = abstract_text {
@@ -144,7 +167,7 @@ pub fn build_delta(
     }
     let content = serde_json::json!({
         "extract": extract,
-        "links": {"total": 0, "urls": []},
+        "links": {"total": links.len() as u64, "urls": links},
         "summary": summary,
     });
     let payload = serde_json::json!({
