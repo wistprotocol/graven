@@ -14,3 +14,5 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rusqlite = { version = "0.32", features = ["bundled"] }
 zstd = "0.13"
 sha2 = "0.10"
+parquet = { version = "56", default-features = false }
+bytes = "1"

@@ -7,6 +7,7 @@ pub mod mcp;
 pub mod registry;
 pub mod store;
 pub mod sync;
+pub mod tier1;
 
 pub use error::Error;
 

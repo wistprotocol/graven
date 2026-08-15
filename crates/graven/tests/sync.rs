@@ -1297,6 +1297,78 @@ fn failed_migration_restores_legacy_layout_and_registers_nothing() {
 }
 
 #[test]
+fn cold_sync_with_tier1_flag_imports_extracts_and_links() {
+    let fx = common::build_fixture_with_tier1();
+    let target = tempfile::tempdir().unwrap();
+
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        true,
+    )
+    .unwrap();
+
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+    let (url, publisher, extract): (String, String, String) = conn
+        .query_row("SELECT url, publisher, extract FROM extracts", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(url, "https://records.example/alpha");
+    assert_eq!(publisher, fx.domain);
+    assert_eq!(extract, "alpha body");
+
+    let (source_url, target_url, position): (String, String, i64) = conn
+        .query_row(
+            "SELECT source_url, target_url, position FROM links",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(source_url, "https://records.example/alpha");
+    assert_eq!(target_url, "https://records.example/other");
+    assert_eq!(position, 0);
+
+    let fts_extract: String = conn
+        .query_row(
+            "SELECT extract FROM extracts_fts WHERE extracts_fts MATCH 'alpha'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(fts_extract, "alpha body");
+}
+
+#[test]
+fn cold_sync_without_tier1_flag_leaves_extracts_absent() {
+    let fx = common::build_fixture_with_tier1();
+    let target = tempfile::tempdir().unwrap();
+
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        false,
+    )
+    .unwrap();
+
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+    let table_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'extracts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_count, 0);
+}
+
+#[test]
 fn mid_migration_rename_failure_restores_first_file_via_public_api() {
     let fx = common::build_fixture(true, false);
     let dir = tempfile::tempdir().unwrap();

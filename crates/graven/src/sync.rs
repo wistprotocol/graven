@@ -2,7 +2,8 @@ use crate::error::{Error, Result};
 use crate::fetch::{resolve, Client};
 use crate::keyset::{url_authority, KeyHistory};
 use crate::registry::{self, LogEntry};
-use crate::store::{CREATE_DECLARATIONS, CREATE_UNIQUE_INDEX};
+use crate::store::{CREATE_DECLARATIONS, CREATE_TIER1, CREATE_UNIQUE_INDEX};
+use crate::tier1;
 use reqwest::Url;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -465,7 +466,7 @@ fn run_registered(
     tier1: bool,
 ) -> Result<SyncReport> {
     let mut reg = registry::load(dir)?;
-    match reg.logs.iter_mut().find(|e| e.log_id == log_id) {
+    let effective_tier1 = match reg.logs.iter_mut().find(|e| e.log_id == log_id) {
         Some(entry) => {
             if entry.anchor != anchor || entry.base != log_base {
                 return Err(Error::Verify(format!(
@@ -476,14 +477,18 @@ fn run_registered(
             if tier1 {
                 entry.tier1 = true;
             }
+            entry.tier1
         }
-        None => reg.logs.push(LogEntry {
-            log_id: log_id.to_string(),
-            anchor: anchor.to_string(),
-            base: log_base.to_string(),
-            tier1,
-        }),
-    }
+        None => {
+            reg.logs.push(LogEntry {
+                log_id: log_id.to_string(),
+                anchor: anchor.to_string(),
+                base: log_base.to_string(),
+                tier1,
+            });
+            tier1
+        }
+    };
     registry::save(dir, &reg)?;
 
     let log_dir = registry::log_dir(dir, log_id);
@@ -493,7 +498,15 @@ fn run_registered(
     if sync_path.exists() {
         run_incremental(client, base, trust_key, log_id, &log_dir, &sync_path)
     } else {
-        run_cold_start(client, base, trust_key, log_id, &log_dir, &sync_path)
+        run_cold_start(
+            client,
+            base,
+            trust_key,
+            log_id,
+            &log_dir,
+            &sync_path,
+            effective_tier1,
+        )
     }
 }
 
@@ -650,6 +663,7 @@ fn run_incremental(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_cold_start(
     client: &Client,
     base: &Url,
@@ -657,6 +671,7 @@ fn run_cold_start(
     log_id: &str,
     dir: &Path,
     sync_path: &Path,
+    tier1: bool,
 ) -> Result<SyncReport> {
     let index_url = resolve(base, "/snapshots/index.json")?;
     let (_, index_value) = client.get_json(&index_url)?;
@@ -696,12 +711,18 @@ fn run_cold_start(
     }
 
     let mut tier0_bytes: Option<Vec<u8>> = None;
+    let mut tier1_extracts: Vec<Vec<u8>> = Vec::new();
+    let mut tier1_links: Vec<Vec<u8>> = Vec::new();
     for f in &manifest.files {
         let file_url = resolve(base, &format!("{snapshot_base}{}", f.path))?;
         let bytes = client.get_bytes(&file_url)?;
         verify_file_integrity(&bytes, &f.sha256, f.bytes)?;
         if f.tier == 0 && f.path == "tier0/index.sqlite" {
             tier0_bytes = Some(bytes);
+        } else if tier1 && f.path.ends_with("tier1/extracts.parquet") {
+            tier1_extracts.push(bytes);
+        } else if tier1 && f.path.ends_with("tier1/links.parquet") {
+            tier1_links.push(bytes);
         }
     }
     let tier0_bytes = tier0_bytes
@@ -721,6 +742,16 @@ fn run_cold_start(
     let conn = Connection::open(&tmp_sqlite_path)?;
     conn.execute(CREATE_UNIQUE_INDEX, [])?;
     conn.execute(CREATE_DECLARATIONS, [])?;
+
+    if tier1 {
+        conn.execute_batch(CREATE_TIER1)?;
+        for bytes in &tier1_extracts {
+            tier1::import_extracts(&conn, bytes)?;
+        }
+        for bytes in &tier1_links {
+            tier1::import_links(&conn, bytes)?;
+        }
+    }
 
     let mut history = KeyHistory::new();
     for entry in &state_env.state.entries {
@@ -766,6 +797,12 @@ fn run_cold_start(
 
     let stats = apply_events(&conn, client, base, &mut history, &events)?;
     conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
+    if tier1 {
+        conn.execute(
+            "INSERT INTO extracts_fts(extracts_fts) VALUES('rebuild')",
+            [],
+        )?;
+    }
     drop(conn);
 
     guard.disarm();

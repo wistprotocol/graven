@@ -1,7 +1,12 @@
+use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
+use parquet::file::properties::WriterProperties;
+use parquet::file::writer::SerializedFileWriter;
+use parquet::schema::parser::parse_message_type;
 use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use wist_core::crypto::{b64u_encode, hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::objects::{
@@ -265,6 +270,62 @@ pub fn write_tier0(path: &Path, records: &[RecordFixture]) -> Vec<u8> {
     std::fs::read(path).unwrap()
 }
 
+fn write_parquet(
+    message_type: &str,
+    byte_columns: &[Vec<Vec<u8>>],
+    int_column: Option<&[i64]>,
+) -> Vec<u8> {
+    let schema = Arc::new(parse_message_type(message_type).unwrap());
+    let mut writer = SerializedFileWriter::new(
+        Vec::new(),
+        schema,
+        Arc::new(WriterProperties::builder().build()),
+    )
+    .unwrap();
+    let mut rg = writer.next_row_group().unwrap();
+    for column in byte_columns {
+        let mut col = rg.next_column().unwrap().unwrap();
+        let values: Vec<ByteArray> = column.iter().map(|v| ByteArray::from(v.clone())).collect();
+        col.typed::<ByteArrayType>()
+            .write_batch(&values, None, None)
+            .unwrap();
+        col.close().unwrap();
+    }
+    if let Some(ints) = int_column {
+        let mut col = rg.next_column().unwrap().unwrap();
+        col.typed::<Int64Type>()
+            .write_batch(ints, None, None)
+            .unwrap();
+        col.close().unwrap();
+    }
+    rg.close().unwrap();
+    writer.into_inner().unwrap()
+}
+
+pub fn write_extracts_parquet(rows: &[(&str, &str, &str, &str)]) -> Vec<u8> {
+    write_parquet(
+        "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary delta_id (UTF8); required binary extract (UTF8); }",
+        &[
+            rows.iter().map(|r| r.0.as_bytes().to_vec()).collect(),
+            rows.iter().map(|r| r.1.as_bytes().to_vec()).collect(),
+            rows.iter().map(|r| r.2.as_bytes().to_vec()).collect(),
+            rows.iter().map(|r| r.3.as_bytes().to_vec()).collect(),
+        ],
+        None,
+    )
+}
+
+pub fn write_links_parquet(rows: &[(&str, &str, i64)]) -> Vec<u8> {
+    write_parquet(
+        "message links { required binary source_url (UTF8); required binary target_url (UTF8); required int64 position; }",
+        &[
+            rows.iter().map(|r| r.0.as_bytes().to_vec()).collect(),
+            rows.iter().map(|r| r.1.as_bytes().to_vec()).collect(),
+        ],
+        Some(&rows.iter().map(|r| r.2).collect::<Vec<_>>()),
+    )
+}
+
 pub fn write_state(
     path: &Path,
     log: &Signer,
@@ -320,7 +381,7 @@ pub fn write_state(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn write_manifest(
+fn write_manifest_with_files(
     path: &Path,
     log: &Signer,
     snapshot_date: &str,
@@ -330,7 +391,24 @@ pub fn write_manifest(
     state_bytes: &[u8],
     state_digest_value: &str,
     sqlite_bytes: &[u8],
+    extra_files: &[(String, Vec<u8>, u8)],
 ) {
+    let mut files = vec![SnapshotFile {
+        path: "tier0/index.sqlite".into(),
+        sha256: sha256_hex(sqlite_bytes),
+        bytes: sqlite_bytes.len() as u64,
+        tier: 0,
+        shard: None,
+    }];
+    for (file_path, bytes, tier) in extra_files {
+        files.push(SnapshotFile {
+            path: file_path.clone(),
+            sha256: sha256_hex(bytes),
+            bytes: bytes.len() as u64,
+            tier: *tier,
+            shard: None,
+        });
+    }
     let manifest = SnapshotManifest {
         wist_version: "1.0.0".into(),
         snapshot_date: snapshot_date.into(),
@@ -344,18 +422,65 @@ pub fn write_manifest(
             state_digest: state_digest_value.into(),
         },
         shards: None,
-        files: vec![SnapshotFile {
-            path: "tier0/index.sqlite".into(),
-            sha256: sha256_hex(sqlite_bytes),
-            bytes: sqlite_bytes.len() as u64,
-            tier: 0,
-            shard: None,
-        }],
+        files,
     };
     let value = serde_json::to_value(&manifest).unwrap();
     let env = sign_envelope(&value, "manifest", "log1", &log.sk).unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, serde_json::to_vec(&env).unwrap()).unwrap();
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_manifest(
+    path: &Path,
+    log: &Signer,
+    snapshot_date: &str,
+    log_position: u64,
+    anchor_block_hash: &str,
+    content_digest_value: &str,
+    state_bytes: &[u8],
+    state_digest_value: &str,
+    sqlite_bytes: &[u8],
+) {
+    write_manifest_with_files(
+        path,
+        log,
+        snapshot_date,
+        log_position,
+        anchor_block_hash,
+        content_digest_value,
+        state_bytes,
+        state_digest_value,
+        sqlite_bytes,
+        &[],
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_manifest_with_tier1(
+    path: &Path,
+    log: &Signer,
+    snapshot_date: &str,
+    log_position: u64,
+    anchor_block_hash: &str,
+    content_digest_value: &str,
+    state_bytes: &[u8],
+    state_digest_value: &str,
+    sqlite_bytes: &[u8],
+    tier1_files: &[(String, Vec<u8>, u8)],
+) {
+    write_manifest_with_files(
+        path,
+        log,
+        snapshot_date,
+        log_position,
+        anchor_block_hash,
+        content_digest_value,
+        state_bytes,
+        state_digest_value,
+        sqlite_bytes,
+        tier1_files,
+    );
 }
 
 pub fn write_index(
@@ -680,11 +805,16 @@ pub fn build_fixture(write_second_payload: bool, duplicate_tier0_record: bool) -
         9,
         write_second_payload,
         duplicate_tier0_record,
+        false,
     )
 }
 
 pub fn build_fixture_with_log_id(log_id: &str, seed: u8) -> Fixture {
-    build_fixture_full(log_id, seed, true, false)
+    build_fixture_full(log_id, seed, true, false, false)
+}
+
+pub fn build_fixture_with_tier1() -> Fixture {
+    build_fixture_full("graven-test-log", 9, true, false, true)
 }
 
 fn build_fixture_full(
@@ -692,6 +822,7 @@ fn build_fixture_full(
     seed: u8,
     write_second_payload: bool,
     duplicate_tier0_record: bool,
+    include_tier1: bool,
 ) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let log = Signer::new([seed; 32]);
@@ -760,17 +891,46 @@ fn build_fixture_full(
         0,
     );
 
-    write_manifest(
-        &snapdir.join("manifest.json"),
-        &log,
-        &snapshot_date,
-        0,
-        &block0_hash,
-        &content_digest_value,
-        &state_bytes,
-        &state_digest_value,
-        &sqlite_bytes,
-    );
+    if include_tier1 {
+        let extracts_bytes = write_extracts_parquet(&[(
+            record1.url.as_str(),
+            record1.publisher.as_str(),
+            record1.delta_id.as_str(),
+            "alpha body",
+        )]);
+        let links_bytes =
+            write_links_parquet(&[(record1.url.as_str(), "https://records.example/other", 0i64)]);
+        std::fs::create_dir_all(snapdir.join("tier1")).unwrap();
+        std::fs::write(snapdir.join("tier1/extracts.parquet"), &extracts_bytes).unwrap();
+        std::fs::write(snapdir.join("tier1/links.parquet"), &links_bytes).unwrap();
+        write_manifest_with_tier1(
+            &snapdir.join("manifest.json"),
+            &log,
+            &snapshot_date,
+            0,
+            &block0_hash,
+            &content_digest_value,
+            &state_bytes,
+            &state_digest_value,
+            &sqlite_bytes,
+            &[
+                ("tier1/extracts.parquet".to_string(), extracts_bytes, 1u8),
+                ("tier1/links.parquet".to_string(), links_bytes, 1u8),
+            ],
+        );
+    } else {
+        write_manifest(
+            &snapdir.join("manifest.json"),
+            &log,
+            &snapshot_date,
+            0,
+            &block0_hash,
+            &content_digest_value,
+            &state_bytes,
+            &state_digest_value,
+            &sqlite_bytes,
+        );
+    }
 
     write_index(
         &dir.path().join("snapshots/index.json"),
