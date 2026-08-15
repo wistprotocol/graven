@@ -59,10 +59,10 @@ fn record_projection(r: &RecordFixture) -> Value {
     })
 }
 
-pub fn write_anchor(path: &Path, log: &Signer) {
+pub fn write_anchor(path: &Path, log: &Signer, log_id: &str) {
     let anchor = Anchor {
         wist_version: "1.0.0".into(),
-        log_id: "graven-test-log".into(),
+        log_id: log_id.into(),
         genesis_key: GenesisKey {
             key_id: "log1".into(),
             alg: "Ed25519".into(),
@@ -670,15 +670,37 @@ impl Fixture {
     }
 }
 
+pub fn synced_log_dir(dir: &Path) -> PathBuf {
+    dir.join("logs/graven-test-log")
+}
+
 pub fn build_fixture(write_second_payload: bool, duplicate_tier0_record: bool) -> Fixture {
+    build_fixture_full(
+        "graven-test-log",
+        9,
+        write_second_payload,
+        duplicate_tier0_record,
+    )
+}
+
+pub fn build_fixture_with_log_id(log_id: &str, seed: u8) -> Fixture {
+    build_fixture_full(log_id, seed, true, false)
+}
+
+fn build_fixture_full(
+    log_id: &str,
+    seed: u8,
+    write_second_payload: bool,
+    duplicate_tier0_record: bool,
+) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let log = Signer::new([9u8; 32]);
+    let log = Signer::new([seed; 32]);
     let other = Signer::new([3u8; 32]);
     let publisher = Signer::new([1u8; 32]);
     let domain = "records.example".to_string();
     let snapshot_date = "2026-08-09".to_string();
 
-    write_anchor(&dir.path().join("anchor.json"), &log);
+    write_anchor(&dir.path().join("anchor.json"), &log, log_id);
 
     let declaration_env = build_declaration(&publisher, "pk1", &domain);
     let wrapped_declaration =

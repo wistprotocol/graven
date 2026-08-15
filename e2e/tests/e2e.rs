@@ -290,10 +290,10 @@ struct McpClient {
 }
 
 impl McpClient {
-    fn start(graven_bin: &Path, dir: &Path, log_id: &str) -> Self {
+    fn start(graven_bin: &Path, dir: &Path) -> Self {
         let dir_str = dir.to_str().expect("non-utf8 path").to_string();
         let mut child = Command::new(graven_bin)
-            .args(["serve", "--dir", &dir_str, "--log-id", log_id])
+            .args(["serve", "--dir", &dir_str])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -586,7 +586,7 @@ fn end_to_end() {
         ],
     );
 
-    let mut mcp = McpClient::start(&graven, &gdir, &clave_host);
+    let mut mcp = McpClient::start(&graven, &gdir);
     let hits = mcp.search("changed");
     assert!(!hits.is_empty(), "search(\"changed\") returned no hits");
     let hit = hits

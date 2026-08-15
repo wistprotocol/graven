@@ -13,14 +13,17 @@ fn cold_sync_verifies_chain_and_populates_store() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
 
     assert_eq!(report.log_position_before, None);
     assert_eq!(report.head, 1);
 
-    let sync_json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(target.path().join("sync.json")).unwrap()).unwrap();
+    let sync_json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(common::synced_log_dir(target.path()).join("sync.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(sync_json["log_position"], 0);
     assert_eq!(sync_json["head_number"], 1);
     assert!(sync_json["head_hash"]
@@ -28,10 +31,14 @@ fn cold_sync_verifies_chain_and_populates_store() {
         .unwrap()
         .starts_with("sha256:"));
 
-    assert!(target.path().join("index.sqlite").exists());
-    assert!(!target.path().join("index.sqlite.verifying").exists());
+    assert!(common::synced_log_dir(target.path())
+        .join("index.sqlite")
+        .exists());
+    assert!(!common::synced_log_dir(target.path())
+        .join("index.sqlite.verifying")
+        .exists());
 
-    let store = Store::open(target.path()).unwrap();
+    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
     let alpha = store.get("https://records.example/alpha").unwrap().unwrap();
     assert_eq!(alpha.title, "Alpha Title");
     assert_eq!(alpha.publisher, fx.domain);
@@ -53,7 +60,7 @@ fn cold_sync_accepts_anchor_fetched_over_http() {
     let target = tempfile::tempdir().unwrap();
     let anchor_url = format!("{}/anchor.json", fx.base_url);
 
-    let report = graven::sync::run(&anchor_url, &fx.base_url, target.path(), true).unwrap();
+    let report = graven::sync::run(&anchor_url, &fx.base_url, target.path(), true, false).unwrap();
 
     assert_eq!(report.head, 1);
 }
@@ -68,11 +75,12 @@ fn cold_sync_records_post_snapshot_delta_with_unfetchable_payload_as_empty() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
     assert_eq!(report.head, 1);
 
-    let store = Store::open(target.path()).unwrap();
+    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
     let beta = store.get("https://records.example/beta").unwrap().unwrap();
     assert_eq!(beta.title, "");
     assert!(beta.r#abstract.is_none());
@@ -93,11 +101,16 @@ fn cold_sync_rejects_tampered_block_file() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     );
 
     assert!(result.is_err());
-    assert!(!target.path().join("sync.json").exists());
-    assert!(!target.path().join("index.sqlite").exists());
+    assert!(!common::synced_log_dir(target.path())
+        .join("sync.json")
+        .exists());
+    assert!(!common::synced_log_dir(target.path())
+        .join("index.sqlite")
+        .exists());
 }
 
 #[test]
@@ -111,10 +124,13 @@ fn cold_sync_rejects_wrong_manifest_content_digest() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     );
 
     assert!(result.is_err());
-    assert!(!target.path().join("sync.json").exists());
+    assert!(!common::synced_log_dir(target.path())
+        .join("sync.json")
+        .exists());
 }
 
 #[test]
@@ -128,6 +144,7 @@ fn cold_sync_rejects_wrong_state_digest_in_manifest() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     );
 
     let err = result.unwrap_err().to_string();
@@ -135,7 +152,9 @@ fn cold_sync_rejects_wrong_state_digest_in_manifest() {
         err.to_lowercase().contains("state_digest"),
         "error was: {err}"
     );
-    assert!(!target.path().join("sync.json").exists());
+    assert!(!common::synced_log_dir(target.path())
+        .join("sync.json")
+        .exists());
 }
 
 #[test]
@@ -149,10 +168,13 @@ fn cold_sync_rejects_state_signed_by_wrong_key() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     );
 
     assert!(result.is_err());
-    assert!(!target.path().join("sync.json").exists());
+    assert!(!common::synced_log_dir(target.path())
+        .join("sync.json")
+        .exists());
 }
 
 #[test]
@@ -166,10 +188,13 @@ fn cold_sync_rejects_checkpoint_signed_by_wrong_key() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     );
 
     assert!(result.is_err());
-    assert!(!target.path().join("sync.json").exists());
+    assert!(!common::synced_log_dir(target.path())
+        .join("sync.json")
+        .exists());
 }
 
 #[test]
@@ -182,12 +207,19 @@ fn cold_sync_leaves_no_partial_state_when_tier0_mutation_fails() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     );
 
     assert!(result.is_err());
-    assert!(!target.path().join("index.sqlite").exists());
-    assert!(!target.path().join("index.sqlite.verifying").exists());
-    assert!(!target.path().join("sync.json").exists());
+    assert!(!common::synced_log_dir(target.path())
+        .join("index.sqlite")
+        .exists());
+    assert!(!common::synced_log_dir(target.path())
+        .join("index.sqlite.verifying")
+        .exists());
+    assert!(!common::synced_log_dir(target.path())
+        .join("sync.json")
+        .exists());
 }
 
 #[test]
@@ -200,6 +232,7 @@ fn continuous_sync_advances_head_and_applies_new_delta() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
     assert_eq!(report1.head, 1);
@@ -211,17 +244,20 @@ fn continuous_sync_advances_head_and_applies_new_delta() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
     assert_eq!(report2.head, 2);
     assert_eq!(report2.log_position_before, Some(1));
 
-    let sync_json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(target.path().join("sync.json")).unwrap()).unwrap();
+    let sync_json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(common::synced_log_dir(target.path()).join("sync.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(sync_json["log_position"], 0);
     assert_eq!(sync_json["head_number"], 2);
 
-    let store = Store::open(target.path()).unwrap();
+    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
     let extra = store.get(&new_url).unwrap().unwrap();
     assert_eq!(extra.title, "Extra Title");
     assert_eq!(extra.r#abstract.as_deref(), Some("Extra abstract"));
@@ -240,6 +276,7 @@ fn continuous_sync_is_noop_when_checkpoint_unchanged() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
 
@@ -248,6 +285,7 @@ fn continuous_sync_is_noop_when_checkpoint_unchanged() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
 
@@ -265,6 +303,7 @@ fn continuous_sync_rejects_rollback_checkpoint() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
 
@@ -276,6 +315,7 @@ fn continuous_sync_rejects_rollback_checkpoint() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
     assert_eq!(report2.head, 2);
@@ -291,6 +331,7 @@ fn continuous_sync_rejects_rollback_checkpoint() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     );
 
     let err = result.unwrap_err().to_string();
@@ -307,6 +348,7 @@ fn continuous_sync_rejects_same_height_different_hash_checkpoint() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
 
@@ -316,6 +358,7 @@ fn continuous_sync_rejects_same_height_different_hash_checkpoint() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
 
@@ -333,6 +376,7 @@ fn continuous_sync_rejects_same_height_different_hash_checkpoint() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     );
 
     assert!(result.is_err());
@@ -342,13 +386,16 @@ fn continuous_sync_rejects_same_height_different_hash_checkpoint() {
 fn cold_sync_refuses_when_sync_json_already_exists() {
     let fx = common::build_fixture(true, false);
     let target = tempfile::tempdir().unwrap();
-    std::fs::write(target.path().join("sync.json"), b"{}").unwrap();
+    let log_dir = common::synced_log_dir(target.path());
+    std::fs::create_dir_all(&log_dir).unwrap();
+    std::fs::write(log_dir.join("sync.json"), b"{}").unwrap();
 
     let result = graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
         &fx.base_url,
         target.path(),
         true,
+        false,
     );
 
     assert!(result.is_err());
@@ -363,7 +410,7 @@ fn continuous_sync_upserts_update_delta_preserving_publisher_port() {
     let snapshot_date = "2026-08-09".to_string();
     let url = "https://records.example:8443/alpha".to_string();
 
-    common::write_anchor(&dir.path().join("anchor.json"), &log);
+    common::write_anchor(&dir.path().join("anchor.json"), &log, "graven-test-log");
 
     let declaration_env = common::build_declaration(&publisher, "pk1", &domain);
     let wrapped_declaration =
@@ -477,11 +524,13 @@ fn continuous_sync_upserts_update_delta_preserving_publisher_port() {
         &base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
     assert_eq!(report.head, 1);
 
-    let conn = Connection::open(target.path().join("index.sqlite")).unwrap();
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM records WHERE url = ?1", [&url], |r| {
             r.get(0)
@@ -520,6 +569,7 @@ fn delta_signed_by_undeclared_key_fails_sync() {
         &fx.base_url,
         dir.path(),
         true,
+        false,
     )
     .unwrap_err();
     assert!(err.to_string().contains("publisher verify"));
@@ -581,6 +631,7 @@ fn delta_after_rotation_signed_by_old_key_fails_sync() {
         &fx.base_url,
         dir.path(),
         true,
+        false,
     )
     .unwrap_err();
     assert!(err.to_string().contains("publisher verify"));
@@ -598,11 +649,12 @@ fn rotation_then_new_key_delta_syncs() {
         &fx.base_url,
         dir.path(),
         true,
+        false,
     )
     .unwrap();
     assert_eq!(report.head, 3);
 
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
     let record = store.get(&new_url).unwrap().unwrap();
     assert_eq!(record.title, "Rotated Title");
 }
@@ -616,6 +668,7 @@ fn incremental_sync_reloads_declarations() {
         &fx.base_url,
         dir.path(),
         true,
+        false,
     )
     .unwrap();
 
@@ -626,11 +679,12 @@ fn incremental_sync_reloads_declarations() {
         &fx.base_url,
         dir.path(),
         true,
+        false,
     )
     .unwrap();
     assert_eq!(report.head, 2);
 
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
     let record = store.get(&new_url).unwrap().unwrap();
     assert_eq!(record.title, "Extra Title");
 }
@@ -644,6 +698,7 @@ fn withdrawal_removes_record_from_local_index() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
 
@@ -664,11 +719,12 @@ fn withdrawal_removes_record_from_local_index() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
     assert_eq!(report.withdrawn, 1);
 
-    let store = Store::open(target.path()).unwrap();
+    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
     assert!(store
         .get("https://records.example/alpha")
         .unwrap()
@@ -685,6 +741,7 @@ fn withdrawal_for_unknown_delta_is_noop() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
 
@@ -696,11 +753,12 @@ fn withdrawal_for_unknown_delta_is_noop() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
     assert_eq!(report.withdrawn, 0);
 
-    let store = Store::open(target.path()).unwrap();
+    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
     assert!(store
         .get("https://records.example/alpha")
         .unwrap()
@@ -717,6 +775,7 @@ fn delete_delta_removes_record() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
 
@@ -737,10 +796,11 @@ fn delete_delta_removes_record() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
 
-    let store = Store::open(target.path()).unwrap();
+    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
     assert!(store
         .get("https://records.example/alpha")
         .unwrap()
@@ -769,11 +829,12 @@ fn cold_start_applies_withdrawals_after_snapshot_position() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
     assert_eq!(report.head, 2);
 
-    let store = Store::open(target.path()).unwrap();
+    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
     assert!(store
         .get("https://records.example/alpha")
         .unwrap()
@@ -790,6 +851,7 @@ fn withdrawal_removes_tier1_and_embedding_rows_when_present() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
 
@@ -804,7 +866,8 @@ fn withdrawal_removes_tier1_and_embedding_rows_when_present() {
         None,
     );
 
-    let conn = Connection::open(target.path().join("index.sqlite")).unwrap();
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
     conn.execute_batch(
         "CREATE TABLE extracts(url TEXT, publisher TEXT, delta_id TEXT, extract TEXT);
          CREATE TABLE links(source_url TEXT, target_url TEXT, position INTEGER);
@@ -848,10 +911,12 @@ fn withdrawal_removes_tier1_and_embedding_rows_when_present() {
         &fx.base_url,
         target.path(),
         true,
+        false,
     )
     .unwrap();
 
-    let conn = Connection::open(target.path().join("index.sqlite")).unwrap();
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
     let extracts_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM extracts", [], |r| r.get(0))
         .unwrap();
@@ -875,10 +940,11 @@ fn failed_incremental_leaves_index_unchanged() {
         &fx.base_url,
         dir.path(),
         true,
+        false,
     )
     .unwrap();
 
-    let sync_before = std::fs::read(dir.path().join("sync.json")).unwrap();
+    let sync_before = std::fs::read(common::synced_log_dir(dir.path()).join("sync.json")).unwrap();
 
     common::extend_fixture_with_forged_delta(&fx);
 
@@ -887,13 +953,14 @@ fn failed_incremental_leaves_index_unchanged() {
         &fx.base_url,
         dir.path(),
         true,
+        false,
     );
     assert!(result.is_err());
 
-    let sync_after = std::fs::read(dir.path().join("sync.json")).unwrap();
+    let sync_after = std::fs::read(common::synced_log_dir(dir.path()).join("sync.json")).unwrap();
     assert_eq!(sync_before, sync_after);
 
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
     assert!(store
         .get("https://records.example/alpha")
         .unwrap()
@@ -904,9 +971,226 @@ fn failed_incremental_leaves_index_unchanged() {
         .unwrap()
         .is_none());
 
-    let conn = Connection::open(dir.path().join("index.sqlite")).unwrap();
+    let conn = Connection::open(common::synced_log_dir(dir.path()).join("index.sqlite")).unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 2);
+}
+
+#[test]
+fn sync_creates_registry_and_per_log_layout() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.log_id, "graven-test-log");
+
+    let registry: graven::registry::Registry =
+        serde_json::from_slice(&std::fs::read(target.path().join("logs.json")).unwrap()).unwrap();
+    assert_eq!(registry.logs.len(), 1);
+    assert_eq!(registry.logs[0].log_id, "graven-test-log");
+    assert_eq!(registry.logs[0].anchor, fx.anchor_path().to_str().unwrap());
+    assert_eq!(registry.logs[0].base, fx.base_url);
+    assert!(!registry.logs[0].tier1);
+
+    let log_dir = common::synced_log_dir(target.path());
+    assert!(log_dir.join("index.sqlite").exists());
+    assert!(log_dir.join("sync.json").exists());
+    assert!(!target.path().join("index.sqlite").exists());
+    assert!(!target.path().join("sync.json").exists());
+}
+
+#[test]
+fn legacy_layout_migrates_on_sync() {
+    let fx = common::build_fixture(true, false);
+    let synced = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        synced.path(),
+        true,
+        false,
+    )
+    .unwrap();
+
+    let legacy = tempfile::tempdir().unwrap();
+    let synced_log_dir = common::synced_log_dir(synced.path());
+    std::fs::copy(
+        synced_log_dir.join("index.sqlite"),
+        legacy.path().join("index.sqlite"),
+    )
+    .unwrap();
+    std::fs::copy(
+        synced_log_dir.join("sync.json"),
+        legacy.path().join("sync.json"),
+    )
+    .unwrap();
+
+    let new_url = common::extend_fixture(&fx);
+
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        legacy.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.head, 2);
+
+    assert!(!legacy.path().join("index.sqlite").exists());
+    assert!(!legacy.path().join("sync.json").exists());
+
+    let migrated_dir = common::synced_log_dir(legacy.path());
+    assert!(migrated_dir.join("index.sqlite").exists());
+    assert!(migrated_dir.join("sync.json").exists());
+
+    let registry: graven::registry::Registry =
+        serde_json::from_slice(&std::fs::read(legacy.path().join("logs.json")).unwrap()).unwrap();
+    assert_eq!(registry.logs.len(), 1);
+    assert_eq!(registry.logs[0].log_id, "graven-test-log");
+
+    let store = Store::open(&migrated_dir).unwrap();
+    let extra = store.get(&new_url).unwrap().unwrap();
+    assert_eq!(extra.title, "Extra Title");
+}
+
+#[test]
+fn conflicting_base_for_same_log_id_errors() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        false,
+    )
+    .unwrap();
+
+    let result = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        "http://127.0.0.1:1/different-base",
+        target.path(),
+        true,
+        false,
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn run_all_syncs_every_registered_log() {
+    let fx1 = common::build_fixture_with_log_id("log-one", 11);
+    let fx2 = common::build_fixture_with_log_id("log-two", 12);
+    let dir = tempfile::tempdir().unwrap();
+
+    graven::sync::run(
+        fx1.anchor_path().to_str().unwrap(),
+        &fx1.base_url,
+        dir.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    graven::sync::run(
+        fx2.anchor_path().to_str().unwrap(),
+        &fx2.base_url,
+        dir.path(),
+        true,
+        false,
+    )
+    .unwrap();
+
+    let new_url1 = common::extend_fixture(&fx1);
+    let new_url2 = common::extend_fixture(&fx2);
+
+    let reports = graven::sync::run_all(dir.path(), true).unwrap();
+    assert_eq!(reports.len(), 2);
+    for report in &reports {
+        assert_eq!(report.head, 2);
+    }
+
+    let store1 = Store::open(&graven::registry::log_dir(dir.path(), "log-one")).unwrap();
+    assert!(store1.get(&new_url1).unwrap().is_some());
+    let store2 = Store::open(&graven::registry::log_dir(dir.path(), "log-two")).unwrap();
+    assert!(store2.get(&new_url2).unwrap().is_some());
+}
+
+#[test]
+fn run_all_errors_clearly_on_unmigrated_legacy_dir() {
+    let fx = common::build_fixture(true, false);
+    let synced = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        synced.path(),
+        true,
+        false,
+    )
+    .unwrap();
+
+    let legacy = tempfile::tempdir().unwrap();
+    let synced_log_dir = common::synced_log_dir(synced.path());
+    std::fs::copy(
+        synced_log_dir.join("index.sqlite"),
+        legacy.path().join("index.sqlite"),
+    )
+    .unwrap();
+    std::fs::copy(
+        synced_log_dir.join("sync.json"),
+        legacy.path().join("sync.json"),
+    )
+    .unwrap();
+
+    let err = graven::sync::run_all(legacy.path(), true).unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("sync") && msg.contains("anchor"),
+        "error was: {msg}"
+    );
+}
+
+#[test]
+fn tier1_flag_is_sticky_once_enabled() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        true,
+    )
+    .unwrap();
+
+    let registry: graven::registry::Registry =
+        serde_json::from_slice(&std::fs::read(target.path().join("logs.json")).unwrap()).unwrap();
+    assert!(registry.logs[0].tier1);
+
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        false,
+    )
+    .unwrap();
+
+    let registry: graven::registry::Registry =
+        serde_json::from_slice(&std::fs::read(target.path().join("logs.json")).unwrap()).unwrap();
+    assert!(
+        registry.logs[0].tier1,
+        "tier1 must never be turned off by a later call that omits --tier1"
+    );
 }

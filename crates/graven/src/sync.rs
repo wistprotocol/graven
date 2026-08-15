@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::fetch::{resolve, Client};
 use crate::keyset::{url_authority, KeyHistory};
+use crate::registry::{self, LogEntry};
 use crate::store::{CREATE_DECLARATIONS, CREATE_UNIQUE_INDEX};
 use reqwest::Url;
 use rusqlite::{Connection, OptionalExtension};
@@ -19,8 +20,9 @@ use wist_core::objects::{
 };
 use wist_core::snapshot::{content_digest, state_digest};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SyncReport {
+    pub log_id: String,
     pub log_position_before: Option<u64>,
     pub head: u64,
     pub withdrawn: u64,
@@ -220,13 +222,13 @@ pub fn walk_blocks(
     Ok((events, last_block_value))
 }
 
-fn load_trust_key(anchor: &str, client: &Client) -> Result<PublicKey> {
+fn load_anchor(anchor: &str, client: &Client) -> Result<(PublicKey, String)> {
     let anchor_bytes = load_anchor_bytes(anchor, client)?;
     let anchor_value: Value = serde_json::from_slice(&anchor_bytes)?;
     let anchor_env: LogAnchorEnvelope = serde_json::from_value(anchor_value.clone())?;
     let trust_key = PublicKey::from_b64u(&anchor_env.anchor.genesis_key.public_key)?;
     verify_envelope(&anchor_value, "anchor", &trust_key)?;
-    Ok(trust_key)
+    Ok((trust_key, anchor_env.anchor.log_id))
 }
 
 fn persist_declaration(
@@ -409,25 +411,79 @@ pub fn apply_events(
     Ok(stats)
 }
 
-pub fn run(anchor: &str, log_base: &str, dir: &Path, allow_http: bool) -> Result<SyncReport> {
+pub fn run(
+    anchor: &str,
+    log_base: &str,
+    dir: &Path,
+    allow_http: bool,
+    tier1: bool,
+) -> Result<SyncReport> {
     std::fs::create_dir_all(dir)?;
-    let sync_path = dir.join("sync.json");
 
     let client = Client::new(allow_http);
     let base = crate::fetch::parse_base(log_base)?;
-    let trust_key = load_trust_key(anchor, &client)?;
+    let (trust_key, log_id) = load_anchor(anchor, &client)?;
+
+    migrate_legacy_layout(dir, &log_id)?;
+
+    let mut reg = registry::load(dir)?;
+    match reg.logs.iter_mut().find(|e| e.log_id == log_id) {
+        Some(entry) => {
+            if entry.anchor != anchor || entry.base != log_base {
+                return Err(Error::Verify(format!(
+                    "log {log_id} is already registered with anchor={} base={}; requested anchor={anchor} base={log_base} conflicts with it",
+                    entry.anchor, entry.base
+                )));
+            }
+            if tier1 {
+                entry.tier1 = true;
+            }
+        }
+        None => reg.logs.push(LogEntry {
+            log_id: log_id.clone(),
+            anchor: anchor.to_string(),
+            base: log_base.to_string(),
+            tier1,
+        }),
+    }
+    registry::save(dir, &reg)?;
+
+    let log_dir = registry::log_dir(dir, &log_id);
+    std::fs::create_dir_all(&log_dir)?;
+    let sync_path = log_dir.join("sync.json");
 
     if sync_path.exists() {
-        run_incremental(&client, &base, &trust_key, dir, &sync_path)
+        run_incremental(&client, &base, &trust_key, &log_id, &log_dir, &sync_path)
     } else {
-        run_cold_start(&client, &base, &trust_key, dir, &sync_path)
+        run_cold_start(&client, &base, &trust_key, &log_id, &log_dir, &sync_path)
     }
+}
+
+pub fn run_all(dir: &Path, allow_http: bool) -> Result<Vec<SyncReport>> {
+    registry::check_not_legacy(dir)?;
+    let reg = registry::load(dir)?;
+    reg.logs
+        .iter()
+        .map(|entry| run(&entry.anchor, &entry.base, dir, allow_http, entry.tier1))
+        .collect()
+}
+
+fn migrate_legacy_layout(dir: &Path, log_id: &str) -> Result<()> {
+    if !registry::is_unmigrated_legacy_layout(dir) {
+        return Ok(());
+    }
+    let target_dir = registry::log_dir(dir, log_id);
+    std::fs::create_dir_all(&target_dir)?;
+    std::fs::rename(dir.join("index.sqlite"), target_dir.join("index.sqlite"))?;
+    std::fs::rename(dir.join("sync.json"), target_dir.join("sync.json"))?;
+    Ok(())
 }
 
 fn run_incremental(
     client: &Client,
     base: &Url,
     trust_key: &PublicKey,
+    log_id: &str,
     dir: &Path,
     sync_path: &Path,
 ) -> Result<SyncReport> {
@@ -450,6 +506,7 @@ fn run_incremental(
     if checkpoint.block_number == local.head_number {
         if checkpoint.block_hash == local.head_hash {
             return Ok(SyncReport {
+                log_id: log_id.to_string(),
                 log_position_before: Some(local.head_number),
                 head: local.head_number,
                 withdrawn: 0,
@@ -493,6 +550,7 @@ fn run_incremental(
     std::fs::write(sync_path, serde_json::to_vec(&sync_state)?)?;
 
     Ok(SyncReport {
+        log_id: log_id.to_string(),
         log_position_before: Some(local.head_number),
         head: checkpoint.block_number,
         withdrawn: stats.withdrawn,
@@ -503,6 +561,7 @@ fn run_cold_start(
     client: &Client,
     base: &Url,
     trust_key: &PublicKey,
+    log_id: &str,
     dir: &Path,
     sync_path: &Path,
 ) -> Result<SyncReport> {
@@ -629,6 +688,7 @@ fn run_cold_start(
     std::fs::write(sync_path, serde_json::to_vec(&sync_state)?)?;
 
     Ok(SyncReport {
+        log_id: log_id.to_string(),
         log_position_before: None,
         head: checkpoint.block_number,
         withdrawn: stats.withdrawn,
