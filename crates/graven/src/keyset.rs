@@ -48,6 +48,11 @@ fn verify_under_set(envelope: &Value, keys: &[PublisherKey], key_id: &str) -> bo
         .is_some_and(|pk| verify_envelope(envelope, "publisher", &pk).is_ok())
 }
 
+fn recovery_keys_canon(keys: &Option<Vec<PublisherKey>>) -> Result<Vec<u8>> {
+    let value = serde_json::to_value(keys)?;
+    Ok(wist_core::jcs::canonicalize(&value)?)
+}
+
 fn parse_timestamp(domain: &str, seq: u64, raw: &str) -> Result<jiff::Timestamp> {
     raw.parse::<jiff::Timestamp>()
         .map_err(|e| Error::PublisherVerify(format!("{domain} seq {seq}: sealed_at {raw}: {e}")))
@@ -125,6 +130,19 @@ impl KeyHistory {
                 }
                 let sealed = parse_timestamp(&domain, seq, sealed_at)?;
                 if verify_under_set(envelope, &pred.publisher.keys, &env.sig.key_id) {
+                    let pred_has_recovery = pred
+                        .publisher
+                        .recovery_keys
+                        .as_ref()
+                        .is_some_and(|rk| !rk.is_empty());
+                    if pred_has_recovery
+                        && recovery_keys_canon(&pred.publisher.recovery_keys)?
+                            != recovery_keys_canon(&env.publisher.recovery_keys)?
+                    {
+                        return Err(Error::PublisherVerify(format!(
+                            "{domain} seq {seq}: ordinary rotation must carry recovery_keys byte-identical to predecessor's"
+                        )));
+                    }
                     (false, sealed, None)
                 } else if verify_under_set(
                     envelope,
@@ -139,9 +157,11 @@ impl KeyHistory {
                             ))
                         })?;
                     (true, sealed, Some(window_end))
+                } else if verify_under_set(envelope, &env.publisher.keys, &env.sig.key_id) {
+                    (false, sealed, None)
                 } else {
                     return Err(Error::PublisherVerify(format!(
-                        "{domain} seq {seq}: signature does not verify under previous keys or recovery_keys"
+                        "{domain} seq {seq}: signature does not verify under previous keys, recovery_keys, or its own keys"
                     )));
                 }
             }
@@ -651,7 +671,7 @@ mod tests {
             3,
             Some(&hash2),
             vec![key_entry(&pk3, "pk3", "2026-08-09T00:00:00Z")],
-            None,
+            Some(vec![key_entry(&rk2, "rk2", "2026-08-09T00:00:00Z")]),
             &pk2,
             "pk2",
         );
@@ -664,7 +684,7 @@ mod tests {
             4,
             Some(&hash3),
             vec![key_entry(&pk4, "pk4", "2026-08-09T00:00:00Z")],
-            None,
+            Some(vec![key_entry(&rk2, "rk2", "2026-08-09T00:00:00Z")]),
             &pk3,
             "pk3",
         );
@@ -700,5 +720,249 @@ mod tests {
             "2026-08-09T12:00:00Z",
         );
         assert!(kh.verify_delta(7, &via_pk2_at7).is_err());
+    }
+
+    #[test]
+    fn fresh_identity_declaration_accepted_and_governs() {
+        let pk1 = Signer::new([1u8; 32]);
+        let pkx = Signer::new([50u8; 32]);
+        let mut kh = KeyHistory::new();
+        let decl0 = decl(
+            "records.example",
+            0,
+            None,
+            vec![key_entry(&pk1, "pk1", "2026-08-09T00:00:00Z")],
+            None,
+            &pk1,
+            "pk1",
+        );
+        kh.add_baseline(0, &decl0).unwrap();
+        let hash0 = publisher_hash(&decl0["publisher"]).unwrap();
+        let decl1 = decl(
+            "records.example",
+            1,
+            Some(&hash0),
+            vec![key_entry(&pkx, "pkx", "2026-08-09T00:00:00Z")],
+            None,
+            &pkx,
+            "pkx",
+        );
+        kh.add_declaration(2, "2026-08-09T13:00:00Z", &decl1)
+            .unwrap();
+
+        let delta_old = delta_env(
+            &pk1,
+            "pk1",
+            "https://records.example/a",
+            "2026-08-09T12:00:00Z",
+        );
+        assert!(kh.verify_delta(1, &delta_old).is_ok());
+        assert!(kh.verify_delta(2, &delta_old).is_err());
+
+        let delta_new = delta_env(
+            &pkx,
+            "pkx",
+            "https://records.example/a",
+            "2026-08-09T14:00:00Z",
+        );
+        assert!(kh.verify_delta(2, &delta_new).is_ok());
+    }
+
+    #[test]
+    fn fresh_identity_yields_to_open_recovery_window() {
+        let pk1 = Signer::new([1u8; 32]);
+        let rk1 = Signer::new([11u8; 32]);
+        let pk2 = Signer::new([2u8; 32]);
+        let rk2 = Signer::new([12u8; 32]);
+        let pky = Signer::new([51u8; 32]);
+        let pkz = Signer::new([52u8; 32]);
+        let domain = "records.example";
+        let mut kh = KeyHistory::new();
+
+        let decl0 = decl(
+            domain,
+            0,
+            None,
+            vec![key_entry(&pk1, "pk1", "2026-08-09T00:00:00Z")],
+            Some(vec![key_entry(&rk1, "rk1", "2026-08-09T00:00:00Z")]),
+            &pk1,
+            "pk1",
+        );
+        kh.add_baseline(0, &decl0).unwrap();
+        let hash0 = publisher_hash(&decl0["publisher"]).unwrap();
+
+        let decl1 = decl(
+            domain,
+            1,
+            Some(&hash0),
+            vec![key_entry(&pk2, "pk2", "2026-08-09T00:00:00Z")],
+            Some(vec![key_entry(&rk2, "rk2", "2026-08-09T00:00:00Z")]),
+            &rk1,
+            "rk1",
+        );
+        kh.add_declaration(2, "2026-08-03T00:00:00Z", &decl1)
+            .unwrap();
+        let hash1 = publisher_hash(&decl1["publisher"]).unwrap();
+
+        let decl2 = decl(
+            domain,
+            2,
+            Some(&hash1),
+            vec![key_entry(&pky, "pky", "2026-08-09T00:00:00Z")],
+            None,
+            &pky,
+            "pky",
+        );
+        kh.add_declaration(3, "2026-08-04T00:00:00Z", &decl2)
+            .unwrap();
+        let hash2 = publisher_hash(&decl2["publisher"]).unwrap();
+
+        let via_pk2_at3 = delta_env(
+            &pk2,
+            "pk2",
+            "https://records.example/a",
+            "2026-08-09T12:00:00Z",
+        );
+        assert!(kh.verify_delta(3, &via_pk2_at3).is_ok());
+        let via_pky_at3 = delta_env(
+            &pky,
+            "pky",
+            "https://records.example/a",
+            "2026-08-09T12:00:00Z",
+        );
+        assert!(kh.verify_delta(3, &via_pky_at3).is_err());
+
+        let decl3 = decl(
+            domain,
+            3,
+            Some(&hash2),
+            vec![key_entry(&pkz, "pkz", "2026-08-09T00:00:00Z")],
+            None,
+            &pky,
+            "pky",
+        );
+        kh.add_declaration(4, "2026-08-11T00:00:00Z", &decl3)
+            .unwrap();
+
+        let via_pkz_at4 = delta_env(
+            &pkz,
+            "pkz",
+            "https://records.example/a",
+            "2026-08-09T12:00:00Z",
+        );
+        assert!(kh.verify_delta(4, &via_pkz_at4).is_ok());
+        let via_pk2_at4 = delta_env(
+            &pk2,
+            "pk2",
+            "https://records.example/a",
+            "2026-08-09T12:00:00Z",
+        );
+        assert!(kh.verify_delta(4, &via_pk2_at4).is_err());
+    }
+
+    #[test]
+    fn ordinary_rotation_dropping_recovery_keys_rejected() {
+        let pk1 = Signer::new([1u8; 32]);
+        let rk1 = Signer::new([11u8; 32]);
+        let pk2 = Signer::new([2u8; 32]);
+        let mut kh = KeyHistory::new();
+        let decl0 = decl(
+            "records.example",
+            0,
+            None,
+            vec![key_entry(&pk1, "pk1", "2026-08-09T00:00:00Z")],
+            Some(vec![key_entry(&rk1, "rk1", "2026-08-09T00:00:00Z")]),
+            &pk1,
+            "pk1",
+        );
+        kh.add_baseline(0, &decl0).unwrap();
+        let hash0 = publisher_hash(&decl0["publisher"]).unwrap();
+        let decl1 = decl(
+            "records.example",
+            1,
+            Some(&hash0),
+            vec![key_entry(&pk2, "pk2", "2026-08-09T00:00:00Z")],
+            None,
+            &pk1,
+            "pk1",
+        );
+        let err = kh
+            .add_declaration(2, "2026-08-09T13:00:00Z", &decl1)
+            .unwrap_err();
+        assert!(err.to_string().contains("recovery_keys"), "{err}");
+    }
+
+    #[test]
+    fn ordinary_rotation_with_identical_recovery_keys_accepted() {
+        let pk1 = Signer::new([1u8; 32]);
+        let rk1 = Signer::new([11u8; 32]);
+        let pk2 = Signer::new([2u8; 32]);
+        let mut kh = KeyHistory::new();
+        let decl0 = decl(
+            "records.example",
+            0,
+            None,
+            vec![key_entry(&pk1, "pk1", "2026-08-09T00:00:00Z")],
+            Some(vec![key_entry(&rk1, "rk1", "2026-08-09T00:00:00Z")]),
+            &pk1,
+            "pk1",
+        );
+        kh.add_baseline(0, &decl0).unwrap();
+        let hash0 = publisher_hash(&decl0["publisher"]).unwrap();
+        let decl1 = decl(
+            "records.example",
+            1,
+            Some(&hash0),
+            vec![key_entry(&pk2, "pk2", "2026-08-09T00:00:00Z")],
+            Some(vec![key_entry(&rk1, "rk1", "2026-08-09T00:00:00Z")]),
+            &pk1,
+            "pk1",
+        );
+        kh.add_declaration(2, "2026-08-09T13:00:00Z", &decl1)
+            .unwrap();
+        let delta = delta_env(
+            &pk2,
+            "pk2",
+            "https://records.example/a",
+            "2026-08-09T14:00:00Z",
+        );
+        assert!(kh.verify_delta(2, &delta).is_ok());
+    }
+
+    #[test]
+    fn ordinary_rotation_establishes_recovery_keys_from_none() {
+        let pk1 = Signer::new([1u8; 32]);
+        let pk2 = Signer::new([2u8; 32]);
+        let rk1 = Signer::new([11u8; 32]);
+        let mut kh = KeyHistory::new();
+        let decl0 = decl(
+            "records.example",
+            0,
+            None,
+            vec![key_entry(&pk1, "pk1", "2026-08-09T00:00:00Z")],
+            None,
+            &pk1,
+            "pk1",
+        );
+        kh.add_baseline(0, &decl0).unwrap();
+        let hash0 = publisher_hash(&decl0["publisher"]).unwrap();
+        let decl1 = decl(
+            "records.example",
+            1,
+            Some(&hash0),
+            vec![key_entry(&pk2, "pk2", "2026-08-09T00:00:00Z")],
+            Some(vec![key_entry(&rk1, "rk1", "2026-08-09T00:00:00Z")]),
+            &pk1,
+            "pk1",
+        );
+        kh.add_declaration(2, "2026-08-09T13:00:00Z", &decl1)
+            .unwrap();
+        let delta = delta_env(
+            &pk2,
+            "pk2",
+            "https://records.example/a",
+            "2026-08-09T14:00:00Z",
+        );
+        assert!(kh.verify_delta(2, &delta).is_ok());
     }
 }
