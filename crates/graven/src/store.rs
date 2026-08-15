@@ -14,6 +14,8 @@ pub const CREATE_DECLARATIONS: &str =
 
 pub const CREATE_TIER1: &str = "CREATE TABLE IF NOT EXISTS extracts(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, extract TEXT NOT NULL, PRIMARY KEY(url, publisher)); CREATE VIRTUAL TABLE IF NOT EXISTS extracts_fts USING fts5(extract, content=extracts, content_rowid=rowid); CREATE TABLE IF NOT EXISTS links(source_url TEXT NOT NULL, target_url TEXT NOT NULL, position INTEGER NOT NULL)";
 
+pub const CREATE_EMBEDDINGS: &str = "CREATE TABLE IF NOT EXISTS embeddings(delta_id TEXT PRIMARY KEY, url TEXT NOT NULL, publisher TEXT NOT NULL, vector BLOB NOT NULL); CREATE TABLE IF NOT EXISTS pack_meta(id INTEGER PRIMARY KEY CHECK(id = 1), model_json TEXT NOT NULL, metric TEXT NOT NULL, dim INTEGER NOT NULL, imported_at TEXT NOT NULL, key_b64u TEXT NOT NULL)";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordHit {
     pub url: String,

@@ -41,6 +41,24 @@ enum Command {
         #[arg(long)]
         dir: PathBuf,
     },
+    Pack {
+        #[command(subcommand)]
+        command: PackCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PackCommand {
+    Import {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long = "log-id")]
+        log_id: String,
+        #[arg(long)]
+        pack: PathBuf,
+        #[arg(long)]
+        key: String,
+    },
 }
 
 fn print_report(report: &SyncReport) {
@@ -85,6 +103,20 @@ fn main() -> Result<(), graven::Error> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(graven::mcp::serve_stdio(&dir))?;
         }
+        Command::Pack { command } => match command {
+            PackCommand::Import {
+                dir,
+                log_id,
+                pack,
+                key,
+            } => {
+                let report = graven::pack::import(&dir, &log_id, &pack, &key)?;
+                println!(
+                    "imported {} vectors ({} skipped) for log {log_id}",
+                    report.imported, report.skipped
+                );
+            }
+        },
     }
     Ok(())
 }

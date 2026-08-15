@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
@@ -782,6 +784,59 @@ pub fn extend_fixture_with_rotation(fx: &Fixture, new_key: &Signer) -> String {
     write_checkpoint(fx.dir.path(), &fx.log, delta_number, &hash2, &sealed_at2);
 
     url
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_pack(
+    dir: &Path,
+    signer: &Signer,
+    content_digest: &str,
+    log_position: u64,
+    rows: &[(&str, &str, &str, Vec<f32>)],
+    dim: u32,
+    metric: &str,
+) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+
+    let mut jsonl = String::new();
+    for (delta_id, url, publisher, vector) in rows {
+        let row = serde_json::json!({
+            "delta_id": delta_id,
+            "url": url,
+            "publisher": publisher,
+            "vector": vector,
+        });
+        jsonl.push_str(&serde_json::to_string(&row).unwrap());
+        jsonl.push('\n');
+    }
+    let compressed = zstd::encode_all(jsonl.as_bytes(), 0).unwrap();
+    let vectors_path = dir.join("vectors.jsonl.zst");
+    std::fs::write(&vectors_path, &compressed).unwrap();
+
+    let pack = serde_json::json!({
+        "wist_version": "1.0.0",
+        "content_digest": content_digest,
+        "log_position": log_position,
+        "model": {
+            "name": "test-model",
+            "version": "1.0.0",
+            "weights_hash": format!("sha256:{}", "a".repeat(64)),
+            "dim": dim,
+            "quantization": "f32",
+            "metric": metric,
+            "source": "summary",
+        },
+        "vectors": {
+            "path": "vectors.jsonl.zst",
+            "sha256": sha256_hex(&compressed),
+            "bytes": compressed.len() as u64,
+            "count": rows.len() as u64,
+        },
+    });
+    let env = sign_envelope(&pack, "pack", "log1", &signer.sk).unwrap();
+    let pack_path = dir.join("pack.json");
+    std::fs::write(&pack_path, serde_json::to_vec(&env).unwrap()).unwrap();
+    pack_path
 }
 
 pub fn serve_static(dir: PathBuf) -> String {
