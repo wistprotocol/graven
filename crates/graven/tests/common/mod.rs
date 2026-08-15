@@ -472,6 +472,79 @@ pub fn extend_fixture(fx: &Fixture) -> String {
     url
 }
 
+pub fn build_delete_delta(
+    publisher: &Signer,
+    key_id: &str,
+    url: &str,
+    prev: &str,
+) -> (String, Value) {
+    let delta = serde_json::json!({
+        "wist_version": "1.0.0",
+        "url": url,
+        "change_type": "delete",
+        "observed_at": "2026-08-09T15:00:00Z",
+        "prev": prev,
+        "meta": {"lang": "en"},
+    });
+    let id = wist_core::delta::delta_id(&delta).unwrap();
+    (
+        id,
+        sign_envelope(&delta, "delta", key_id, &publisher.sk).unwrap(),
+    )
+}
+
+pub fn extend_fixture_with_withdrawal(fx: &Fixture, delta_id: &str) {
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let next_number = prev_number + 1;
+
+    let update = serde_json::json!({
+        "wist_version": "1.0.0",
+        "action": "payload_withdrawal",
+        "subject": fx.domain,
+        "details": {"delta_id": delta_id, "legal_basis": "court order", "jurisdiction": "EU"},
+        "effective_at": "2026-08-09T15:00:00Z",
+    });
+    let body = sign_envelope(&update, "update", "log1", &fx.log.sk).unwrap();
+    let wrapped = serde_json::json!({"type": "registry_update", "body": body});
+
+    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
+    let (block, new_hash) = build_block(&fx.log, next_number, &prev_hash, &sealed_at, &[wrapped]);
+    write_block(fx.dir.path(), next_number, &block);
+    write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+}
+
+pub fn extend_fixture_with_delete(fx: &Fixture, url: &str, prev: &str) {
+    let publisher = Signer::new([1u8; 32]);
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let next_number = prev_number + 1;
+
+    let (_id, delta_env) = build_delete_delta(&publisher, "pk1", url, prev);
+    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
+
+    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
+    let (block, new_hash) = build_block(
+        &fx.log,
+        next_number,
+        &prev_hash,
+        &sealed_at,
+        &[wrapped_delta],
+    );
+    write_block(fx.dir.path(), next_number, &block);
+    write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+}
+
 pub fn extend_fixture_with_forged_delta(fx: &Fixture) {
     let attacker = Signer::new([7u8; 32]);
     let checkpoint_path = fx.dir.path().join("log/checkpoint.json");

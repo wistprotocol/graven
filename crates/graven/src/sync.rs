@@ -3,7 +3,7 @@ use crate::fetch::{resolve, Client};
 use crate::keyset::{url_authority, KeyHistory};
 use crate::store::{CREATE_DECLARATIONS, CREATE_UNIQUE_INDEX};
 use reqwest::Url;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -23,6 +23,7 @@ use wist_core::snapshot::{content_digest, state_digest};
 pub struct SyncReport {
     pub log_position_before: Option<u64>,
     pub head: u64,
+    pub withdrawn: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -250,6 +251,64 @@ fn persist_declaration(
     Ok(())
 }
 
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let hit: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(hit.is_some())
+}
+
+fn remove_derived(conn: &Connection, delta_id: &str, url: &str) -> Result<()> {
+    if table_exists(conn, "extracts")? {
+        conn.execute("DELETE FROM extracts WHERE delta_id = ?1", [delta_id])?;
+    }
+    if table_exists(conn, "links")? {
+        conn.execute("DELETE FROM links WHERE source_url = ?1", [url])?;
+    }
+    if table_exists(conn, "embeddings")? {
+        conn.execute("DELETE FROM embeddings WHERE delta_id = ?1", [delta_id])?;
+    }
+    Ok(())
+}
+
+fn remove_by_delta_id(conn: &Connection, delta_id: &str) -> Result<bool> {
+    let url: Option<String> = conn
+        .query_row(
+            "SELECT url FROM records WHERE delta_id = ?1",
+            [delta_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(url) = url else {
+        return Ok(false);
+    };
+    conn.execute("DELETE FROM records WHERE delta_id = ?1", [delta_id])?;
+    remove_derived(conn, delta_id, &url)?;
+    Ok(true)
+}
+
+fn remove_by_url(conn: &Connection, url: &str, publisher: &str) -> Result<()> {
+    let delta_id: Option<String> = conn
+        .query_row(
+            "SELECT delta_id FROM records WHERE url = ?1 AND publisher = ?2",
+            [url, publisher],
+            |row| row.get(0),
+        )
+        .optional()?;
+    conn.execute(
+        "DELETE FROM records WHERE url = ?1 AND publisher = ?2",
+        [url, publisher],
+    )?;
+    if let Some(id) = delta_id {
+        remove_derived(conn, &id, url)?;
+    }
+    Ok(())
+}
+
 pub fn load_history(conn: &Connection) -> Result<KeyHistory> {
     let mut stmt = conn.prepare(
         "SELECT height, sealed_at, baseline, envelope FROM declarations ORDER BY height, seq",
@@ -295,13 +354,15 @@ pub fn apply_events(
             persist_declaration(conn, event.height, &event.sealed_at, false, declaration)?;
         }
 
+        for delta_id in &event.withdrawals {
+            if remove_by_delta_id(conn, delta_id)? {
+                stats.withdrawn += 1;
+            }
+        }
+
         for body in &event.delta_bodies {
             let env: DeltaEnvelope = serde_json::from_value(body.clone())?;
             let id = history.verify_delta(event.height, body)?;
-            if !matches!(env.delta.change_type, ChangeType::New | ChangeType::Update) {
-                continue;
-            }
-            let hex = id.trim_start_matches("sha256:");
             let publisher = Url::parse(&env.delta.url)
                 .ok()
                 .as_ref()
@@ -310,31 +371,39 @@ pub fn apply_events(
                     Error::Verify(format!("delta url {}: no authority", env.delta.url))
                 })?;
 
-            let (title, abstract_text) = match &env.delta.payload {
-                Some(commitment) => {
-                    fetch_payload(client, base, hex, commitment).unwrap_or((String::new(), None))
-                }
-                None => (String::new(), None),
-            };
+            match env.delta.change_type {
+                ChangeType::New | ChangeType::Update => {
+                    let hex = id.trim_start_matches("sha256:");
+                    let (title, abstract_text) = match &env.delta.payload {
+                        Some(commitment) => fetch_payload(client, base, hex, commitment)
+                            .unwrap_or((String::new(), None)),
+                        None => (String::new(), None),
+                    };
 
-            conn.execute(
-                "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang)
-                 VALUES (?1, ?2, ?3, ?4, 'full', ?5, ?6, ?7)
-                 ON CONFLICT(url, publisher) DO UPDATE SET
-                    delta_id = excluded.delta_id, observed_at = excluded.observed_at,
-                    weight = excluded.weight, title = excluded.title,
-                    abstract = excluded.abstract, lang = excluded.lang",
-                (
-                    &env.delta.url,
-                    &publisher,
-                    &id,
-                    &env.delta.observed_at,
-                    &title,
-                    &abstract_text,
-                    &env.delta.meta.lang,
-                ),
-            )?;
-            stats.applied += 1;
+                    conn.execute(
+                        "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang)
+                         VALUES (?1, ?2, ?3, ?4, 'full', ?5, ?6, ?7)
+                         ON CONFLICT(url, publisher) DO UPDATE SET
+                            delta_id = excluded.delta_id, observed_at = excluded.observed_at,
+                            weight = excluded.weight, title = excluded.title,
+                            abstract = excluded.abstract, lang = excluded.lang",
+                        (
+                            &env.delta.url,
+                            &publisher,
+                            &id,
+                            &env.delta.observed_at,
+                            &title,
+                            &abstract_text,
+                            &env.delta.meta.lang,
+                        ),
+                    )?;
+                    stats.applied += 1;
+                }
+                ChangeType::Delete => {
+                    remove_by_url(conn, &env.delta.url, &publisher)?;
+                }
+                ChangeType::Attest => {}
+            }
         }
     }
     Ok(stats)
@@ -383,6 +452,7 @@ fn run_incremental(
             return Ok(SyncReport {
                 log_position_before: Some(local.head_number),
                 head: local.head_number,
+                withdrawn: 0,
             });
         }
         return Err(Error::Verify(format!(
@@ -410,7 +480,7 @@ fn run_incremental(
     let tx = conn.unchecked_transaction()?;
     tx.execute(CREATE_UNIQUE_INDEX, [])?;
     tx.execute(CREATE_DECLARATIONS, [])?;
-    apply_events(&tx, client, base, &mut history, &events)?;
+    let stats = apply_events(&tx, client, base, &mut history, &events)?;
     tx.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
     tx.commit()?;
 
@@ -425,6 +495,7 @@ fn run_incremental(
     Ok(SyncReport {
         log_position_before: Some(local.head_number),
         head: checkpoint.block_number,
+        withdrawn: stats.withdrawn,
     })
 }
 
@@ -541,7 +612,7 @@ fn run_cold_start(
         }
     }
 
-    apply_events(&conn, client, base, &mut history, &events)?;
+    let stats = apply_events(&conn, client, base, &mut history, &events)?;
     conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
     drop(conn);
 
@@ -560,5 +631,6 @@ fn run_cold_start(
     Ok(SyncReport {
         log_position_before: None,
         head: checkpoint.block_number,
+        withdrawn: stats.withdrawn,
     })
 }

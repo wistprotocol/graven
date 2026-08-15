@@ -41,8 +41,8 @@ fn main() -> Result<(), graven::Error> {
         } => {
             let report = graven::sync::run(&anchor, &log_base, &dir, allow_http)?;
             println!(
-                "synced to log_position {:?}, head block {}",
-                report.log_position_before, report.head
+                "synced to log_position {:?}, head block {}, withdrawn {}",
+                report.log_position_before, report.head, report.withdrawn
             );
         }
         Command::Serve { dir, log_id } => {

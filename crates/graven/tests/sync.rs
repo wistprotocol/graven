@@ -636,6 +636,237 @@ fn incremental_sync_reloads_declarations() {
 }
 
 #[test]
+fn withdrawal_removes_record_from_local_index() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+
+    let publisher = common::Signer::new([1u8; 32]);
+    let (alpha_id, _, _) = common::build_delta(
+        &publisher,
+        "pk1",
+        "https://records.example/alpha",
+        "Alpha Title",
+        Some("Alpha abstract"),
+        "alpha body",
+        None,
+    );
+    common::extend_fixture_with_withdrawal(&fx, &alpha_id);
+
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(report.withdrawn, 1);
+
+    let store = Store::open(target.path()).unwrap();
+    assert!(store
+        .get("https://records.example/alpha")
+        .unwrap()
+        .is_none());
+    assert!(store.get("https://records.example/beta").unwrap().is_some());
+}
+
+#[test]
+fn withdrawal_for_unknown_delta_is_noop() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+
+    let unknown_id = format!("sha256:{}", "f".repeat(64));
+    common::extend_fixture_with_withdrawal(&fx, &unknown_id);
+
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(report.withdrawn, 0);
+
+    let store = Store::open(target.path()).unwrap();
+    assert!(store
+        .get("https://records.example/alpha")
+        .unwrap()
+        .is_some());
+    assert!(store.get("https://records.example/beta").unwrap().is_some());
+}
+
+#[test]
+fn delete_delta_removes_record() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+
+    let publisher = common::Signer::new([1u8; 32]);
+    let (alpha_id, _, _) = common::build_delta(
+        &publisher,
+        "pk1",
+        "https://records.example/alpha",
+        "Alpha Title",
+        Some("Alpha abstract"),
+        "alpha body",
+        None,
+    );
+    common::extend_fixture_with_delete(&fx, "https://records.example/alpha", &alpha_id);
+
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+
+    let store = Store::open(target.path()).unwrap();
+    assert!(store
+        .get("https://records.example/alpha")
+        .unwrap()
+        .is_none());
+    assert!(store.get("https://records.example/beta").unwrap().is_some());
+}
+
+#[test]
+fn cold_start_applies_withdrawals_after_snapshot_position() {
+    let fx = common::build_fixture(true, false);
+    let publisher = common::Signer::new([1u8; 32]);
+    let (alpha_id, _, _) = common::build_delta(
+        &publisher,
+        "pk1",
+        "https://records.example/alpha",
+        "Alpha Title",
+        Some("Alpha abstract"),
+        "alpha body",
+        None,
+    );
+    common::extend_fixture_with_withdrawal(&fx, &alpha_id);
+
+    let target = tempfile::tempdir().unwrap();
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(report.head, 2);
+
+    let store = Store::open(target.path()).unwrap();
+    assert!(store
+        .get("https://records.example/alpha")
+        .unwrap()
+        .is_none());
+    assert!(store.get("https://records.example/beta").unwrap().is_some());
+}
+
+#[test]
+fn withdrawal_removes_tier1_and_embedding_rows_when_present() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+
+    let publisher = common::Signer::new([1u8; 32]);
+    let (alpha_id, _, _) = common::build_delta(
+        &publisher,
+        "pk1",
+        "https://records.example/alpha",
+        "Alpha Title",
+        Some("Alpha abstract"),
+        "alpha body",
+        None,
+    );
+
+    let conn = Connection::open(target.path().join("index.sqlite")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE extracts(url TEXT, publisher TEXT, delta_id TEXT, extract TEXT);
+         CREATE TABLE links(source_url TEXT, target_url TEXT, position INTEGER);
+         CREATE TABLE embeddings(delta_id TEXT PRIMARY KEY, url TEXT, publisher TEXT, vector BLOB);",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, ?2, ?3, ?4)",
+        (
+            "https://records.example/alpha",
+            &fx.domain,
+            &alpha_id,
+            "alpha body",
+        ),
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO links(source_url, target_url, position) VALUES (?1, ?2, ?3)",
+        (
+            "https://records.example/alpha",
+            "https://records.example/other",
+            0i64,
+        ),
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO embeddings(delta_id, url, publisher, vector) VALUES (?1, ?2, ?3, ?4)",
+        (
+            &alpha_id,
+            "https://records.example/alpha",
+            &fx.domain,
+            vec![0u8; 4],
+        ),
+    )
+    .unwrap();
+    drop(conn);
+
+    common::extend_fixture_with_withdrawal(&fx, &alpha_id);
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+    )
+    .unwrap();
+
+    let conn = Connection::open(target.path().join("index.sqlite")).unwrap();
+    let extracts_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM extracts", [], |r| r.get(0))
+        .unwrap();
+    let links_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM links", [], |r| r.get(0))
+        .unwrap();
+    let embeddings_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(extracts_count, 0);
+    assert_eq!(links_count, 0);
+    assert_eq!(embeddings_count, 0);
+}
+
+#[test]
 fn failed_incremental_leaves_index_unchanged() {
     let fx = common::build_fixture(true, false);
     let dir = tempfile::tempdir().unwrap();
