@@ -116,14 +116,6 @@ fn fetch_payload(
     ))
 }
 
-fn url_authority(url: &Url) -> Option<String> {
-    let host = url.host_str()?;
-    Some(match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
-    })
-}
-
 struct BlockWalk {
     delta_bodies: Vec<Value>,
     last_block_value: Option<Value>,
@@ -204,7 +196,11 @@ fn apply_post_snapshot_deltas(
         let Some(hex) = id.strip_prefix("sha256:") else {
             continue;
         };
-        let Some(publisher) = Url::parse(&delta.url).ok().as_ref().and_then(url_authority) else {
+        let Some(publisher) = Url::parse(&delta.url)
+            .ok()
+            .as_ref()
+            .and_then(crate::keyset::url_authority)
+        else {
             continue;
         };
 

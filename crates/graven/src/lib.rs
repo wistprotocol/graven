@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod fetch;
+pub mod keyset;
 pub mod mcp;
 pub mod store;
 pub mod sync;
