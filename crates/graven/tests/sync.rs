@@ -1601,3 +1601,108 @@ fn incremental_sync_leaves_tier1_absent_when_payload_fetch_fails() {
         .unwrap();
     assert_eq!(extract_count, 0);
 }
+
+#[test]
+fn incremental_sync_purges_stale_tier1_rows_when_update_payload_fetch_fails() {
+    let fx = common::build_fixture_with_tier1();
+    let target = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        true,
+    )
+    .unwrap();
+
+    let publisher = common::Signer::new([1u8; 32]);
+    let (alpha_id, _, _) = common::build_delta(
+        &publisher,
+        "pk1",
+        "https://records.example/alpha",
+        "Alpha Title",
+        Some("Alpha abstract"),
+        "alpha body",
+        None,
+    );
+
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let next_number = prev_number + 1;
+
+    let (id2, delta2_env, _payload2) = common::build_delta(
+        &publisher,
+        "pk1",
+        "https://records.example/alpha",
+        "Alpha Title",
+        Some("Alpha abstract"),
+        "alpha body v2",
+        Some(&alpha_id),
+    );
+    let wrapped_delta2 = serde_json::json!({"type": "publisher_delta", "body": delta2_env});
+
+    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
+    let (block, new_hash) = common::build_block(
+        &fx.log,
+        next_number,
+        &prev_hash,
+        &sealed_at,
+        &[wrapped_delta2],
+    );
+    common::write_block(fx.dir.path(), next_number, &block);
+    common::write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        true,
+    )
+    .unwrap();
+
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+    let (delta_id, title): (String, String) = conn
+        .query_row(
+            "SELECT delta_id, title FROM records WHERE url = ?1",
+            ["https://records.example/alpha"],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        delta_id, id2,
+        "record must reflect the failed-fetch update delta"
+    );
+    assert_eq!(title, "");
+
+    let extract_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM extracts WHERE url = ?1",
+            ["https://records.example/alpha"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        extract_count, 0,
+        "stale extract from the prior successful sync must not survive a failed-fetch update"
+    );
+
+    let links_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM links WHERE source_url = ?1",
+            ["https://records.example/alpha"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        links_count, 0,
+        "stale links from the prior successful sync must not survive a failed-fetch update"
+    );
+}

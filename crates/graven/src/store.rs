@@ -102,7 +102,7 @@ fn quote_phrase(q: &str) -> String {
     format!("\"{}\"", q.replace('"', "\"\""))
 }
 
-fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+pub(crate) fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     let hit: Option<i64> = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",

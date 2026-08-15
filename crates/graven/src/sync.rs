@@ -2,7 +2,7 @@ use crate::error::{Error, Result};
 use crate::fetch::{resolve, Client};
 use crate::keyset::{url_authority, KeyHistory};
 use crate::registry::{self, LogEntry};
-use crate::store::{CREATE_DECLARATIONS, CREATE_TIER1, CREATE_UNIQUE_INDEX};
+use crate::store::{table_exists, CREATE_DECLARATIONS, CREATE_TIER1, CREATE_UNIQUE_INDEX};
 use crate::tier1;
 use reqwest::Url;
 use rusqlite::{Connection, OptionalExtension};
@@ -263,17 +263,6 @@ fn persist_declaration(
     Ok(())
 }
 
-fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
-    let hit: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            [name],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(hit.is_some())
-}
-
 fn remove_derived(conn: &Connection, delta_id: &str, url: &str) -> Result<()> {
     if table_exists(conn, "extracts")? {
         conn.execute("DELETE FROM extracts WHERE delta_id = ?1", [delta_id])?;
@@ -417,23 +406,35 @@ pub fn apply_events(
                     stats.applied += 1;
 
                     if tier1 {
-                        if let Some(f) = &fields {
-                            if let Some(extract) = &f.extract {
+                        match &fields {
+                            Some(f) => {
+                                if let Some(extract) = &f.extract {
+                                    conn.execute(
+                                        "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, ?2, ?3, ?4)
+                                         ON CONFLICT(url, publisher) DO UPDATE SET
+                                            delta_id = excluded.delta_id, extract = excluded.extract",
+                                        (&env.delta.url, &publisher, &id, extract),
+                                    )?;
+                                }
                                 conn.execute(
-                                    "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, ?2, ?3, ?4)
-                                     ON CONFLICT(url, publisher) DO UPDATE SET
-                                        delta_id = excluded.delta_id, extract = excluded.extract",
-                                    (&env.delta.url, &publisher, &id, extract),
+                                    "DELETE FROM links WHERE source_url = ?1",
+                                    [&env.delta.url],
                                 )?;
+                                for (position, target_url) in f.links.iter().enumerate() {
+                                    conn.execute(
+                                        "INSERT INTO links(source_url, target_url, position) VALUES (?1, ?2, ?3)",
+                                        (&env.delta.url, target_url, position as i64),
+                                    )?;
+                                }
                             }
-                            conn.execute(
-                                "DELETE FROM links WHERE source_url = ?1",
-                                [&env.delta.url],
-                            )?;
-                            for (position, target_url) in f.links.iter().enumerate() {
+                            None => {
                                 conn.execute(
-                                    "INSERT INTO links(source_url, target_url, position) VALUES (?1, ?2, ?3)",
-                                    (&env.delta.url, target_url, position as i64),
+                                    "DELETE FROM extracts WHERE url = ?1 AND publisher = ?2",
+                                    (&env.delta.url, &publisher),
+                                )?;
+                                conn.execute(
+                                    "DELETE FROM links WHERE source_url = ?1",
+                                    [&env.delta.url],
                                 )?;
                             }
                         }
