@@ -423,9 +423,43 @@ pub fn run(
     let client = Client::new(allow_http);
     let base = crate::fetch::parse_base(log_base)?;
     let (trust_key, log_id) = load_anchor(anchor, &client)?;
+    registry::validate_log_id(&log_id)?;
 
-    migrate_legacy_layout(dir, &log_id)?;
+    let migrated = migrate_legacy_layout(dir, &log_id)?;
 
+    match run_registered(
+        &client, &base, &trust_key, anchor, log_base, dir, &log_id, tier1,
+    ) {
+        Ok(report) => Ok(report),
+        Err(err) => {
+            if migrated {
+                rollback_migration(dir, &log_id);
+            }
+            Err(err)
+        }
+    }
+}
+
+pub fn run_all(dir: &Path, allow_http: bool) -> Result<Vec<SyncReport>> {
+    registry::check_not_legacy(dir)?;
+    let reg = registry::load(dir)?;
+    reg.logs
+        .iter()
+        .map(|entry| run(&entry.anchor, &entry.base, dir, allow_http, entry.tier1))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_registered(
+    client: &Client,
+    base: &Url,
+    trust_key: &PublicKey,
+    anchor: &str,
+    log_base: &str,
+    dir: &Path,
+    log_id: &str,
+    tier1: bool,
+) -> Result<SyncReport> {
     let mut reg = registry::load(dir)?;
     match reg.logs.iter_mut().find(|e| e.log_id == log_id) {
         Some(entry) => {
@@ -440,7 +474,7 @@ pub fn run(
             }
         }
         None => reg.logs.push(LogEntry {
-            log_id: log_id.clone(),
+            log_id: log_id.to_string(),
             anchor: anchor.to_string(),
             base: log_base.to_string(),
             tier1,
@@ -448,35 +482,34 @@ pub fn run(
     }
     registry::save(dir, &reg)?;
 
-    let log_dir = registry::log_dir(dir, &log_id);
+    let log_dir = registry::log_dir(dir, log_id);
     std::fs::create_dir_all(&log_dir)?;
     let sync_path = log_dir.join("sync.json");
 
     if sync_path.exists() {
-        run_incremental(&client, &base, &trust_key, &log_id, &log_dir, &sync_path)
+        run_incremental(client, base, trust_key, log_id, &log_dir, &sync_path)
     } else {
-        run_cold_start(&client, &base, &trust_key, &log_id, &log_dir, &sync_path)
+        run_cold_start(client, base, trust_key, log_id, &log_dir, &sync_path)
     }
 }
 
-pub fn run_all(dir: &Path, allow_http: bool) -> Result<Vec<SyncReport>> {
-    registry::check_not_legacy(dir)?;
-    let reg = registry::load(dir)?;
-    reg.logs
-        .iter()
-        .map(|entry| run(&entry.anchor, &entry.base, dir, allow_http, entry.tier1))
-        .collect()
-}
-
-fn migrate_legacy_layout(dir: &Path, log_id: &str) -> Result<()> {
+fn migrate_legacy_layout(dir: &Path, log_id: &str) -> Result<bool> {
     if !registry::is_unmigrated_legacy_layout(dir) {
-        return Ok(());
+        return Ok(false);
     }
     let target_dir = registry::log_dir(dir, log_id);
     std::fs::create_dir_all(&target_dir)?;
     std::fs::rename(dir.join("index.sqlite"), target_dir.join("index.sqlite"))?;
     std::fs::rename(dir.join("sync.json"), target_dir.join("sync.json"))?;
-    Ok(())
+    Ok(true)
+}
+
+fn rollback_migration(dir: &Path, log_id: &str) {
+    let target_dir = registry::log_dir(dir, log_id);
+    let _ = std::fs::rename(target_dir.join("index.sqlite"), dir.join("index.sqlite"));
+    let _ = std::fs::rename(target_dir.join("sync.json"), dir.join("sync.json"));
+    let _ = std::fs::remove_dir_all(&target_dir);
+    let _ = std::fs::remove_file(dir.join("logs.json"));
 }
 
 fn run_incremental(

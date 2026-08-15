@@ -51,6 +51,16 @@ pub fn log_dir(dir: &Path, log_id: &str) -> PathBuf {
     dir.join("logs").join(sanitize(log_id))
 }
 
+pub fn validate_log_id(log_id: &str) -> Result<()> {
+    let sanitized = sanitize(log_id);
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        return Err(Error::Verify(format!(
+            "log_id {log_id:?} is not safe to use as a directory name (sanitizes to {sanitized:?})"
+        )));
+    }
+    Ok(())
+}
+
 pub fn is_unmigrated_legacy_layout(dir: &Path) -> bool {
     !registry_path(dir).exists()
         && dir.join("index.sqlite").exists()
@@ -121,5 +131,20 @@ mod tests {
 
         save(dir.path(), &Registry::default()).unwrap();
         assert!(!is_unmigrated_legacy_layout(dir.path()));
+    }
+
+    #[test]
+    fn validate_log_id_rejects_ids_that_sanitize_to_dot_dot_or_empty() {
+        assert!(validate_log_id("..").is_err());
+        assert!(validate_log_id(".").is_err());
+        assert!(validate_log_id("").is_err());
+        assert!(validate_log_id("graven-test-log").is_ok());
+        assert!(validate_log_id("...").is_ok());
+    }
+
+    #[test]
+    fn validate_log_id_error_names_the_offending_log_id() {
+        let err = validate_log_id("..").unwrap_err();
+        assert!(err.to_string().contains(".."), "error was: {err}");
     }
 }

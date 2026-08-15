@@ -1194,3 +1194,104 @@ fn tier1_flag_is_sticky_once_enabled() {
         "tier1 must never be turned off by a later call that omits --tier1"
     );
 }
+
+#[test]
+fn log_id_that_escapes_logs_dir_is_rejected() {
+    let fx = common::build_fixture_with_log_id("..", 31);
+    let target = tempfile::tempdir().unwrap();
+
+    let result = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        false,
+    );
+
+    let err = result.unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains(".."), "error was: {msg}");
+
+    assert!(!target.path().join("index.sqlite").exists());
+    assert!(!target.path().join("sync.json").exists());
+    assert!(!target.path().join("logs.json").exists());
+    assert!(!target.path().join("logs").exists());
+}
+
+#[test]
+fn failed_migration_restores_legacy_layout_and_registers_nothing() {
+    let fx_a = common::build_fixture(true, false);
+    let fx_b = common::build_fixture_with_log_id("other-log", 21);
+
+    let synced = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx_a.anchor_path().to_str().unwrap(),
+        &fx_a.base_url,
+        synced.path(),
+        true,
+        false,
+    )
+    .unwrap();
+
+    let legacy = tempfile::tempdir().unwrap();
+    let synced_log_dir = common::synced_log_dir(synced.path());
+    std::fs::copy(
+        synced_log_dir.join("index.sqlite"),
+        legacy.path().join("index.sqlite"),
+    )
+    .unwrap();
+    std::fs::copy(
+        synced_log_dir.join("sync.json"),
+        legacy.path().join("sync.json"),
+    )
+    .unwrap();
+
+    // fixture content is deterministic, so two logs can coincidentally hash
+    // identically at height 1; forge fx_b's hash to force equivocation.
+    let forged_hash = format!("sha256:{}", "cd".repeat(32));
+    common::write_checkpoint(
+        fx_b.dir.path(),
+        &fx_b.log,
+        1,
+        &forged_hash,
+        "2026-08-09T13:00:00Z",
+    );
+
+    let result = graven::sync::run(
+        fx_b.anchor_path().to_str().unwrap(),
+        &fx_b.base_url,
+        legacy.path(),
+        true,
+        false,
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("equivocation"),
+        "error was: {err}"
+    );
+
+    assert!(legacy.path().join("index.sqlite").exists());
+    assert!(legacy.path().join("sync.json").exists());
+    assert!(!legacy.path().join("logs.json").exists());
+    assert!(!graven::registry::log_dir(legacy.path(), "other-log").exists());
+
+    let report = graven::sync::run(
+        fx_a.anchor_path().to_str().unwrap(),
+        &fx_a.base_url,
+        legacy.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.head, 1);
+
+    let migrated_dir = common::synced_log_dir(legacy.path());
+    assert!(migrated_dir.join("index.sqlite").exists());
+    assert!(migrated_dir.join("sync.json").exists());
+    assert!(!legacy.path().join("index.sqlite").exists());
+    assert!(!legacy.path().join("sync.json").exists());
+
+    let store = Store::open(&migrated_dir).unwrap();
+    let alpha = store.get("https://records.example/alpha").unwrap().unwrap();
+    assert_eq!(alpha.title, "Alpha Title");
+}
