@@ -78,19 +78,6 @@ pub fn check_not_legacy(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn resolve_default_log(dir: &Path) -> Result<LogEntry> {
-    check_not_legacy(dir)?;
-    let reg = load(dir)?;
-    let entry = reg.logs.into_iter().next().ok_or_else(|| {
-        Error::Verify(format!(
-            "no logs registered in {}; run `graven follow` first",
-            dir.display()
-        ))
-    })?;
-    validate_log_id(&entry.log_id)?;
-    Ok(entry)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,57 +145,6 @@ mod tests {
     #[test]
     fn validate_log_id_error_names_the_offending_log_id() {
         let err = validate_log_id("..").unwrap_err();
-        assert!(err.to_string().contains(".."), "error was: {err}");
-    }
-
-    #[test]
-    fn resolve_default_log_returns_first_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let reg = Registry {
-            logs: vec![
-                LogEntry {
-                    log_id: "a".into(),
-                    anchor: "anchor-a".into(),
-                    base: "https://a.example".into(),
-                    tier1: false,
-                },
-                LogEntry {
-                    log_id: "b".into(),
-                    anchor: "anchor-b".into(),
-                    base: "https://b.example".into(),
-                    tier1: true,
-                },
-            ],
-        };
-        save(dir.path(), &reg).unwrap();
-        let entry = resolve_default_log(dir.path()).unwrap();
-        assert_eq!(entry.log_id, "a");
-    }
-
-    #[test]
-    fn resolve_default_log_errors_when_no_logs_registered() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = resolve_default_log(dir.path()).unwrap_err();
-        assert!(
-            err.to_string().contains("run `graven follow`"),
-            "error was: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_default_log_rejects_a_hand_edited_unsafe_log_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let reg = Registry {
-            logs: vec![LogEntry {
-                log_id: "..".into(),
-                anchor: "anchor.json".into(),
-                base: "https://log.example".into(),
-                tier1: false,
-            }],
-        };
-        save(dir.path(), &reg).unwrap();
-
-        let err = resolve_default_log(dir.path()).unwrap_err();
         assert!(err.to_string().contains(".."), "error was: {err}");
     }
 }

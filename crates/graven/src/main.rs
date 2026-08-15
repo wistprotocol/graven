@@ -82,10 +82,8 @@ fn main() -> Result<(), graven::Error> {
             }
         },
         Command::Serve { dir } => {
-            let entry = graven::registry::resolve_default_log(&dir)?;
-            let log_dir = graven::registry::log_dir(&dir, &entry.log_id);
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(graven::mcp::serve_stdio(&log_dir, entry.log_id))?;
+            rt.block_on(graven::mcp::serve_stdio(&dir))?;
         }
     }
     Ok(())

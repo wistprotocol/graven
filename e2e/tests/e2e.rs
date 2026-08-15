@@ -594,7 +594,7 @@ fn end_to_end() {
         .find(|h| h["url"].as_str().unwrap_or_default().ends_with("/a.html"))
         .unwrap_or_else(|| panic!("no hit ending in /a.html among {hits:?}"));
     assert!(
-        hit["provenance"]["synced_height"].as_u64().unwrap_or(0) >= 1,
+        hit["provenance"][0]["synced_height"].as_u64().unwrap_or(0) >= 1,
         "expected synced_height >= 1, got {hit}"
     );
     let url = hit["url"]
