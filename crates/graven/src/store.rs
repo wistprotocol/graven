@@ -118,6 +118,7 @@ impl MultiStore {
         }
         let mut logs = Vec::with_capacity(reg.logs.len());
         for entry in reg.logs {
+            crate::registry::validate_log_id(&entry.log_id)?;
             let log_dir = crate::registry::log_dir(dir, &entry.log_id);
             let store = Store::open_read_only(&log_dir)?;
             let synced_height = read_synced_height(&log_dir)?;
@@ -538,6 +539,44 @@ mod tests {
             panic!("expected legacy layout error");
         };
         assert!(err.to_string().contains("run `graven sync --anchor"));
+    }
+
+    #[test]
+    fn multi_store_open_read_only_rejects_a_hand_edited_unsafe_log_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("logs")).unwrap();
+        seed(tmp.path());
+        std::fs::write(
+            tmp.path().join("sync.json"),
+            serde_json::to_vec(&SyncState {
+                log_position: 0,
+                head_number: 1,
+                head_hash: "sha256:deadbeef".into(),
+                content_digest: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        crate::registry::save(
+            tmp.path(),
+            &crate::registry::Registry {
+                logs: vec![crate::registry::LogEntry {
+                    log_id: "..".into(),
+                    anchor: "anchor.json".into(),
+                    base: "https://log.example".into(),
+                    tier1: false,
+                }],
+            },
+        )
+        .unwrap();
+
+        let Err(err) = MultiStore::open_read_only(tmp.path()) else {
+            panic!(
+                "expected an error rejecting the unsafe log_id, not a silently opened store over {}",
+                tmp.path().display()
+            );
+        };
+        assert!(err.to_string().contains(".."), "error was: {err}");
     }
 
     #[test]
