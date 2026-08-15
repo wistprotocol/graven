@@ -509,3 +509,173 @@ fn continuous_sync_upserts_update_delta_preserving_publisher_port() {
     );
     assert_eq!(title_col, "Alpha Title");
 }
+
+#[test]
+fn delta_signed_by_undeclared_key_fails_sync() {
+    let fx = common::build_fixture(true, false);
+    common::extend_fixture_with_forged_delta(&fx);
+    let dir = tempfile::tempdir().unwrap();
+    let err = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("publisher verify"));
+}
+
+#[test]
+fn delta_after_rotation_signed_by_old_key_fails_sync() {
+    let fx = common::build_fixture(true, false);
+    let old = common::Signer::new([1u8; 32]);
+    let new_key = common::Signer::new([2u8; 32]);
+
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let decl0 = common::build_declaration(&old, "pk1", &fx.domain);
+    let hash0 = common::declaration_hash(&decl0);
+
+    let rotation_number = prev_number + 1;
+    let rotation_decl = common::build_declaration_full(
+        &old,
+        "pk1",
+        &fx.domain,
+        1,
+        Some(&hash0),
+        &[("pk2", &new_key, "2026-08-09T00:00:00Z")],
+    );
+    let wrapped_decl = serde_json::json!({"type": "publisher_declaration", "body": rotation_decl});
+    let sealed_at1 = format!("2026-08-09T{:02}:00:00Z", 14 + rotation_number);
+    let (block1, hash1) = common::build_block(
+        &fx.log,
+        rotation_number,
+        &prev_hash,
+        &sealed_at1,
+        &[wrapped_decl],
+    );
+    common::write_block(fx.dir.path(), rotation_number, &block1);
+    common::write_checkpoint(fx.dir.path(), &fx.log, rotation_number, &hash1, &sealed_at1);
+
+    let delta_number = rotation_number + 1;
+    let url = format!("https://records.example/extra-{delta_number}");
+    let (_id, delta_env, _payload) =
+        common::build_delta(&old, "pk1", &url, "Stale Title", None, "stale body", None);
+    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
+    let sealed_at2 = format!("2026-08-09T{:02}:00:00Z", 14 + delta_number);
+    let (block2, hash2) =
+        common::build_block(&fx.log, delta_number, &hash1, &sealed_at2, &[wrapped_delta]);
+    common::write_block(fx.dir.path(), delta_number, &block2);
+    common::write_checkpoint(fx.dir.path(), &fx.log, delta_number, &hash2, &sealed_at2);
+
+    let dir = tempfile::tempdir().unwrap();
+    let err = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("publisher verify"));
+}
+
+#[test]
+fn rotation_then_new_key_delta_syncs() {
+    let fx = common::build_fixture(true, false);
+    let new_key = common::Signer::new([2u8; 32]);
+    let new_url = common::extend_fixture_with_rotation(&fx, &new_key);
+    let dir = tempfile::tempdir().unwrap();
+
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(report.head, 3);
+
+    let store = Store::open(dir.path()).unwrap();
+    let record = store.get(&new_url).unwrap().unwrap();
+    assert_eq!(record.title, "Rotated Title");
+}
+
+#[test]
+fn incremental_sync_reloads_declarations() {
+    let fx = common::build_fixture(true, false);
+    let dir = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+    )
+    .unwrap();
+
+    let new_url = common::extend_fixture(&fx);
+
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(report.head, 2);
+
+    let store = Store::open(dir.path()).unwrap();
+    let record = store.get(&new_url).unwrap().unwrap();
+    assert_eq!(record.title, "Extra Title");
+}
+
+#[test]
+fn failed_incremental_leaves_index_unchanged() {
+    let fx = common::build_fixture(true, false);
+    let dir = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+    )
+    .unwrap();
+
+    let sync_before = std::fs::read(dir.path().join("sync.json")).unwrap();
+
+    common::extend_fixture_with_forged_delta(&fx);
+
+    let result = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+    );
+    assert!(result.is_err());
+
+    let sync_after = std::fs::read(dir.path().join("sync.json")).unwrap();
+    assert_eq!(sync_before, sync_after);
+
+    let store = Store::open(dir.path()).unwrap();
+    assert!(store
+        .get("https://records.example/alpha")
+        .unwrap()
+        .is_some());
+    assert!(store.get("https://records.example/beta").unwrap().is_some());
+    assert!(store
+        .get("https://records.example/extra-2")
+        .unwrap()
+        .is_none());
+
+    let conn = Connection::open(dir.path().join("index.sqlite")).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+}

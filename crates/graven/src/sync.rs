@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::fetch::{resolve, Client};
-use crate::store::CREATE_UNIQUE_INDEX;
+use crate::keyset::{url_authority, KeyHistory};
+use crate::store::{CREATE_DECLARATIONS, CREATE_UNIQUE_INDEX};
 use reqwest::Url;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -9,11 +10,12 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use wist_core::block::{block_hash, verify_block, verify_chain_link, verify_checkpoint_binding};
 use wist_core::crypto::{hex_encode, PublicKey};
-use wist_core::delta::{content_bytes, delta_id, verify_commitment};
+use wist_core::delta::{content_bytes, verify_commitment};
 use wist_core::envelope::verify_envelope;
 use wist_core::objects::{
     ChangeType, CheckpointEnvelope, DeltaEnvelope, DeltaPayloadCommitment, LogAnchorEnvelope,
-    Payload, SnapshotIndexEnvelope, SnapshotManifestEnvelope, SnapshotStateEnvelope,
+    Payload, PublisherEnvelope, SnapshotIndexEnvelope, SnapshotManifestEnvelope,
+    SnapshotStateEnvelope, StateEntry,
 };
 use wist_core::snapshot::{content_digest, state_digest};
 
@@ -28,6 +30,21 @@ pub struct SyncState {
     pub log_position: u64,
     pub head_number: u64,
     pub head_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
+}
+
+pub struct BlockEvent {
+    pub height: u64,
+    pub sealed_at: String,
+    pub declarations: Vec<Value>,
+    pub withdrawals: Vec<String>,
+    pub delta_bodies: Vec<Value>,
+}
+
+pub struct ApplyStats {
+    pub applied: u64,
+    pub withdrawn: u64,
 }
 
 struct TempFileGuard<'a> {
@@ -116,22 +133,17 @@ fn fetch_payload(
     ))
 }
 
-struct BlockWalk {
-    delta_bodies: Vec<Value>,
-    last_block_value: Option<Value>,
-}
-
-fn walk_blocks(
+pub fn walk_blocks(
     client: &Client,
     base: &Url,
     trust_key: &PublicKey,
     start_number: u64,
     end_number: u64,
     start_hash: &str,
-) -> Result<BlockWalk> {
+) -> Result<(Vec<BlockEvent>, Option<Value>)> {
     let mut prev_hash = start_hash.to_string();
     let mut last_block_value: Option<Value> = None;
-    let mut delta_bodies: Vec<Value> = Vec::new();
+    let mut events: Vec<BlockEvent> = Vec::new();
     for n in start_number..=end_number {
         let block_url = resolve(base, &format!("/log/blocks/{n:09}.json.zst"))?;
         let compressed = client.get_bytes(&block_url)?;
@@ -144,24 +156,67 @@ fn walk_blocks(
             .ok_or_else(|| Error::Verify(format!("block {n} missing header")))?;
         verify_chain_link(header, &prev_hash)?;
         prev_hash = block_hash(header)?;
+        let sealed_at = header
+            .get("sealed_at")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Verify(format!("block {n} missing header.sealed_at")))?
+            .to_string();
+
+        let mut declarations = Vec::new();
+        let mut withdrawals = Vec::new();
+        let mut delta_bodies = Vec::new();
+
         for entry in block_value
             .get("entries")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
-            if entry.get("type").and_then(Value::as_str) == Some("publisher_delta") {
-                if let Some(delta_entry_body) = entry.get("body") {
-                    delta_bodies.push(delta_entry_body.clone());
+            match entry.get("type").and_then(Value::as_str) {
+                Some("publisher_declaration") => {
+                    let body = entry.get("body").ok_or_else(|| {
+                        Error::Verify(format!(
+                            "block {n}: publisher_declaration entry missing body"
+                        ))
+                    })?;
+                    declarations.push(body.clone());
                 }
+                Some("registry_update") => {
+                    let body = entry.get("body").ok_or_else(|| {
+                        Error::Verify(format!("block {n}: registry_update entry missing body"))
+                    })?;
+                    verify_envelope(body, "update", trust_key)?;
+                    if body["update"]["action"] == "payload_withdrawal" {
+                        let withdrawn_id = body["update"]["details"]["delta_id"]
+                            .as_str()
+                            .ok_or_else(|| {
+                                Error::Verify(format!(
+                                    "block {n}: payload_withdrawal missing details.delta_id"
+                                ))
+                            })?;
+                        withdrawals.push(withdrawn_id.to_string());
+                    }
+                }
+                Some("publisher_delta") => {
+                    let body = entry.get("body").ok_or_else(|| {
+                        Error::Verify(format!("block {n}: publisher_delta entry missing body"))
+                    })?;
+                    delta_bodies.push(body.clone());
+                }
+                _ => {}
             }
         }
+
+        events.push(BlockEvent {
+            height: n,
+            sealed_at,
+            declarations,
+            withdrawals,
+            delta_bodies,
+        });
         last_block_value = Some(block_value);
     }
-    Ok(BlockWalk {
-        delta_bodies,
-        last_block_value,
-    })
+    Ok((events, last_block_value))
 }
 
 fn load_trust_key(anchor: &str, client: &Client) -> Result<PublicKey> {
@@ -173,63 +228,116 @@ fn load_trust_key(anchor: &str, client: &Client) -> Result<PublicKey> {
     Ok(trust_key)
 }
 
-fn apply_post_snapshot_deltas(
+fn persist_declaration(
+    conn: &Connection,
+    height: u64,
+    sealed_at: &str,
+    baseline: bool,
+    envelope: &Value,
+) -> Result<()> {
+    let env: PublisherEnvelope = serde_json::from_value(envelope.clone())?;
+    conn.execute(
+        "INSERT INTO declarations(domain, seq, height, sealed_at, baseline, envelope) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        (
+            env.publisher.domain,
+            env.publisher.seq as i64,
+            height as i64,
+            sealed_at,
+            baseline as i64,
+            serde_json::to_string(envelope)?,
+        ),
+    )?;
+    Ok(())
+}
+
+pub fn load_history(conn: &Connection) -> Result<KeyHistory> {
+    let mut stmt = conn.prepare(
+        "SELECT height, sealed_at, baseline, envelope FROM declarations ORDER BY height, seq",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut history = KeyHistory::new();
+    for (height, sealed_at, baseline, envelope) in rows {
+        let value: Value = serde_json::from_str(&envelope)?;
+        let height = height as u64;
+        if baseline != 0 {
+            history.add_baseline(height, &value)?;
+        } else {
+            history.add_declaration(height, &sealed_at, &value)?;
+        }
+    }
+    Ok(history)
+}
+
+pub fn apply_events(
     conn: &Connection,
     client: &Client,
     base: &Url,
-    delta_bodies: Vec<Value>,
-) -> Result<()> {
-    for body in delta_bodies {
-        let Some(delta_body) = body.get("delta") else {
-            continue;
-        };
-        let Ok(env) = serde_json::from_value::<DeltaEnvelope>(body.clone()) else {
-            continue;
-        };
-        let delta = env.delta;
-        if !matches!(delta.change_type, ChangeType::New | ChangeType::Update) {
-            continue;
+    history: &mut KeyHistory,
+    events: &[BlockEvent],
+) -> Result<ApplyStats> {
+    let mut stats = ApplyStats {
+        applied: 0,
+        withdrawn: 0,
+    };
+    for event in events {
+        for declaration in &event.declarations {
+            history.add_declaration(event.height, &event.sealed_at, declaration)?;
+            persist_declaration(conn, event.height, &event.sealed_at, false, declaration)?;
         }
-        let Ok(id) = delta_id(delta_body) else {
-            continue;
-        };
-        let Some(hex) = id.strip_prefix("sha256:") else {
-            continue;
-        };
-        let Some(publisher) = Url::parse(&delta.url)
-            .ok()
-            .as_ref()
-            .and_then(crate::keyset::url_authority)
-        else {
-            continue;
-        };
 
-        let (title, abstract_text) = match &delta.payload {
-            Some(commitment) => {
-                fetch_payload(client, base, hex, commitment).unwrap_or((String::new(), None))
+        for body in &event.delta_bodies {
+            let env: DeltaEnvelope = serde_json::from_value(body.clone())?;
+            let id = history.verify_delta(event.height, body)?;
+            if !matches!(env.delta.change_type, ChangeType::New | ChangeType::Update) {
+                continue;
             }
-            None => (String::new(), None),
-        };
+            let hex = id.trim_start_matches("sha256:");
+            let publisher = Url::parse(&env.delta.url)
+                .ok()
+                .as_ref()
+                .and_then(url_authority)
+                .ok_or_else(|| {
+                    Error::Verify(format!("delta url {}: no authority", env.delta.url))
+                })?;
 
-        conn.execute(
-            "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang)
-             VALUES (?1, ?2, ?3, ?4, 'full', ?5, ?6, ?7)
-             ON CONFLICT(url, publisher) DO UPDATE SET
-                delta_id = excluded.delta_id, observed_at = excluded.observed_at,
-                weight = excluded.weight, title = excluded.title,
-                abstract = excluded.abstract, lang = excluded.lang",
-            (
-                &delta.url,
-                &publisher,
-                &id,
-                &delta.observed_at,
-                &title,
-                &abstract_text,
-                &delta.meta.lang,
-            ),
-        )?;
+            let (title, abstract_text) = match &env.delta.payload {
+                Some(commitment) => {
+                    fetch_payload(client, base, hex, commitment).unwrap_or((String::new(), None))
+                }
+                None => (String::new(), None),
+            };
+
+            conn.execute(
+                "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang)
+                 VALUES (?1, ?2, ?3, ?4, 'full', ?5, ?6, ?7)
+                 ON CONFLICT(url, publisher) DO UPDATE SET
+                    delta_id = excluded.delta_id, observed_at = excluded.observed_at,
+                    weight = excluded.weight, title = excluded.title,
+                    abstract = excluded.abstract, lang = excluded.lang",
+                (
+                    &env.delta.url,
+                    &publisher,
+                    &id,
+                    &env.delta.observed_at,
+                    &title,
+                    &abstract_text,
+                    &env.delta.meta.lang,
+                ),
+            )?;
+            stats.applied += 1;
+        }
     }
-    Ok(())
+    Ok(stats)
 }
 
 pub fn run(anchor: &str, log_base: &str, dir: &Path, allow_http: bool) -> Result<SyncReport> {
@@ -283,7 +391,7 @@ fn run_incremental(
         )));
     }
 
-    let walk = walk_blocks(
+    let (events, last_block_value) = walk_blocks(
         client,
         base,
         trust_key,
@@ -291,23 +399,26 @@ fn run_incremental(
         checkpoint.block_number,
         &local.head_hash,
     )?;
-    let last_block_value = walk.last_block_value.ok_or_else(|| {
+    let last_block_value = last_block_value.ok_or_else(|| {
         Error::Verify("continuous sync produced no blocks despite checkpoint advancing".into())
     })?;
     verify_checkpoint_binding(&checkpoint_value, &last_block_value)?;
 
     let index_sqlite_path = dir.join("index.sqlite");
-    {
-        let conn = Connection::open(&index_sqlite_path)?;
-        conn.execute(CREATE_UNIQUE_INDEX, [])?;
-        apply_post_snapshot_deltas(&conn, client, base, walk.delta_bodies)?;
-        conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
-    }
+    let conn = Connection::open(&index_sqlite_path)?;
+    let mut history = load_history(&conn)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(CREATE_UNIQUE_INDEX, [])?;
+    tx.execute(CREATE_DECLARATIONS, [])?;
+    apply_events(&tx, client, base, &mut history, &events)?;
+    tx.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
+    tx.commit()?;
 
     let sync_state = SyncState {
         log_position: local.log_position,
         head_number: checkpoint.block_number,
         head_hash: checkpoint.block_hash.clone(),
+        content_digest: local.content_digest.clone(),
     };
     std::fs::write(sync_path, serde_json::to_vec(&sync_state)?)?;
 
@@ -384,6 +495,18 @@ fn run_cold_start(
         ));
     }
 
+    let conn = Connection::open(&tmp_sqlite_path)?;
+    conn.execute(CREATE_UNIQUE_INDEX, [])?;
+    conn.execute(CREATE_DECLARATIONS, [])?;
+
+    let mut history = KeyHistory::new();
+    for entry in &state_env.state.entries {
+        if let StateEntry::Declaration(d) = entry {
+            history.add_baseline(d.sealing_height, &d.declaration)?;
+            persist_declaration(&conn, d.sealing_height, "", true, &d.declaration)?;
+        }
+    }
+
     let checkpoint_url = resolve(base, "/log/checkpoint.json")?;
     let (_, checkpoint_value) = client.get_json(&checkpoint_url)?;
     verify_envelope(&checkpoint_value, "checkpoint", trust_key)?;
@@ -396,7 +519,7 @@ fn run_cold_start(
         ));
     }
 
-    let walk = walk_blocks(
+    let (events, last_block_value) = walk_blocks(
         client,
         base,
         trust_key,
@@ -405,7 +528,7 @@ fn run_cold_start(
         &manifest.anchor_block_hash,
     )?;
 
-    match &walk.last_block_value {
+    match &last_block_value {
         Some(block_value) => verify_checkpoint_binding(&checkpoint_value, block_value)?,
         None => {
             if checkpoint.block_number != manifest.log_position
@@ -418,12 +541,9 @@ fn run_cold_start(
         }
     }
 
-    {
-        let conn = Connection::open(&tmp_sqlite_path)?;
-        conn.execute(CREATE_UNIQUE_INDEX, [])?;
-        apply_post_snapshot_deltas(&conn, client, base, walk.delta_bodies)?;
-        conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
-    }
+    apply_events(&conn, client, base, &mut history, &events)?;
+    conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
+    drop(conn);
 
     guard.disarm();
     let index_sqlite_path = dir.join("index.sqlite");
@@ -433,6 +553,7 @@ fn run_cold_start(
         log_position: manifest.log_position,
         head_number: checkpoint.block_number,
         head_hash: checkpoint.block_hash.clone(),
+        content_digest: Some(manifest.content_digest.clone()),
     };
     std::fs::write(sync_path, serde_json::to_vec(&sync_state)?)?;
 

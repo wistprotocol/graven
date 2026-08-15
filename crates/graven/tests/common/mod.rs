@@ -76,19 +76,51 @@ pub fn write_anchor(path: &Path, log: &Signer) {
     std::fs::write(path, serde_json::to_vec(&env).unwrap()).unwrap();
 }
 
-pub fn build_declaration(publisher: &Signer, key_id: &str, domain: &str) -> Value {
-    let doc = serde_json::json!({
+pub fn build_declaration_full(
+    signing: &Signer,
+    signing_key_id: &str,
+    domain: &str,
+    seq: u64,
+    prev: Option<&str>,
+    keys: &[(&str, &Signer, &str)],
+) -> Value {
+    let key_entries: Vec<Value> = keys
+        .iter()
+        .map(|(key_id, signer, valid_from)| {
+            serde_json::json!({
+                "key_id": key_id,
+                "alg": "Ed25519",
+                "public_key": signer.public_b64u(),
+                "valid_from": valid_from,
+            })
+        })
+        .collect();
+    let mut doc = serde_json::json!({
         "wist_version": "1.0.0",
         "domain": domain,
-        "keys": [{
-            "key_id": key_id,
-            "alg": "Ed25519",
-            "public_key": publisher.public_b64u(),
-            "valid_from": "2026-08-09T00:00:00Z",
-        }],
-        "seq": 0,
+        "keys": key_entries,
+        "seq": seq,
     });
-    sign_envelope(&doc, "publisher", key_id, &publisher.sk).unwrap()
+    if let Some(p) = prev {
+        doc["prev_declaration"] = p.into();
+    }
+    sign_envelope(&doc, "publisher", signing_key_id, &signing.sk).unwrap()
+}
+
+pub fn build_declaration(publisher: &Signer, key_id: &str, domain: &str) -> Value {
+    build_declaration_full(
+        publisher,
+        key_id,
+        domain,
+        0,
+        None,
+        &[(key_id, publisher, "2026-08-09T00:00:00Z")],
+    )
+}
+
+pub fn declaration_hash(envelope: &Value) -> String {
+    let canon = jcs::canonicalize(&envelope["publisher"]).unwrap();
+    format!("sha256:{}", hex_encode(&Sha256::digest(&canon)))
 }
 
 pub fn build_delta(
@@ -436,6 +468,97 @@ pub fn extend_fixture(fx: &Fixture) -> String {
     );
     write_block(fx.dir.path(), next_number, &block);
     write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+
+    url
+}
+
+pub fn extend_fixture_with_forged_delta(fx: &Fixture) {
+    let attacker = Signer::new([7u8; 32]);
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let next_number = prev_number + 1;
+
+    let url = format!("https://records.example/extra-{next_number}");
+    let (_id, delta_env, _payload) = build_delta(
+        &attacker,
+        "pk1",
+        &url,
+        "Extra Title",
+        Some("Extra abstract"),
+        "extra body",
+        None,
+    );
+    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
+
+    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
+    let (block, new_hash) = build_block(
+        &fx.log,
+        next_number,
+        &prev_hash,
+        &sealed_at,
+        &[wrapped_delta],
+    );
+    write_block(fx.dir.path(), next_number, &block);
+    write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+}
+
+pub fn extend_fixture_with_rotation(fx: &Fixture, new_key: &Signer) -> String {
+    let old = Signer::new([1u8; 32]);
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let decl0 = build_declaration(&old, "pk1", &fx.domain);
+    let hash0 = declaration_hash(&decl0);
+
+    let rotation_number = prev_number + 1;
+    let rotation_decl = build_declaration_full(
+        &old,
+        "pk1",
+        &fx.domain,
+        1,
+        Some(&hash0),
+        &[("pk2", new_key, "2026-08-09T00:00:00Z")],
+    );
+    let wrapped_decl = serde_json::json!({"type": "publisher_declaration", "body": rotation_decl});
+    let sealed_at1 = format!("2026-08-09T{:02}:00:00Z", 14 + rotation_number);
+    let (block1, hash1) = build_block(
+        &fx.log,
+        rotation_number,
+        &prev_hash,
+        &sealed_at1,
+        &[wrapped_decl],
+    );
+    write_block(fx.dir.path(), rotation_number, &block1);
+    write_checkpoint(fx.dir.path(), &fx.log, rotation_number, &hash1, &sealed_at1);
+
+    let delta_number = rotation_number + 1;
+    let url = format!("https://records.example/extra-{delta_number}");
+    let (id, delta_env, payload) = build_delta(
+        new_key,
+        "pk2",
+        &url,
+        "Rotated Title",
+        Some("Rotated abstract"),
+        "rotated body",
+        None,
+    );
+    let hex = id.strip_prefix("sha256:").unwrap();
+    write_payload(fx.dir.path(), hex, &payload);
+    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
+    let sealed_at2 = format!("2026-08-09T{:02}:00:00Z", 14 + delta_number);
+    let (block2, hash2) = build_block(&fx.log, delta_number, &hash1, &sealed_at2, &[wrapped_delta]);
+    write_block(fx.dir.path(), delta_number, &block2);
+    write_checkpoint(fx.dir.path(), &fx.log, delta_number, &hash2, &sealed_at2);
 
     url
 }

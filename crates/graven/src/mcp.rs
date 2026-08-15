@@ -287,6 +287,7 @@ mod tests {
                 log_position: 0,
                 head_number: 3,
                 head_hash: "sha256:deadbeef".into(),
+                content_digest: None,
             })
             .unwrap(),
         )
