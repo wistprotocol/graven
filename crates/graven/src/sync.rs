@@ -433,7 +433,11 @@ pub fn run(
         Ok(report) => Ok(report),
         Err(err) => {
             if migrated {
-                rollback_migration(dir, &log_id);
+                if let Err(rollback_err) = rollback_migration(dir, &log_id) {
+                    return Err(Error::Verify(format!(
+                        "sync failed: {err}; additionally, rollback of the legacy-layout migration failed: {rollback_err}"
+                    )));
+                }
             }
             Err(err)
         }
@@ -499,17 +503,73 @@ fn migrate_legacy_layout(dir: &Path, log_id: &str) -> Result<bool> {
     }
     let target_dir = registry::log_dir(dir, log_id);
     std::fs::create_dir_all(&target_dir)?;
-    std::fs::rename(dir.join("index.sqlite"), target_dir.join("index.sqlite"))?;
-    std::fs::rename(dir.join("sync.json"), target_dir.join("sync.json"))?;
+
+    let index_src = dir.join("index.sqlite");
+    let index_dst = target_dir.join("index.sqlite");
+    std::fs::rename(&index_src, &index_dst)?;
+
+    let sync_src = dir.join("sync.json");
+    let sync_dst = target_dir.join("sync.json");
+    if let Err(err) = std::fs::rename(&sync_src, &sync_dst) {
+        if let Err(undo_err) = std::fs::rename(&index_dst, &index_src) {
+            return Err(Error::Verify(format!(
+                "legacy migration failed moving {} into {} ({err}); additionally, could not move {} back to {} ({undo_err}); index.sqlite is stranded at {}",
+                sync_src.display(),
+                sync_dst.display(),
+                index_dst.display(),
+                index_src.display(),
+                index_dst.display()
+            )));
+        }
+        return Err(Error::Verify(format!(
+            "legacy migration failed moving {} into {}: {err}",
+            sync_src.display(),
+            sync_dst.display()
+        )));
+    }
     Ok(true)
 }
 
-fn rollback_migration(dir: &Path, log_id: &str) {
+fn rollback_migration(dir: &Path, log_id: &str) -> Result<()> {
     let target_dir = registry::log_dir(dir, log_id);
-    let _ = std::fs::rename(target_dir.join("index.sqlite"), dir.join("index.sqlite"));
-    let _ = std::fs::rename(target_dir.join("sync.json"), dir.join("sync.json"));
-    let _ = std::fs::remove_dir_all(&target_dir);
-    let _ = std::fs::remove_file(dir.join("logs.json"));
+    let index_src = target_dir.join("index.sqlite");
+    let index_dst = dir.join("index.sqlite");
+    let sync_src = target_dir.join("sync.json");
+    let sync_dst = dir.join("sync.json");
+
+    if let Err(err) = std::fs::rename(&index_src, &index_dst) {
+        return Err(Error::Verify(format!(
+            "rollback of legacy migration failed: could not move {} back to {}: {err}; both files remain in {}",
+            index_src.display(),
+            index_dst.display(),
+            target_dir.display()
+        )));
+    }
+    if let Err(err) = std::fs::rename(&sync_src, &sync_dst) {
+        return Err(Error::Verify(format!(
+            "rollback of legacy migration failed: index.sqlite was restored to {} but could not move {} back to {}: {err}; sync.json remains in {}",
+            dir.display(),
+            sync_src.display(),
+            sync_dst.display(),
+            target_dir.display()
+        )));
+    }
+
+    std::fs::remove_dir_all(&target_dir).map_err(|err| {
+        Error::Verify(format!(
+            "rollback of legacy migration restored both files to {} but could not remove {}: {err}",
+            dir.display(),
+            target_dir.display()
+        ))
+    })?;
+    std::fs::remove_file(dir.join("logs.json")).map_err(|err| {
+        Error::Verify(format!(
+            "rollback of legacy migration restored both files to {} but could not remove {}: {err}",
+            dir.display(),
+            dir.join("logs.json").display()
+        ))
+    })?;
+    Ok(())
 }
 
 fn run_incremental(
@@ -726,4 +786,135 @@ fn run_cold_start(
         head: checkpoint.block_number,
         withdrawn: stats.withdrawn,
     })
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn migrate_legacy_layout_is_noop_when_not_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!migrate_legacy_layout(dir.path(), "log-a").unwrap());
+    }
+
+    #[test]
+    fn migrate_legacy_layout_moves_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.sqlite"), b"idx").unwrap();
+        std::fs::write(dir.path().join("sync.json"), b"sync").unwrap();
+
+        assert!(migrate_legacy_layout(dir.path(), "log-a").unwrap());
+
+        let target = registry::log_dir(dir.path(), "log-a");
+        assert_eq!(std::fs::read(target.join("index.sqlite")).unwrap(), b"idx");
+        assert_eq!(std::fs::read(target.join("sync.json")).unwrap(), b"sync");
+        assert!(!dir.path().join("index.sqlite").exists());
+        assert!(!dir.path().join("sync.json").exists());
+    }
+
+    #[test]
+    fn migrate_legacy_layout_restores_first_file_when_second_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.sqlite"), b"idx").unwrap();
+        std::fs::write(dir.path().join("sync.json"), b"sync").unwrap();
+
+        let target = registry::log_dir(dir.path(), "log-a");
+        std::fs::create_dir_all(target.join("sync.json")).unwrap();
+
+        let err = migrate_legacy_layout(dir.path(), "log-a").unwrap_err();
+        assert!(err.to_string().contains("sync.json"), "error was: {err}");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("index.sqlite")).unwrap(),
+            b"idx",
+            "index.sqlite must be restored to the top level, not stranded in target_dir"
+        );
+        assert!(!target.join("index.sqlite").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("sync.json")).unwrap(),
+            b"sync"
+        );
+    }
+
+    #[test]
+    fn rollback_migration_moves_files_back_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = registry::log_dir(dir.path(), "log-a");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("index.sqlite"), b"idx").unwrap();
+        std::fs::write(target.join("sync.json"), b"sync").unwrap();
+        std::fs::write(dir.path().join("logs.json"), b"{}").unwrap();
+
+        rollback_migration(dir.path(), "log-a").unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join("index.sqlite")).unwrap(),
+            b"idx"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("sync.json")).unwrap(),
+            b"sync"
+        );
+        assert!(!target.exists());
+        assert!(!dir.path().join("logs.json").exists());
+    }
+
+    #[test]
+    fn rollback_migration_leaves_target_dir_intact_when_first_rename_back_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = registry::log_dir(dir.path(), "log-a");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("index.sqlite"), b"idx").unwrap();
+        std::fs::write(target.join("sync.json"), b"sync").unwrap();
+        std::fs::write(dir.path().join("logs.json"), b"{}").unwrap();
+
+        std::fs::create_dir_all(dir.path().join("index.sqlite")).unwrap();
+
+        let err = rollback_migration(dir.path(), "log-a").unwrap_err();
+        assert!(err.to_string().contains("index.sqlite"), "error was: {err}");
+
+        assert_eq!(
+            std::fs::read(target.join("index.sqlite")).unwrap(),
+            b"idx",
+            "index.sqlite must still be in target_dir, not deleted by a premature remove_dir_all"
+        );
+        assert_eq!(std::fs::read(target.join("sync.json")).unwrap(), b"sync");
+        assert!(
+            target.exists(),
+            "target_dir must not be removed while rollback is incomplete"
+        );
+        assert!(dir.path().join("logs.json").exists());
+    }
+
+    #[test]
+    fn rollback_migration_preserves_sync_json_when_second_rename_back_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = registry::log_dir(dir.path(), "log-a");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("index.sqlite"), b"idx").unwrap();
+        std::fs::write(target.join("sync.json"), b"sync").unwrap();
+        std::fs::write(dir.path().join("logs.json"), b"{}").unwrap();
+
+        std::fs::create_dir_all(dir.path().join("sync.json")).unwrap();
+
+        let err = rollback_migration(dir.path(), "log-a").unwrap_err();
+        assert!(err.to_string().contains("sync.json"), "error was: {err}");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("index.sqlite")).unwrap(),
+            b"idx",
+            "index.sqlite rename-back had already succeeded and must not be undone"
+        );
+        assert_eq!(
+            std::fs::read(target.join("sync.json")).unwrap(),
+            b"sync",
+            "sync.json must still be in target_dir, not deleted by a premature remove_dir_all"
+        );
+        assert!(
+            target.exists(),
+            "target_dir must not be removed while rollback is incomplete"
+        );
+        assert!(dir.path().join("logs.json").exists());
+    }
 }

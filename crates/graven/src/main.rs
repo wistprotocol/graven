@@ -82,18 +82,10 @@ fn main() -> Result<(), graven::Error> {
             }
         },
         Command::Serve { dir } => {
-            graven::registry::check_not_legacy(&dir)?;
-            let registry = graven::registry::load(&dir)?;
-            let entry = registry.logs.first().ok_or_else(|| {
-                graven::Error::Verify(format!(
-                    "no logs registered in {}; run `graven follow` first",
-                    dir.display()
-                ))
-            })?;
+            let entry = graven::registry::resolve_default_log(&dir)?;
             let log_dir = graven::registry::log_dir(&dir, &entry.log_id);
-            let log_id = entry.log_id.clone();
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(graven::mcp::serve_stdio(&log_dir, log_id))?;
+            rt.block_on(graven::mcp::serve_stdio(&log_dir, entry.log_id))?;
         }
     }
     Ok(())

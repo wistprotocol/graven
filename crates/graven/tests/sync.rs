@@ -1295,3 +1295,31 @@ fn failed_migration_restores_legacy_layout_and_registers_nothing() {
     let alpha = store.get("https://records.example/alpha").unwrap().unwrap();
     assert_eq!(alpha.title, "Alpha Title");
 }
+
+#[test]
+fn mid_migration_rename_failure_restores_first_file_via_public_api() {
+    let fx = common::build_fixture(true, false);
+    let dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(dir.path().join("index.sqlite"), b"legacy-index-bytes").unwrap();
+    std::fs::write(dir.path().join("sync.json"), b"legacy-sync-bytes").unwrap();
+
+    let target_dir = graven::registry::log_dir(dir.path(), "graven-test-log");
+    std::fs::create_dir_all(target_dir.join("sync.json")).unwrap();
+
+    let result = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+        false,
+    );
+
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read(dir.path().join("index.sqlite")).unwrap(),
+        b"legacy-index-bytes"
+    );
+    assert!(!target_dir.join("index.sqlite").exists());
+    assert!(!dir.path().join("logs.json").exists());
+}
