@@ -57,6 +57,12 @@ pub struct MergedHit {
     pub provenance: Vec<ProvEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimilarHit {
+    pub hit: MergedHit,
+    pub score: f64,
+}
+
 #[derive(Debug, Clone)]
 struct ExtractRow {
     extract: String,
@@ -113,6 +119,82 @@ pub(crate) fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
         )
         .optional()?;
     Ok(hit.is_some())
+}
+
+fn blob_to_vec(blob: &[u8]) -> Result<Vec<f32>> {
+    if !blob.len().is_multiple_of(4) {
+        return Err(Error::Verify(format!(
+            "embedding vector blob length {} is not a multiple of 4",
+            blob.len()
+        )));
+    }
+    Ok(blob
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+fn cosine_score(a: &[f32], b: &[f32]) -> f64 {
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
+    let norm_a: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let norm_b: f64 = b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        dot / (norm_a * norm_b)
+    }
+}
+
+fn dot_score(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum()
+}
+
+fn euclidean_distance(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (f64::from(*x) - f64::from(*y)).powi(2))
+        .sum::<f64>()
+        .sqrt()
+}
+
+fn score_for(metric: &str, a: &[f32], b: &[f32]) -> Result<f64> {
+    match metric {
+        "cosine" => Ok(cosine_score(a, b)),
+        "dot" => Ok(dot_score(a, b)),
+        "euclidean" => Ok(-euclidean_distance(a, b)),
+        other => Err(Error::Verify(format!("unsupported metric {other:?}"))),
+    }
+}
+
+struct SimilarCandidate {
+    delta_id: String,
+    vector: Vec<u8>,
+    url: String,
+    publisher: String,
+    observed_at: String,
+    weight: String,
+    title: String,
+    r#abstract: Option<String>,
+}
+
+fn row_to_similar_candidate(row: &rusqlite::Row) -> rusqlite::Result<SimilarCandidate> {
+    Ok(SimilarCandidate {
+        delta_id: row.get(0)?,
+        vector: row.get(1)?,
+        url: row.get(2)?,
+        publisher: row.get(3)?,
+        observed_at: row.get(4)?,
+        weight: row.get(5)?,
+        title: row.get(6)?,
+        r#abstract: row.get(7)?,
+    })
 }
 
 fn merge(rows: Vec<(String, u64, RecordHit)>) -> Vec<MergedHit> {
@@ -241,6 +323,19 @@ impl MultiStore {
             None => Ok(Vec::new()),
         }
     }
+
+    pub fn similar(&self, url: &str, k: usize) -> Result<Vec<SimilarHit>> {
+        for handle in &self.logs {
+            if let Some(hits) =
+                handle
+                    .store
+                    .similar_within(url, k, &handle.log_id, handle.synced_height)?
+            {
+                return Ok(hits);
+            }
+        }
+        Err(Error::Verify(format!("no embedding for url {url}")))
+    }
 }
 
 pub struct Store {
@@ -341,6 +436,87 @@ impl Store {
             .query_map([url], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    fn similar_within(
+        &self,
+        url: &str,
+        k: usize,
+        log_id: &str,
+        synced_height: u64,
+    ) -> Result<Option<Vec<SimilarHit>>> {
+        if !table_exists(&self.conn, "embeddings")? {
+            return Ok(None);
+        }
+        let metric: Option<String> = self
+            .conn
+            .query_row("SELECT metric FROM pack_meta WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(metric) = metric else {
+            return Ok(None);
+        };
+
+        let target: Option<(String, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT delta_id, vector FROM embeddings WHERE url = ?1 LIMIT 1",
+                [url],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((self_delta_id, target_blob)) = target else {
+            return Ok(None);
+        };
+        let target_vec = blob_to_vec(&target_blob)?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT e.delta_id, e.vector, r.url, r.publisher, r.observed_at, r.weight, r.title, r.abstract
+             FROM embeddings e JOIN records r ON r.delta_id = e.delta_id",
+        )?;
+        let candidates = stmt
+            .query_map([], row_to_similar_candidate)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut scored: Vec<(f64, SimilarCandidate)> = Vec::new();
+        for candidate in candidates {
+            if candidate.delta_id == self_delta_id {
+                continue;
+            }
+            let vector = blob_to_vec(&candidate.vector)?;
+            let score = score_for(&metric, &target_vec, &vector)?;
+            scored.push((score, candidate));
+        }
+
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.delta_id.cmp(&b.1.delta_id))
+        });
+        scored.truncate(k);
+
+        Ok(Some(
+            scored
+                .into_iter()
+                .map(|(score, candidate)| SimilarHit {
+                    hit: MergedHit {
+                        url: candidate.url,
+                        publisher: candidate.publisher,
+                        delta_id: candidate.delta_id,
+                        observed_at: candidate.observed_at,
+                        title: candidate.title,
+                        r#abstract: candidate.r#abstract,
+                        provenance: vec![ProvEntry {
+                            log_id: log_id.to_string(),
+                            synced_height,
+                            weight: candidate.weight,
+                        }],
+                    },
+                    score,
+                })
+                .collect(),
+        ))
     }
 }
 
@@ -859,6 +1035,266 @@ mod tests {
             links,
             vec![("https://example.com/fresh-link".to_string(), 0)]
         );
+    }
+
+    fn vector_blob(v: &[f32]) -> Vec<u8> {
+        let mut blob = Vec::with_capacity(v.len() * 4);
+        for x in v {
+            blob.extend_from_slice(&x.to_le_bytes());
+        }
+        blob
+    }
+
+    fn seed_embeddings(log_dir: &Path, metric: &str, dim: i64, rows: &[(&str, &str, &[f32])]) {
+        std::fs::create_dir_all(log_dir).unwrap();
+        let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+        conn.execute_batch(CREATE_EMBEDDINGS).unwrap();
+        for (delta_id, url, vector) in rows {
+            conn.execute(
+                "INSERT INTO embeddings(delta_id, url, publisher, vector) VALUES (?1, ?2, 'example.com', ?3)",
+                (*delta_id, *url, vector_blob(vector)),
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO pack_meta(id, model_json, metric, dim, imported_at, key_b64u) VALUES (1, '{}', ?1, ?2, 'now', 'key')",
+            (metric, dim),
+        )
+        .unwrap();
+    }
+
+    fn seed_four_cosine_records(log_dir: &Path) {
+        seed_row(
+            log_dir,
+            "https://example.com/a",
+            "sha256:a",
+            "2026-08-09T00:00:00Z",
+            "full",
+            "A",
+        );
+        seed_row(
+            log_dir,
+            "https://example.com/b",
+            "sha256:b",
+            "2026-08-09T00:00:00Z",
+            "full",
+            "B",
+        );
+        seed_row(
+            log_dir,
+            "https://example.com/c",
+            "sha256:c",
+            "2026-08-09T00:00:00Z",
+            "full",
+            "C",
+        );
+        seed_row(
+            log_dir,
+            "https://example.com/d",
+            "sha256:d",
+            "2026-08-09T00:00:00Z",
+            "full",
+            "D",
+        );
+        seed_embeddings(
+            log_dir,
+            "cosine",
+            2,
+            &[
+                ("sha256:a", "https://example.com/a", &[1.0, 0.0]),
+                ("sha256:b", "https://example.com/b", &[1.0, 1.0]),
+                ("sha256:c", "https://example.com/c", &[0.0, 1.0]),
+                ("sha256:d", "https://example.com/d", &[-1.0, 0.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn cosine_score_treats_zero_norm_vector_as_zero_score() {
+        assert_eq!(cosine_score(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+        assert_eq!(cosine_score(&[1.0, 1.0], &[0.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn similar_cosine_orders_by_score_descending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_a = crate::registry::log_dir(tmp.path(), "log-a");
+        seed_four_cosine_records(&log_a);
+        seed_sync(&log_a, 1);
+        seed_registry(tmp.path(), &["log-a"]);
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        let hits = store.similar("https://example.com/a", 5).unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].hit.delta_id, "sha256:b");
+        assert!((hits[0].score - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-9);
+        assert_eq!(hits[1].hit.delta_id, "sha256:c");
+        assert!((hits[1].score - 0.0).abs() < 1e-9);
+        assert_eq!(hits[2].hit.delta_id, "sha256:d");
+        assert!((hits[2].score - (-1.0)).abs() < 1e-9);
+        assert_eq!(hits[0].hit.provenance.len(), 1);
+        assert_eq!(hits[0].hit.provenance[0].log_id, "log-a");
+        assert_eq!(hits[0].hit.provenance[0].weight, "full");
+    }
+
+    #[test]
+    fn similar_respects_k_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_a = crate::registry::log_dir(tmp.path(), "log-a");
+        seed_four_cosine_records(&log_a);
+        seed_sync(&log_a, 1);
+        seed_registry(tmp.path(), &["log-a"]);
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        let hits = store.similar("https://example.com/a", 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].hit.delta_id, "sha256:b");
+    }
+
+    #[test]
+    fn similar_excludes_self() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_a = crate::registry::log_dir(tmp.path(), "log-a");
+        seed_four_cosine_records(&log_a);
+        seed_sync(&log_a, 1);
+        seed_registry(tmp.path(), &["log-a"]);
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        let hits = store.similar("https://example.com/a", 10).unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().all(|h| h.hit.delta_id != "sha256:a"));
+    }
+
+    #[test]
+    fn similar_euclidean_orders_by_negative_distance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_a = crate::registry::log_dir(tmp.path(), "log-a");
+        seed_row(
+            &log_a,
+            "https://example.com/origin",
+            "sha256:origin",
+            "2026-08-09T00:00:00Z",
+            "full",
+            "Origin",
+        );
+        seed_row(
+            &log_a,
+            "https://example.com/near",
+            "sha256:near",
+            "2026-08-09T00:00:00Z",
+            "full",
+            "Near",
+        );
+        seed_row(
+            &log_a,
+            "https://example.com/mid",
+            "sha256:mid",
+            "2026-08-09T00:00:00Z",
+            "full",
+            "Mid",
+        );
+        seed_row(
+            &log_a,
+            "https://example.com/far",
+            "sha256:far",
+            "2026-08-09T00:00:00Z",
+            "full",
+            "Far",
+        );
+        seed_embeddings(
+            &log_a,
+            "euclidean",
+            2,
+            &[
+                ("sha256:origin", "https://example.com/origin", &[0.0, 0.0]),
+                ("sha256:near", "https://example.com/near", &[1.0, 0.0]),
+                ("sha256:mid", "https://example.com/mid", &[0.0, 2.0]),
+                ("sha256:far", "https://example.com/far", &[3.0, 4.0]),
+            ],
+        );
+        seed_sync(&log_a, 1);
+        seed_registry(tmp.path(), &["log-a"]);
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        let hits = store.similar("https://example.com/origin", 5).unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].hit.delta_id, "sha256:near");
+        assert!((hits[0].score - (-1.0)).abs() < 1e-9);
+        assert_eq!(hits[1].hit.delta_id, "sha256:mid");
+        assert!((hits[1].score - (-2.0)).abs() < 1e-9);
+        assert_eq!(hits[2].hit.delta_id, "sha256:far");
+        assert!((hits[2].score - (-5.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn similar_picks_first_registry_log_with_embeddings_for_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_a = crate::registry::log_dir(tmp.path(), "log-a");
+        let log_b = crate::registry::log_dir(tmp.path(), "log-b");
+        seed_row(
+            &log_a,
+            "https://example.com/other",
+            "sha256:other",
+            "2026-08-09T00:00:00Z",
+            "full",
+            "Other",
+        );
+        seed_sync(&log_a, 1);
+
+        seed_row(
+            &log_b,
+            "https://example.com/a",
+            "sha256:a",
+            "2026-08-09T00:00:00Z",
+            "full",
+            "A",
+        );
+        seed_row(
+            &log_b,
+            "https://example.com/b",
+            "sha256:b",
+            "2026-08-09T00:00:00Z",
+            "full",
+            "B",
+        );
+        seed_embeddings(
+            &log_b,
+            "cosine",
+            2,
+            &[
+                ("sha256:a", "https://example.com/a", &[1.0, 0.0]),
+                ("sha256:b", "https://example.com/b", &[1.0, 0.0]),
+            ],
+        );
+        seed_sync(&log_b, 2);
+        seed_registry(tmp.path(), &["log-a", "log-b"]);
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        let hits = store.similar("https://example.com/a", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].hit.provenance[0].log_id, "log-b");
+    }
+
+    #[test]
+    fn similar_errors_when_no_log_has_the_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_a = crate::registry::log_dir(tmp.path(), "log-a");
+        seed_row(
+            &log_a,
+            "https://example.com/a",
+            "sha256:a",
+            "2026-08-09T00:00:00Z",
+            "full",
+            "A",
+        );
+        seed_sync(&log_a, 1);
+        seed_registry(tmp.path(), &["log-a"]);
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        let Err(err) = store.similar("https://example.com/nope", 5) else {
+            panic!("expected an error for a url with no embedding in any log");
+        };
+        assert!(err.to_string().contains("no embedding for url"));
     }
 
     #[test]

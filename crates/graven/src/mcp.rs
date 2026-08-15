@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::store::{MergedHit, MultiStore, ProvEntry};
+use crate::store::{MergedHit, MultiStore, ProvEntry, SimilarHit};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -44,8 +44,33 @@ pub struct LinkOut {
     pub position: i64,
 }
 
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct SimilarOut {
+    pub url: String,
+    pub publisher: String,
+    pub delta_id: String,
+    pub title: String,
+    pub score: f64,
+    pub provenance: Vec<ProvEntry>,
+}
+
+fn to_similar_out(hit: SimilarHit) -> SimilarOut {
+    SimilarOut {
+        url: hit.hit.url,
+        publisher: hit.hit.publisher,
+        delta_id: hit.hit.delta_id,
+        title: hit.hit.title,
+        score: hit.score,
+        provenance: hit.hit.provenance,
+    }
+}
+
 fn default_limit() -> usize {
     10
+}
+
+fn default_k() -> usize {
+    5
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -58,6 +83,13 @@ pub struct SearchParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetRecordParams {
     pub url: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SimilarParams {
+    pub url: String,
+    #[serde(default = "default_k")]
+    pub k: usize,
 }
 
 #[derive(Clone)]
@@ -146,13 +178,27 @@ impl GravenServer {
                 .collect(),
         ))
     }
+
+    #[tool(description = "Nearest records by imported embedding pack (single-log scores)")]
+    fn similar_records(
+        &self,
+        Parameters(SimilarParams { url, k }): Parameters<SimilarParams>,
+    ) -> std::result::Result<Json<Vec<SimilarOut>>, ErrorData> {
+        let hits = self.store().similar(&url, k).map_err(|e| match &e {
+            Error::Verify(msg) if msg.starts_with("no embedding for url") => {
+                ErrorData::resource_not_found(msg.clone(), None)
+            }
+            _ => ErrorData::internal_error(e.to_string(), None),
+        })?;
+        Ok(Json(hits.into_iter().map(to_similar_out).collect()))
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for GravenServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Graven: search, get_record, get_extract and get_links over a local WIST index",
+            "Graven: search, get_record, get_extract, get_links and similar_records over a local WIST index",
         )
     }
 }
@@ -295,6 +341,50 @@ mod tests {
     fn test_server_with_tier1(dir: &Path) -> GravenServer {
         let log_dir = setup_server_dir(dir);
         seed_tier1(&log_dir);
+        let store = MultiStore::open_read_only(dir).unwrap();
+        GravenServer::new(store)
+    }
+
+    fn seed_embeddings(log_dir: &Path) {
+        let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+        conn.execute_batch(crate::store::CREATE_EMBEDDINGS).unwrap();
+        let blob = |v: &[f32]| -> Vec<u8> {
+            let mut b = Vec::with_capacity(v.len() * 4);
+            for x in v {
+                b.extend_from_slice(&x.to_le_bytes());
+            }
+            b
+        };
+        conn.execute(
+            "INSERT INTO embeddings(delta_id, url, publisher, vector) VALUES (?1, ?2, ?3, ?4)",
+            (
+                "sha256:a",
+                "https://example.com/alpha",
+                "example.com",
+                blob(&[1.0, 0.0]),
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO embeddings(delta_id, url, publisher, vector) VALUES (?1, ?2, ?3, ?4)",
+            (
+                "sha256:b",
+                "https://example.com/beta",
+                "example.com",
+                blob(&[1.0, 1.0]),
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pack_meta(id, model_json, metric, dim, imported_at, key_b64u) VALUES (1, '{}', 'cosine', 2, 'now', 'key')",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn test_server_with_embeddings(dir: &Path) -> GravenServer {
+        let log_dir = setup_server_dir(dir);
+        seed_embeddings(&log_dir);
         let store = MultiStore::open_read_only(dir).unwrap();
         GravenServer::new(store)
     }
@@ -468,5 +558,41 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].url, "https://example.com/alpha");
+    }
+
+    #[test]
+    fn similar_params_default_k_via_serde() {
+        let params: SimilarParams = serde_json::from_str(r#"{"url":"https://x"}"#).unwrap();
+        assert_eq!(params.k, 5);
+    }
+
+    #[test]
+    fn similar_records_returns_scored_results_with_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server_with_embeddings(tmp.path());
+        let Json(results) = server
+            .similar_records(Parameters(SimilarParams {
+                url: "https://example.com/alpha".into(),
+                k: default_k(),
+            }))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://example.com/beta");
+        assert_eq!(results[0].delta_id, "sha256:b");
+        assert_eq!(results[0].provenance.len(), 1);
+        assert_eq!(results[0].provenance[0].log_id, "test-log");
+    }
+
+    #[test]
+    fn similar_records_returns_not_found_for_url_without_vector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(tmp.path());
+        let Err(err) = server.similar_records(Parameters(SimilarParams {
+            url: "https://example.com/alpha".into(),
+            k: default_k(),
+        })) else {
+            panic!("expected resource_not_found error");
+        };
+        assert_eq!(err.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
     }
 }
