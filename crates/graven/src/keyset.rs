@@ -13,8 +13,7 @@ pub const RECOVERY_WINDOW_DAYS: i64 = 7;
 struct DeclRecord {
     seq: u64,
     height: u64,
-    recovery: bool,
-    sealed_at: Option<jiff::Timestamp>,
+    superseded: bool,
     window_end: Option<jiff::Timestamp>,
     publisher: Publisher,
     hash: String,
@@ -53,6 +52,27 @@ fn recovery_keys_canon(keys: &Option<Vec<PublisherKey>>) -> Result<Vec<u8>> {
     Ok(wist_core::jcs::canonicalize(&value)?)
 }
 
+/// WIST-1 §5.2: `keys` and `recovery_keys` are disjoint by `key_id` and by
+/// `public_key` — a recovery key that is also a signing key is stolen with it.
+fn disjoint_key_sets(domain: &str, publisher: &Publisher) -> Result<()> {
+    let Some(recovery) = publisher.recovery_keys.as_deref() else {
+        return Ok(());
+    };
+    for r in recovery {
+        if publisher
+            .keys
+            .iter()
+            .any(|k| k.key_id == r.key_id || k.public_key == r.public_key)
+        {
+            return Err(Error::PublisherVerify(format!(
+                "{domain} seq {}: key {} is named in both keys and recovery_keys",
+                publisher.seq, r.key_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn parse_timestamp(domain: &str, seq: u64, raw: &str) -> Result<jiff::Timestamp> {
     raw.parse::<jiff::Timestamp>()
         .map_err(|e| Error::PublisherVerify(format!("{domain} seq {seq}: sealed_at {raw}: {e}")))
@@ -73,8 +93,7 @@ impl KeyHistory {
         self.domains.entry(domain).or_default().push(DeclRecord {
             seq: env.publisher.seq,
             height,
-            recovery: false,
-            sealed_at: None,
+            superseded: false,
             window_end: None,
             publisher: env.publisher,
             hash,
@@ -100,8 +119,11 @@ impl KeyHistory {
             return Ok(());
         }
 
+        disjoint_key_sets(&domain, &env.publisher)?;
+
         let seq = env.publisher.seq;
-        let (recovery, sealed, window_end) = match entries.last() {
+        let head = entries.iter().rev().find(|e| !e.superseded);
+        let (recovery, sealed, window_end, fresh) = match head {
             None => {
                 if seq != 0 {
                     return Err(Error::PublisherVerify(format!(
@@ -114,7 +136,7 @@ impl KeyHistory {
                     )));
                 }
                 let sealed = parse_timestamp(&domain, seq, sealed_at)?;
-                (false, sealed, None)
+                (false, sealed, None, false)
             }
             Some(pred) => {
                 if seq <= pred.seq {
@@ -143,7 +165,7 @@ impl KeyHistory {
                             "{domain} seq {seq}: ordinary rotation must carry recovery_keys byte-identical to predecessor's"
                         )));
                     }
-                    (false, sealed, None)
+                    (false, sealed, pred.window_end, false)
                 } else if verify_under_set(
                     envelope,
                     pred.publisher.recovery_keys.as_deref().unwrap_or(&[]),
@@ -156,9 +178,9 @@ impl KeyHistory {
                                 "{domain} seq {seq}: recovery window overflow: {e}"
                             ))
                         })?;
-                    (true, sealed, Some(window_end))
+                    (true, sealed, Some(window_end), false)
                 } else if verify_under_set(envelope, &env.publisher.keys, &env.sig.key_id) {
-                    (false, sealed, None)
+                    (false, sealed, pred.window_end, true)
                 } else {
                     return Err(Error::PublisherVerify(format!(
                         "{domain} seq {seq}: signature does not verify under previous keys, recovery_keys, or its own keys"
@@ -167,12 +189,25 @@ impl KeyHistory {
             }
         };
 
+        // WIST-1 §5.2: inside an open recovery window only the chain that
+        // legitimately follows the recovery Declaration takes effect. An
+        // ordinary or recovery rotation off the chain head is that chain; a
+        // fresh identity is not, and is superseded at the window's end.
+        let inside_window = window_end.is_some_and(|end| sealed < end);
+        let superseded = fresh && inside_window;
         entries.push(DeclRecord {
             seq,
             height,
-            recovery,
-            sealed_at: Some(sealed),
-            window_end,
+            superseded,
+            window_end: if superseded || !inside_window {
+                if recovery {
+                    window_end
+                } else {
+                    None
+                }
+            } else {
+                window_end
+            },
             publisher: env.publisher,
             hash,
         });
@@ -184,16 +219,7 @@ impl KeyHistory {
             Error::PublisherVerify(format!("{domain}: no declaration at height {height}"))
         })?;
         let mut winner: Option<&DeclRecord> = None;
-        for entry in entries.iter().filter(|e| e.height <= height) {
-            if let Some(w) = winner {
-                if w.recovery && !entry.recovery {
-                    if let (Some(end), Some(sealed)) = (w.window_end, entry.sealed_at) {
-                        if sealed < end {
-                            continue;
-                        }
-                    }
-                }
-            }
+        for entry in entries.iter().filter(|e| e.height <= height && !e.superseded) {
             winner = Some(entry);
         }
         winner.ok_or_else(|| {
@@ -713,20 +739,33 @@ mod tests {
         kh.add_declaration(6, "2026-08-11T00:00:00Z", &decl4)
             .unwrap();
 
-        let via_pk2_at5 = delta_env(
-            &pk2,
-            "pk2",
-            "https://records.example/a",
-            "2026-08-09T12:00:00Z",
-        );
-        assert!(kh.verify_delta(5, &via_pk2_at5).is_ok());
+        // decl3 is signed by the recovery Declaration's own signing key, so it
+        // legitimately follows the recovery chain and governs from its height
+        // (WIST-1 §5.2): the recovering Publisher may rotate inside its own
+        // window, and pk2 is rotated out when it does.
         let via_pk3_at5 = delta_env(
             &pk3,
             "pk3",
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(5, &via_pk3_at5).is_err());
+        assert!(kh.verify_delta(5, &via_pk3_at5).is_ok());
+        let via_pk2_at5 = delta_env(
+            &pk2,
+            "pk2",
+            "https://records.example/a",
+            "2026-08-09T12:00:00Z",
+        );
+        assert!(kh.verify_delta(5, &via_pk2_at5).is_err());
+        // The attacker's ordinary rotation, sealed before the recovery, never
+        // governs inside the window.
+        let via_atk_at5 = delta_env(
+            &atk,
+            "atk",
+            "https://records.example/a",
+            "2026-08-09T12:00:00Z",
+        );
+        assert!(kh.verify_delta(5, &via_atk_at5).is_err());
 
         let via_pk4_at7 = delta_env(
             &pk4,
@@ -854,7 +893,10 @@ mod tests {
         );
         assert!(kh.verify_delta(3, &via_pky_at3).is_err());
 
-        let decl3 = decl(
+        // The fresh identity is superseded, so its own successor chains off a
+        // Declaration that never took effect and is rejected: after the
+        // window, the domain continues from the recovery chain's head.
+        let orphan = decl(
             domain,
             3,
             Some(&hash2),
@@ -863,7 +905,20 @@ mod tests {
             &pky,
             "pky",
         );
-        kh.add_declaration(4, "2026-08-11T00:00:00Z", &decl3)
+        assert!(kh
+            .add_declaration(4, "2026-08-11T00:00:00Z", &orphan)
+            .is_err());
+
+        let continued = decl(
+            domain,
+            3,
+            Some(&hash1),
+            vec![key_entry(&pkz, "pkz", "2026-08-09T00:00:00Z")],
+            Some(vec![key_entry(&rk2, "rk2", "2026-08-09T00:00:00Z")]),
+            &pk2,
+            "pk2",
+        );
+        kh.add_declaration(4, "2026-08-11T00:00:00Z", &continued)
             .unwrap();
 
         let via_pkz_at4 = delta_env(
