@@ -60,6 +60,9 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - name: "fetch wist-core sibling"
+        run: "git clone --depth 1 https://github.com/wistprotocol/core \"$GITHUB_WORKSPACE/../core\""
+        shell: "bash"
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
@@ -182,6 +185,9 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - name: "fetch wist-core sibling"
+        run: "git clone --depth 1 https://github.com/wistprotocol/core \"$GITHUB_WORKSPACE/../core\""
+        shell: "bash"
       - name: Install cached dist
         uses: actions/download-artifact@v8
         with:
@@ -232,6 +238,9 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - name: "fetch wist-core sibling"
+        run: "git clone --depth 1 https://github.com/wistprotocol/core \"$GITHUB_WORKSPACE/../core\""
+        shell: "bash"
       - name: Install cached dist
         uses: actions/download-artifact@v8
         with:

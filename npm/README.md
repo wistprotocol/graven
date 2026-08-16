@@ -29,3 +29,7 @@ npm publish
 ```
 
 `npm publish` requires an npm auth token with publish rights on `wist-graven`; it is never run in CI.
+
+### `release.yml` regeneration caveat
+
+`cargo-dist`'s `github-build-setup` config only injects the `wist-core` sibling clone into the `build-local-artifacts` job; the `plan`, `build-global-artifacts`, and `host` jobs each also run `dist` against the checked-out workspace (`cargo metadata` fails without the sibling present) and had the same clone step hand-added after their checkout step, with `allow-dirty = ["ci"]` set in `dist-workspace.toml` so `dist plan`/`dist host` don't reject the resulting drift from a clean `dist generate`; re-running `dist generate` (e.g. after changing targets or installers) regenerates `release.yml` from scratch and drops all four hand-added clone steps, so they must be re-added to `plan`, `build-local-artifacts`, `build-global-artifacts`, and `host` immediately after any regenerate.
