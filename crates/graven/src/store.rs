@@ -260,6 +260,16 @@ impl MultiStore {
         if reg.logs.is_empty() {
             return Err(Error::NotSynced(dir.to_path_buf()));
         }
+        for entry in &reg.logs {
+            if let Some(other) = crate::registry::find_collision(&reg.logs, &entry.log_id) {
+                return Err(Error::Verify(format!(
+                    "log_id {:?} sanitizes to the same directory as log_id {:?} (both -> {:?}); refusing to open the shared directory as two logs",
+                    entry.log_id,
+                    other.log_id,
+                    crate::registry::sanitize(&entry.log_id)
+                )));
+            }
+        }
         let mut logs = Vec::with_capacity(reg.logs.len());
         for entry in reg.logs {
             crate::registry::validate_log_id(&entry.log_id)?;
@@ -922,6 +932,49 @@ mod tests {
             );
         };
         assert!(err.to_string().contains(".."), "error was: {err}");
+    }
+
+    #[test]
+    fn multi_store_open_read_only_rejects_hand_edited_sanitized_dir_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_dir = crate::registry::log_dir(tmp.path(), "host-9");
+        seed_row(
+            &log_dir,
+            "https://example.com/alpha",
+            "sha256:a",
+            "2026-08-09T00:00:00Z",
+            "full",
+            "Alpha Title",
+        );
+        seed_sync(&log_dir, 1);
+        crate::registry::save(
+            tmp.path(),
+            &crate::registry::Registry {
+                logs: vec![
+                    crate::registry::LogEntry {
+                        log_id: "host-9".into(),
+                        anchor: "anchor-a.json".into(),
+                        base: "https://host-9.example".into(),
+                        tier1: false,
+                    },
+                    crate::registry::LogEntry {
+                        log_id: "host:9".into(),
+                        anchor: "anchor-b.json".into(),
+                        base: "https://host-b.example".into(),
+                        tier1: false,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let Err(err) = MultiStore::open_read_only(tmp.path()) else {
+            panic!("expected an error rejecting the sanitized-directory collision");
+        };
+        assert!(
+            err.to_string().contains("host-9") && err.to_string().contains("host:9"),
+            "error was: {err}"
+        );
     }
 
     #[test]

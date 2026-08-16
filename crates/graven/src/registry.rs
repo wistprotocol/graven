@@ -51,6 +51,12 @@ pub fn log_dir(dir: &Path, log_id: &str) -> PathBuf {
     dir.join("logs").join(sanitize(log_id))
 }
 
+pub fn find_collision<'a>(logs: &'a [LogEntry], log_id: &str) -> Option<&'a LogEntry> {
+    let target = sanitize(log_id);
+    logs.iter()
+        .find(|e| e.log_id != log_id && sanitize(&e.log_id) == target)
+}
+
 pub fn validate_log_id(log_id: &str) -> Result<()> {
     let sanitized = sanitize(log_id);
     if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
@@ -146,5 +152,33 @@ mod tests {
     fn validate_log_id_error_names_the_offending_log_id() {
         let err = validate_log_id("..").unwrap_err();
         assert!(err.to_string().contains(".."), "error was: {err}");
+    }
+
+    fn entry(log_id: &str) -> LogEntry {
+        LogEntry {
+            log_id: log_id.into(),
+            anchor: "a".into(),
+            base: "b".into(),
+            tier1: false,
+        }
+    }
+
+    #[test]
+    fn find_collision_detects_ids_that_sanitize_identically() {
+        let logs = vec![entry("host:9")];
+        let hit = find_collision(&logs, "host-9");
+        assert_eq!(hit.map(|e| e.log_id.as_str()), Some("host:9"));
+    }
+
+    #[test]
+    fn find_collision_ignores_the_same_log_id() {
+        let logs = vec![entry("host-9")];
+        assert!(find_collision(&logs, "host-9").is_none());
+    }
+
+    #[test]
+    fn find_collision_ignores_distinct_non_colliding_ids() {
+        let logs = vec![entry("log-one")];
+        assert!(find_collision(&logs, "log-two").is_none());
     }
 }

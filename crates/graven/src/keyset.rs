@@ -208,7 +208,12 @@ impl KeyHistory {
         let mut rest = domain;
         while let Some((_, parent)) = rest.split_once('.') {
             if let Ok(record) = self.resolve(parent, height) {
-                if record.publisher.subdomain_scope.is_some() {
+                if record
+                    .publisher
+                    .subdomain_scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.iter().any(|h| h == domain))
+                {
                     return Ok(record);
                 }
             }
@@ -316,6 +321,23 @@ mod tests {
         if let Some(rk) = recovery_keys {
             doc["recovery_keys"] = serde_json::json!(rk);
         }
+        sign_envelope(&doc, "publisher", sign_key_id, &sign.sk).unwrap()
+    }
+
+    fn decl_scoped(
+        domain: &str,
+        keys: Vec<Value>,
+        subdomain_scope: Vec<&str>,
+        sign: &Signer,
+        sign_key_id: &str,
+    ) -> Value {
+        let doc = serde_json::json!({
+            "wist_version": "1.0.0",
+            "domain": domain,
+            "keys": keys,
+            "seq": 0,
+            "subdomain_scope": subdomain_scope,
+        });
         sign_envelope(&doc, "publisher", sign_key_id, &sign.sk).unwrap()
     }
 
@@ -964,5 +986,48 @@ mod tests {
             "2026-08-09T14:00:00Z",
         );
         assert!(kh.verify_delta(2, &delta).is_ok());
+    }
+
+    #[test]
+    fn subdomain_listed_in_parent_scope_verifies() {
+        let pk1 = Signer::new([1u8; 32]);
+        let mut kh = KeyHistory::new();
+        let decl0 = decl_scoped(
+            "records.example",
+            vec![key_entry(&pk1, "pk1", "2026-08-09T00:00:00Z")],
+            vec!["sub.records.example"],
+            &pk1,
+            "pk1",
+        );
+        kh.add_baseline(0, &decl0).unwrap();
+        let delta = delta_env(
+            &pk1,
+            "pk1",
+            "https://sub.records.example/a",
+            "2026-08-09T12:00:00Z",
+        );
+        assert!(kh.verify_delta(1, &delta).is_ok());
+    }
+
+    #[test]
+    fn subdomain_not_listed_in_parent_scope_is_rejected() {
+        let pk1 = Signer::new([1u8; 32]);
+        let mut kh = KeyHistory::new();
+        let decl0 = decl_scoped(
+            "records.example",
+            vec![key_entry(&pk1, "pk1", "2026-08-09T00:00:00Z")],
+            vec!["other.records.example"],
+            &pk1,
+            "pk1",
+        );
+        kh.add_baseline(0, &decl0).unwrap();
+        let delta = delta_env(
+            &pk1,
+            "pk1",
+            "https://sub.records.example/a",
+            "2026-08-09T12:00:00Z",
+        );
+        let err = kh.verify_delta(1, &delta).unwrap_err();
+        assert!(err.to_string().contains("sub.records.example"), "{err}");
     }
 }

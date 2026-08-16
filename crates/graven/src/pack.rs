@@ -84,6 +84,20 @@ fn vector_to_blob(vector: &[f32]) -> Vec<u8> {
     buf
 }
 
+fn safe_join(base_dir: &Path, rel: &str) -> Result<std::path::PathBuf> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(Error::Verify(format!(
+            "pack vectors path {rel:?} is not a safe relative path"
+        )));
+    }
+    Ok(base_dir.join(rel_path))
+}
+
 fn resolve_log_dir(dir: &Path, log_id: &str) -> Result<std::path::PathBuf> {
     registry::check_not_legacy(dir)?;
     let reg = registry::load(dir)?;
@@ -126,7 +140,7 @@ pub fn import(dir: &Path, log_id: &str, pack_path: &Path, key_b64u: &str) -> Res
     }
 
     let base_dir = pack_path.parent().unwrap_or_else(|| Path::new("."));
-    let vectors_path = base_dir.join(&pack.vectors.path);
+    let vectors_path = safe_join(base_dir, &pack.vectors.path)?;
     let compressed = std::fs::read(&vectors_path)?;
     if compressed.len() as u64 != pack.vectors.bytes {
         return Err(Error::Verify(format!(
@@ -253,5 +267,23 @@ mod tests {
     fn vector_row_rejects_unknown_fields() {
         let json = r#"{"delta_id":"sha256:a","url":"https://x","publisher":"x.example","vector":[0.1],"extra":true}"#;
         assert!(serde_json::from_str::<VectorRow>(json).is_err());
+    }
+
+    #[test]
+    fn safe_join_rejects_parent_dir_traversal() {
+        let err = safe_join(Path::new("/tmp/base"), "../../etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("safe"), "{err}");
+    }
+
+    #[test]
+    fn safe_join_rejects_absolute_path() {
+        let err = safe_join(Path::new("/tmp/base"), "/etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("safe"), "{err}");
+    }
+
+    #[test]
+    fn safe_join_accepts_plain_relative_path() {
+        let joined = safe_join(Path::new("/tmp/base"), "vectors.jsonl.zst").unwrap();
+        assert_eq!(joined, Path::new("/tmp/base/vectors.jsonl.zst"));
     }
 }

@@ -504,6 +504,13 @@ fn run_registered(
     tier1: bool,
 ) -> Result<SyncReport> {
     let mut reg = registry::load(dir)?;
+    if let Some(other) = registry::find_collision(&reg.logs, log_id) {
+        return Err(Error::Verify(format!(
+            "log_id {log_id:?} sanitizes to the same directory as already-registered log_id {:?} (both -> {:?}); refusing to register to avoid a cross-log directory collision",
+            other.log_id,
+            registry::sanitize(log_id)
+        )));
+    }
     let effective_tier1 = match reg.logs.iter_mut().find(|e| e.log_id == log_id) {
         Some(entry) => {
             if entry.anchor != anchor || entry.base != log_base {

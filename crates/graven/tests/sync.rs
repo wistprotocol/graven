@@ -1089,6 +1089,61 @@ fn conflicting_base_for_same_log_id_errors() {
 }
 
 #[test]
+fn distinct_log_ids_that_sanitize_identically_are_rejected() {
+    let fx1 = common::build_fixture_with_log_id("host:9", 13);
+    let fx2 = common::build_fixture_with_log_id("host-9", 14);
+    let dir = tempfile::tempdir().unwrap();
+
+    graven::sync::run(
+        fx1.anchor_path().to_str().unwrap(),
+        &fx1.base_url,
+        dir.path(),
+        true,
+        false,
+    )
+    .unwrap();
+
+    let store_before = Store::open(&graven::registry::log_dir(dir.path(), "host:9")).unwrap();
+    let alpha_before = store_before
+        .get("https://records.example/alpha")
+        .unwrap()
+        .unwrap();
+
+    let result = graven::sync::run(
+        fx2.anchor_path().to_str().unwrap(),
+        &fx2.base_url,
+        dir.path(),
+        true,
+        false,
+    );
+
+    let err = result.unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("host:9") && msg.contains("host-9"),
+        "error should name both colliding log_ids, was: {msg}"
+    );
+
+    let registry: graven::registry::Registry =
+        serde_json::from_slice(&std::fs::read(dir.path().join("logs.json")).unwrap()).unwrap();
+    assert_eq!(
+        registry.logs.len(),
+        1,
+        "rejected registration must not add a second entry"
+    );
+
+    let store_after = Store::open(&graven::registry::log_dir(dir.path(), "host:9")).unwrap();
+    let alpha_after = store_after
+        .get("https://records.example/alpha")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        alpha_before.delta_id, alpha_after.delta_id,
+        "the surviving log's index must be untouched by the rejected collision"
+    );
+}
+
+#[test]
 fn run_all_syncs_every_registered_log() {
     let fx1 = common::build_fixture_with_log_id("log-one", 11);
     let fx2 = common::build_fixture_with_log_id("log-two", 12);

@@ -62,9 +62,12 @@ enum PackCommand {
 }
 
 fn print_report(report: &SyncReport) {
+    let from = report
+        .log_position_before
+        .map_or_else(|| "cold start".to_string(), |n| n.to_string());
     println!(
-        "[{}] synced to log_position {:?}, head block {}, withdrawn {}",
-        report.log_id, report.log_position_before, report.head, report.withdrawn
+        "[{}] synced from {from} to head block {}, withdrawn {}",
+        report.log_id, report.head, report.withdrawn
     );
 }
 
