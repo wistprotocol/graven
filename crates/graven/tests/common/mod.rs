@@ -368,8 +368,8 @@ pub fn write_state(
     }));
     entries.push(StateEntry::Parameter(ParameterEntry {
         name: "block_cadence_seconds".into(),
-        value: cadence,
         effective_at: "2026-08-09T13:00:00Z".into(),
+        value: cadence,
     }));
     for (domain, declaration) in declarations {
         entries.push(StateEntry::Declaration(DeclarationEntry {
