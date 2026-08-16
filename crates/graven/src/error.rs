@@ -18,6 +18,8 @@ pub enum Error {
     NotSynced(std::path::PathBuf),
     #[error("mcp: {0}")]
     Mcp(String),
+    #[error("publisher verify: {0}")]
+    PublisherVerify(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

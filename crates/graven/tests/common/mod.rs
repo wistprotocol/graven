@@ -1,7 +1,14 @@
+#![allow(dead_code)]
+
+use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
+use parquet::file::properties::WriterProperties;
+use parquet::file::writer::SerializedFileWriter;
+use parquet::schema::parser::parse_message_type;
 use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use wist_core::crypto::{b64u_encode, hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::objects::{
@@ -59,10 +66,10 @@ fn record_projection(r: &RecordFixture) -> Value {
     })
 }
 
-pub fn write_anchor(path: &Path, log: &Signer) {
+pub fn write_anchor(path: &Path, log: &Signer, log_id: &str) {
     let anchor = Anchor {
         wist_version: "1.0.0".into(),
-        log_id: "graven-test-log".into(),
+        log_id: log_id.into(),
         genesis_key: GenesisKey {
             key_id: "log1".into(),
             alg: "Ed25519".into(),
@@ -76,19 +83,51 @@ pub fn write_anchor(path: &Path, log: &Signer) {
     std::fs::write(path, serde_json::to_vec(&env).unwrap()).unwrap();
 }
 
-pub fn build_declaration(publisher: &Signer, key_id: &str, domain: &str) -> Value {
-    let doc = serde_json::json!({
+pub fn build_declaration_full(
+    signing: &Signer,
+    signing_key_id: &str,
+    domain: &str,
+    seq: u64,
+    prev: Option<&str>,
+    keys: &[(&str, &Signer, &str)],
+) -> Value {
+    let key_entries: Vec<Value> = keys
+        .iter()
+        .map(|(key_id, signer, valid_from)| {
+            serde_json::json!({
+                "key_id": key_id,
+                "alg": "Ed25519",
+                "public_key": signer.public_b64u(),
+                "valid_from": valid_from,
+            })
+        })
+        .collect();
+    let mut doc = serde_json::json!({
         "wist_version": "1.0.0",
         "domain": domain,
-        "keys": [{
-            "key_id": key_id,
-            "alg": "Ed25519",
-            "public_key": publisher.public_b64u(),
-            "valid_from": "2026-08-09T00:00:00Z",
-        }],
-        "seq": 0,
+        "keys": key_entries,
+        "seq": seq,
     });
-    sign_envelope(&doc, "publisher", key_id, &publisher.sk).unwrap()
+    if let Some(p) = prev {
+        doc["prev_declaration"] = p.into();
+    }
+    sign_envelope(&doc, "publisher", signing_key_id, &signing.sk).unwrap()
+}
+
+pub fn build_declaration(publisher: &Signer, key_id: &str, domain: &str) -> Value {
+    build_declaration_full(
+        publisher,
+        key_id,
+        domain,
+        0,
+        None,
+        &[(key_id, publisher, "2026-08-09T00:00:00Z")],
+    )
+}
+
+pub fn declaration_hash(envelope: &Value) -> String {
+    let canon = jcs::canonicalize(&envelope["publisher"]).unwrap();
+    format!("sha256:{}", hex_encode(&Sha256::digest(&canon)))
 }
 
 pub fn build_delta(
@@ -100,6 +139,29 @@ pub fn build_delta(
     extract: &str,
     prev: Option<&str>,
 ) -> (String, Value, Value) {
+    build_delta_with_links(
+        publisher,
+        key_id,
+        url,
+        title,
+        abstract_text,
+        extract,
+        &[],
+        prev,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_delta_with_links(
+    publisher: &Signer,
+    key_id: &str,
+    url: &str,
+    title: &str,
+    abstract_text: Option<&str>,
+    extract: &str,
+    links: &[&str],
+    prev: Option<&str>,
+) -> (String, Value, Value) {
     let salt = b64u_encode(&[5u8; 16]);
     let mut summary = serde_json::json!({"title": title});
     if let Some(a) = abstract_text {
@@ -107,7 +169,7 @@ pub fn build_delta(
     }
     let content = serde_json::json!({
         "extract": extract,
-        "links": {"total": 0, "urls": []},
+        "links": {"total": links.len() as u64, "urls": links},
         "summary": summary,
     });
     let payload = serde_json::json!({
@@ -233,6 +295,62 @@ pub fn write_tier0(path: &Path, records: &[RecordFixture]) -> Vec<u8> {
     std::fs::read(path).unwrap()
 }
 
+fn write_parquet(
+    message_type: &str,
+    byte_columns: &[Vec<Vec<u8>>],
+    int_column: Option<&[i64]>,
+) -> Vec<u8> {
+    let schema = Arc::new(parse_message_type(message_type).unwrap());
+    let mut writer = SerializedFileWriter::new(
+        Vec::new(),
+        schema,
+        Arc::new(WriterProperties::builder().build()),
+    )
+    .unwrap();
+    let mut rg = writer.next_row_group().unwrap();
+    for column in byte_columns {
+        let mut col = rg.next_column().unwrap().unwrap();
+        let values: Vec<ByteArray> = column.iter().map(|v| ByteArray::from(v.clone())).collect();
+        col.typed::<ByteArrayType>()
+            .write_batch(&values, None, None)
+            .unwrap();
+        col.close().unwrap();
+    }
+    if let Some(ints) = int_column {
+        let mut col = rg.next_column().unwrap().unwrap();
+        col.typed::<Int64Type>()
+            .write_batch(ints, None, None)
+            .unwrap();
+        col.close().unwrap();
+    }
+    rg.close().unwrap();
+    writer.into_inner().unwrap()
+}
+
+pub fn write_extracts_parquet(rows: &[(&str, &str, &str, &str)]) -> Vec<u8> {
+    write_parquet(
+        "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary delta_id (UTF8); required binary extract (UTF8); }",
+        &[
+            rows.iter().map(|r| r.0.as_bytes().to_vec()).collect(),
+            rows.iter().map(|r| r.1.as_bytes().to_vec()).collect(),
+            rows.iter().map(|r| r.2.as_bytes().to_vec()).collect(),
+            rows.iter().map(|r| r.3.as_bytes().to_vec()).collect(),
+        ],
+        None,
+    )
+}
+
+pub fn write_links_parquet(rows: &[(&str, &str, i64)]) -> Vec<u8> {
+    write_parquet(
+        "message links { required binary source_url (UTF8); required binary target_url (UTF8); required int64 position; }",
+        &[
+            rows.iter().map(|r| r.0.as_bytes().to_vec()).collect(),
+            rows.iter().map(|r| r.1.as_bytes().to_vec()).collect(),
+        ],
+        Some(&rows.iter().map(|r| r.2).collect::<Vec<_>>()),
+    )
+}
+
 pub fn write_state(
     path: &Path,
     log: &Signer,
@@ -288,7 +406,7 @@ pub fn write_state(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn write_manifest(
+fn write_manifest_with_files(
     path: &Path,
     log: &Signer,
     snapshot_date: &str,
@@ -298,7 +416,24 @@ pub fn write_manifest(
     state_bytes: &[u8],
     state_digest_value: &str,
     sqlite_bytes: &[u8],
+    extra_files: &[(String, Vec<u8>, u8)],
 ) {
+    let mut files = vec![SnapshotFile {
+        path: "tier0/index.sqlite".into(),
+        sha256: sha256_hex(sqlite_bytes),
+        bytes: sqlite_bytes.len() as u64,
+        tier: 0,
+        shard: None,
+    }];
+    for (file_path, bytes, tier) in extra_files {
+        files.push(SnapshotFile {
+            path: file_path.clone(),
+            sha256: sha256_hex(bytes),
+            bytes: bytes.len() as u64,
+            tier: *tier,
+            shard: None,
+        });
+    }
     let manifest = SnapshotManifest {
         wist_version: "1.0.0".into(),
         snapshot_date: snapshot_date.into(),
@@ -312,18 +447,65 @@ pub fn write_manifest(
             state_digest: state_digest_value.into(),
         },
         shards: None,
-        files: vec![SnapshotFile {
-            path: "tier0/index.sqlite".into(),
-            sha256: sha256_hex(sqlite_bytes),
-            bytes: sqlite_bytes.len() as u64,
-            tier: 0,
-            shard: None,
-        }],
+        files,
     };
     let value = serde_json::to_value(&manifest).unwrap();
     let env = sign_envelope(&value, "manifest", "log1", &log.sk).unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, serde_json::to_vec(&env).unwrap()).unwrap();
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_manifest(
+    path: &Path,
+    log: &Signer,
+    snapshot_date: &str,
+    log_position: u64,
+    anchor_block_hash: &str,
+    content_digest_value: &str,
+    state_bytes: &[u8],
+    state_digest_value: &str,
+    sqlite_bytes: &[u8],
+) {
+    write_manifest_with_files(
+        path,
+        log,
+        snapshot_date,
+        log_position,
+        anchor_block_hash,
+        content_digest_value,
+        state_bytes,
+        state_digest_value,
+        sqlite_bytes,
+        &[],
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_manifest_with_tier1(
+    path: &Path,
+    log: &Signer,
+    snapshot_date: &str,
+    log_position: u64,
+    anchor_block_hash: &str,
+    content_digest_value: &str,
+    state_bytes: &[u8],
+    state_digest_value: &str,
+    sqlite_bytes: &[u8],
+    tier1_files: &[(String, Vec<u8>, u8)],
+) {
+    write_manifest_with_files(
+        path,
+        log,
+        snapshot_date,
+        log_position,
+        anchor_block_hash,
+        content_digest_value,
+        state_bytes,
+        state_digest_value,
+        sqlite_bytes,
+        tier1_files,
+    );
 }
 
 pub fn write_index(
@@ -440,6 +622,223 @@ pub fn extend_fixture(fx: &Fixture) -> String {
     url
 }
 
+pub fn build_delete_delta(
+    publisher: &Signer,
+    key_id: &str,
+    url: &str,
+    prev: &str,
+) -> (String, Value) {
+    let delta = serde_json::json!({
+        "wist_version": "1.0.0",
+        "url": url,
+        "change_type": "delete",
+        "observed_at": "2026-08-09T15:00:00Z",
+        "prev": prev,
+        "meta": {"lang": "en"},
+    });
+    let id = wist_core::delta::delta_id(&delta).unwrap();
+    (
+        id,
+        sign_envelope(&delta, "delta", key_id, &publisher.sk).unwrap(),
+    )
+}
+
+pub fn extend_fixture_with_withdrawal(fx: &Fixture, delta_id: &str) {
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let next_number = prev_number + 1;
+
+    let update = serde_json::json!({
+        "wist_version": "1.0.0",
+        "action": "payload_withdrawal",
+        "subject": fx.domain,
+        "details": {"delta_id": delta_id, "legal_basis": "court order", "jurisdiction": "EU"},
+        "effective_at": "2026-08-09T15:00:00Z",
+    });
+    let body = sign_envelope(&update, "update", "log1", &fx.log.sk).unwrap();
+    let wrapped = serde_json::json!({"type": "registry_update", "body": body});
+
+    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
+    let (block, new_hash) = build_block(&fx.log, next_number, &prev_hash, &sealed_at, &[wrapped]);
+    write_block(fx.dir.path(), next_number, &block);
+    write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+}
+
+pub fn extend_fixture_with_delete(fx: &Fixture, url: &str, prev: &str) {
+    let publisher = Signer::new([1u8; 32]);
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let next_number = prev_number + 1;
+
+    let (_id, delta_env) = build_delete_delta(&publisher, "pk1", url, prev);
+    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
+
+    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
+    let (block, new_hash) = build_block(
+        &fx.log,
+        next_number,
+        &prev_hash,
+        &sealed_at,
+        &[wrapped_delta],
+    );
+    write_block(fx.dir.path(), next_number, &block);
+    write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+}
+
+pub fn extend_fixture_with_forged_delta(fx: &Fixture) {
+    let attacker = Signer::new([7u8; 32]);
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let next_number = prev_number + 1;
+
+    let url = format!("https://records.example/extra-{next_number}");
+    let (_id, delta_env, _payload) = build_delta(
+        &attacker,
+        "pk1",
+        &url,
+        "Extra Title",
+        Some("Extra abstract"),
+        "extra body",
+        None,
+    );
+    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
+
+    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
+    let (block, new_hash) = build_block(
+        &fx.log,
+        next_number,
+        &prev_hash,
+        &sealed_at,
+        &[wrapped_delta],
+    );
+    write_block(fx.dir.path(), next_number, &block);
+    write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+}
+
+pub fn extend_fixture_with_rotation(fx: &Fixture, new_key: &Signer) -> String {
+    let old = Signer::new([1u8; 32]);
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let decl0 = build_declaration(&old, "pk1", &fx.domain);
+    let hash0 = declaration_hash(&decl0);
+
+    let rotation_number = prev_number + 1;
+    let rotation_decl = build_declaration_full(
+        &old,
+        "pk1",
+        &fx.domain,
+        1,
+        Some(&hash0),
+        &[("pk2", new_key, "2026-08-09T00:00:00Z")],
+    );
+    let wrapped_decl = serde_json::json!({"type": "publisher_declaration", "body": rotation_decl});
+    let sealed_at1 = format!("2026-08-09T{:02}:00:00Z", 14 + rotation_number);
+    let (block1, hash1) = build_block(
+        &fx.log,
+        rotation_number,
+        &prev_hash,
+        &sealed_at1,
+        &[wrapped_decl],
+    );
+    write_block(fx.dir.path(), rotation_number, &block1);
+    write_checkpoint(fx.dir.path(), &fx.log, rotation_number, &hash1, &sealed_at1);
+
+    let delta_number = rotation_number + 1;
+    let url = format!("https://records.example/extra-{delta_number}");
+    let (id, delta_env, payload) = build_delta(
+        new_key,
+        "pk2",
+        &url,
+        "Rotated Title",
+        Some("Rotated abstract"),
+        "rotated body",
+        None,
+    );
+    let hex = id.strip_prefix("sha256:").unwrap();
+    write_payload(fx.dir.path(), hex, &payload);
+    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
+    let sealed_at2 = format!("2026-08-09T{:02}:00:00Z", 14 + delta_number);
+    let (block2, hash2) = build_block(&fx.log, delta_number, &hash1, &sealed_at2, &[wrapped_delta]);
+    write_block(fx.dir.path(), delta_number, &block2);
+    write_checkpoint(fx.dir.path(), &fx.log, delta_number, &hash2, &sealed_at2);
+
+    url
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_pack(
+    dir: &Path,
+    signer: &Signer,
+    content_digest: &str,
+    log_position: u64,
+    rows: &[(&str, &str, &str, Vec<f32>)],
+    dim: u32,
+    metric: &str,
+) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+
+    let mut jsonl = String::new();
+    for (delta_id, url, publisher, vector) in rows {
+        let row = serde_json::json!({
+            "delta_id": delta_id,
+            "url": url,
+            "publisher": publisher,
+            "vector": vector,
+        });
+        jsonl.push_str(&serde_json::to_string(&row).unwrap());
+        jsonl.push('\n');
+    }
+    let compressed = zstd::encode_all(jsonl.as_bytes(), 0).unwrap();
+    let vectors_path = dir.join("vectors.jsonl.zst");
+    std::fs::write(&vectors_path, &compressed).unwrap();
+
+    let pack = serde_json::json!({
+        "wist_version": "1.0.0",
+        "content_digest": content_digest,
+        "log_position": log_position,
+        "model": {
+            "name": "test-model",
+            "version": "1.0.0",
+            "weights_hash": format!("sha256:{}", "a".repeat(64)),
+            "dim": dim,
+            "quantization": "f32",
+            "metric": metric,
+            "source": "summary",
+        },
+        "vectors": {
+            "path": "vectors.jsonl.zst",
+            "sha256": sha256_hex(&compressed),
+            "bytes": compressed.len() as u64,
+            "count": rows.len() as u64,
+        },
+    });
+    let env = sign_envelope(&pack, "pack", "log1", &signer.sk).unwrap();
+    let pack_path = dir.join("pack.json");
+    std::fs::write(&pack_path, serde_json::to_vec(&env).unwrap()).unwrap();
+    pack_path
+}
+
 pub fn serve_static(dir: PathBuf) -> String {
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -474,15 +873,43 @@ impl Fixture {
     }
 }
 
+pub fn synced_log_dir(dir: &Path) -> PathBuf {
+    dir.join("logs/graven-test-log")
+}
+
 pub fn build_fixture(write_second_payload: bool, duplicate_tier0_record: bool) -> Fixture {
+    build_fixture_full(
+        "graven-test-log",
+        9,
+        write_second_payload,
+        duplicate_tier0_record,
+        false,
+    )
+}
+
+pub fn build_fixture_with_log_id(log_id: &str, seed: u8) -> Fixture {
+    build_fixture_full(log_id, seed, true, false, false)
+}
+
+pub fn build_fixture_with_tier1() -> Fixture {
+    build_fixture_full("graven-test-log", 9, true, false, true)
+}
+
+fn build_fixture_full(
+    log_id: &str,
+    seed: u8,
+    write_second_payload: bool,
+    duplicate_tier0_record: bool,
+    include_tier1: bool,
+) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let log = Signer::new([9u8; 32]);
+    let log = Signer::new([seed; 32]);
     let other = Signer::new([3u8; 32]);
     let publisher = Signer::new([1u8; 32]);
     let domain = "records.example".to_string();
     let snapshot_date = "2026-08-09".to_string();
 
-    write_anchor(&dir.path().join("anchor.json"), &log);
+    write_anchor(&dir.path().join("anchor.json"), &log, log_id);
 
     let declaration_env = build_declaration(&publisher, "pk1", &domain);
     let wrapped_declaration =
@@ -542,17 +969,46 @@ pub fn build_fixture(write_second_payload: bool, duplicate_tier0_record: bool) -
         0,
     );
 
-    write_manifest(
-        &snapdir.join("manifest.json"),
-        &log,
-        &snapshot_date,
-        0,
-        &block0_hash,
-        &content_digest_value,
-        &state_bytes,
-        &state_digest_value,
-        &sqlite_bytes,
-    );
+    if include_tier1 {
+        let extracts_bytes = write_extracts_parquet(&[(
+            record1.url.as_str(),
+            record1.publisher.as_str(),
+            record1.delta_id.as_str(),
+            "alpha body",
+        )]);
+        let links_bytes =
+            write_links_parquet(&[(record1.url.as_str(), "https://records.example/other", 0i64)]);
+        std::fs::create_dir_all(snapdir.join("tier1")).unwrap();
+        std::fs::write(snapdir.join("tier1/extracts.parquet"), &extracts_bytes).unwrap();
+        std::fs::write(snapdir.join("tier1/links.parquet"), &links_bytes).unwrap();
+        write_manifest_with_tier1(
+            &snapdir.join("manifest.json"),
+            &log,
+            &snapshot_date,
+            0,
+            &block0_hash,
+            &content_digest_value,
+            &state_bytes,
+            &state_digest_value,
+            &sqlite_bytes,
+            &[
+                ("tier1/extracts.parquet".to_string(), extracts_bytes, 1u8),
+                ("tier1/links.parquet".to_string(), links_bytes, 1u8),
+            ],
+        );
+    } else {
+        write_manifest(
+            &snapdir.join("manifest.json"),
+            &log,
+            &snapshot_date,
+            0,
+            &block0_hash,
+            &content_digest_value,
+            &state_bytes,
+            &state_digest_value,
+            &sqlite_bytes,
+        );
+    }
 
     write_index(
         &dir.path().join("snapshots/index.json"),

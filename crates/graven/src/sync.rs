@@ -1,26 +1,32 @@
 use crate::error::{Error, Result};
 use crate::fetch::{resolve, Client};
-use crate::store::CREATE_UNIQUE_INDEX;
+use crate::keyset::{url_authority, KeyHistory};
+use crate::registry::{self, LogEntry};
+use crate::store::{table_exists, CREATE_DECLARATIONS, CREATE_TIER1, CREATE_UNIQUE_INDEX};
+use crate::tier1;
 use reqwest::Url;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use wist_core::block::{block_hash, verify_block, verify_chain_link, verify_checkpoint_binding};
 use wist_core::crypto::{hex_encode, PublicKey};
-use wist_core::delta::{content_bytes, delta_id, verify_commitment};
+use wist_core::delta::{content_bytes, verify_commitment};
 use wist_core::envelope::verify_envelope;
 use wist_core::objects::{
     ChangeType, CheckpointEnvelope, DeltaEnvelope, DeltaPayloadCommitment, LogAnchorEnvelope,
-    Payload, SnapshotIndexEnvelope, SnapshotManifestEnvelope, SnapshotStateEnvelope,
+    Payload, PublisherEnvelope, SnapshotIndexEnvelope, SnapshotManifestEnvelope,
+    SnapshotStateEnvelope, StateEntry,
 };
 use wist_core::snapshot::{content_digest, state_digest};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SyncReport {
+    pub log_id: String,
     pub log_position_before: Option<u64>,
     pub head: u64,
+    pub withdrawn: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -28,6 +34,21 @@ pub struct SyncState {
     pub log_position: u64,
     pub head_number: u64,
     pub head_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
+}
+
+pub struct BlockEvent {
+    pub height: u64,
+    pub sealed_at: String,
+    pub declarations: Vec<Value>,
+    pub withdrawals: Vec<String>,
+    pub delta_bodies: Vec<Value>,
+}
+
+pub struct ApplyStats {
+    pub applied: u64,
+    pub withdrawn: u64,
 }
 
 struct TempFileGuard<'a> {
@@ -97,12 +118,19 @@ fn recompute_content_digest(sqlite_path: &Path) -> Result<String> {
     Ok(content_digest(&records)?)
 }
 
+struct PayloadFields {
+    title: String,
+    abstract_text: Option<String>,
+    extract: Option<String>,
+    links: Vec<String>,
+}
+
 fn fetch_payload(
     client: &Client,
     base: &Url,
     hex: &str,
     commitment: &DeltaPayloadCommitment,
-) -> Result<(String, Option<String>)> {
+) -> Result<PayloadFields> {
     let url = resolve(base, &format!("/payloads/{hex}.json"))?;
     let (_, value) = client.get_json(&url)?;
     let payload: Payload = serde_json::from_value(value.clone())?;
@@ -110,36 +138,25 @@ fn fetch_payload(
     if content_bytes(&value["content"])? != commitment.bytes {
         return Err(Error::Verify("payload content bytes mismatch".into()));
     }
-    Ok((
-        payload.content.summary.title,
-        payload.content.summary.r#abstract,
-    ))
-}
-
-fn url_authority(url: &Url) -> Option<String> {
-    let host = url.host_str()?;
-    Some(match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
+    Ok(PayloadFields {
+        title: payload.content.summary.title,
+        abstract_text: payload.content.summary.r#abstract,
+        extract: Some(payload.content.extract),
+        links: payload.content.links.urls,
     })
 }
 
-struct BlockWalk {
-    delta_bodies: Vec<Value>,
-    last_block_value: Option<Value>,
-}
-
-fn walk_blocks(
+pub fn walk_blocks(
     client: &Client,
     base: &Url,
     trust_key: &PublicKey,
     start_number: u64,
     end_number: u64,
     start_hash: &str,
-) -> Result<BlockWalk> {
+) -> Result<(Vec<BlockEvent>, Option<Value>)> {
     let mut prev_hash = start_hash.to_string();
     let mut last_block_value: Option<Value> = None;
-    let mut delta_bodies: Vec<Value> = Vec::new();
+    let mut events: Vec<BlockEvent> = Vec::new();
     for n in start_number..=end_number {
         let block_url = resolve(base, &format!("/log/blocks/{n:09}.json.zst"))?;
         let compressed = client.get_bytes(&block_url)?;
@@ -152,111 +169,484 @@ fn walk_blocks(
             .ok_or_else(|| Error::Verify(format!("block {n} missing header")))?;
         verify_chain_link(header, &prev_hash)?;
         prev_hash = block_hash(header)?;
+        let sealed_at = header
+            .get("sealed_at")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Verify(format!("block {n} missing header.sealed_at")))?
+            .to_string();
+
+        let mut declarations = Vec::new();
+        let mut withdrawals = Vec::new();
+        let mut delta_bodies = Vec::new();
+
         for entry in block_value
             .get("entries")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
-            if entry.get("type").and_then(Value::as_str) == Some("publisher_delta") {
-                if let Some(delta_entry_body) = entry.get("body") {
-                    delta_bodies.push(delta_entry_body.clone());
+            match entry.get("type").and_then(Value::as_str) {
+                Some("publisher_declaration") => {
+                    let body = entry.get("body").ok_or_else(|| {
+                        Error::Verify(format!(
+                            "block {n}: publisher_declaration entry missing body"
+                        ))
+                    })?;
+                    declarations.push(body.clone());
                 }
+                Some("registry_update") => {
+                    let body = entry.get("body").ok_or_else(|| {
+                        Error::Verify(format!("block {n}: registry_update entry missing body"))
+                    })?;
+                    verify_envelope(body, "update", trust_key)?;
+                    if body["update"]["action"] == "payload_withdrawal" {
+                        let withdrawn_id = body["update"]["details"]["delta_id"]
+                            .as_str()
+                            .ok_or_else(|| {
+                                Error::Verify(format!(
+                                    "block {n}: payload_withdrawal missing details.delta_id"
+                                ))
+                            })?;
+                        withdrawals.push(withdrawn_id.to_string());
+                    }
+                }
+                Some("publisher_delta") => {
+                    let body = entry.get("body").ok_or_else(|| {
+                        Error::Verify(format!("block {n}: publisher_delta entry missing body"))
+                    })?;
+                    delta_bodies.push(body.clone());
+                }
+                _ => {}
             }
         }
+
+        events.push(BlockEvent {
+            height: n,
+            sealed_at,
+            declarations,
+            withdrawals,
+            delta_bodies,
+        });
         last_block_value = Some(block_value);
     }
-    Ok(BlockWalk {
-        delta_bodies,
-        last_block_value,
-    })
+    Ok((events, last_block_value))
 }
 
-fn load_trust_key(anchor: &str, client: &Client) -> Result<PublicKey> {
+fn load_anchor(anchor: &str, client: &Client) -> Result<(PublicKey, String)> {
     let anchor_bytes = load_anchor_bytes(anchor, client)?;
     let anchor_value: Value = serde_json::from_slice(&anchor_bytes)?;
     let anchor_env: LogAnchorEnvelope = serde_json::from_value(anchor_value.clone())?;
     let trust_key = PublicKey::from_b64u(&anchor_env.anchor.genesis_key.public_key)?;
     verify_envelope(&anchor_value, "anchor", &trust_key)?;
-    Ok(trust_key)
+    Ok((trust_key, anchor_env.anchor.log_id))
 }
 
-fn apply_post_snapshot_deltas(
+fn persist_declaration(
     conn: &Connection,
-    client: &Client,
-    base: &Url,
-    delta_bodies: Vec<Value>,
+    height: u64,
+    sealed_at: &str,
+    baseline: bool,
+    envelope: &Value,
 ) -> Result<()> {
-    for body in delta_bodies {
-        let Some(delta_body) = body.get("delta") else {
-            continue;
-        };
-        let Ok(env) = serde_json::from_value::<DeltaEnvelope>(body.clone()) else {
-            continue;
-        };
-        let delta = env.delta;
-        if !matches!(delta.change_type, ChangeType::New | ChangeType::Update) {
-            continue;
-        }
-        let Ok(id) = delta_id(delta_body) else {
-            continue;
-        };
-        let Some(hex) = id.strip_prefix("sha256:") else {
-            continue;
-        };
-        let Some(publisher) = Url::parse(&delta.url).ok().as_ref().and_then(url_authority) else {
-            continue;
-        };
+    let env: PublisherEnvelope = serde_json::from_value(envelope.clone())?;
+    conn.execute(
+        "INSERT INTO declarations(domain, seq, height, sealed_at, baseline, envelope) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        (
+            env.publisher.domain,
+            env.publisher.seq as i64,
+            height as i64,
+            sealed_at,
+            baseline as i64,
+            serde_json::to_string(envelope)?,
+        ),
+    )?;
+    Ok(())
+}
 
-        let (title, abstract_text) = match &delta.payload {
-            Some(commitment) => {
-                fetch_payload(client, base, hex, commitment).unwrap_or((String::new(), None))
-            }
-            None => (String::new(), None),
-        };
-
-        conn.execute(
-            "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang)
-             VALUES (?1, ?2, ?3, ?4, 'full', ?5, ?6, ?7)
-             ON CONFLICT(url, publisher) DO UPDATE SET
-                delta_id = excluded.delta_id, observed_at = excluded.observed_at,
-                weight = excluded.weight, title = excluded.title,
-                abstract = excluded.abstract, lang = excluded.lang",
-            (
-                &delta.url,
-                &publisher,
-                &id,
-                &delta.observed_at,
-                &title,
-                &abstract_text,
-                &delta.meta.lang,
-            ),
-        )?;
+fn remove_derived(conn: &Connection, delta_id: &str, url: &str) -> Result<()> {
+    if table_exists(conn, "extracts")? {
+        conn.execute("DELETE FROM extracts WHERE delta_id = ?1", [delta_id])?;
+    }
+    if table_exists(conn, "links")? {
+        conn.execute("DELETE FROM links WHERE source_url = ?1", [url])?;
+    }
+    if table_exists(conn, "embeddings")? {
+        conn.execute("DELETE FROM embeddings WHERE delta_id = ?1", [delta_id])?;
     }
     Ok(())
 }
 
-pub fn run(anchor: &str, log_base: &str, dir: &Path, allow_http: bool) -> Result<SyncReport> {
+fn remove_by_delta_id(conn: &Connection, delta_id: &str) -> Result<bool> {
+    let url: Option<String> = conn
+        .query_row(
+            "SELECT url FROM records WHERE delta_id = ?1",
+            [delta_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(url) = url else {
+        return Ok(false);
+    };
+    conn.execute("DELETE FROM records WHERE delta_id = ?1", [delta_id])?;
+    remove_derived(conn, delta_id, &url)?;
+    Ok(true)
+}
+
+fn remove_by_url(conn: &Connection, url: &str, publisher: &str) -> Result<()> {
+    let delta_id: Option<String> = conn
+        .query_row(
+            "SELECT delta_id FROM records WHERE url = ?1 AND publisher = ?2",
+            [url, publisher],
+            |row| row.get(0),
+        )
+        .optional()?;
+    conn.execute(
+        "DELETE FROM records WHERE url = ?1 AND publisher = ?2",
+        [url, publisher],
+    )?;
+    if let Some(id) = delta_id {
+        remove_derived(conn, &id, url)?;
+    }
+    Ok(())
+}
+
+pub fn load_history(conn: &Connection) -> Result<KeyHistory> {
+    let mut stmt = conn.prepare(
+        "SELECT height, sealed_at, baseline, envelope FROM declarations ORDER BY height, seq",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut history = KeyHistory::new();
+    for (height, sealed_at, baseline, envelope) in rows {
+        let value: Value = serde_json::from_str(&envelope)?;
+        let height = height as u64;
+        if baseline != 0 {
+            history.add_baseline(height, &value)?;
+        } else {
+            history.add_declaration(height, &sealed_at, &value)?;
+        }
+    }
+    Ok(history)
+}
+
+pub fn apply_events(
+    conn: &Connection,
+    client: &Client,
+    base: &Url,
+    history: &mut KeyHistory,
+    events: &[BlockEvent],
+    tier1: bool,
+) -> Result<ApplyStats> {
+    let mut stats = ApplyStats {
+        applied: 0,
+        withdrawn: 0,
+    };
+    if tier1 {
+        conn.execute_batch(CREATE_TIER1)?;
+    }
+    for event in events {
+        for declaration in &event.declarations {
+            history.add_declaration(event.height, &event.sealed_at, declaration)?;
+            persist_declaration(conn, event.height, &event.sealed_at, false, declaration)?;
+        }
+
+        for delta_id in &event.withdrawals {
+            if remove_by_delta_id(conn, delta_id)? {
+                stats.withdrawn += 1;
+            }
+        }
+
+        for body in &event.delta_bodies {
+            let env: DeltaEnvelope = serde_json::from_value(body.clone())?;
+            let id = history.verify_delta(event.height, body)?;
+            let publisher = Url::parse(&env.delta.url)
+                .ok()
+                .as_ref()
+                .and_then(url_authority)
+                .ok_or_else(|| {
+                    Error::Verify(format!("delta url {}: no authority", env.delta.url))
+                })?;
+
+            match env.delta.change_type {
+                ChangeType::New | ChangeType::Update => {
+                    let hex = id.trim_start_matches("sha256:");
+                    let fields = match &env.delta.payload {
+                        Some(commitment) => fetch_payload(client, base, hex, commitment).ok(),
+                        None => None,
+                    };
+                    let title = fields.as_ref().map(|f| f.title.clone()).unwrap_or_default();
+                    let abstract_text = fields.as_ref().and_then(|f| f.abstract_text.clone());
+
+                    conn.execute(
+                        "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang)
+                         VALUES (?1, ?2, ?3, ?4, 'full', ?5, ?6, ?7)
+                         ON CONFLICT(url, publisher) DO UPDATE SET
+                            delta_id = excluded.delta_id, observed_at = excluded.observed_at,
+                            weight = excluded.weight, title = excluded.title,
+                            abstract = excluded.abstract, lang = excluded.lang",
+                        (
+                            &env.delta.url,
+                            &publisher,
+                            &id,
+                            &env.delta.observed_at,
+                            &title,
+                            &abstract_text,
+                            &env.delta.meta.lang,
+                        ),
+                    )?;
+                    stats.applied += 1;
+
+                    if tier1 {
+                        match &fields {
+                            Some(f) => {
+                                if let Some(extract) = &f.extract {
+                                    conn.execute(
+                                        "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, ?2, ?3, ?4)
+                                         ON CONFLICT(url, publisher) DO UPDATE SET
+                                            delta_id = excluded.delta_id, extract = excluded.extract",
+                                        (&env.delta.url, &publisher, &id, extract),
+                                    )?;
+                                }
+                                conn.execute(
+                                    "DELETE FROM links WHERE source_url = ?1",
+                                    [&env.delta.url],
+                                )?;
+                                for (position, target_url) in f.links.iter().enumerate() {
+                                    conn.execute(
+                                        "INSERT INTO links(source_url, target_url, position) VALUES (?1, ?2, ?3)",
+                                        (&env.delta.url, target_url, position as i64),
+                                    )?;
+                                }
+                            }
+                            None => {
+                                conn.execute(
+                                    "DELETE FROM extracts WHERE url = ?1 AND publisher = ?2",
+                                    (&env.delta.url, &publisher),
+                                )?;
+                                conn.execute(
+                                    "DELETE FROM links WHERE source_url = ?1",
+                                    [&env.delta.url],
+                                )?;
+                            }
+                        }
+                    }
+                }
+                ChangeType::Delete => {
+                    remove_by_url(conn, &env.delta.url, &publisher)?;
+                }
+                ChangeType::Attest => {}
+            }
+        }
+    }
+    Ok(stats)
+}
+
+pub fn run(
+    anchor: &str,
+    log_base: &str,
+    dir: &Path,
+    allow_http: bool,
+    tier1: bool,
+) -> Result<SyncReport> {
     std::fs::create_dir_all(dir)?;
-    let sync_path = dir.join("sync.json");
 
     let client = Client::new(allow_http);
     let base = crate::fetch::parse_base(log_base)?;
-    let trust_key = load_trust_key(anchor, &client)?;
+    let (trust_key, log_id) = load_anchor(anchor, &client)?;
+    registry::validate_log_id(&log_id)?;
 
-    if sync_path.exists() {
-        run_incremental(&client, &base, &trust_key, dir, &sync_path)
-    } else {
-        run_cold_start(&client, &base, &trust_key, dir, &sync_path)
+    let migrated = migrate_legacy_layout(dir, &log_id)?;
+
+    match run_registered(
+        &client, &base, &trust_key, anchor, log_base, dir, &log_id, tier1,
+    ) {
+        Ok(report) => Ok(report),
+        Err(err) => {
+            if migrated {
+                if let Err(rollback_err) = rollback_migration(dir, &log_id) {
+                    return Err(Error::Verify(format!(
+                        "sync failed: {err}; additionally, rollback of the legacy-layout migration failed: {rollback_err}"
+                    )));
+                }
+            }
+            Err(err)
+        }
     }
 }
 
+pub fn run_all(dir: &Path, allow_http: bool) -> Result<Vec<SyncReport>> {
+    registry::check_not_legacy(dir)?;
+    let reg = registry::load(dir)?;
+    reg.logs
+        .iter()
+        .map(|entry| run(&entry.anchor, &entry.base, dir, allow_http, entry.tier1))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_registered(
+    client: &Client,
+    base: &Url,
+    trust_key: &PublicKey,
+    anchor: &str,
+    log_base: &str,
+    dir: &Path,
+    log_id: &str,
+    tier1: bool,
+) -> Result<SyncReport> {
+    let mut reg = registry::load(dir)?;
+    if let Some(other) = registry::find_collision(&reg.logs, log_id) {
+        return Err(Error::Verify(format!(
+            "log_id {log_id:?} sanitizes to the same directory as already-registered log_id {:?} (both -> {:?}); refusing to register to avoid a cross-log directory collision",
+            other.log_id,
+            registry::sanitize(log_id)
+        )));
+    }
+    let effective_tier1 = match reg.logs.iter_mut().find(|e| e.log_id == log_id) {
+        Some(entry) => {
+            if entry.anchor != anchor || entry.base != log_base {
+                return Err(Error::Verify(format!(
+                    "log {log_id} is already registered with anchor={} base={}; requested anchor={anchor} base={log_base} conflicts with it",
+                    entry.anchor, entry.base
+                )));
+            }
+            if tier1 {
+                entry.tier1 = true;
+            }
+            entry.tier1
+        }
+        None => {
+            reg.logs.push(LogEntry {
+                log_id: log_id.to_string(),
+                anchor: anchor.to_string(),
+                base: log_base.to_string(),
+                tier1,
+            });
+            tier1
+        }
+    };
+    registry::save(dir, &reg)?;
+
+    let log_dir = registry::log_dir(dir, log_id);
+    std::fs::create_dir_all(&log_dir)?;
+    let sync_path = log_dir.join("sync.json");
+
+    if sync_path.exists() {
+        run_incremental(
+            client,
+            base,
+            trust_key,
+            log_id,
+            &log_dir,
+            &sync_path,
+            effective_tier1,
+        )
+    } else {
+        run_cold_start(
+            client,
+            base,
+            trust_key,
+            log_id,
+            &log_dir,
+            &sync_path,
+            effective_tier1,
+        )
+    }
+}
+
+fn migrate_legacy_layout(dir: &Path, log_id: &str) -> Result<bool> {
+    if !registry::is_unmigrated_legacy_layout(dir) {
+        return Ok(false);
+    }
+    let target_dir = registry::log_dir(dir, log_id);
+    std::fs::create_dir_all(&target_dir)?;
+
+    let index_src = dir.join("index.sqlite");
+    let index_dst = target_dir.join("index.sqlite");
+    std::fs::rename(&index_src, &index_dst)?;
+
+    let sync_src = dir.join("sync.json");
+    let sync_dst = target_dir.join("sync.json");
+    if let Err(err) = std::fs::rename(&sync_src, &sync_dst) {
+        if let Err(undo_err) = std::fs::rename(&index_dst, &index_src) {
+            return Err(Error::Verify(format!(
+                "legacy migration failed moving {} into {} ({err}); additionally, could not move {} back to {} ({undo_err}); index.sqlite is stranded at {}",
+                sync_src.display(),
+                sync_dst.display(),
+                index_dst.display(),
+                index_src.display(),
+                index_dst.display()
+            )));
+        }
+        return Err(Error::Verify(format!(
+            "legacy migration failed moving {} into {}: {err}",
+            sync_src.display(),
+            sync_dst.display()
+        )));
+    }
+    Ok(true)
+}
+
+fn rollback_migration(dir: &Path, log_id: &str) -> Result<()> {
+    let target_dir = registry::log_dir(dir, log_id);
+    let index_src = target_dir.join("index.sqlite");
+    let index_dst = dir.join("index.sqlite");
+    let sync_src = target_dir.join("sync.json");
+    let sync_dst = dir.join("sync.json");
+
+    if let Err(err) = std::fs::rename(&index_src, &index_dst) {
+        return Err(Error::Verify(format!(
+            "rollback of legacy migration failed: could not move {} back to {}: {err}; both files remain in {}",
+            index_src.display(),
+            index_dst.display(),
+            target_dir.display()
+        )));
+    }
+    if let Err(err) = std::fs::rename(&sync_src, &sync_dst) {
+        return Err(Error::Verify(format!(
+            "rollback of legacy migration failed: index.sqlite was restored to {} but could not move {} back to {}: {err}; sync.json remains in {}",
+            dir.display(),
+            sync_src.display(),
+            sync_dst.display(),
+            target_dir.display()
+        )));
+    }
+
+    std::fs::remove_dir_all(&target_dir).map_err(|err| {
+        Error::Verify(format!(
+            "rollback of legacy migration restored both files to {} but could not remove {}: {err}",
+            dir.display(),
+            target_dir.display()
+        ))
+    })?;
+    std::fs::remove_file(dir.join("logs.json")).map_err(|err| {
+        Error::Verify(format!(
+            "rollback of legacy migration restored both files to {} but could not remove {}: {err}",
+            dir.display(),
+            dir.join("logs.json").display()
+        ))
+    })?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_incremental(
     client: &Client,
     base: &Url,
     trust_key: &PublicKey,
+    log_id: &str,
     dir: &Path,
     sync_path: &Path,
+    tier1: bool,
 ) -> Result<SyncReport> {
     let sync_bytes = std::fs::read(sync_path)?;
     let local: SyncState = serde_json::from_slice(&sync_bytes)?;
@@ -277,8 +667,10 @@ fn run_incremental(
     if checkpoint.block_number == local.head_number {
         if checkpoint.block_hash == local.head_hash {
             return Ok(SyncReport {
+                log_id: log_id.to_string(),
                 log_position_before: Some(local.head_number),
                 head: local.head_number,
+                withdrawn: 0,
             });
         }
         return Err(Error::Verify(format!(
@@ -287,7 +679,7 @@ fn run_incremental(
         )));
     }
 
-    let walk = walk_blocks(
+    let (events, last_block_value) = walk_blocks(
         client,
         base,
         trust_key,
@@ -295,38 +687,52 @@ fn run_incremental(
         checkpoint.block_number,
         &local.head_hash,
     )?;
-    let last_block_value = walk.last_block_value.ok_or_else(|| {
+    let last_block_value = last_block_value.ok_or_else(|| {
         Error::Verify("continuous sync produced no blocks despite checkpoint advancing".into())
     })?;
     verify_checkpoint_binding(&checkpoint_value, &last_block_value)?;
 
     let index_sqlite_path = dir.join("index.sqlite");
-    {
-        let conn = Connection::open(&index_sqlite_path)?;
-        conn.execute(CREATE_UNIQUE_INDEX, [])?;
-        apply_post_snapshot_deltas(&conn, client, base, walk.delta_bodies)?;
-        conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
+    let conn = Connection::open(&index_sqlite_path)?;
+    let mut history = load_history(&conn)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(CREATE_UNIQUE_INDEX, [])?;
+    tx.execute(CREATE_DECLARATIONS, [])?;
+    let stats = apply_events(&tx, client, base, &mut history, &events, tier1)?;
+    tx.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
+    if tier1 {
+        tx.execute(
+            "INSERT INTO extracts_fts(extracts_fts) VALUES('rebuild')",
+            [],
+        )?;
     }
+    tx.commit()?;
 
     let sync_state = SyncState {
         log_position: local.log_position,
         head_number: checkpoint.block_number,
         head_hash: checkpoint.block_hash.clone(),
+        content_digest: local.content_digest.clone(),
     };
     std::fs::write(sync_path, serde_json::to_vec(&sync_state)?)?;
 
     Ok(SyncReport {
+        log_id: log_id.to_string(),
         log_position_before: Some(local.head_number),
         head: checkpoint.block_number,
+        withdrawn: stats.withdrawn,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_cold_start(
     client: &Client,
     base: &Url,
     trust_key: &PublicKey,
+    log_id: &str,
     dir: &Path,
     sync_path: &Path,
+    tier1: bool,
 ) -> Result<SyncReport> {
     let index_url = resolve(base, "/snapshots/index.json")?;
     let (_, index_value) = client.get_json(&index_url)?;
@@ -366,12 +772,18 @@ fn run_cold_start(
     }
 
     let mut tier0_bytes: Option<Vec<u8>> = None;
+    let mut tier1_extracts: Vec<Vec<u8>> = Vec::new();
+    let mut tier1_links: Vec<Vec<u8>> = Vec::new();
     for f in &manifest.files {
         let file_url = resolve(base, &format!("{snapshot_base}{}", f.path))?;
         let bytes = client.get_bytes(&file_url)?;
         verify_file_integrity(&bytes, &f.sha256, f.bytes)?;
         if f.tier == 0 && f.path == "tier0/index.sqlite" {
             tier0_bytes = Some(bytes);
+        } else if tier1 && f.path.ends_with("tier1/extracts.parquet") {
+            tier1_extracts.push(bytes);
+        } else if tier1 && f.path.ends_with("tier1/links.parquet") {
+            tier1_links.push(bytes);
         }
     }
     let tier0_bytes = tier0_bytes
@@ -388,6 +800,28 @@ fn run_cold_start(
         ));
     }
 
+    let conn = Connection::open(&tmp_sqlite_path)?;
+    conn.execute(CREATE_UNIQUE_INDEX, [])?;
+    conn.execute(CREATE_DECLARATIONS, [])?;
+
+    if tier1 {
+        conn.execute_batch(CREATE_TIER1)?;
+        for bytes in &tier1_extracts {
+            tier1::import_extracts(&conn, bytes)?;
+        }
+        for bytes in &tier1_links {
+            tier1::import_links(&conn, bytes)?;
+        }
+    }
+
+    let mut history = KeyHistory::new();
+    for entry in &state_env.state.entries {
+        if let StateEntry::Declaration(d) = entry {
+            history.add_baseline(d.sealing_height, &d.declaration)?;
+            persist_declaration(&conn, d.sealing_height, "", true, &d.declaration)?;
+        }
+    }
+
     let checkpoint_url = resolve(base, "/log/checkpoint.json")?;
     let (_, checkpoint_value) = client.get_json(&checkpoint_url)?;
     verify_envelope(&checkpoint_value, "checkpoint", trust_key)?;
@@ -400,7 +834,7 @@ fn run_cold_start(
         ));
     }
 
-    let walk = walk_blocks(
+    let (events, last_block_value) = walk_blocks(
         client,
         base,
         trust_key,
@@ -409,7 +843,7 @@ fn run_cold_start(
         &manifest.anchor_block_hash,
     )?;
 
-    match &walk.last_block_value {
+    match &last_block_value {
         Some(block_value) => verify_checkpoint_binding(&checkpoint_value, block_value)?,
         None => {
             if checkpoint.block_number != manifest.log_position
@@ -422,12 +856,15 @@ fn run_cold_start(
         }
     }
 
-    {
-        let conn = Connection::open(&tmp_sqlite_path)?;
-        conn.execute(CREATE_UNIQUE_INDEX, [])?;
-        apply_post_snapshot_deltas(&conn, client, base, walk.delta_bodies)?;
-        conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
+    let stats = apply_events(&conn, client, base, &mut history, &events, tier1)?;
+    conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
+    if tier1 {
+        conn.execute(
+            "INSERT INTO extracts_fts(extracts_fts) VALUES('rebuild')",
+            [],
+        )?;
     }
+    drop(conn);
 
     guard.disarm();
     let index_sqlite_path = dir.join("index.sqlite");
@@ -437,11 +874,145 @@ fn run_cold_start(
         log_position: manifest.log_position,
         head_number: checkpoint.block_number,
         head_hash: checkpoint.block_hash.clone(),
+        content_digest: Some(manifest.content_digest.clone()),
     };
     std::fs::write(sync_path, serde_json::to_vec(&sync_state)?)?;
 
     Ok(SyncReport {
+        log_id: log_id.to_string(),
         log_position_before: None,
         head: checkpoint.block_number,
+        withdrawn: stats.withdrawn,
     })
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn migrate_legacy_layout_is_noop_when_not_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!migrate_legacy_layout(dir.path(), "log-a").unwrap());
+    }
+
+    #[test]
+    fn migrate_legacy_layout_moves_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.sqlite"), b"idx").unwrap();
+        std::fs::write(dir.path().join("sync.json"), b"sync").unwrap();
+
+        assert!(migrate_legacy_layout(dir.path(), "log-a").unwrap());
+
+        let target = registry::log_dir(dir.path(), "log-a");
+        assert_eq!(std::fs::read(target.join("index.sqlite")).unwrap(), b"idx");
+        assert_eq!(std::fs::read(target.join("sync.json")).unwrap(), b"sync");
+        assert!(!dir.path().join("index.sqlite").exists());
+        assert!(!dir.path().join("sync.json").exists());
+    }
+
+    #[test]
+    fn migrate_legacy_layout_restores_first_file_when_second_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.sqlite"), b"idx").unwrap();
+        std::fs::write(dir.path().join("sync.json"), b"sync").unwrap();
+
+        let target = registry::log_dir(dir.path(), "log-a");
+        std::fs::create_dir_all(target.join("sync.json")).unwrap();
+
+        let err = migrate_legacy_layout(dir.path(), "log-a").unwrap_err();
+        assert!(err.to_string().contains("sync.json"), "error was: {err}");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("index.sqlite")).unwrap(),
+            b"idx",
+            "index.sqlite must be restored to the top level, not stranded in target_dir"
+        );
+        assert!(!target.join("index.sqlite").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("sync.json")).unwrap(),
+            b"sync"
+        );
+    }
+
+    #[test]
+    fn rollback_migration_moves_files_back_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = registry::log_dir(dir.path(), "log-a");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("index.sqlite"), b"idx").unwrap();
+        std::fs::write(target.join("sync.json"), b"sync").unwrap();
+        std::fs::write(dir.path().join("logs.json"), b"{}").unwrap();
+
+        rollback_migration(dir.path(), "log-a").unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join("index.sqlite")).unwrap(),
+            b"idx"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("sync.json")).unwrap(),
+            b"sync"
+        );
+        assert!(!target.exists());
+        assert!(!dir.path().join("logs.json").exists());
+    }
+
+    #[test]
+    fn rollback_migration_leaves_target_dir_intact_when_first_rename_back_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = registry::log_dir(dir.path(), "log-a");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("index.sqlite"), b"idx").unwrap();
+        std::fs::write(target.join("sync.json"), b"sync").unwrap();
+        std::fs::write(dir.path().join("logs.json"), b"{}").unwrap();
+
+        std::fs::create_dir_all(dir.path().join("index.sqlite")).unwrap();
+
+        let err = rollback_migration(dir.path(), "log-a").unwrap_err();
+        assert!(err.to_string().contains("index.sqlite"), "error was: {err}");
+
+        assert_eq!(
+            std::fs::read(target.join("index.sqlite")).unwrap(),
+            b"idx",
+            "index.sqlite must still be in target_dir, not deleted by a premature remove_dir_all"
+        );
+        assert_eq!(std::fs::read(target.join("sync.json")).unwrap(), b"sync");
+        assert!(
+            target.exists(),
+            "target_dir must not be removed while rollback is incomplete"
+        );
+        assert!(dir.path().join("logs.json").exists());
+    }
+
+    #[test]
+    fn rollback_migration_preserves_sync_json_when_second_rename_back_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = registry::log_dir(dir.path(), "log-a");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("index.sqlite"), b"idx").unwrap();
+        std::fs::write(target.join("sync.json"), b"sync").unwrap();
+        std::fs::write(dir.path().join("logs.json"), b"{}").unwrap();
+
+        std::fs::create_dir_all(dir.path().join("sync.json")).unwrap();
+
+        let err = rollback_migration(dir.path(), "log-a").unwrap_err();
+        assert!(err.to_string().contains("sync.json"), "error was: {err}");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("index.sqlite")).unwrap(),
+            b"idx",
+            "index.sqlite rename-back had already succeeded and must not be undone"
+        );
+        assert_eq!(
+            std::fs::read(target.join("sync.json")).unwrap(),
+            b"sync",
+            "sync.json must still be in target_dir, not deleted by a premature remove_dir_all"
+        );
+        assert!(
+            target.exists(),
+            "target_dir must not be removed while rollback is incomplete"
+        );
+        assert!(dir.path().join("logs.json").exists());
+    }
 }

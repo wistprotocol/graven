@@ -290,10 +290,10 @@ struct McpClient {
 }
 
 impl McpClient {
-    fn start(graven_bin: &Path, dir: &Path, log_id: &str) -> Self {
+    fn start(graven_bin: &Path, dir: &Path) -> Self {
         let dir_str = dir.to_str().expect("non-utf8 path").to_string();
         let mut child = Command::new(graven_bin)
-            .args(["serve", "--dir", &dir_str, "--log-id", log_id])
+            .args(["serve", "--dir", &dir_str])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -394,6 +394,10 @@ impl McpClient {
     fn get_record(&mut self, url: &str) -> Value {
         self.tool_call("get_record", json!({"url": url}))
     }
+
+    fn get_extract(&mut self, url: &str) -> Value {
+        self.tool_call("get_extract", json!({"url": url}))
+    }
 }
 
 fn validate_artifacts(site: &Path, clave_data: &Path) {
@@ -475,6 +479,27 @@ fn end_to_end() {
     );
     let clave_base = format!("http://{clave_host}");
 
+    let clave2_data = tmp.path().join("clave-data-2");
+    let clave2_host = free_loopback_addr();
+    run(
+        &clave,
+        &[
+            "init",
+            "--log-id",
+            &clave2_host,
+            "--data",
+            s(&clave2_data),
+            "--cadence",
+            "1",
+        ],
+    );
+    let (_clave2_child, clave2_bound_addr) = spawn_clave_serve(&clave, &clave2_data, &clave2_host);
+    assert_eq!(
+        clave2_bound_addr, clave2_host,
+        "clave serve bound a different address than the pre-picked --log-id"
+    );
+    let clave2_base = format!("http://{clave2_host}");
+
     run(
         &spake,
         &[
@@ -517,10 +542,25 @@ fn end_to_end() {
         ],
     );
     wait_until_status_active(&http, &clave_base, &site_host);
+    run(
+        &spake,
+        &[
+            "ping",
+            "--log",
+            &clave2_base,
+            "--domain",
+            &site_host,
+            "--allow-http",
+            "--no-retry",
+        ],
+    );
+    wait_until_status_active(&http, &clave2_base, &site_host);
 
     run(&clave, &["seal", "--data", s(&clave_data)]);
+    run(&clave, &["seal", "--data", s(&clave2_data)]);
 
     let anchor_path = clave_data.join("anchor.json");
+    let anchor2_path = clave2_data.join("anchor.json");
     run(
         &graven,
         &[
@@ -529,6 +569,20 @@ fn end_to_end() {
             s(&anchor_path),
             "--log",
             &clave_base,
+            "--dir",
+            s(&gdir),
+            "--tier1",
+            "--allow-http",
+        ],
+    );
+    run(
+        &graven,
+        &[
+            "sync",
+            "--anchor",
+            s(&anchor2_path),
+            "--log",
+            &clave2_base,
             "--dir",
             s(&gdir),
             "--allow-http",
@@ -563,7 +617,20 @@ fn end_to_end() {
             "--no-retry",
         ],
     );
+    run(
+        &spake,
+        &[
+            "ping",
+            "--log",
+            &clave2_base,
+            "--domain",
+            &site_host,
+            "--allow-http",
+            "--no-retry",
+        ],
+    );
     let final_status = wait_until_pulled_since(&http, &clave_base, &site_host, &since);
+    wait_until_pulled_since(&http, &clave2_base, &site_host, &since);
     std::fs::write(
         clave_data.join("status.json"),
         serde_json::to_vec(&final_status).expect("serialize status"),
@@ -572,41 +639,100 @@ fn end_to_end() {
 
     std::thread::sleep(Duration::from_secs(2));
     run(&clave, &["seal", "--data", s(&clave_data)]);
-    run(
-        &graven,
-        &[
-            "sync",
-            "--anchor",
-            s(&anchor_path),
-            "--log",
-            &clave_base,
-            "--dir",
-            s(&gdir),
-            "--allow-http",
-        ],
-    );
+    run(&clave, &["seal", "--data", s(&clave2_data)]);
+    run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
 
-    let mut mcp = McpClient::start(&graven, &gdir, &clave_host);
+    let mut mcp = McpClient::start(&graven, &gdir);
     let hits = mcp.search("changed");
     assert!(!hits.is_empty(), "search(\"changed\") returned no hits");
     let hit = hits
         .iter()
         .find(|h| h["url"].as_str().unwrap_or_default().ends_with("/a.html"))
         .unwrap_or_else(|| panic!("no hit ending in /a.html among {hits:?}"));
+    let provenance = hit["provenance"]
+        .as_array()
+        .unwrap_or_else(|| panic!("provenance is not an array: {hit}"));
+    assert_eq!(
+        provenance.len(),
+        2,
+        "expected dedup across 2 logs, got {hit}"
+    );
+    let log_ids: Vec<&str> = provenance
+        .iter()
+        .map(|p| p["log_id"].as_str().expect("log_id is a string"))
+        .collect();
+    assert_ne!(
+        log_ids[0], log_ids[1],
+        "expected distinct log_ids, got {hit}"
+    );
     assert!(
-        hit["provenance"]["synced_height"].as_u64().unwrap_or(0) >= 1,
-        "expected synced_height >= 1, got {hit}"
+        provenance
+            .iter()
+            .all(|p| p["synced_height"].as_u64().unwrap_or(0) >= 1),
+        "expected synced_height >= 1 for both logs, got {hit}"
     );
     let url = hit["url"]
         .as_str()
         .expect("hit url is a string")
+        .to_string();
+    let delta_id = hit["delta_id"]
+        .as_str()
+        .expect("delta_id is a string")
         .to_string();
     let rec = mcp.get_record(&url);
     assert_eq!(
         rec["delta_id"], hit["delta_id"],
         "get_record delta_id mismatch"
     );
+
+    let extract = mcp.get_extract(&url);
+    let extract_text = extract["extract"].as_str().expect("extract is a string");
+    assert!(!extract_text.is_empty(), "extract is empty");
+    assert!(
+        extract_text.contains("changed"),
+        "extract does not contain \"changed\": {extract_text}"
+    );
     drop(mcp);
+
+    run(
+        &clave,
+        &[
+            "withdraw",
+            "--data",
+            s(&clave_data),
+            "--domain",
+            &site_host,
+            "--delta-id",
+            &delta_id,
+            "--legal-basis",
+            "test",
+            "--jurisdiction",
+            "test",
+        ],
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    run(&clave, &["seal", "--data", s(&clave_data)]);
+    run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+
+    let mut mcp2 = McpClient::start(&graven, &gdir);
+    let hits2 = mcp2.search("changed");
+    let hit2 = hits2
+        .iter()
+        .find(|h| h["url"].as_str().unwrap_or_default().ends_with("/a.html"))
+        .unwrap_or_else(|| panic!("no hit ending in /a.html among {hits2:?}"));
+    let provenance2 = hit2["provenance"]
+        .as_array()
+        .unwrap_or_else(|| panic!("provenance is not an array: {hit2}"));
+    assert_eq!(
+        provenance2.len(),
+        1,
+        "expected single surviving log after withdrawal, got {hit2}"
+    );
+    assert_eq!(
+        provenance2[0]["log_id"], clave2_host,
+        "expected surviving provenance to be log 2, got {hit2}"
+    );
+    drop(mcp2);
 
     validate_artifacts(&site, &clave_data);
 
