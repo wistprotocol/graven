@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::store::{MergedHit, MultiStore, ProvEntry, SimilarHit};
+use crate::store::{DomainCoverage, MergedHit, MultiStore, ProvEntry, SimilarHit};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -81,6 +81,13 @@ pub struct SearchParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CoverageParams {
+    /// One publisher domain to check, or omit for every covered domain.
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetRecordParams {
     pub url: String,
 }
@@ -114,7 +121,18 @@ impl GravenServer {
 
 #[tool_router]
 impl GravenServer {
-    #[tool(description = "Full-text search the local WIST index")]
+    #[tool(
+        description = "Full-text search a local index of publisher-signed page records. \
+Coverage is limited to domains that publish to WIST, so this is not open web \
+discovery: it returns nothing for a domain outside the index, which check_coverage \
+reports before a query is spent. Each hit carries the publishing domain's own signed \
+statement about the page, synced from an append-only log, typically hours fresh, with \
+the log and its synced height on every row. Best for documentation, news, product and \
+catalogue pages from known publishers, and for questions where provenance matters more \
+than reach. Defer to a web search tool for open discovery, for a domain check_coverage \
+does not list, and for anything needing the live page rather than what its publisher \
+signed."
+    )]
     fn search(
         &self,
         Parameters(SearchParams { query, limit }): Parameters<SearchParams>,
@@ -126,7 +144,29 @@ impl GravenServer {
         Ok(Json(hits.into_iter().map(to_record_out).collect()))
     }
 
-    #[tool(description = "Fetch a single record by URL")]
+    #[tool(
+        description = "Report which publisher domains this index covers and since when, \
+so a caller can route a question without spending a query. Pass a domain to check one, \
+or omit it to list every covered domain with the instant its first Declaration was \
+sealed and how many of its records are held. A domain absent here is not in the index \
+at all, and a web search tool is the right destination for it."
+    )]
+    fn check_coverage(
+        &self,
+        Parameters(CoverageParams { domain }): Parameters<CoverageParams>,
+    ) -> std::result::Result<Json<Vec<DomainCoverage>>, ErrorData> {
+        let rows = self
+            .store()
+            .coverage(domain.as_deref())
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(Json(rows))
+    }
+
+    #[tool(
+        description = "Fetch one record by its exact Normalized URL — the publisher's \
+signed title, abstract and observation instant. Use after search, or when the URL is \
+already known; it does no matching."
+    )]
     fn get_record(
         &self,
         Parameters(GetRecordParams { url }): Parameters<GetRecordParams>,
@@ -141,7 +181,11 @@ impl GravenServer {
         }
     }
 
-    #[tool(description = "Fetch the stored tier1 extract for a URL")]
+    #[tool(
+        description = "Fetch the publisher's committed extract — the page's main text as \
+the publisher signed it — for one URL. Present only where the local index carries the \
+extract tier; use get_record first if unsure the URL is held."
+    )]
     fn get_extract(
         &self,
         Parameters(GetRecordParams { url }): Parameters<GetRecordParams>,
@@ -160,7 +204,10 @@ impl GravenServer {
         }
     }
 
-    #[tool(description = "List outbound declared links for a URL")]
+    #[tool(
+        description = "List the outbound links a page's publisher declared for one URL, \
+in the order declared. This is the publisher's own citation graph, not a crawl."
+    )]
     fn get_links(
         &self,
         Parameters(GetRecordParams { url }): Parameters<GetRecordParams>,
@@ -179,7 +226,11 @@ impl GravenServer {
         ))
     }
 
-    #[tool(description = "Nearest records by imported embedding pack (single-log scores)")]
+    #[tool(
+        description = "Nearest records to one URL by meaning, using an imported embedding \
+pack. Available only where a pack has been imported, and scores are comparable within a \
+single log, never across logs. Use search for keyword matching."
+    )]
     fn similar_records(
         &self,
         Parameters(SimilarParams { url, k }): Parameters<SimilarParams>,
@@ -198,7 +249,13 @@ impl GravenServer {
 impl ServerHandler for GravenServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Graven: search, get_record, get_extract, get_links and similar_records over a local WIST index",
+            "A local index of page records published and signed by their own domains, \
+synced from an append-only log and verified against it. Coverage is the set of \
+publishing domains, not the open web: check_coverage says which domains are held and \
+since when, search finds pages within them, get_record, get_extract and get_links read \
+one page's signed statement, and similar_records ranks by meaning where an embedding \
+pack has been imported. For a domain check_coverage does not list, and for anything \
+needing the live page rather than what its publisher signed, use a web search tool.",
         )
     }
 }

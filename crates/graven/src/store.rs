@@ -258,6 +258,15 @@ fn read_synced_height(dir: &Path) -> Result<u64> {
     Ok(state.head_number)
 }
 
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct DomainCoverage {
+    pub domain: String,
+    /// The `sealed_at` of the earliest Declaration this index holds for
+    /// the domain — the instant from which its statements are covered.
+    pub since: String,
+    pub records: i64,
+}
+
 pub struct LogHandle {
     pub log_id: String,
     pub synced_height: u64,
@@ -349,6 +358,28 @@ impl MultiStore {
         }
     }
 
+    /// Every Publisher domain the local index carries, with the earliest
+    /// Declaration instant it holds for that domain and the record
+    /// count, so a caller can tell whether a domain is covered at all
+    /// before spending a query on it.
+    pub fn coverage(&self, domain: Option<&str>) -> Result<Vec<DomainCoverage>> {
+        let mut merged: BTreeMap<String, DomainCoverage> = BTreeMap::new();
+        for handle in &self.logs {
+            for row in handle.store.coverage(domain)? {
+                merged
+                    .entry(row.domain.clone())
+                    .and_modify(|existing| {
+                        if row.since < existing.since {
+                            existing.since = row.since.clone();
+                        }
+                        existing.records += row.records;
+                    })
+                    .or_insert(row);
+            }
+        }
+        Ok(merged.into_values().collect())
+    }
+
     pub fn similar(&self, url: &str, k: usize) -> Result<Vec<SimilarHit>> {
         for handle in &self.logs {
             if let Some(hits) =
@@ -413,6 +444,28 @@ impl Store {
             }
         }
         Ok(rows)
+    }
+
+    pub fn coverage(&self, domain: Option<&str>) -> Result<Vec<DomainCoverage>> {
+        if !table_exists(&self.conn, "declarations")? {
+            return Ok(Vec::new());
+        }
+        let sql = "SELECT d.domain, MIN(d.sealed_at), (SELECT COUNT(*) FROM records r WHERE r.publisher = d.domain)
+                   FROM declarations d GROUP BY d.domain ORDER BY d.domain";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(DomainCoverage {
+                    domain: row.get(0)?,
+                    since: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    records: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(match domain {
+            Some(wanted) => rows.into_iter().filter(|r| r.domain == wanted).collect(),
+            None => rows,
+        })
     }
 
     pub fn get(&self, url: &str) -> Result<Option<RecordHit>> {
