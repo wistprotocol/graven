@@ -1845,3 +1845,101 @@ fn a_log_that_rotates_its_aggregator_key_stays_syncable() {
     .unwrap();
     assert_eq!(report.head, after);
 }
+
+fn sanction_update(domain: &str, level: u64) -> serde_json::Value {
+    serde_json::json!({
+        "wist_version": "1.0.0",
+        "action": "sanction",
+        "subject": domain,
+        "details": {"level": level, "severity": 1},
+        "evidence": [format!("sha256:{}", "1".repeat(64)), format!("sha256:{}", "2".repeat(64))],
+        "effective_at": "2026-08-09T15:00:00Z",
+    })
+}
+
+fn seal_sanction_then_delta(fx: &common::Fixture, level: u64) -> String {
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let n = prev_number + 1;
+    let update = sanction_update("records.example", level);
+    let envelope =
+        wist_core::envelope::sign_envelope(&update, "update", "log1", &fx.log.sk).unwrap();
+    let publisher = common::Signer::new([1u8; 32]);
+    let url = format!("https://records.example/sanctioned-{n}");
+    let (_id, delta_env, payload) = common::build_delta(
+        &publisher,
+        "pk1",
+        &url,
+        "Sanctioned Title",
+        None,
+        "sanctioned body",
+        None,
+    );
+    let hex = wist_core::delta::delta_id(&delta_env["delta"])
+        .unwrap()
+        .trim_start_matches("sha256:")
+        .to_string();
+    common::write_payload(fx.dir.path(), &hex, &payload);
+    let entries = vec![
+        serde_json::json!({"type": "registry_update", "body": envelope}),
+        serde_json::json!({"type": "publisher_delta", "body": delta_env}),
+    ];
+    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + n);
+    let (block, hash) = common::build_block(&fx.log, n, &prev_hash, &sealed_at, &entries);
+    common::write_block(fx.dir.path(), n, &block);
+    common::write_checkpoint(fx.dir.path(), &fx.log, n, &hash, &sealed_at);
+    url
+}
+
+#[test]
+fn a_level_two_sanction_marks_the_domains_records_reduced_weight() {
+    let fx = common::build_fixture(true, false);
+    let url = seal_sanction_then_delta(&fx, 2);
+    let dir = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    let conn = Connection::open(common::synced_log_dir(dir.path()).join("index.sqlite")).unwrap();
+    let weight: String = conn
+        .query_row("SELECT weight FROM records WHERE url = ?1", [&url], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(weight, "reduced");
+}
+
+#[test]
+fn a_level_four_sanction_removes_the_domains_records() {
+    let fx = common::build_fixture(true, false);
+    seal_sanction_then_delta(&fx, 4);
+    let dir = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    let conn = Connection::open(common::synced_log_dir(dir.path()).join("index.sqlite")).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM records WHERE publisher = 'records.example'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}

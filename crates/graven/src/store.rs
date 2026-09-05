@@ -22,6 +22,11 @@ pub const CREATE_CHAIN_TIPS: &str =
 pub const CREATE_AGGREGATOR_KEYS: &str =
     "CREATE TABLE IF NOT EXISTS aggregator_keys(key_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, removed INTEGER NOT NULL)";
 
+/// WIST-4 §7's ladder as the Log states it, and WIST-4 §5's exclusions,
+/// both of which WIST-3 §7 reads when materializing.
+pub const CREATE_SANCTIONS: &str =
+    "CREATE TABLE IF NOT EXISTS sanctions(domain TEXT PRIMARY KEY, level INTEGER NOT NULL, since_height INTEGER NOT NULL, notice_at INTEGER, appeal_at INTEGER, ruling TEXT, ruling_at INTEGER); CREATE TABLE IF NOT EXISTS exclusions(publisher TEXT NOT NULL, url TEXT NOT NULL, since_height INTEGER NOT NULL, PRIMARY KEY(publisher, url))";
+
 pub const CREATE_TIER1: &str = "CREATE TABLE IF NOT EXISTS extracts(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, extract TEXT NOT NULL, PRIMARY KEY(url, publisher)); CREATE VIRTUAL TABLE IF NOT EXISTS extracts_fts USING fts5(extract, content=extracts, content_rowid=rowid); CREATE TABLE IF NOT EXISTS links(source_url TEXT NOT NULL, target_url TEXT NOT NULL, position INTEGER NOT NULL)";
 
 pub const CREATE_EMBEDDINGS: &str = "CREATE TABLE IF NOT EXISTS embeddings(delta_id TEXT PRIMARY KEY, url TEXT NOT NULL, publisher TEXT NOT NULL, vector BLOB NOT NULL); CREATE TABLE IF NOT EXISTS pack_meta(id INTEGER PRIMARY KEY CHECK(id = 1), model_json TEXT NOT NULL, metric TEXT NOT NULL, dim INTEGER NOT NULL, imported_at TEXT NOT NULL, key_b64u TEXT NOT NULL)";

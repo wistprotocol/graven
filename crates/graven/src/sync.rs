@@ -21,6 +21,7 @@ use wist_core::objects::{
     Payload, PublisherEnvelope, SnapshotIndexEnvelope, SnapshotManifestEnvelope,
     SnapshotStateEnvelope, StateEntry,
 };
+use wist_core::sanctions::Outcome;
 use wist_core::snapshot::{content_digest, state_digest};
 
 #[derive(Debug, Clone)]
@@ -46,6 +47,10 @@ pub struct BlockEvent {
     pub declarations: Vec<Value>,
     pub withdrawals: Vec<String>,
     pub delta_bodies: Vec<Value>,
+    /// WIST-4 §7 governance acts, from which the sanction ladder is
+    /// derived; WIST-3 §7 reads levels 2, 3 and 4 as materialization
+    /// inputs.
+    pub governance: Vec<Value>,
 }
 
 pub struct ApplyStats {
@@ -345,6 +350,7 @@ pub fn walk_blocks(
         let mut declarations = Vec::new();
         let mut withdrawals = Vec::new();
         let mut delta_bodies = Vec::new();
+        let mut governance = Vec::new();
 
         for entry in block_value
             .get("entries")
@@ -365,6 +371,12 @@ pub fn walk_blocks(
                     let body = entry.get("body").ok_or_else(|| {
                         Error::Verify(format!("block {n}: registry_update entry missing body"))
                     })?;
+                    if matches!(
+                        body["update"]["action"].as_str(),
+                        Some("sanction" | "sanction_lift" | "notice" | "appeal" | "appeal_ruling")
+                    ) {
+                        governance.push(body["update"].clone());
+                    }
                     if body["update"]["action"] == "payload_withdrawal" {
                         let withdrawn_id = body["update"]["details"]["delta_id"]
                             .as_str()
@@ -392,6 +404,7 @@ pub fn walk_blocks(
             declarations,
             withdrawals,
             delta_bodies,
+            governance,
         });
         last_block_value = Some(block_value);
     }
@@ -508,6 +521,167 @@ pub fn load_history(conn: &Connection) -> Result<KeyHistory> {
     Ok(history)
 }
 
+#[derive(Debug, Clone, Default)]
+struct DomainSanction {
+    level: u8,
+    since_height: u64,
+    notice_at: Option<i64>,
+    appeal_at: Option<i64>,
+    ruling: Option<(Outcome, i64)>,
+}
+
+/// WIST-4 §7 as WIST-3 §7 reads it: level 2 marks a domain's records
+/// reduced-weight, level 3 stops its later Deltas from materializing
+/// from the height it takes effect, level 4 removes its records. A
+/// lapsed T, a lapsed ruling deadline and an "overturned" ruling void
+/// the level-3 and level-4 states, leaving the rungs below in force.
+#[derive(Default)]
+struct SanctionLedger {
+    domains: BTreeMap<String, DomainSanction>,
+    exclusions: BTreeMap<(String, String), u64>,
+}
+
+impl SanctionLedger {
+    fn apply(&mut self, height: u64, sealed_at_s: i64, update: &Value) {
+        let Some(domain) = update["subject"].as_str() else {
+            return;
+        };
+        let entry = self.domains.entry(domain.to_string()).or_default();
+        match update["action"].as_str() {
+            Some("sanction") => {
+                if let Some(level) = update["details"]["level"].as_u64() {
+                    entry.level = level.clamp(0, 4) as u8;
+                    entry.since_height = height;
+                }
+            }
+            Some("sanction_lift") => *entry = DomainSanction::default(),
+            Some("notice") if update["details"]["kind"] == "sanction" => {
+                entry.notice_at = Some(sealed_at_s);
+            }
+            Some("appeal") => entry.appeal_at = Some(sealed_at_s),
+            Some("appeal_ruling") => {
+                let outcome = match update["details"]["outcome"].as_str() {
+                    Some("overturned") => Outcome::Overturned,
+                    Some("upheld") => Outcome::Upheld,
+                    _ => Outcome::Unappealed,
+                };
+                entry.ruling = Some((outcome, sealed_at_s));
+            }
+            _ => {}
+        }
+    }
+
+    fn level_at(&self, domain: &str, now_s: i64) -> (u8, u64) {
+        let Some(state) = self.domains.get(domain) else {
+            return (0, 0);
+        };
+        if state.level >= 3 {
+            if let Some(void_at) =
+                wist_core::sanctions::state_void_at(state.notice_at, state.appeal_at, state.ruling)
+            {
+                if now_s >= void_at {
+                    return (state.level.clamp(1, 2), state.since_height);
+                }
+            }
+        }
+        (state.level, state.since_height)
+    }
+
+    fn excluded(&self, publisher: &str, url: &str, height: u64) -> bool {
+        self.exclusions
+            .get(&(publisher.to_string(), url.to_string()))
+            .is_some_and(|since| height >= *since)
+    }
+}
+
+fn load_sanctions(conn: &Connection) -> Result<SanctionLedger> {
+    conn.execute_batch(crate::store::CREATE_SANCTIONS)?;
+    let mut ledger = SanctionLedger::default();
+    let mut stmt = conn.prepare(
+        "SELECT domain, level, since_height, notice_at, appeal_at, ruling, ruling_at FROM sanctions",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (domain, level, since, notice_at, appeal_at, ruling, ruling_at) in rows {
+        let ruling = match (ruling.as_deref(), ruling_at) {
+            (Some("overturned"), Some(at)) => Some((Outcome::Overturned, at)),
+            (Some("upheld"), Some(at)) => Some((Outcome::Upheld, at)),
+            (Some("unappealed"), Some(at)) => Some((Outcome::Unappealed, at)),
+            _ => None,
+        };
+        ledger.domains.insert(
+            domain,
+            DomainSanction {
+                level: level.clamp(0, 4) as u8,
+                since_height: since.max(0) as u64,
+                notice_at,
+                appeal_at,
+                ruling,
+            },
+        );
+    }
+    let mut stmt = conn.prepare("SELECT publisher, url, since_height FROM exclusions")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (publisher, url, since) in rows {
+        ledger
+            .exclusions
+            .insert((publisher, url), since.max(0) as u64);
+    }
+    Ok(ledger)
+}
+
+fn save_sanctions(conn: &Connection, ledger: &SanctionLedger) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_SANCTIONS)?;
+    for (domain, state) in &ledger.domains {
+        let (ruling, ruling_at) = match state.ruling {
+            Some((Outcome::Overturned, at)) => (Some("overturned"), Some(at)),
+            Some((Outcome::Upheld, at)) => (Some("upheld"), Some(at)),
+            Some((Outcome::Unappealed, at)) => (Some("unappealed"), Some(at)),
+            None => (None, None),
+        };
+        conn.execute(
+            "INSERT INTO sanctions(domain, level, since_height, notice_at, appeal_at, ruling, ruling_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(domain) DO UPDATE SET level = excluded.level, since_height = excluded.since_height, notice_at = excluded.notice_at, appeal_at = excluded.appeal_at, ruling = excluded.ruling, ruling_at = excluded.ruling_at",
+            (
+                domain,
+                state.level as i64,
+                state.since_height as i64,
+                state.notice_at,
+                state.appeal_at,
+                ruling,
+                ruling_at,
+            ),
+        )?;
+    }
+    for ((publisher, url), since) in &ledger.exclusions {
+        conn.execute(
+            "INSERT INTO exclusions(publisher, url, since_height) VALUES (?1, ?2, ?3)
+             ON CONFLICT(publisher, url) DO UPDATE SET since_height = excluded.since_height",
+            (publisher, url, *since as i64),
+        )?;
+    }
+    Ok(())
+}
+
 pub fn apply_events(
     conn: &Connection,
     client: &Client,
@@ -525,7 +699,16 @@ pub fn apply_events(
     }
     conn.execute_batch(crate::store::CREATE_CHAIN_TIPS)?;
     let mut tips = load_chain_tips(conn)?;
+    let mut ledger = load_sanctions(conn)?;
     for event in events {
+        let sealed_at_s = event
+            .sealed_at
+            .parse::<jiff::Timestamp>()
+            .map(|t| t.as_second())
+            .unwrap_or(0);
+        for update in &event.governance {
+            ledger.apply(event.height, sealed_at_s, update);
+        }
         for declaration in &event.declarations {
             history.add_declaration(event.height, &event.sealed_at, declaration)?;
             persist_declaration(conn, event.height, &event.sealed_at, false, declaration)?;
@@ -560,6 +743,21 @@ pub fn apply_events(
             if !verified.materializes {
                 continue;
             }
+            let (level, since_height) = ledger.level_at(&publisher, sealed_at_s);
+            // WIST-3 §7: level 4 removes the domain's records, level 3
+            // stops its later Deltas from materializing at all, and
+            // level 2 marks what does materialize reduced-weight.
+            if level == 4 {
+                conn.execute("DELETE FROM records WHERE publisher = ?1", [&publisher])?;
+                continue;
+            }
+            if level == 3 && event.height >= since_height {
+                continue;
+            }
+            if ledger.excluded(&publisher, &env.delta.url, event.height) {
+                continue;
+            }
+            let weight = if level == 2 { "reduced" } else { "full" };
 
             match env.delta.change_type {
                 ChangeType::New | ChangeType::Update => {
@@ -573,7 +771,7 @@ pub fn apply_events(
 
                     conn.execute(
                         "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang)
-                         VALUES (?1, ?2, ?3, ?4, 'full', ?5, ?6, ?7)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                          ON CONFLICT(url, publisher) DO UPDATE SET
                             delta_id = excluded.delta_id, observed_at = excluded.observed_at,
                             weight = excluded.weight, title = excluded.title,
@@ -583,6 +781,7 @@ pub fn apply_events(
                             &publisher,
                             &id,
                             &env.delta.observed_at,
+                            weight,
                             &title,
                             &abstract_text,
                             &env.delta.meta.lang,
@@ -640,6 +839,7 @@ pub fn apply_events(
         }
     }
     save_chain_tips(conn, &tips)?;
+    save_sanctions(conn, &ledger)?;
     Ok(stats)
 }
 
@@ -1092,6 +1292,8 @@ fn run_cold_start(
     conn.execute_batch(crate::store::CREATE_CHAIN_TIPS)?;
     let mut tips = ChainTips::new();
     let mut adopted_keys: Vec<(String, String, Option<u64>)> = Vec::new();
+    let mut adopted_sanctions: Vec<(String, u64)> = Vec::new();
+    let mut adopted_exclusions: Vec<(String, String, u64)> = Vec::new();
     for entry in &state_env.state.entries {
         match entry {
             StateEntry::Declaration(d) => {
@@ -1105,10 +1307,31 @@ fn run_cold_start(
             StateEntry::AggregatorKey(k) => {
                 adopted_keys.push((k.key_id.clone(), k.public_key.clone(), k.removed_height));
             }
+            StateEntry::SanctionState(state) => {
+                adopted_sanctions.push((state.domain.clone(), state.level));
+            }
+            StateEntry::Exclusion(e) => {
+                adopted_exclusions.push((
+                    e.publisher.clone(),
+                    e.url.clone(),
+                    e.excluded_since_height,
+                ));
+            }
             _ => {}
         }
     }
     save_chain_tips(&conn, &tips)?;
+    let mut ledger = load_sanctions(&conn)?;
+    for (domain, level) in &adopted_sanctions {
+        let entry = ledger.domains.entry(domain.clone()).or_default();
+        entry.level = (*level).clamp(0, 4) as u8;
+    }
+    for (publisher, url, since) in &adopted_exclusions {
+        ledger
+            .exclusions
+            .insert((publisher.clone(), url.clone()), *since);
+    }
+    save_sanctions(&conn, &ledger)?;
 
     let checkpoint_url = resolve(base, "/log/checkpoint.json")?;
     let (_, checkpoint_value) = client.get_json(&checkpoint_url)?;
