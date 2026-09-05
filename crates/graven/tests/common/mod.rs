@@ -212,6 +212,24 @@ pub fn build_block(
     sealed_at: &str,
     wrapped_entries: &[Value],
 ) -> (Value, String) {
+    build_block_as(
+        log,
+        "log1",
+        block_number,
+        prev_block_hash,
+        sealed_at,
+        wrapped_entries,
+    )
+}
+
+pub fn build_block_as(
+    log: &Signer,
+    key_id: &str,
+    block_number: u64,
+    prev_block_hash: &str,
+    sealed_at: &str,
+    wrapped_entries: &[Value],
+) -> (Value, String) {
     let leaves: Vec<[u8; 32]> = wrapped_entries
         .iter()
         .map(|e| merkle::leaf_hash(&jcs::canonicalize(e).unwrap()))
@@ -234,7 +252,7 @@ pub fn build_block(
     let block = serde_json::json!({
         "header": header,
         "entries": wrapped_entries,
-        "sig": {"key_id": "log1", "alg": "Ed25519", "value": sig_value},
+        "sig": {"key_id": key_id, "alg": "Ed25519", "value": sig_value},
     });
     (block, block_hash)
 }
@@ -258,6 +276,17 @@ pub fn write_checkpoint(
     block_hash: &str,
     sealed_at: &str,
 ) {
+    write_checkpoint_as(dir, log, "log1", block_number, block_hash, sealed_at)
+}
+
+pub fn write_checkpoint_as(
+    dir: &Path,
+    log: &Signer,
+    key_id: &str,
+    block_number: u64,
+    block_hash: &str,
+    sealed_at: &str,
+) {
     let checkpoint = Checkpoint {
         wist_version: "1.0.0".into(),
         block_number,
@@ -265,7 +294,7 @@ pub fn write_checkpoint(
         sealed_at: sealed_at.into(),
     };
     let value = serde_json::to_value(&checkpoint).unwrap();
-    let env = sign_envelope(&value, "checkpoint", "log1", &log.sk).unwrap();
+    let env = sign_envelope(&value, "checkpoint", key_id, &log.sk).unwrap();
     let path = dir.join("log/checkpoint.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, serde_json::to_vec(&env).unwrap()).unwrap();

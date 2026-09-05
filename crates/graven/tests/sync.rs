@@ -1773,3 +1773,75 @@ fn incremental_sync_purges_stale_tier1_rows_when_update_payload_fetch_fails() {
         "stale links from the prior successful sync must not survive a failed-fetch update"
     );
 }
+
+#[test]
+fn a_manifest_disagreeing_with_its_index_entry_is_rejected() {
+    let fx = common::build_fixture(true, false);
+    let index_path = fx.dir.path().join("snapshots/index.json");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+    let mut index = doc["index"].clone();
+    index["snapshots"][0]["content_digest"] = format!("sha256:{}", "9".repeat(64)).into();
+    let envelope = wist_core::envelope::sign_envelope(&index, "index", "log1", &fx.log.sk).unwrap();
+    std::fs::write(&index_path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let err = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+        false,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("WIST3-E04"), "{err}");
+}
+
+#[test]
+fn a_log_that_rotates_its_aggregator_key_stays_syncable() {
+    let fx = common::build_fixture(true, false);
+    let next = common::Signer::new([21u8; 32]);
+
+    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
+    let prev_hash = doc["checkpoint"]["block_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let add_number = prev_number + 1;
+    let add = serde_json::json!({
+        "wist_version": "1.0.0",
+        "action": "aggregator_key_add",
+        "subject": "log",
+        "details": {"key_id": "log2", "public_key": next.public_b64u()},
+        "effective_at": "2026-08-09T15:00:00Z",
+    });
+    let envelope = wist_core::envelope::sign_envelope(&add, "update", "log1", &fx.log.sk).unwrap();
+    let wrapped = serde_json::json!({"type": "registry_update", "body": envelope});
+    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + add_number);
+    let (block, hash) =
+        common::build_block(&fx.log, add_number, &prev_hash, &sealed_at, &[wrapped]);
+    common::write_block(fx.dir.path(), add_number, &block);
+    common::write_checkpoint(fx.dir.path(), &fx.log, add_number, &hash, &sealed_at);
+
+    // The next Block is signed by the key the previous one admitted.
+    let after = add_number + 1;
+    let sealed_after = format!("2026-08-09T{:02}:00:00Z", 14 + after);
+    let (block2, hash2) = common::build_block_as(&next, "log2", after, &hash, &sealed_after, &[]);
+    common::write_block(fx.dir.path(), after, &block2);
+    common::write_checkpoint_as(fx.dir.path(), &next, "log2", after, &hash2, &sealed_after);
+
+    let dir = tempfile::tempdir().unwrap();
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.head, after);
+}

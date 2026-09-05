@@ -9,6 +9,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use wist_core::block::{block_hash, verify_block, verify_chain_link, verify_checkpoint_binding};
 use wist_core::chain::ChainTips;
@@ -147,10 +148,153 @@ fn fetch_payload(
     })
 }
 
+/// WIST-3 §3.4: a Block sealed at height N MUST be signed by a key
+/// valid at N — the genesis key, or one a validly-signed
+/// `aggregator_key_add` sealed at a height ≤ N named and no
+/// `aggregator_key_remove` has retired. Removal is permanent, so an
+/// `aggregator_key_add` naming a removed `key_id` is rejected and
+/// restores nothing.
+pub struct AggregatorKeys {
+    valid: BTreeMap<String, PublicKey>,
+    removed: BTreeSet<String>,
+}
+
+impl AggregatorKeys {
+    pub fn admit(&mut self, key_id: &str, public_key: &str, removed: bool) -> Result<()> {
+        if removed {
+            self.valid.remove(key_id);
+            self.removed.insert(key_id.to_string());
+        } else {
+            self.valid
+                .insert(key_id.to_string(), PublicKey::from_b64u(public_key)?);
+        }
+        Ok(())
+    }
+}
+
+impl AggregatorKeys {
+    pub fn genesis(key_id: &str, key: PublicKey) -> Self {
+        let mut valid = BTreeMap::new();
+        valid.insert(key_id.to_string(), key);
+        AggregatorKeys {
+            valid,
+            removed: BTreeSet::new(),
+        }
+    }
+
+    pub fn key(&self, key_id: &str) -> Option<&PublicKey> {
+        self.valid.get(key_id)
+    }
+
+    fn signer_of(&self, envelope: &Value) -> Result<&PublicKey> {
+        let key_id = envelope["sig"]["key_id"]
+            .as_str()
+            .ok_or_else(|| Error::Verify("entry signature names no key_id".into()))?;
+        self.key(key_id).ok_or_else(|| {
+            Error::Verify(format!(
+                "no Aggregator key {key_id} is valid at this height"
+            ))
+        })
+    }
+
+    fn apply(&mut self, update: &Value) -> Result<()> {
+        let action = update["update"]["action"].as_str().unwrap_or_default();
+        let key_id = match update["update"]["details"]["key_id"].as_str() {
+            Some(id) => id.to_string(),
+            None => return Ok(()),
+        };
+        match action {
+            "aggregator_key_add" => {
+                if self.removed.contains(&key_id) {
+                    return Err(Error::Verify(format!(
+                        "aggregator_key_add names the retired key {key_id}"
+                    )));
+                }
+                let public_key = update["update"]["details"]["public_key"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        Error::Verify("aggregator_key_add names no public_key".into())
+                    })?;
+                self.valid.insert(key_id, PublicKey::from_b64u(public_key)?);
+            }
+            "aggregator_key_remove" => {
+                self.valid.remove(&key_id);
+                self.removed.insert(key_id);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// A Checkpoint names a Block, so it is verified under the Aggregator
+/// key set valid at that Block rather than under the genesis key alone.
+fn verify_checkpoint_signature(checkpoint_value: &Value, keys: &AggregatorKeys) -> Result<()> {
+    let key_id = checkpoint_value["sig"]["key_id"]
+        .as_str()
+        .ok_or_else(|| Error::Verify("checkpoint signature names no key_id".into()))?;
+    let key = keys.key(key_id).ok_or_else(|| {
+        Error::Verify(format!(
+            "checkpoint is signed by {key_id}, valid at no height here"
+        ))
+    })?;
+    verify_envelope(checkpoint_value, "checkpoint", key)?;
+    Ok(())
+}
+
+fn load_aggregator_keys(
+    conn: &Connection,
+    genesis_key_id: &str,
+    genesis_key: &PublicKey,
+) -> Result<AggregatorKeys> {
+    conn.execute_batch(crate::store::CREATE_AGGREGATOR_KEYS)?;
+    let mut keys = AggregatorKeys::genesis(genesis_key_id, genesis_key.clone());
+    let mut stmt =
+        conn.prepare("SELECT key_id, public_key, removed FROM aggregator_keys WHERE key_id != ?1")?;
+    let rows = stmt
+        .query_map([genesis_key_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (key_id, public_key, removed) in rows {
+        if removed {
+            keys.valid.remove(&key_id);
+            keys.removed.insert(key_id);
+        } else {
+            keys.valid
+                .insert(key_id, PublicKey::from_b64u(&public_key)?);
+        }
+    }
+    Ok(keys)
+}
+
+fn save_aggregator_keys(conn: &Connection, keys: &AggregatorKeys) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_AGGREGATOR_KEYS)?;
+    for (key_id, key) in &keys.valid {
+        conn.execute(
+            "INSERT INTO aggregator_keys(key_id, public_key, removed) VALUES (?1, ?2, 0)
+             ON CONFLICT(key_id) DO UPDATE SET public_key = excluded.public_key, removed = 0",
+            (key_id, key.to_b64u()),
+        )?;
+    }
+    for key_id in &keys.removed {
+        conn.execute(
+            "INSERT INTO aggregator_keys(key_id, public_key, removed) VALUES (?1, '', 1)
+             ON CONFLICT(key_id) DO UPDATE SET removed = 1",
+            [key_id],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn walk_blocks(
     client: &Client,
     base: &Url,
-    trust_key: &PublicKey,
+    keys: &mut AggregatorKeys,
     start_number: u64,
     end_number: u64,
     start_hash: &str,
@@ -164,7 +308,29 @@ pub fn walk_blocks(
         let decompressed = zstd::decode_all(compressed.as_slice())
             .map_err(|e| Error::Verify(format!("zstd decode of block {n}: {e}")))?;
         let block_value: Value = serde_json::from_slice(&decompressed)?;
-        verify_block(&block_value, trust_key)?;
+        for entry in block_value
+            .get("entries")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.get("type").and_then(Value::as_str) == Some("registry_update"))
+        {
+            let body = entry
+                .get("body")
+                .ok_or_else(|| Error::Verify(format!("block {n}: registry_update missing body")))?;
+            let signer = keys.signer_of(body)?.clone();
+            verify_envelope(body, "update", &signer)?;
+            keys.apply(body)?;
+        }
+        let block_key_id = block_value["sig"]["key_id"]
+            .as_str()
+            .ok_or_else(|| Error::Verify(format!("block {n} signature names no key_id")))?;
+        let block_key = keys.key(block_key_id).ok_or_else(|| {
+            Error::Verify(format!(
+                "block {n} is signed by {block_key_id}, valid at no height here"
+            ))
+        })?;
+        verify_block(&block_value, block_key)?;
         let header = block_value
             .get("header")
             .ok_or_else(|| Error::Verify(format!("block {n} missing header")))?;
@@ -199,7 +365,6 @@ pub fn walk_blocks(
                     let body = entry.get("body").ok_or_else(|| {
                         Error::Verify(format!("block {n}: registry_update entry missing body"))
                     })?;
-                    verify_envelope(body, "update", trust_key)?;
                     if body["update"]["action"] == "payload_withdrawal" {
                         let withdrawn_id = body["update"]["details"]["delta_id"]
                             .as_str()
@@ -233,13 +398,17 @@ pub fn walk_blocks(
     Ok((events, last_block_value))
 }
 
-fn load_anchor(anchor: &str, client: &Client) -> Result<(PublicKey, String)> {
+fn load_anchor(anchor: &str, client: &Client) -> Result<(PublicKey, String, String)> {
     let anchor_bytes = load_anchor_bytes(anchor, client)?;
     let anchor_value: Value = serde_json::from_slice(&anchor_bytes)?;
     let anchor_env: LogAnchorEnvelope = serde_json::from_value(anchor_value.clone())?;
     let trust_key = PublicKey::from_b64u(&anchor_env.anchor.genesis_key.public_key)?;
     verify_envelope(&anchor_value, "anchor", &trust_key)?;
-    Ok((trust_key, anchor_env.anchor.log_id))
+    Ok((
+        trust_key,
+        anchor_env.anchor.log_id,
+        anchor_env.anchor.genesis_key.key_id,
+    ))
 }
 
 fn persist_declaration(
@@ -514,13 +683,21 @@ pub fn run(
 
     let client = Client::new(allow_http);
     let base = crate::fetch::parse_base(log_base)?;
-    let (trust_key, log_id) = load_anchor(anchor, &client)?;
+    let (trust_key, log_id, genesis_key_id) = load_anchor(anchor, &client)?;
     registry::validate_log_id(&log_id)?;
 
     let migrated = migrate_legacy_layout(dir, &log_id)?;
 
     match run_registered(
-        &client, &base, &trust_key, anchor, log_base, dir, &log_id, tier1,
+        &client,
+        &base,
+        &trust_key,
+        &genesis_key_id,
+        anchor,
+        log_base,
+        dir,
+        &log_id,
+        tier1,
     ) {
         Ok(report) => Ok(report),
         Err(err) => {
@@ -550,6 +727,7 @@ fn run_registered(
     client: &Client,
     base: &Url,
     trust_key: &PublicKey,
+    genesis_key_id: &str,
     anchor: &str,
     log_base: &str,
     dir: &Path,
@@ -598,6 +776,7 @@ fn run_registered(
             client,
             base,
             trust_key,
+            genesis_key_id,
             log_id,
             &log_dir,
             &sync_path,
@@ -608,6 +787,7 @@ fn run_registered(
             client,
             base,
             trust_key,
+            genesis_key_id,
             log_id,
             &log_dir,
             &sync_path,
@@ -696,6 +876,7 @@ fn run_incremental(
     client: &Client,
     base: &Url,
     trust_key: &PublicKey,
+    genesis_key_id: &str,
     log_id: &str,
     dir: &Path,
     sync_path: &Path,
@@ -706,7 +887,6 @@ fn run_incremental(
 
     let checkpoint_url = resolve(base, "/log/checkpoint.json")?;
     let (_, checkpoint_value) = client.get_json(&checkpoint_url)?;
-    verify_envelope(&checkpoint_value, "checkpoint", trust_key)?;
     let checkpoint_env: CheckpointEnvelope = serde_json::from_value(checkpoint_value.clone())?;
     let checkpoint = checkpoint_env.checkpoint;
 
@@ -718,6 +898,12 @@ fn run_incremental(
     }
 
     if checkpoint.block_number == local.head_number {
+        let keys = load_aggregator_keys(
+            &Connection::open(dir.join("index.sqlite"))?,
+            genesis_key_id,
+            trust_key,
+        )?;
+        verify_checkpoint_signature(&checkpoint_value, &keys)?;
         if checkpoint.block_hash == local.head_hash {
             return Ok(SyncReport {
                 log_id: log_id.to_string(),
@@ -732,21 +918,24 @@ fn run_incremental(
         )));
     }
 
+    let index_sqlite_path = dir.join("index.sqlite");
+    let conn = Connection::open(&index_sqlite_path)?;
+    let mut aggregator_keys = load_aggregator_keys(&conn, genesis_key_id, trust_key)?;
     let (events, last_block_value) = walk_blocks(
         client,
         base,
-        trust_key,
+        &mut aggregator_keys,
         local.head_number + 1,
         checkpoint.block_number,
         &local.head_hash,
     )?;
+    verify_checkpoint_signature(&checkpoint_value, &aggregator_keys)?;
+    save_aggregator_keys(&conn, &aggregator_keys)?;
     let last_block_value = last_block_value.ok_or_else(|| {
         Error::Verify("continuous sync produced no blocks despite checkpoint advancing".into())
     })?;
     verify_checkpoint_binding(&checkpoint_value, &last_block_value)?;
 
-    let index_sqlite_path = dir.join("index.sqlite");
-    let conn = Connection::open(&index_sqlite_path)?;
     let mut history = load_history(&conn)?;
     let tx = conn.unchecked_transaction()?;
     tx.execute(CREATE_UNIQUE_INDEX, [])?;
@@ -782,6 +971,7 @@ fn run_cold_start(
     client: &Client,
     base: &Url,
     trust_key: &PublicKey,
+    genesis_key_id: &str,
     log_id: &str,
     dir: &Path,
     sync_path: &Path,
@@ -803,6 +993,33 @@ fn run_cold_start(
     verify_envelope(&manifest_value, "manifest", trust_key)?;
     let manifest_env: SnapshotManifestEnvelope = serde_json::from_value(manifest_value)?;
     let manifest = manifest_env.manifest;
+    // WIST-3 §8 step 2: the index entry and the manifest are two
+    // independently signed statements about the same Snapshot, so they
+    // must agree before either is trusted.
+    for (field, from_index, from_manifest) in [
+        (
+            "snapshot_date",
+            &newest.snapshot_date,
+            &manifest.snapshot_date,
+        ),
+        (
+            "content_digest",
+            &newest.content_digest,
+            &manifest.content_digest,
+        ),
+    ] {
+        if from_index != from_manifest {
+            return Err(Error::Verify(format!(
+                "WIST3-E04: snapshot index names {field} {from_index}, its manifest {from_manifest}"
+            )));
+        }
+    }
+    if newest.log_position != manifest.log_position {
+        return Err(Error::Verify(format!(
+            "WIST3-E04: snapshot index names log_position {}, its manifest {}",
+            newest.log_position, manifest.log_position
+        )));
+    }
     let snapshot_base = format!("/snapshots/{}/", manifest.snapshot_date);
 
     let state_url = resolve(base, &format!("{snapshot_base}{}", manifest.state.path))?;
@@ -874,6 +1091,7 @@ fn run_cold_start(
     let mut history = KeyHistory::new();
     conn.execute_batch(crate::store::CREATE_CHAIN_TIPS)?;
     let mut tips = ChainTips::new();
+    let mut adopted_keys: Vec<(String, String, Option<u64>)> = Vec::new();
     for entry in &state_env.state.entries {
         match entry {
             StateEntry::Declaration(d) => {
@@ -884,6 +1102,9 @@ fn run_cold_start(
                 history.open_window(&w.domain, &w.window_end)?;
             }
             StateEntry::Record(r) => tips.adopt(&r.publisher, &r.url, &r.delta_id),
+            StateEntry::AggregatorKey(k) => {
+                adopted_keys.push((k.key_id.clone(), k.public_key.clone(), k.removed_height));
+            }
             _ => {}
         }
     }
@@ -891,7 +1112,6 @@ fn run_cold_start(
 
     let checkpoint_url = resolve(base, "/log/checkpoint.json")?;
     let (_, checkpoint_value) = client.get_json(&checkpoint_url)?;
-    verify_envelope(&checkpoint_value, "checkpoint", trust_key)?;
     let checkpoint_env: CheckpointEnvelope = serde_json::from_value(checkpoint_value.clone())?;
     let checkpoint = checkpoint_env.checkpoint;
 
@@ -901,14 +1121,20 @@ fn run_cold_start(
         ));
     }
 
+    let mut aggregator_keys = load_aggregator_keys(&conn, genesis_key_id, trust_key)?;
+    for (key_id, public_key, removed_height) in &adopted_keys {
+        aggregator_keys.admit(key_id, public_key, removed_height.is_some())?;
+    }
     let (events, last_block_value) = walk_blocks(
         client,
         base,
-        trust_key,
+        &mut aggregator_keys,
         manifest.log_position + 1,
         checkpoint.block_number,
         &manifest.anchor_block_hash,
     )?;
+    verify_checkpoint_signature(&checkpoint_value, &aggregator_keys)?;
+    save_aggregator_keys(&conn, &aggregator_keys)?;
 
     match &last_block_value {
         Some(block_value) => verify_checkpoint_binding(&checkpoint_value, block_value)?,
