@@ -560,23 +560,31 @@ fn continuous_sync_upserts_update_delta_preserving_publisher_port() {
 }
 
 #[test]
-fn delta_signed_by_undeclared_key_fails_sync() {
+fn delta_signed_by_undeclared_key_is_ignored_like_a_fork() {
     let fx = common::build_fixture(true, false);
     common::extend_fixture_with_forged_delta(&fx);
     let dir = tempfile::tempdir().unwrap();
-    let err = graven::sync::run(
+    graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
         &fx.base_url,
         dir.path(),
         true,
         false,
     )
-    .unwrap_err();
-    assert!(err.to_string().contains("publisher verify"));
+    .unwrap();
+    let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
+    assert!(store
+        .get("https://records.example/extra-2")
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get("https://records.example/alpha")
+        .unwrap()
+        .is_some());
 }
 
 #[test]
-fn delta_after_rotation_signed_by_old_key_fails_sync() {
+fn delta_after_rotation_signed_by_old_key_is_ignored_like_a_fork() {
     let fx = common::build_fixture(true, false);
     let old = common::Signer::new([1u8; 32]);
     let new_key = common::Signer::new([2u8; 32]);
@@ -626,15 +634,16 @@ fn delta_after_rotation_signed_by_old_key_fails_sync() {
     common::write_checkpoint(fx.dir.path(), &fx.log, delta_number, &hash2, &sealed_at2);
 
     let dir = tempfile::tempdir().unwrap();
-    let err = graven::sync::run(
+    graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
         &fx.base_url,
         dir.path(),
         true,
         false,
     )
-    .unwrap_err();
-    assert!(err.to_string().contains("publisher verify"));
+    .unwrap();
+    let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
+    assert!(store.get(&url).unwrap().is_none());
 }
 
 #[test]
@@ -932,7 +941,7 @@ fn withdrawal_removes_tier1_and_embedding_rows_when_present() {
 }
 
 #[test]
-fn failed_incremental_leaves_index_unchanged() {
+fn an_ignored_delta_leaves_the_index_unchanged() {
     let fx = common::build_fixture(true, false);
     let dir = tempfile::tempdir().unwrap();
     graven::sync::run(
@@ -948,17 +957,20 @@ fn failed_incremental_leaves_index_unchanged() {
 
     common::extend_fixture_with_forged_delta(&fx);
 
-    let result = graven::sync::run(
+    graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
         &fx.base_url,
         dir.path(),
         true,
         false,
-    );
-    assert!(result.is_err());
+    )
+    .unwrap();
 
     let sync_after = std::fs::read(common::synced_log_dir(dir.path()).join("sync.json")).unwrap();
-    assert_eq!(sync_before, sync_after);
+    assert_ne!(
+        sync_before, sync_after,
+        "the sync advances past a Block whose only Delta is ignored"
+    );
 
     let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
     assert!(store

@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::fetch::{resolve, Client};
-use crate::keyset::{url_authority, KeyHistory};
+use crate::keyset::KeyHistory;
 use crate::registry::{self, LogEntry};
 use crate::store::{table_exists, CREATE_DECLARATIONS, CREATE_TIER1, CREATE_UNIQUE_INDEX};
 use crate::tier1;
@@ -11,6 +11,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use wist_core::block::{block_hash, verify_block, verify_chain_link, verify_checkpoint_binding};
+use wist_core::chain::ChainTips;
 use wist_core::crypto::{hex_encode, PublicKey};
 use wist_core::delta::{content_bytes, verify_commitment};
 use wist_core::envelope::verify_envelope;
@@ -353,6 +354,8 @@ pub fn apply_events(
     if tier1 {
         conn.execute_batch(CREATE_TIER1)?;
     }
+    conn.execute_batch(crate::store::CREATE_CHAIN_TIPS)?;
+    let mut tips = load_chain_tips(conn)?;
     for event in events {
         for declaration in &event.declarations {
             history.add_declaration(event.height, &event.sealed_at, declaration)?;
@@ -367,14 +370,27 @@ pub fn apply_events(
 
         for body in &event.delta_bodies {
             let env: DeltaEnvelope = serde_json::from_value(body.clone())?;
-            let id = history.verify_delta(event.height, body)?;
-            let publisher = Url::parse(&env.delta.url)
-                .ok()
-                .as_ref()
-                .and_then(url_authority)
-                .ok_or_else(|| {
-                    Error::Verify(format!("delta url {}: no authority", env.delta.url))
-                })?;
+            // WIST-3 §3.3: a sealed Delta that fails the Key Set its own
+            // Block resolves is ignored exactly as a fork is — applied to
+            // nothing, moving no chain tip — never a reason to abandon
+            // the sync.
+            let verified = match history.verify_delta(event.height, body) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("ignoring a Delta at height {}: {e}", event.height);
+                    continue;
+                }
+            };
+            let id = verified.id;
+            let publisher = verified.publisher;
+            // WIST-1 §3.5: a Delta whose prev is not the chain tip the
+            // state carries is a fork, and moves nothing.
+            if !tips.apply(&publisher, &env.delta.url, &id, env.delta.prev.as_deref()) {
+                continue;
+            }
+            if !verified.materializes {
+                continue;
+            }
 
             match env.delta.change_type {
                 ChangeType::New | ChangeType::Update => {
@@ -443,11 +459,48 @@ pub fn apply_events(
                 ChangeType::Delete => {
                     remove_by_url(conn, &env.delta.url, &publisher)?;
                 }
-                ChangeType::Attest => {}
+                ChangeType::Attest => {
+                    // WIST-3 §7: an attest refreshes the record's
+                    // observed_at and leaves its anchor Delta in place.
+                    conn.execute(
+                        "UPDATE records SET observed_at = ?3 WHERE url = ?1 AND publisher = ?2",
+                        (&env.delta.url, &publisher, &env.delta.observed_at),
+                    )?;
+                }
             }
         }
     }
+    save_chain_tips(conn, &tips)?;
     Ok(stats)
+}
+
+fn load_chain_tips(conn: &Connection) -> Result<ChainTips> {
+    let mut tips = ChainTips::new();
+    let mut stmt = conn.prepare("SELECT publisher, url, tip FROM chain_tips")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (publisher, url, tip) in rows {
+        tips.adopt(&publisher, &url, &tip);
+    }
+    Ok(tips)
+}
+
+fn save_chain_tips(conn: &Connection, tips: &ChainTips) -> Result<()> {
+    for (publisher, url, tip) in tips.tips() {
+        conn.execute(
+            "INSERT INTO chain_tips(publisher, url, tip) VALUES (?1, ?2, ?3)
+             ON CONFLICT(publisher, url) DO UPDATE SET tip = excluded.tip",
+            (publisher, url, tip),
+        )?;
+    }
+    Ok(())
 }
 
 pub fn run(
@@ -814,13 +867,27 @@ fn run_cold_start(
         }
     }
 
+    // WIST-3 §8 step 10: adopt the state the Snapshot carries. Without
+    // the chain tips, the first Delta continuing a chain the Snapshot
+    // already holds reads as a fork; without the recovery windows, an
+    // in-window rotation by a thief is invisible.
     let mut history = KeyHistory::new();
+    conn.execute_batch(crate::store::CREATE_CHAIN_TIPS)?;
+    let mut tips = ChainTips::new();
     for entry in &state_env.state.entries {
-        if let StateEntry::Declaration(d) = entry {
-            history.add_baseline(d.sealing_height, &d.declaration)?;
-            persist_declaration(&conn, d.sealing_height, "", true, &d.declaration)?;
+        match entry {
+            StateEntry::Declaration(d) => {
+                history.add_baseline(d.sealing_height, &d.declaration)?;
+                persist_declaration(&conn, d.sealing_height, "", true, &d.declaration)?;
+            }
+            StateEntry::RecoveryWindow(w) => {
+                history.open_window(&w.domain, &w.window_end)?;
+            }
+            StateEntry::Record(r) => tips.adopt(&r.publisher, &r.url, &r.delta_id),
+            _ => {}
         }
     }
+    save_chain_tips(&conn, &tips)?;
 
     let checkpoint_url = resolve(base, "/log/checkpoint.json")?;
     let (_, checkpoint_value) = client.get_json(&checkpoint_url)?;

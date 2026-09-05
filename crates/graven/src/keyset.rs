@@ -10,6 +10,16 @@ use wist_core::objects::{DeltaEnvelope, Publisher, PublisherEnvelope, PublisherK
 
 pub const RECOVERY_WINDOW_DAYS: i64 = 7;
 
+/// A sealed Delta that verifies: its ID, the domain of the Publisher
+/// whose key signed it — the record key WIST-3 §7 uses — and whether
+/// §7's one-URL-one-Publisher rule lets it materialize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedDelta {
+    pub id: String,
+    pub publisher: String,
+    pub materializes: bool,
+}
+
 struct DeclRecord {
     seq: u64,
     height: u64,
@@ -98,6 +108,23 @@ impl KeyHistory {
             publisher: env.publisher,
             hash,
         });
+        Ok(())
+    }
+
+    /// WIST-3 §8 step 10: restore an open recovery window a Snapshot
+    /// carries, so a Declaration sealed inside it is superseded at the
+    /// window's end exactly as it would be on a full replay.
+    pub fn open_window(&mut self, domain: &str, window_end: &str) -> Result<()> {
+        let end: jiff::Timestamp = window_end.parse().map_err(|e| {
+            Error::PublisherVerify(format!("{domain}: recovery window end {window_end}: {e}"))
+        })?;
+        if let Some(record) = self
+            .domains
+            .get_mut(domain)
+            .and_then(|entries| entries.iter_mut().rfind(|e| !e.superseded))
+        {
+            record.window_end = Some(end);
+        }
         Ok(())
     }
 
@@ -219,7 +246,10 @@ impl KeyHistory {
             Error::PublisherVerify(format!("{domain}: no declaration at height {height}"))
         })?;
         let mut winner: Option<&DeclRecord> = None;
-        for entry in entries.iter().filter(|e| e.height <= height && !e.superseded) {
+        for entry in entries
+            .iter()
+            .filter(|e| e.height <= height && !e.superseded)
+        {
             winner = Some(entry);
         }
         winner.ok_or_else(|| {
@@ -227,37 +257,60 @@ impl KeyHistory {
         })
     }
 
-    fn resolve_scoped(&self, domain: &str, height: u64) -> Result<&DeclRecord> {
-        if let Ok(record) = self.resolve(domain, height) {
-            return Ok(record);
+    /// WIST-1 §3.2: a URL inside both a subdomain's own authority and a
+    /// scoped parent's has a valid Delta from either Publisher, so the
+    /// signer decides which Key Set applies. WIST-3 §7's
+    /// one-URL-one-Publisher rule then decides which of them
+    /// materializes.
+    fn signing_record(&self, host: &str, height: u64, key_id: &str) -> Result<&DeclRecord> {
+        let mut candidates = Vec::new();
+        if let Ok(record) = self.resolve(host, height) {
+            candidates.push(record);
         }
-        let mut rest = domain;
+        let mut rest = host;
         while let Some((_, parent)) = rest.split_once('.') {
             if let Ok(record) = self.resolve(parent, height) {
                 if record
                     .publisher
                     .subdomain_scope
                     .as_ref()
-                    .is_some_and(|scope| scope.iter().any(|h| h == domain))
+                    .is_some_and(|scope| scope.iter().any(|h| h == host))
                 {
-                    return Ok(record);
+                    candidates.push(record);
                 }
             }
             rest = parent;
         }
-        Err(Error::PublisherVerify(format!(
-            "{domain} height {height}: no declaration for domain or scoped parent"
-        )))
+        candidates
+            .into_iter()
+            .find(|record| key_by_id(&record.publisher.keys, key_id).is_some())
+            .ok_or_else(|| {
+                Error::PublisherVerify(format!(
+                    "{host} height {height}: no declaration whose Key Set holds key_id {key_id}"
+                ))
+            })
     }
 
-    pub fn verify_delta(&self, height: u64, entry_body: &Value) -> Result<String> {
+    /// True once the host's own `seq`-0 Declaration has sealed, from
+    /// which height only that Publisher's Deltas materialize for its
+    /// URLs (WIST-3 §7).
+    pub fn self_declared_at(&self, host: &str, height: u64) -> bool {
+        self.domains.get(host).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e.seq == 0 && e.height <= height && !e.superseded)
+        })
+    }
+
+    pub fn verify_delta(&self, height: u64, entry_body: &Value) -> Result<VerifiedDelta> {
         let env: DeltaEnvelope = serde_json::from_value(entry_body.clone())?;
         let url = Url::parse(&env.delta.url)
             .map_err(|e| Error::PublisherVerify(format!("delta url {}: {e}", env.delta.url)))?;
-        let domain = url_authority(&url).ok_or_else(|| {
+        let host = url_authority(&url).ok_or_else(|| {
             Error::PublisherVerify(format!("delta url {}: no authority", env.delta.url))
         })?;
-        let record = self.resolve_scoped(&domain, height)?;
+        let record = self.signing_record(&host, height, &env.sig.key_id)?;
+        let domain = record.publisher.domain.clone();
         let key = key_by_id(&record.publisher.keys, &env.sig.key_id).ok_or_else(|| {
             Error::PublisherVerify(format!(
                 "{domain} height {height}: unknown key_id {}",
@@ -284,7 +337,11 @@ impl KeyHistory {
                 "{domain} height {height}: observed_at precedes key valid_from"
             )));
         }
-        Ok(delta_id(&entry_body["delta"])?)
+        Ok(VerifiedDelta {
+            id: delta_id(&entry_body["delta"])?,
+            materializes: domain == host || !self.self_declared_at(&host, height),
+            publisher: domain,
+        })
     }
 }
 
@@ -398,8 +455,9 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        let id = kh.verify_delta(1, &delta).unwrap();
-        assert!(id.starts_with("sha256:"));
+        let verified = kh.verify_delta(1, &delta).unwrap();
+        assert!(verified.id.starts_with("sha256:"));
+        assert!(verified.materializes);
     }
 
     #[test]
