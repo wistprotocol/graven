@@ -257,40 +257,6 @@ impl KeyHistory {
         })
     }
 
-    /// WIST-1 §3.2: a URL inside both a subdomain's own authority and a
-    /// scoped parent's has a valid Delta from either Publisher, so the
-    /// signer decides which Key Set applies. WIST-3 §7's
-    /// one-URL-one-Publisher rule then decides which of them
-    /// materializes.
-    fn signing_record(&self, host: &str, height: u64, key_id: &str) -> Result<&DeclRecord> {
-        let mut candidates = Vec::new();
-        if let Ok(record) = self.resolve(host, height) {
-            candidates.push(record);
-        }
-        let mut rest = host;
-        while let Some((_, parent)) = rest.split_once('.') {
-            if let Ok(record) = self.resolve(parent, height) {
-                if record
-                    .publisher
-                    .subdomain_scope
-                    .as_ref()
-                    .is_some_and(|scope| scope.iter().any(|h| h == host))
-                {
-                    candidates.push(record);
-                }
-            }
-            rest = parent;
-        }
-        candidates
-            .into_iter()
-            .find(|record| key_by_id(&record.publisher.keys, key_id).is_some())
-            .ok_or_else(|| {
-                Error::PublisherVerify(format!(
-                    "{host} height {height}: no declaration whose Key Set holds key_id {key_id}"
-                ))
-            })
-    }
-
     /// True once the host's own `seq`-0 Declaration has sealed, from
     /// which height only that Publisher's Deltas materialize for its
     /// URLs (WIST-3 §7).
@@ -303,14 +269,26 @@ impl KeyHistory {
     }
 
     pub fn verify_delta(&self, height: u64, entry_body: &Value) -> Result<VerifiedDelta> {
+        let domain = wist_core::delta::publisher(&entry_body["delta"])?;
         let env: DeltaEnvelope = serde_json::from_value(entry_body.clone())?;
         let url = Url::parse(&env.delta.url)
             .map_err(|e| Error::PublisherVerify(format!("delta url {}: {e}", env.delta.url)))?;
         let host = url_authority(&url).ok_or_else(|| {
             Error::PublisherVerify(format!("delta url {}: no authority", env.delta.url))
         })?;
-        let record = self.signing_record(&host, height, &env.sig.key_id)?;
-        let domain = record.publisher.domain.clone();
+        let record = self.resolve(domain, height)?;
+        if host != domain
+            && !record
+                .publisher
+                .subdomain_scope
+                .as_ref()
+                .is_some_and(|scope| scope.contains(&host))
+        {
+            return Err(Error::PublisherVerify(format!(
+                "WIST1-E03: {host} outside signed Publisher {domain} scope"
+            )));
+        }
+        let domain = domain.to_string();
         let key = key_by_id(&record.publisher.keys, &env.sig.key_id).ok_or_else(|| {
             Error::PublisherVerify(format!(
                 "{domain} height {height}: unknown key_id {}",
@@ -427,6 +405,7 @@ mod tests {
     fn delta_env(signer: &Signer, key_id: &str, url: &str, observed_at: &str) -> Value {
         let delta = serde_json::json!({
             "wist_version": "1.0.0",
+            "publisher": "records.example",
             "url": url,
             "change_type": "new",
             "observed_at": observed_at,
@@ -1142,5 +1121,49 @@ mod tests {
         );
         let err = kh.verify_delta(1, &delta).unwrap_err();
         assert!(err.to_string().contains("sub.records.example"), "{err}");
+    }
+    #[test]
+    fn signed_publisher_attribution_vectors_select_only_the_named_author() {
+        let root = std::env::var_os("WIST_SPEC_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
+            });
+        let vector: Value = serde_json::from_slice(
+            &std::fs::read(root.join("vectors/wist1/delta-attribution.json")).unwrap(),
+        )
+        .unwrap();
+        for case in vector["cases"].as_array().unwrap() {
+            if case.get("feed_domain").is_some() {
+                continue;
+            }
+            for reverse in [false, true] {
+                let mut declarations = case["declarations"].as_array().unwrap().clone();
+                if reverse {
+                    declarations.reverse();
+                }
+                let mut history = KeyHistory::new();
+                for declaration in declarations {
+                    history
+                        .add_declaration(0, "2026-08-01T00:00:00Z", &declaration)
+                        .unwrap();
+                }
+                for (index, envelope) in case["envelopes"].as_array().unwrap().iter().enumerate() {
+                    let original = envelope.clone();
+                    let actual = history.verify_delta(1, envelope);
+                    assert_eq!(
+                        actual.is_ok(),
+                        case["expected"][index] == "accepted",
+                        "{}: {actual:?}",
+                        case["name"]
+                    );
+                    if let Ok(verified) = actual {
+                        assert_eq!(verified.publisher, envelope["delta"]["publisher"]);
+                        assert_eq!(verified.id, case["delta_ids"][index]);
+                    }
+                    assert_eq!(*envelope, original);
+                }
+            }
+        }
     }
 }

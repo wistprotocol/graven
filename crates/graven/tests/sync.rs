@@ -402,13 +402,13 @@ fn cold_sync_refuses_when_sync_json_already_exists() {
 }
 
 #[test]
-fn continuous_sync_upserts_update_delta_preserving_publisher_port() {
+fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
     let dir = tempfile::tempdir().unwrap();
     let log = common::Signer::new([9u8; 32]);
     let publisher = common::Signer::new([1u8; 32]);
-    let domain = "records.example:8443".to_string();
+    let domain = "records.example".to_string();
     let snapshot_date = "2026-08-09".to_string();
-    let url = "https://records.example:8443/alpha".to_string();
+    let url = "https://records.example/alpha".to_string();
 
     common::write_anchor(&dir.path().join("anchor.json"), &log, "graven-test-log");
 
@@ -1942,4 +1942,73 @@ fn a_level_four_sanction_removes_the_domains_records() {
         )
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[test]
+fn malformed_signed_publisher_does_not_abort_sync_or_advance_a_chain() {
+    for field in [
+        None,
+        Some(serde_json::json!("RECORDS.EXAMPLE")),
+        Some(serde_json::Value::Null),
+    ] {
+        let fx = common::build_fixture(true, false);
+        let checkpoint: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fx.dir.path().join("log/checkpoint.json")).unwrap(),
+        )
+        .unwrap();
+        let height = checkpoint["checkpoint"]["block_number"].as_u64().unwrap() + 1;
+        let previous = checkpoint["checkpoint"]["block_hash"].as_str().unwrap();
+        let signer = common::Signer::new([1u8; 32]);
+        let (_, envelope, _) = common::build_delta(
+            &signer,
+            "pk1",
+            "https://records.example/malformed",
+            "Malformed",
+            None,
+            "body",
+            None,
+        );
+        let mut inner = envelope["delta"].clone();
+        match field {
+            Some(value) => inner["publisher"] = value,
+            None => {
+                inner.as_object_mut().unwrap().remove("publisher");
+            }
+        }
+        let signed =
+            wist_core::envelope::sign_envelope(&inner, "delta", "pk1", &signer.sk).unwrap();
+        let wrapped = serde_json::json!({"type":"publisher_delta", "body":signed});
+        let at = "2026-08-09T18:00:00Z";
+        let (block, hash) = common::build_block(&fx.log, height, previous, at, &[wrapped]);
+        common::write_block(fx.dir.path(), height, &block);
+        common::write_checkpoint(fx.dir.path(), &fx.log, height, &hash, at);
+        let target = tempfile::tempdir().unwrap();
+        graven::sync::run(
+            fx.anchor_path().to_str().unwrap(),
+            &fx.base_url,
+            target.path(),
+            true,
+            false,
+        )
+        .unwrap();
+        let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
+        assert!(store
+            .get("https://records.example/malformed")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get("https://records.example/alpha")
+            .unwrap()
+            .is_some());
+        let conn =
+            Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chain_tips WHERE url = ?1",
+                ["https://records.example/malformed"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 }

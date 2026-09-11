@@ -181,6 +181,7 @@ pub fn build_delta_with_links(
     let bytes = wist_core::delta::content_bytes(&content).unwrap();
     let mut delta = serde_json::json!({
         "wist_version": "1.0.0",
+        "publisher": reqwest::Url::parse(url).unwrap().host_str().unwrap(),
         "url": url,
         "change_type": if prev.is_some() { "update" } else { "new" },
         "observed_at": "2026-08-09T12:00:00Z",
@@ -659,6 +660,7 @@ pub fn build_delete_delta(
 ) -> (String, Value) {
     let delta = serde_json::json!({
         "wist_version": "1.0.0",
+        "publisher": reqwest::Url::parse(url).unwrap().host_str().unwrap(),
         "url": url,
         "change_type": "delete",
         "observed_at": "2026-08-09T15:00:00Z",

@@ -1,5 +1,9 @@
 # graven
 
+The signed Delta format targets [WIST specification revision `b96e21fe97b591075c369db17346df81292a8158`](https://github.com/wistprotocol/spec/tree/b96e21fe97b591075c369db17346df81292a8158). Object version `1.0.0` alone does not identify a compatible draft.
+
+Delta verification selects Declaration history only for the canonical signed `publisher`, then checks its literal URL scope and signature. Shared keys and reused identifiers in other domains cannot change authorship. Malformed or unauthorized Deltas are ignored without advancing their chains. Full recovery replay and materialization preference among overlapping scoped Publishers remain separate validation requirements.
+
 WIST Protocol consumer and MCP server. Graven cold-syncs a verified snapshot
 from an aggregator's log (checking the chain, checkpoint signature, and
 every Merkle proof before trusting a byte of it), then follows the block

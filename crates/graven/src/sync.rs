@@ -721,7 +721,6 @@ pub fn apply_events(
         }
 
         for body in &event.delta_bodies {
-            let env: DeltaEnvelope = serde_json::from_value(body.clone())?;
             // WIST-3 §3.3: a sealed Delta that fails the Key Set its own
             // Block resolves is ignored exactly as a fork is — applied to
             // nothing, moving no chain tip — never a reason to abandon
@@ -733,6 +732,7 @@ pub fn apply_events(
                     continue;
                 }
             };
+            let env: DeltaEnvelope = serde_json::from_value(body.clone())?;
             let id = verified.id;
             let publisher = verified.publisher;
             // WIST-1 §3.5: a Delta whose prev is not the chain tip the
