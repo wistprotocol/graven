@@ -119,7 +119,12 @@ fn poll_until<T>(timeout: Duration, interval: Duration, mut f: impl FnMut() -> O
     }
 }
 
-fn spawn_clave_serve(bin: &Path, data: &Path, bind_addr: &str) -> (ChildGuard, String) {
+fn spawn_clave_serve(
+    bin: &Path,
+    data: &Path,
+    bind_addr: &str,
+    proxy: &str,
+) -> (ChildGuard, String) {
     let data_str = data.to_str().expect("non-utf8 path").to_string();
     let mut child = Command::new(bin)
         .args([
@@ -130,6 +135,10 @@ fn spawn_clave_serve(bin: &Path, data: &Path, bind_addr: &str) -> (ChildGuard, S
             bind_addr,
             "--allow-http",
         ])
+        .env("HTTP_PROXY", proxy)
+        .env("http_proxy", proxy)
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -198,6 +207,7 @@ fn serve_one_request(mut stream: TcpStream, dir: &Path) {
             break;
         }
     }
+    let path = path.strip_prefix("http://localhost").unwrap_or(&path);
     let rel = path
         .split('?')
         .next()
@@ -452,7 +462,9 @@ fn end_to_end() {
 
     let tmp = tempfile::tempdir().expect("create tempdir");
     let site = stage_fixture_site(tmp.path());
-    let site_host = serve_static(site.clone());
+    let site_addr = serve_static(site.clone());
+    let site_proxy = format!("http://{site_addr}");
+    let site_host = "localhost".to_string();
     rewrite_sitemap_host(&site, &site_host);
 
     let spake_state = tmp.path().join("spake-state");
@@ -472,7 +484,8 @@ fn end_to_end() {
             "1",
         ],
     );
-    let (_clave_child, clave_bound_addr) = spawn_clave_serve(&clave, &clave_data, &clave_host);
+    let (_clave_child, clave_bound_addr) =
+        spawn_clave_serve(&clave, &clave_data, &clave_host, &site_proxy);
     assert_eq!(
         clave_bound_addr, clave_host,
         "clave serve bound a different address than the pre-picked --log-id"
@@ -493,7 +506,8 @@ fn end_to_end() {
             "1",
         ],
     );
-    let (_clave2_child, clave2_bound_addr) = spawn_clave_serve(&clave, &clave2_data, &clave2_host);
+    let (_clave2_child, clave2_bound_addr) =
+        spawn_clave_serve(&clave, &clave2_data, &clave2_host, &site_proxy);
     assert_eq!(
         clave2_bound_addr, clave2_host,
         "clave serve bound a different address than the pre-picked --log-id"
