@@ -2,20 +2,11 @@
 
 The signed Delta format targets [WIST specification revision `b96e21fe97b591075c369db17346df81292a8158`](https://github.com/wistprotocol/spec/tree/b96e21fe97b591075c369db17346df81292a8158). Object version `1.0.0` alone does not identify a compatible draft.
 
-Delta verification selects Declaration history only for the canonical signed `publisher`, then checks its literal URL scope and signature. Shared keys and reused identifiers in other domains cannot change authorship. Malformed or unauthorized Deltas are ignored without advancing their chains. Full recovery replay and materialization preference among overlapping scoped Publishers remain separate validation requirements.
-
-WIST Protocol consumer and MCP server. Graven cold-syncs a verified snapshot
-from an aggregator's log (checking the chain, checkpoint signature, and
-every Merkle proof before trusting a byte of it), then follows the block
-stream to stay current, applying each new delta to a local SQLite index —
-one per log, so a consumer can follow any number of aggregators without
-their state leaking into each other (WIST-3 §8, "Following more than one
-Log"). Every delta is also checked against its own publisher's declared
-key history (WIST-1 §5.2) independently of the aggregator's chain, so a
-misbehaving aggregator cannot forge attribution even though its chain
-verifies cleanly. A `serve` command exposes the merged index to an LLM
-agent over MCP — every returned record carries the provenance an agent
-needs to judge trust for itself, never a bare claim.
+WIST Protocol consumer and MCP server. Graven cold-syncs a verified Snapshot,
+then applies incremental Blocks to a separate SQLite index per Log (WIST-3 §8).
+`serve` exposes the merged index with per-record provenance to an LLM agent
+over MCP. Verification checks and limits are listed
+[below](#what-sync-verifies).
 
 Subcommands: `follow --anchor <url|path> --log <base-url> --dir <dir>`
 (register the log in `<dir>/logs.json` if new, cold-sync if never synced,
@@ -55,7 +46,12 @@ rolls the migration back.
 Per-delta, independently of the above (WIST-1 §5.2): each delta's
 `sig.key_id` must resolve to a key in its publisher's key set as of the
 sealing height; that key's `valid_from` must not be after the delta's
-`observed_at`; and the chain of Publisher Declarations that produced that
+`observed_at`. Verification selects history by the canonical signed
+`publisher` and checks its literal URL scope; shared keys and reused
+identifiers in other domains cannot change authorship. Malformed or
+unauthorized Deltas are ignored without advancing their chains.
+
+The chain of Publisher Declarations that produced that
 key set must itself be well-formed — `seq` and `prev_declaration` strictly
 monotonic and hash-linked, an ordinary rotation (signed by the prior key
 set) carrying `recovery_keys` byte-identical to its predecessor's (or
@@ -63,10 +59,9 @@ introducing them for the first time), and a declaration signed by a
 `recovery_keys` entry opening a 7-day recovery window that takes
 precedence over any ordinary declaration sealed inside it. A declaration
 under keys the history doesn't recognize is still accepted as a fresh
-identity, but yields to a still-open recovery window. Any failure —
-unknown `key_id`, a not-yet-valid key, a broken declaration chain, a
-signature verifying under none of the previous/recovery/own key sets —
-fails the whole sync, not just that delta.
+identity, but yields to a still-open recovery window. An invalid Declaration
+fails the sync. Full recovery replay and materialization preference among
+overlapping scoped Publishers remain separate validation requirements.
 
 ## Companion packs
 
@@ -160,9 +155,4 @@ logbook & distribution (sync, snapshots, proofs).
 
 `.github/workflows/ci.yml` checks out `core`, `spec`, `spake`, and `clave`
 from `wistprotocol/*` (sibling clones).
-`release.yml` (`cargo-dist`, triggered on a `v<version>` tag) builds the
-six target archives and checksums and publishes a GitHub release; each of
-its jobs also clones `wistprotocol/core` as a sibling checkout, since
-`dist` needs the workspace's `wist-core` path dependency to resolve. See
-`npm/README.md` for the full maintainer release flow, including the
-manual (never-CI) `npm publish` step.
+Release and workflow-regeneration procedures: [RELEASING.md](RELEASING.md).
