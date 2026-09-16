@@ -1,4 +1,5 @@
 use super::history::{AggregatorKeys, ChainState, DomainSanction, SanctionLedger};
+use super::SyncState;
 use crate::error::{Error, Result};
 use crate::keyset::KeyHistory;
 use rusqlite::{Connection, OptionalExtension};
@@ -235,5 +236,35 @@ pub(super) fn save_chain_tips(conn: &Connection, tips: &ChainTips) -> Result<()>
             (publisher, url, tip),
         )?;
     }
+    Ok(())
+}
+
+/// The sync cursor and verification state, committed in the same
+/// transaction as the index rows it describes.
+pub const CREATE_SYNC_STATE: &str = "CREATE TABLE IF NOT EXISTS sync_state(id INTEGER PRIMARY KEY CHECK(id = 1), state TEXT NOT NULL)";
+
+pub fn load_sync_state(conn: &Connection) -> Result<Option<SyncState>> {
+    if !crate::store::table_exists(conn, "sync_state")? {
+        return Ok(None);
+    }
+    let state: Option<String> = conn
+        .query_row("SELECT state FROM sync_state WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    state
+        .map(|state| {
+            wist_core::json::validate(state.as_bytes())?;
+            Ok(serde_json::from_str(&state)?)
+        })
+        .transpose()
+}
+
+pub fn save_sync_state(conn: &Connection, state: &SyncState) -> Result<()> {
+    conn.execute_batch(CREATE_SYNC_STATE)?;
+    conn.execute(
+        "INSERT INTO sync_state(id, state) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET state = excluded.state",
+        [serde_json::to_string(state)?],
+    )?;
     Ok(())
 }

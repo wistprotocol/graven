@@ -6,6 +6,7 @@ use history::*;
 pub use history::{AggregatorKeys, ApplyStats, BlockEvent, ChainState};
 use install::*;
 use persist::*;
+pub use persist::{load_sync_state, save_sync_state, CREATE_SYNC_STATE};
 
 use crate::error::{Error, Result};
 
@@ -152,8 +153,26 @@ fn run_registered(
     let log_dir = registry::log_dir(dir, log_id);
     std::fs::create_dir_all(&log_dir)?;
     let sync_path = log_dir.join("sync.json");
+    let index_path = log_dir.join("index.sqlite");
 
-    if sync_path.exists() {
+    let mut synced =
+        index_path.exists() && load_sync_state(&Connection::open(&index_path)?)?.is_some();
+    if !synced && sync_path.exists() {
+        let sync_bytes = std::fs::read(&sync_path)?;
+        wist_core::json::validate(&sync_bytes)?;
+        let legacy: SyncState = serde_json::from_slice(&sync_bytes)?;
+        if !index_path.exists() {
+            return Err(Error::Verify(format!(
+                "{} records a sync but {} is missing; remove the record to start over",
+                sync_path.display(),
+                index_path.display()
+            )));
+        }
+        save_sync_state(&Connection::open(&index_path)?, &legacy)?;
+        synced = true;
+    }
+
+    if synced {
         run_incremental(
             client,
             base,
@@ -189,9 +208,10 @@ fn run_incremental(
     sync_path: &Path,
     tier1: bool,
 ) -> Result<SyncReport> {
-    let sync_bytes = std::fs::read(sync_path)?;
-    wist_core::json::validate(&sync_bytes)?;
-    let local: SyncState = serde_json::from_slice(&sync_bytes)?;
+    let index_sqlite_path = dir.join("index.sqlite");
+    let conn = Connection::open(&index_sqlite_path)?;
+    let local = load_sync_state(&conn)?
+        .ok_or_else(|| Error::Verify("the index carries no sync state".into()))?;
 
     let checkpoint_url = resolve(base, "/log/checkpoint.json")?;
     let (_, checkpoint_value) = client.get_json(&checkpoint_url)?;
@@ -206,11 +226,7 @@ fn run_incremental(
     }
 
     if checkpoint.block_number == local.head_number {
-        let keys = load_aggregator_keys(
-            &Connection::open(dir.join("index.sqlite"))?,
-            genesis_key_id,
-            trust_key,
-        )?;
+        let keys = load_aggregator_keys(&conn, genesis_key_id, trust_key)?;
         verify_checkpoint_signature(&checkpoint_value, &keys)?;
         if checkpoint.block_hash == local.head_hash {
             return Ok(SyncReport {
@@ -226,8 +242,6 @@ fn run_incremental(
         )));
     }
 
-    let index_sqlite_path = dir.join("index.sqlite");
-    let conn = Connection::open(&index_sqlite_path)?;
     let mut aggregator_keys = load_aggregator_keys(&conn, genesis_key_id, trust_key)?;
     let mut chain = ChainState::restore(&local, load_parameters(&conn)?);
     let (events, last_block_value) = walk_blocks(
@@ -239,9 +253,7 @@ fn run_incremental(
         checkpoint.block_number,
         &local.head_hash,
     )?;
-    save_parameters(&conn, &chain)?;
     verify_checkpoint_signature(&checkpoint_value, &aggregator_keys)?;
-    save_aggregator_keys(&conn, &aggregator_keys)?;
     let last_block_value = last_block_value.ok_or_else(|| {
         Error::Verify("continuous sync produced no blocks despite checkpoint advancing".into())
     })?;
@@ -250,6 +262,8 @@ fn run_incremental(
     let mut history = load_history(&conn)?;
     let mut replay = load_replay(&conn)?;
     let tx = conn.unchecked_transaction()?;
+    save_parameters(&tx, &chain)?;
+    save_aggregator_keys(&tx, &aggregator_keys)?;
     tx.execute(CREATE_UNIQUE_INDEX, [])?;
     tx.execute(CREATE_DECLARATIONS, [])?;
     let stats = apply_events(&tx, client, base, &mut history, &mut replay, &events, tier1)?;
@@ -260,8 +274,6 @@ fn run_incremental(
             [],
         )?;
     }
-    tx.commit()?;
-
     let sync_state = SyncState {
         log_position: local.log_position,
         head_number: checkpoint.block_number,
@@ -271,7 +283,9 @@ fn run_incremental(
         prior_sealed_at_s: chain.prior_at(),
         largest_block_bytes: chain.largest(),
     };
-    std::fs::write(sync_path, serde_json::to_vec(&sync_state)?)?;
+    save_sync_state(&tx, &sync_state)?;
+    tx.commit()?;
+    mirror_sync_state(sync_path, &sync_state);
 
     Ok(SyncReport {
         log_id: log_id.to_string(),
@@ -349,18 +363,18 @@ fn run_cold_start(
             [],
         )?;
     }
-    let committed = installed.commit(dir)?;
-
     let sync_state = SyncState {
-        log_position: committed.log_position,
+        log_position: installed.log_position,
         head_number: checkpoint.block_number,
         head_hash: checkpoint.block_hash.clone(),
-        content_digest: Some(committed.content_digest),
-        schedule_first_s: committed.chain.schedule_first_s(),
-        prior_sealed_at_s: committed.chain.prior_at(),
-        largest_block_bytes: committed.chain.largest(),
+        content_digest: Some(installed.content_digest.clone()),
+        schedule_first_s: installed.chain.schedule_first_s(),
+        prior_sealed_at_s: installed.chain.prior_at(),
+        largest_block_bytes: installed.chain.largest(),
     };
-    std::fs::write(sync_path, serde_json::to_vec(&sync_state)?)?;
+    save_sync_state(&installed.conn, &sync_state)?;
+    installed.commit(dir)?;
+    mirror_sync_state(sync_path, &sync_state);
 
     Ok(SyncReport {
         log_id: log_id.to_string(),
@@ -368,4 +382,13 @@ fn run_cold_start(
         head: checkpoint.block_number,
         withdrawn: stats.withdrawn,
     })
+}
+
+/// Writes the committed sync state next to the index for readers of the
+/// file; the index row is authoritative, so a failure here changes
+/// nothing a later sync relies on.
+fn mirror_sync_state(sync_path: &Path, state: &SyncState) {
+    if let Ok(bytes) = serde_json::to_vec(state) {
+        let _ = std::fs::write(sync_path, bytes);
+    }
 }

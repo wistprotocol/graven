@@ -24,11 +24,21 @@ companion pack against one already-synced log).
 `<dir>/logs.json` is the log registry: one entry per followed log
 (`log_id`, `anchor`, `base`, sticky `tier1`). Each log gets its own
 `<dir>/logs/<sanitized-log-id>/` holding `index.sqlite` (records, and,
-where `--tier1` is on, `extracts`/`links`/FTS tables) and `sync.json`
-(`log_position`, head block number/hash, `content_digest`). Publisher
-declarations seen while syncing are persisted in `index.sqlite` too, so an
-incremental sync reloads the key history without re-walking the chain from
-genesis. A log id that would escape its directory is rejected before
+where `--tier1` is on, `extracts`/`links`/FTS tables) whose `sync_state`
+row is the sync cursor (`log_position`, head block number/hash,
+`content_digest`, the schedule position); `sync.json` beside it mirrors
+that row for readers of the file and is rewritten after each commit.
+Publisher declarations, chain tips, Aggregator keys, parameters and the
+replay engines' state are persisted in `index.sqlite` too, so an
+incremental sync reloads them without re-walking the chain from genesis.
+Every incremental sync commits the cursor, keys, parameters and index
+rows in one transaction, so a sync that cannot commit leaves all of them
+at the previous head; a cold start builds the whole index, cursor
+included, in `index.sqlite.verifying` and renames it into place with the
+directory synced, so a crash leaves either no store or a complete one,
+and a stale verifying file is replaced by the next cold start. A store
+that predates the row is read from its `sync.json` and imported on its
+next sync. A log id that would escape its directory is rejected before
 anything is written. A directory in the earlier single-log layout
 (top-level `index.sqlite`/`sync.json`, no `logs.json`) is migrated into
 this layout automatically on the next `sync`/`follow`, and rolled back
@@ -56,7 +66,7 @@ Log-signed `parameter_change` acts replay through core's accepted-schedule
 rules (WIST-4 §9, ADR-0020): rejected amendments are ignored, an amendment
 cannot cut the cap below a Block already sealed, and a Block above the cap
 in force at its instant fails the sync. The accepted schedule, the largest
-Block seen and the previous instant persist in `sync.json` and the
+Block seen and the previous instant persist in the sync cursor and the
 `parameters` table; a cold start seeds the schedule from the Snapshot's
 `parameter` tuples, so pending amendments survive. Any mismatch fails the
 sync closed and, on an already-migrated directory, rolls the migration back.
@@ -129,7 +139,7 @@ explicitly with `--key`: trust in a pack is trust in its publisher, the
 protocol makes no claim about vector correctness). `pack` fields:
 `wist_version`; `content_digest` and `log_position`, binding the pack to
 one exact synced snapshot of one log (WIST-3 §7) — `pack import` rejects a
-mismatch with the local `sync.json`; `model` (`name`, `version`,
+mismatch with the local sync cursor; `model` (`name`, `version`,
 `weights_hash`, `dim`, `quantization`, `metric` — one of
 `cosine`/`dot`/`euclidean` — `source`); `vectors` (`path`, `sha256`,
 `bytes`, `count`) describing a zstd-compressed JSONL file alongside the

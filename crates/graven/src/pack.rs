@@ -1,7 +1,6 @@
 use crate::error::{Error, Result};
 use crate::registry;
 use crate::store::CREATE_EMBEDDINGS;
-use crate::sync::SyncState;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -126,10 +125,7 @@ pub fn import(dir: &Path, log_id: &str, pack_path: &Path, key_b64u: &str) -> Res
     validate_metric(&pack.model.metric)?;
 
     let log_dir = resolve_log_dir(dir, log_id)?;
-    let sync_path = log_dir.join("sync.json");
-    let sync_bytes = std::fs::read(&sync_path).map_err(|_| Error::NotSynced(log_dir.clone()))?;
-    wist_core::json::validate(&sync_bytes)?;
-    let sync_state: SyncState = serde_json::from_slice(&sync_bytes)?;
+    let sync_state = crate::store::synced_state(&log_dir)?;
 
     if pack.log_position != sync_state.log_position
         || Some(pack.content_digest.clone()) != sync_state.content_digest

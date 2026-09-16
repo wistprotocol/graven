@@ -2667,3 +2667,162 @@ fn roster_and_canary_acts_replay_through_the_shared_engines_and_persist_between_
         vec![("w1".to_string(), 2, Some(3)), ("w2".to_string(), 3, None)]
     );
 }
+
+fn synced_state(target: &std::path::Path) -> graven::sync::SyncState {
+    graven::store::synced_state(&common::synced_log_dir(target)).unwrap()
+}
+
+fn count(conn: &Connection, table: &str) -> i64 {
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn a_sync_that_cannot_commit_leaves_cursor_keys_and_index_unchanged() {
+    let fx = common::build_fixture(true, false);
+    let dir = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    let index = common::synced_log_dir(dir.path()).join("index.sqlite");
+    let before = synced_state(dir.path());
+    assert_eq!(before.head_number, 1);
+    let snapshot = |conn: &Connection| {
+        (
+            count(conn, "records"),
+            count(conn, "aggregator_keys"),
+            count(conn, "parameters"),
+            count(conn, "declarations"),
+        )
+    };
+    let counts_before = snapshot(&Connection::open(&index).unwrap());
+
+    let new_url = common::extend_fixture(&fx);
+    let holder = Connection::open(&index).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let failed = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+        false,
+    );
+    assert!(
+        failed.is_err(),
+        "the index was locked against the sync's commit"
+    );
+    holder.execute_batch("ROLLBACK").unwrap();
+    drop(holder);
+
+    let after = synced_state(dir.path());
+    assert_eq!(after.head_number, 1);
+    assert_eq!(after.head_hash, before.head_hash);
+    let conn = Connection::open(&index).unwrap();
+    assert_eq!(snapshot(&conn), counts_before);
+    let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
+    assert!(store.get(&new_url).unwrap().is_none());
+    drop(store);
+    drop(conn);
+
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.head, 2);
+    assert_eq!(synced_state(dir.path()).head_number, 2);
+    let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
+    assert!(store.get(&new_url).unwrap().is_some());
+}
+
+#[test]
+fn the_sync_cursor_lives_in_the_index_not_the_mirror_file() {
+    let fx = common::build_fixture(true, false);
+    let dir = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    let log_dir = common::synced_log_dir(dir.path());
+    std::fs::remove_file(log_dir.join("sync.json")).unwrap();
+    common::extend_fixture(&fx);
+
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.log_position_before, Some(1));
+    assert_eq!(report.head, 2);
+    let mirrored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(log_dir.join("sync.json")).unwrap()).unwrap();
+    assert_eq!(mirrored["head_number"], 2);
+    assert_eq!(synced_state(dir.path()).head_number, 2);
+}
+
+#[test]
+fn a_store_carrying_only_the_sync_file_is_read_and_imported() {
+    let fx = common::build_fixture(true, false);
+    let dir = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    let log_dir = common::synced_log_dir(dir.path());
+    let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+    conn.execute_batch("DROP TABLE sync_state").unwrap();
+    drop(conn);
+    assert_eq!(synced_state(dir.path()).head_number, 1);
+    common::extend_fixture(&fx);
+
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        dir.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.log_position_before, Some(1));
+    assert_eq!(report.head, 2);
+}
+
+#[test]
+fn a_cold_start_replaces_the_verifying_index_a_crash_left_behind() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+    let log_dir = common::synced_log_dir(target.path());
+    std::fs::create_dir_all(&log_dir).unwrap();
+    std::fs::write(log_dir.join("index.sqlite.verifying"), b"not a database").unwrap();
+
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.head, 1);
+    assert!(!log_dir.join("index.sqlite.verifying").exists());
+    assert_eq!(synced_state(target.path()).head_number, 1);
+}

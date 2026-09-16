@@ -259,12 +259,23 @@ fn merge(rows: Vec<(String, u64, RecordHit)>) -> Vec<MergedHit> {
     by_url_publisher.into_values().collect()
 }
 
-fn read_synced_height(dir: &Path) -> Result<u64> {
+/// The committed sync state of a Log directory: the index row, or the
+/// file a store written before the row carried.
+pub fn synced_state(dir: &Path) -> Result<SyncState> {
+    let index_path = dir.join("index.sqlite");
+    if index_path.exists() {
+        if let Some(state) = crate::sync::load_sync_state(&Connection::open(&index_path)?)? {
+            return Ok(state);
+        }
+    }
     let sync_path = dir.join("sync.json");
     let bytes = std::fs::read(&sync_path).map_err(|_| Error::NotSynced(dir.to_path_buf()))?;
     wist_core::json::validate(&bytes)?;
-    let state: SyncState = serde_json::from_slice(&bytes)?;
-    Ok(state.head_number)
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn read_synced_height(dir: &Path) -> Result<u64> {
+    Ok(synced_state(dir)?.head_number)
 }
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]

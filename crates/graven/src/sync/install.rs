@@ -122,35 +122,21 @@ pub(super) struct Installation {
     pub(super) chain: ChainState,
 }
 
-/// What the sync record needs from an installation after its index is in
-/// place.
-pub(super) struct Committed {
-    pub(super) log_position: u64,
-    pub(super) content_digest: String,
-    pub(super) chain: ChainState,
-}
-
 impl Installation {
     /// Moves the verified index into place once the walk above the
     /// anchor has been applied to it.
-    pub(super) fn commit(self, dir: &Path) -> Result<Committed> {
+    pub(super) fn commit(self, dir: &Path) -> Result<()> {
         let Installation {
             mut guard,
             tmp_sqlite_path,
             conn,
-            log_position,
-            content_digest,
-            chain,
             ..
         } = self;
         drop(conn);
         guard.disarm();
         std::fs::rename(&tmp_sqlite_path, dir.join("index.sqlite"))?;
-        Ok(Committed {
-            log_position,
-            content_digest,
-            chain,
-        })
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
     }
 }
 
