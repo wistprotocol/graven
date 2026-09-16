@@ -4,7 +4,6 @@ use crate::store::CREATE_EMBEDDINGS;
 use crate::sync::SyncState;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
@@ -119,7 +118,7 @@ pub fn import(dir: &Path, log_id: &str, pack_path: &Path, key_b64u: &str) -> Res
     let key = PublicKey::from_b64u(key_b64u)?;
 
     let bytes = std::fs::read(pack_path)?;
-    let value: Value = serde_json::from_slice(&bytes)?;
+    let value = wist_core::json::parse(&bytes)?;
     verify_envelope(&value, "pack", &key)?;
 
     let envelope: PackEnvelope = serde_json::from_value(value)?;
@@ -129,6 +128,7 @@ pub fn import(dir: &Path, log_id: &str, pack_path: &Path, key_b64u: &str) -> Res
     let log_dir = resolve_log_dir(dir, log_id)?;
     let sync_path = log_dir.join("sync.json");
     let sync_bytes = std::fs::read(&sync_path).map_err(|_| Error::NotSynced(log_dir.clone()))?;
+    wist_core::json::validate(&sync_bytes)?;
     let sync_state: SyncState = serde_json::from_slice(&sync_bytes)?;
 
     if pack.log_position != sync_state.log_position
@@ -160,7 +160,10 @@ pub fn import(dir: &Path, log_id: &str, pack_path: &Path, key_b64u: &str) -> Res
     let rows: Vec<VectorRow> = text
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).map_err(Error::from))
+        .map(|l| {
+            wist_core::json::validate(l.as_bytes())?;
+            serde_json::from_str(l).map_err(Error::from)
+        })
         .collect::<Result<_>>()?;
 
     if rows.len() as u64 != pack.vectors.count {

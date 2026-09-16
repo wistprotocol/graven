@@ -430,7 +430,8 @@ pub fn walk_blocks(
         let compressed = client.get_bytes(&block_url)?;
         let decompressed = wist_core::block_frames::decode(&compressed, chain.transport_bound())
             .map_err(|e| Error::Verify(format!("block {n}: {e}")))?;
-        let block_value: Value = serde_json::from_slice(&decompressed)?;
+        let block_value = wist_core::json::parse(&decompressed)
+            .map_err(|e| Error::Verify(format!("block {n}: WIST3-E03 {e}")))?;
         if wist_core::jcs::canonicalize(&block_value)? != decompressed {
             return Err(Error::Verify(format!(
                 "block {n}: WIST3-E03 Block file does not contain canonical JCS bytes"
@@ -634,7 +635,7 @@ fn load_parameters(conn: &Connection) -> Result<Vec<Amendment>> {
 
 fn load_anchor(anchor: &str, client: &Client) -> Result<(PublicKey, String, String)> {
     let anchor_bytes = load_anchor_bytes(anchor, client)?;
-    let anchor_value: Value = serde_json::from_slice(&anchor_bytes)?;
+    let anchor_value = wist_core::json::parse(&anchor_bytes)?;
     let anchor_env: LogAnchorEnvelope = serde_json::from_value(anchor_value.clone())?;
     let trust_key = PublicKey::from_b64u(&anchor_env.anchor.genesis_key.public_key)?;
     verify_envelope(&anchor_value, "anchor", &trust_key)?;
@@ -731,7 +732,7 @@ pub fn load_history(conn: &Connection) -> Result<KeyHistory> {
 
     let mut history = KeyHistory::new();
     for (height, sealed_at, baseline, envelope) in rows {
-        let value: Value = serde_json::from_str(&envelope)?;
+        let value = wist_core::json::parse(envelope.as_bytes())?;
         let height = height as u64;
         if baseline != 0 {
             history.add_baseline(height, &value)?;
@@ -1302,6 +1303,7 @@ fn run_incremental(
     tier1: bool,
 ) -> Result<SyncReport> {
     let sync_bytes = std::fs::read(sync_path)?;
+    wist_core::json::validate(&sync_bytes)?;
     let local: SyncState = serde_json::from_slice(&sync_bytes)?;
 
     let checkpoint_url = resolve(base, "/log/checkpoint.json")?;
@@ -1450,7 +1452,7 @@ fn run_cold_start(
     let state_url = resolve(base, &format!("{snapshot_base}{}", manifest.state.path))?;
     let state_bytes = client.get_bytes(&state_url)?;
     verify_file_integrity(&state_bytes, &manifest.state.sha256, manifest.state.bytes)?;
-    let state_value: Value = serde_json::from_slice(&state_bytes)?;
+    let state_value = wist_core::json::parse(&state_bytes)?;
     verify_envelope(&state_value, "state", trust_key)?;
     let state_env: SnapshotStateEnvelope = serde_json::from_value(state_value)?;
     let state_entry_values: Vec<Value> = state_env

@@ -25,6 +25,7 @@ pub fn load(dir: &Path) -> Result<Registry> {
         return Ok(Registry::default());
     }
     let bytes = std::fs::read(&path)?;
+    wist_core::json::validate(&bytes)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 

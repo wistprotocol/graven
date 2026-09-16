@@ -262,6 +262,7 @@ fn merge(rows: Vec<(String, u64, RecordHit)>) -> Vec<MergedHit> {
 fn read_synced_height(dir: &Path) -> Result<u64> {
     let sync_path = dir.join("sync.json");
     let bytes = std::fs::read(&sync_path).map_err(|_| Error::NotSynced(dir.to_path_buf()))?;
+    wist_core::json::validate(&bytes)?;
     let state: SyncState = serde_json::from_slice(&bytes)?;
     Ok(state.head_number)
 }

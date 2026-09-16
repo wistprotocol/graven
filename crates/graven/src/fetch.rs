@@ -74,7 +74,7 @@ impl Client {
 
     pub fn get_json(&self, url: &Url) -> Result<(Vec<u8>, serde_json::Value)> {
         let bytes = self.get_bytes(url)?;
-        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let value = wist_core::json::parse(&bytes)?;
         Ok((bytes, value))
     }
 }

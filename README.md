@@ -36,6 +36,13 @@ cleanly if that sync then fails.
 
 ## What sync verifies
 
+Every protocol input — the Log Anchor, checkpoint, Block files, Snapshot
+index, manifest and state, Payloads, companion packs and the store's own
+retained JSON — is rejected when any object at any depth repeats a decoded
+member name, escaped spellings included, before field, signature or replay
+checks see a parsed value (WIST-1 §4, RFC 8785 §3.1); a rejected Payload
+supplies no record fields, and a rejected Log file fails the sync.
+
 Chain-level: every Block's signature, hash chain, and Merkle root; the
 checkpoint's signature and its binding to the head Block; on cold start,
 the snapshot index/manifest/state signatures and the recomputed
