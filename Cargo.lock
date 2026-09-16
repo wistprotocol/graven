@@ -517,6 +517,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "zerovec",
+ "zstd",
 ]
 
 [[package]]

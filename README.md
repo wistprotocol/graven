@@ -171,7 +171,16 @@ instants (`clave seal --at`), advancing Log time by whole hours while
 Deltas keep wall-clock `observed_at` values; it validates artifacts against the spec's schemas via
 `WIST_SPEC_DIR`, requiring `jsonschema`, `rfc8785`, and `cryptography` on
 `PATH`'s python3 — set `CI=1` to hard-fail instead of skipping when they're
-missing).
+missing). The same crate's `baseline` binary drives the pipeline at scale
+for capacity measurements: `cargo run -p e2e --bin baseline -- --domains N
+--pages M [--changed-percent P] [--body-words W] [--extra-empty-seals K]
+[--no-tier1] [--out report.json]` publishes N loopback sites of M pages
+through the publisher, ingests them through one aggregator behind a
+request-counting proxy, seals, cold-starts a consumer, changes P percent of
+the pages, seals again, seals K further empty Blocks, verifies the history
+and catches the consumer up, reporting wall seconds, bytes and request
+counts per stage together with every repository revision it ran. Set
+`WIST_BUILD_PROFILE=release` to build and time release executables.
 
 ## Verification
 

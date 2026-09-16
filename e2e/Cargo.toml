@@ -8,9 +8,10 @@ license = "MIT OR Apache-2.0"
 [package.metadata.dist]
 dist = false
 
-[dev-dependencies]
-tempfile = "3"
+[dependencies]
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 jiff = { workspace = true }
 zerovec = { workspace = true }
+zstd = { workspace = true }
+tempfile = "3"
