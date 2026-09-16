@@ -156,6 +156,8 @@ impl ChainState {
 
 pub struct BlockEvent {
     pub height: u64,
+    pub block_hash: String,
+    pub prev_block_hash: String,
     pub sealed_at: String,
     pub sealed_at_s: i64,
     /// The caps and clock allowance accepted at `sealed_at`, under which
@@ -164,6 +166,7 @@ pub struct BlockEvent {
     /// `recovery_window_days` in force at `sealed_at`, which freezes the
     /// end of a recovery window opened in this Block (WIST-1 §5.2).
     pub recovery_window_days: i64,
+    /// The `publisher_declaration` Entries in canonical Block order.
     pub declarations: Vec<Value>,
     pub withdrawals: Vec<String>,
     pub delta_bodies: Vec<Value>,
@@ -553,12 +556,12 @@ pub fn walk_blocks(
         {
             match entry.get("type").and_then(Value::as_str) {
                 Some("publisher_declaration") => {
-                    let body = entry.get("body").ok_or_else(|| {
-                        Error::Verify(format!(
+                    if entry.get("body").is_none() {
+                        return Err(Error::Verify(format!(
                             "block {n}: publisher_declaration entry missing body"
-                        ))
-                    })?;
-                    declarations.push(body.clone());
+                        )));
+                    }
+                    declarations.push(entry.clone());
                 }
                 Some("registry_update") => {
                     let body = entry.get("body").ok_or_else(|| {
@@ -593,6 +596,11 @@ pub fn walk_blocks(
 
         events.push(BlockEvent {
             height: n,
+            block_hash: wist_core::block::block_hash(&block_value["header"])?,
+            prev_block_hash: block_value["header"]["prev_block_hash"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
             sealed_at,
             sealed_at_s: at,
             profile,
@@ -735,32 +743,20 @@ fn remove_by_url(conn: &Connection, url: &str, publisher: &str) -> Result<()> {
 }
 
 pub fn load_history(conn: &Connection) -> Result<KeyHistory> {
-    let mut stmt = conn.prepare(
-        "SELECT height, sealed_at, baseline, envelope, recovery_window_days FROM declarations ORDER BY height, seq",
-    )?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let mut history = KeyHistory::new();
-    for (height, sealed_at, baseline, envelope, recovery_window_days) in rows {
-        let value = wist_core::json::parse(envelope.as_bytes())?;
-        let height = height as u64;
-        if baseline != 0 {
-            history.add_baseline(height, &value)?;
-        } else {
-            history.add_declaration(height, &sealed_at, recovery_window_days, &value)?;
-        }
+    conn.execute_batch(CREATE_DECLARATION_STATE)?;
+    let state: Option<String> = conn
+        .query_row(
+            "SELECT state FROM declaration_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match state {
+        Some(state) => KeyHistory::from_state(&state),
+        None => Err(Error::Verify(
+            "the store carries no Declaration state; run a cold start".into(),
+        )),
     }
-    Ok(history)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -947,23 +943,24 @@ pub fn apply_events(
         for update in &event.governance {
             ledger.apply(event.height, sealed_at_s, update);
         }
-        for declaration in &event.declarations {
-            history.add_declaration(
-                event.height,
-                &event.sealed_at,
-                event.recovery_window_days,
-                declaration,
-            )?;
+        history.apply_block(
+            event.height,
+            &event.prev_block_hash,
+            &event.block_hash,
+            &event.sealed_at,
+            event.recovery_window_days,
+            &event.declarations,
+        )?;
+        for entry in &event.declarations {
             persist_declaration(
                 conn,
                 event.height,
                 &event.sealed_at,
                 false,
                 event.recovery_window_days,
-                declaration,
+                &entry["body"],
             )?;
         }
-
         for delta_id in &event.withdrawals {
             if remove_by_delta_id(conn, delta_id)? {
                 stats.withdrawn += 1;
@@ -1092,7 +1089,19 @@ pub fn apply_events(
     }
     save_chain_tips(conn, &tips)?;
     save_sanctions(conn, &ledger)?;
+    save_history(conn, history)?;
     Ok(stats)
+}
+
+pub const CREATE_DECLARATION_STATE: &str = "CREATE TABLE IF NOT EXISTS declaration_state(id INTEGER PRIMARY KEY CHECK(id = 1), state TEXT NOT NULL)";
+
+fn save_history(conn: &Connection, history: &KeyHistory) -> Result<()> {
+    conn.execute_batch(CREATE_DECLARATION_STATE)?;
+    conn.execute(
+        "INSERT INTO declaration_state(id, state) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET state = excluded.state",
+        [history.state()?],
+    )?;
+    Ok(())
 }
 
 fn load_chain_tips(conn: &Connection) -> Result<ChainTips> {
@@ -1562,8 +1571,12 @@ fn run_cold_start(
                 adopted_parameters.push((p.name.clone(), p.effective_at.clone(), p.value));
             }
             StateEntry::Declaration(d) => {
-                history.add_baseline(d.sealing_height, &d.declaration)?;
-                history.adopt_floor(&d.domain, d.highest_accepted_seq);
+                history.adopt_domain(
+                    &d.domain,
+                    &d.declaration,
+                    d.sealing_height,
+                    d.highest_accepted_seq,
+                )?;
                 persist_declaration(
                     &conn,
                     d.sealing_height,
@@ -1660,6 +1673,9 @@ fn run_cold_start(
     }
     for (domain, window_end, head, head_height) in &adopted_windows {
         history.adopt_window(domain, window_end, head, *head_height)?;
+    }
+    history.seed_head(manifest.log_position, &manifest.anchor_block_hash);
+    for (_, _, head, head_height) in &adopted_windows {
         persist_declaration(
             &conn,
             *head_height,

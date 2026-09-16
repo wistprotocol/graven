@@ -1,7 +1,8 @@
 mod common;
 
-use graven::keyset::{Admission, KeyHistory};
-use serde_json::Value;
+use graven::keyset::KeyHistory;
+use serde_json::{json, Value};
+use wist_core::declaration::Decision;
 
 fn spec_dir() -> std::path::PathBuf {
     std::env::var_os("WIST_SPEC_DIR")
@@ -11,29 +12,54 @@ fn spec_dir() -> std::path::PathBuf {
         })
 }
 
+fn entry(declaration: &Value) -> Value {
+    json!({"type": "publisher_declaration", "body": declaration})
+}
+
+fn code(text: &str) -> String {
+    let start = text
+        .find("WIST")
+        .unwrap_or_else(|| panic!("no diagnostic code in {text}"));
+    text[start..start + 9].to_string()
+}
+
 fn outcome(stored: &Value, fetched: &Value) -> String {
     let mut history = KeyHistory::new();
     if !stored.is_null() {
-        assert_eq!(
-            history
-                .add_declaration(0, "2026-08-02T12:00:00Z", 7, stored)
-                .unwrap(),
-            Admission::Initial
-        );
+        let effects = history
+            .apply_block(
+                0,
+                "sha256:genesis",
+                "h0",
+                "2026-08-02T12:00:00Z",
+                7,
+                &[entry(stored)],
+            )
+            .unwrap();
+        assert_eq!(effects.installations[0].decision, None);
     }
-    match history.add_declaration(1, "2026-08-03T12:00:00Z", 7, fetched) {
-        Ok(Admission::Initial) => "initial".into(),
-        Ok(Admission::Ordinary) => "ordinary_rotation".into(),
-        Ok(Admission::Recovery) => "recovery_rotation".into(),
-        Ok(Admission::FreshIdentity) => "fresh_identity".into(),
-        Ok(Admission::Duplicate) => "idempotent".into(),
-        Err(error) => {
-            let text = error.to_string();
-            let start = text
-                .find("WIST")
-                .unwrap_or_else(|| panic!("no diagnostic code in {text}"));
-            text[start..start + 9].to_string()
-        }
+    let (height, prev) = if stored.is_null() {
+        (0, "sha256:genesis")
+    } else {
+        (1, "h0")
+    };
+    match history.apply_block(
+        height,
+        prev,
+        "h1",
+        "2026-08-03T12:00:00Z",
+        7,
+        &[entry(fetched)],
+    ) {
+        Ok(effects) => match effects.installations.first().and_then(|i| i.decision) {
+            None if effects.installations.is_empty() => "idempotent".into(),
+            None => "initial".into(),
+            Some(Decision::Ordinary) => "ordinary_rotation".into(),
+            Some(Decision::Recovery) => "recovery_rotation".into(),
+            Some(Decision::FreshIdentity) => "fresh_identity".into(),
+            Some(Decision::Unchanged) => "idempotent".into(),
+        },
+        Err(error) => code(&error.to_string()),
     }
 }
 
@@ -58,7 +84,7 @@ fn declaration_binding_and_key_eligibility_vectors_select_the_documented_outcome
 }
 
 #[test]
-fn a_renamed_signing_key_keeps_its_identity_and_deltas_verify_under_the_alias() {
+fn a_renamed_signing_key_keeps_its_identity() {
     let vector: Value = serde_json::from_slice(
         &std::fs::read(spec_dir().join("vectors/wist1/declaration-binding.json")).unwrap(),
     )
@@ -71,13 +97,26 @@ fn a_renamed_signing_key_keeps_its_identity_and_deltas_verify_under_the_alias() 
         .unwrap();
     let mut history = KeyHistory::new();
     history
-        .add_declaration(0, "2026-08-02T12:00:00Z", 7, &case["stored"])
+        .apply_block(
+            0,
+            "sha256:genesis",
+            "h0",
+            "2026-08-02T12:00:00Z",
+            7,
+            &[entry(&case["stored"])],
+        )
         .unwrap();
-    assert_eq!(
-        history
-            .add_declaration(3, "2026-08-03T12:00:00Z", 7, &case["fetched"])
-            .unwrap(),
-        Admission::Ordinary
-    );
-    assert!(history.self_declared_at("example.com", 3));
+    let effects = history
+        .apply_block(
+            1,
+            "h0",
+            "h1",
+            "2026-08-03T12:00:00Z",
+            7,
+            &[entry(&case["fetched"])],
+        )
+        .unwrap();
+    assert_eq!(effects.installations[0].decision, Some(Decision::Ordinary));
+    assert!(!effects.installations[0].resets_identity);
+    assert!(history.declared("example.com"));
 }

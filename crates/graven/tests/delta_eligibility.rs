@@ -21,14 +21,16 @@ fn vector(name: &str) -> Value {
 fn baseline(domain: &str, key_id: &str, public_key: &Value, valid_from: &str) -> KeyHistory {
     let mut history = KeyHistory::new();
     history
-        .add_baseline(
-            0,
+        .adopt_domain(
+            domain,
             &json!({
                 "publisher": {"wist_version": "1.0.0", "domain": domain, "seq": 0,
                     "keys": [{"key_id": key_id, "alg": "Ed25519", "public_key": public_key,
                         "valid_from": valid_from}]},
                 "sig": {"key_id": key_id, "alg": "Ed25519", "value": b64u_encode(&[0; 64])},
             }),
+            0,
+            0,
         )
         .unwrap();
     history
@@ -45,7 +47,7 @@ fn code(error: &graven::error::Error) -> String {
 #[test]
 fn signed_field_vectors_are_rejected_before_any_semantic_check() {
     let vector = vector("delta-fields.json");
-    let history = baseline(
+    let mut history = baseline(
         "example.com",
         "test-k1",
         &vector["author_key"],
@@ -95,11 +97,24 @@ fn signed_field_vectors_are_rejected_before_any_semantic_check() {
 fn version_cases_keep_same_major_values_and_reject_other_majors() {
     let vector = vector("delta-attribution.json");
     let mut history = KeyHistory::new();
-    for declaration in vector["cases"][0]["declarations"].as_array().unwrap() {
-        history
-            .add_declaration(0, "2026-08-01T00:00:00Z", 7, declaration)
-            .unwrap();
-    }
+    let mut entries: Vec<Value> = vector["cases"][0]["declarations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| json!({"type": "publisher_declaration", "body": d}))
+        .collect();
+    entries
+        .sort_by_key(|e| wist_core::merkle::leaf_hash(&wist_core::jcs::canonicalize(e).unwrap()));
+    history
+        .apply_block(
+            0,
+            "sha256:genesis",
+            "h0",
+            "2026-08-01T00:00:00Z",
+            7,
+            &entries,
+        )
+        .unwrap();
     for case in vector["version_cases"].as_array().unwrap() {
         let doc = &case["envelope"];
         let before = doc.clone();
@@ -127,7 +142,7 @@ fn version_cases_keep_same_major_values_and_reject_other_majors() {
 #[test]
 fn historical_clock_probes_use_the_committing_block_and_its_allowance() {
     let vector = vector("delta-clock-time.json");
-    let history = baseline(
+    let mut history = baseline(
         "example.com",
         "test-k1",
         &vector["public_key"],
