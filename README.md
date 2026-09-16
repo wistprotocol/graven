@@ -164,8 +164,11 @@ Conformance tests read the spec repo's schemas/vectors from `../spec`
 (sibling checkout) by default, or from `WIST_SPEC_DIR` if set. Building also
 resolves `wist-core` from `../core`. The `e2e` workspace member additionally
 drives real `spake` and `clave` binaries end to end, so `../spake` and
-`../clave` must also be sibling checkouts (`SPAKE_BIN`/`CLAVE_BIN` override
-the binary paths; it validates artifacts against the spec's schemas via
+`../clave` must also be sibling checkouts, rebuilt from their current
+sources on every run (`SPAKE_BIN`/`CLAVE_BIN` override the binary paths and
+skip that build); it seals on the default hourly cadence grid at explicit
+instants (`clave seal --at`), advancing Log time by whole hours while
+Deltas keep wall-clock `observed_at` values; it validates artifacts against the spec's schemas via
 `WIST_SPEC_DIR`, requiring `jsonschema`, `rfc8785`, and `cryptography` on
 `PATH`'s python3 — set `CI=1` to hard-fail instead of skipping when they're
 missing).

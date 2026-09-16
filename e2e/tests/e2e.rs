@@ -36,9 +36,7 @@ fn resolve_sibling_bin(env_var: &str, name: &str) -> PathBuf {
         .expect("graven repo has a parent directory")
         .join(name);
     let path = repo.join("target/debug").join(name);
-    if !path.exists() {
-        cargo_build(&repo, name);
-    }
+    cargo_build(&repo, name);
     assert!(
         path.exists(),
         "{} still missing after cargo build -p {name} in {}",
@@ -124,7 +122,7 @@ fn spawn_clave_serve(
     data: &Path,
     bind_addr: &str,
     proxy: &str,
-) -> (ChildGuard, String) {
+) -> (ChildGuard, String, Arc<Mutex<String>>) {
     let data_str = data.to_str().expect("non-utf8 path").to_string();
     let mut child = Command::new(bin)
         .args([
@@ -166,7 +164,7 @@ fn spawn_clave_serve(
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    (ChildGuard(child), addr)
+    (ChildGuard(child), addr, stderr_buf)
 }
 
 fn free_loopback_addr() -> String {
@@ -280,15 +278,45 @@ fn wait_until_pulled_since(
     base: &str,
     domain: &str,
     since: &str,
+    child_stderr: &Arc<Mutex<String>>,
 ) -> Value {
-    poll_until(Duration::from_secs(30), Duration::from_millis(100), || {
-        fetch_status(http, base, domain).filter(|v| {
+    let mut last_status = None;
+    let start = Instant::now();
+    loop {
+        let status = fetch_status(http, base, domain);
+        if let Some(status) = status.as_ref().filter(|v| {
             v["rejections"]
                 .as_array()
                 .is_some_and(|rejections| rejections.is_empty())
                 && v["last_pull_at"].as_str().is_some_and(|t| t >= since)
-        })
-    })
+        }) {
+            return status.clone();
+        }
+        last_status = status.or(last_status);
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "no clean pull of {domain} at {base} since {since} within 30s\nlast status={}\nclave serve stderr={}",
+            last_status
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".into()),
+            child_stderr.lock().unwrap_or_else(|e| e.into_inner())
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// WIST-3 §3.2 seals on the accepted cadence grid, hourly by default and
+/// amendable only with a seven-day grace, so the harness advances Log time
+/// by whole hours: the first Block seals at the next hour boundary and each
+/// later one an hour after it, while Deltas keep wall-clock `observed_at`
+/// values that stay inside every Block's clock allowance.
+fn grid_instant(hours_ahead: i64) -> String {
+    let now = jiff::Timestamp::now().as_second();
+    let next_hour = now.div_euclid(3600) * 3600 + 3600;
+    jiff::Timestamp::from_second(next_hour + hours_ahead * 3600)
+        .expect("grid instant is in range")
+        .to_string()
 }
 
 struct McpClient {
@@ -474,17 +502,9 @@ fn end_to_end() {
     let clave_host = free_loopback_addr();
     run(
         &clave,
-        &[
-            "init",
-            "--log-id",
-            &clave_host,
-            "--data",
-            s(&clave_data),
-            "--cadence",
-            "1",
-        ],
+        &["init", "--log-id", &clave_host, "--data", s(&clave_data)],
     );
-    let (_clave_child, clave_bound_addr) =
+    let (_clave_child, clave_bound_addr, clave_stderr) =
         spawn_clave_serve(&clave, &clave_data, &clave_host, &site_proxy);
     assert_eq!(
         clave_bound_addr, clave_host,
@@ -496,17 +516,9 @@ fn end_to_end() {
     let clave2_host = free_loopback_addr();
     run(
         &clave,
-        &[
-            "init",
-            "--log-id",
-            &clave2_host,
-            "--data",
-            s(&clave2_data),
-            "--cadence",
-            "1",
-        ],
+        &["init", "--log-id", &clave2_host, "--data", s(&clave2_data)],
     );
-    let (_clave2_child, clave2_bound_addr) =
+    let (_clave2_child, clave2_bound_addr, clave2_stderr) =
         spawn_clave_serve(&clave, &clave2_data, &clave2_host, &site_proxy);
     assert_eq!(
         clave2_bound_addr, clave2_host,
@@ -570,8 +582,15 @@ fn end_to_end() {
     );
     wait_until_status_active(&http, &clave2_base, &site_host);
 
-    run(&clave, &["seal", "--data", s(&clave_data)]);
-    run(&clave, &["seal", "--data", s(&clave2_data)]);
+    let first_seal = grid_instant(0);
+    run(
+        &clave,
+        &["seal", "--data", s(&clave_data), "--at", &first_seal],
+    );
+    run(
+        &clave,
+        &["seal", "--data", s(&clave2_data), "--at", &first_seal],
+    );
 
     let anchor_path = clave_data.join("anchor.json");
     let anchor2_path = clave2_data.join("anchor.json");
@@ -643,8 +662,9 @@ fn end_to_end() {
             "--no-retry",
         ],
     );
-    let final_status = wait_until_pulled_since(&http, &clave_base, &site_host, &since);
-    wait_until_pulled_since(&http, &clave2_base, &site_host, &since);
+    let final_status =
+        wait_until_pulled_since(&http, &clave_base, &site_host, &since, &clave_stderr);
+    wait_until_pulled_since(&http, &clave2_base, &site_host, &since, &clave2_stderr);
     std::fs::write(
         clave_data.join("status.json"),
         serde_json::to_vec(&final_status).expect("serialize status"),
@@ -652,8 +672,15 @@ fn end_to_end() {
     .expect("write status.json");
 
     std::thread::sleep(Duration::from_secs(2));
-    run(&clave, &["seal", "--data", s(&clave_data)]);
-    run(&clave, &["seal", "--data", s(&clave2_data)]);
+    let second_seal = grid_instant(1);
+    run(
+        &clave,
+        &["seal", "--data", s(&clave_data), "--at", &second_seal],
+    );
+    run(
+        &clave,
+        &["seal", "--data", s(&clave2_data), "--at", &second_seal],
+    );
     run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
 
     let mut mcp = McpClient::start(&graven, &gdir);
@@ -725,7 +752,11 @@ fn end_to_end() {
         ],
     );
     std::thread::sleep(Duration::from_secs(2));
-    run(&clave, &["seal", "--data", s(&clave_data)]);
+    let third_seal = grid_instant(2);
+    run(
+        &clave,
+        &["seal", "--data", s(&clave_data), "--at", &third_seal],
+    );
     run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
 
     let mut mcp2 = McpClient::start(&graven, &gdir);

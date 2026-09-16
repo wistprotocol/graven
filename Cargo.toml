@@ -13,6 +13,7 @@ thiserror = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 zstd = "0.13"
+zerovec = { version = "0.11", features = ["alloc"] }
 sha2 = "0.10"
 parquet = { version = "56", default-features = false }
 bytes = "1"

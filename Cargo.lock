@@ -516,6 +516,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tempfile",
+ "zerovec",
 ]
 
 [[package]]
