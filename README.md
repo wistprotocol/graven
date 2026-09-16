@@ -72,14 +72,20 @@ ignored without advancing their chains.
 
 The chain of Publisher Declarations that produced that
 key set must itself be well-formed — `seq` and `prev_declaration` strictly
-monotonic and hash-linked, an ordinary rotation (signed by the prior key
-set) carrying `recovery_keys` byte-identical to its predecessor's (or
-introducing them for the first time), and a declaration signed by a
-`recovery_keys` entry opening a 7-day recovery window that takes
-precedence over any ordinary declaration sealed inside it. A declaration
-under keys the history doesn't recognize is still accepted as a fresh
-identity, but yields to a still-open recovery window. An invalid Declaration
-fails the sync. On cold start the Snapshot's `declaration` tuple supplies the
+monotonic and hash-linked, every key identifier occurring once across
+`keys` and `recovery_keys` with no public key in both sets (`WIST1-E08`,
+ADR-0023), an ordinary rotation carrying `recovery_keys` byte-identical to
+its predecessor's (or introducing them for the first time), and a
+declaration signed by a `recovery_keys` entry opening a 7-day recovery
+window that takes precedence over any ordinary declaration sealed inside
+it. The signer is resolved by `sig.key_id` among the usable previous
+signing and recovery bindings and the incoming signing bindings (keys that
+are not canonical, non-small-order Ed25519 points are excluded; `WIST1-E02`
+names none, `WIST1-E01` verifies under none), and continuity follows the
+authenticated public bytes: a renamed signing key is an ordinary rotation,
+a renamed recovery key keeps recovery authority, and an unknown key is a
+fresh identity that cannot alter a protected recovery set and yields to a
+still-open recovery window. An invalid Declaration fails the sync. On cold start the Snapshot's `declaration` tuple supplies the
 accepted sequence floor every later Declaration must exceed, and a
 `recovery_window` tuple restores the recovery-chain head at its own height
 with the window end on it (WIST-3 §§7/8); the `auditor`, `observer`,

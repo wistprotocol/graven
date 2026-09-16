@@ -13,6 +13,17 @@ pub const RECOVERY_WINDOW_DAYS: i64 = 7;
 /// A sealed Delta that verifies: its ID, the domain of the Publisher
 /// whose key signed it — the record key WIST-3 §7 uses — and whether
 /// §7's one-URL-one-Publisher rule lets it materialize.
+/// How a sealed Declaration relates to its domain's accepted chain
+/// (WIST-1 §5.2, ADR-0023).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    Duplicate,
+    Initial,
+    Ordinary,
+    Recovery,
+    FreshIdentity,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedDelta {
     pub id: String,
@@ -52,31 +63,72 @@ fn key_by_id<'a>(keys: &'a [PublisherKey], key_id: &str) -> Option<&'a Publisher
     keys.iter().find(|k| k.key_id == key_id)
 }
 
-fn verify_under_set(envelope: &Value, keys: &[PublisherKey], key_id: &str) -> bool {
-    key_by_id(keys, key_id)
-        .and_then(|k| PublicKey::from_b64u(&k.public_key).ok())
-        .is_some_and(|pk| verify_envelope(envelope, "publisher", &pk).is_ok())
+fn usable(key: &PublisherKey) -> Option<PublicKey> {
+    (key.alg == "Ed25519")
+        .then(|| PublicKey::from_b64u(&key.public_key).ok())
+        .flatten()
+}
+
+/// ADR-0023: the signer is the named entry, among the usable previous
+/// signing and recovery bindings and the usable incoming signing bindings,
+/// whose key verifies the Envelope; `WIST1-E02` names no usable binding,
+/// `WIST1-E01` verifies under none.
+fn resolve_signer<'a>(
+    envelope: &Value,
+    key_id: &str,
+    previous: Option<&'a Publisher>,
+    incoming: &'a Publisher,
+) -> std::result::Result<&'a PublisherKey, &'static str> {
+    let candidates: Vec<(&PublisherKey, PublicKey)> = previous
+        .into_iter()
+        .flat_map(|p| p.keys.iter().chain(p.recovery_keys.iter().flatten()))
+        .chain(incoming.keys.iter())
+        .filter(|key| key.key_id == key_id)
+        .filter_map(|key| usable(key).map(|pk| (key, pk)))
+        .collect();
+    if candidates.is_empty() {
+        return Err("WIST1-E02");
+    }
+    candidates
+        .into_iter()
+        .find(|(_, pk)| verify_envelope(envelope, "publisher", pk).is_ok())
+        .map(|(key, _)| key)
+        .ok_or("WIST1-E01")
 }
 
 fn recovery_keys_canon(keys: &Option<Vec<PublisherKey>>) -> Result<Vec<u8>> {
-    let value = serde_json::to_value(keys)?;
-    Ok(wist_core::jcs::canonicalize(&value)?)
+    match keys {
+        Some(keys) if !keys.is_empty() => {
+            let value = serde_json::to_value(keys)?;
+            Ok(wist_core::jcs::canonicalize(&value)?)
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
-/// WIST-1 §5.2: `keys` and `recovery_keys` are disjoint by `key_id` and by
-/// `public_key` — a recovery key that is also a signing key is stolen with it.
-fn disjoint_key_sets(domain: &str, publisher: &Publisher) -> Result<()> {
-    let Some(recovery) = publisher.recovery_keys.as_deref() else {
-        return Ok(());
-    };
-    for r in recovery {
-        if publisher
-            .keys
-            .iter()
-            .any(|k| k.key_id == r.key_id || k.public_key == r.public_key)
-        {
+/// WIST-1 §5.2 and ADR-0023: every key identifier occurs once across
+/// `keys` and `recovery_keys`, identical duplicates included, and the two
+/// sets share neither identifiers nor public bytes — a recovery key that is
+/// also a signing key is stolen with it. Every signed entry counts, usable
+/// or not.
+fn well_formed_key_sets(domain: &str, publisher: &Publisher) -> Result<()> {
+    let mut identifiers = std::collections::BTreeSet::new();
+    for key in publisher
+        .keys
+        .iter()
+        .chain(publisher.recovery_keys.iter().flatten())
+    {
+        if !identifiers.insert(&key.key_id) {
             return Err(Error::PublisherVerify(format!(
-                "{domain} seq {}: key {} is named in both keys and recovery_keys",
+                "WIST1-E08: {domain} seq {}: duplicate key_id {} in Declaration",
+                publisher.seq, key.key_id
+            )));
+        }
+    }
+    for r in publisher.recovery_keys.iter().flatten() {
+        if publisher.keys.iter().any(|k| k.public_key == r.public_key) {
+            return Err(Error::PublisherVerify(format!(
+                "WIST1-E08: {domain} seq {}: key {} is named in both keys and recovery_keys",
                 publisher.seq, r.key_id
             )));
         }
@@ -174,12 +226,14 @@ impl KeyHistory {
         Ok(())
     }
 
+    /// Admits a sealed Declaration under WIST-1 §5.2 and ADR-0023 and says
+    /// how it relates to the accepted chain.
     pub fn add_declaration(
         &mut self,
         height: u64,
         sealed_at: &str,
         envelope: &Value,
-    ) -> Result<()> {
+    ) -> Result<Admission> {
         let env: PublisherEnvelope = serde_json::from_value(envelope.clone())?;
         let publisher_value = envelope.get("publisher").ok_or_else(|| {
             Error::PublisherVerify("declaration envelope missing publisher".into())
@@ -190,83 +244,96 @@ impl KeyHistory {
         let entries = self.domains.entry(domain.clone()).or_default();
 
         if entries.iter().any(|e| e.hash == hash) {
-            return Ok(());
+            return Ok(Admission::Duplicate);
         }
 
-        disjoint_key_sets(&domain, &env.publisher)?;
+        well_formed_key_sets(&domain, &env.publisher)?;
 
         let seq = env.publisher.seq;
         if let Some(floor) = floor {
             if seq <= floor {
                 return Err(Error::PublisherVerify(format!(
-                    "{domain} seq {seq}: not greater than the accepted sequence floor {floor}"
+                    "WIST1-E08: {domain} seq {seq}: not greater than the accepted sequence floor {floor}"
                 )));
             }
         }
         let head = entries.iter().rev().find(|e| !e.superseded);
-        let (recovery, sealed, window_end, fresh) = match head {
+        let (admission, sealed, window_end) = match head {
             None => {
-                if seq != 0 {
+                if seq != 0 || env.publisher.prev_declaration.is_some() {
                     return Err(Error::PublisherVerify(format!(
-                        "{domain} seq {seq}: first declaration for domain must have seq 0"
+                        "WIST1-E08: {domain} seq {seq}: first declaration for domain must have seq 0 and no predecessor"
                     )));
                 }
-                if !verify_under_set(envelope, &env.publisher.keys, &env.sig.key_id) {
-                    return Err(Error::PublisherVerify(format!(
-                        "{domain} seq {seq}: self-signature does not verify under its own keys"
-                    )));
-                }
+                resolve_signer(envelope, &env.sig.key_id, None, &env.publisher).map_err(|code| {
+                    Error::PublisherVerify(format!(
+                        "{code}: {domain} seq {seq}: self-signature does not verify under its own usable keys"
+                    ))
+                })?;
                 let sealed = parse_timestamp(&domain, seq, sealed_at)?;
-                (false, sealed, None, false)
+                (Admission::Initial, sealed, None)
             }
             Some(pred) => {
                 if seq <= pred.seq {
                     return Err(Error::PublisherVerify(format!(
-                        "{domain} seq {seq}: not greater than previous seq {}",
+                        "WIST1-E08: {domain} seq {seq}: not greater than previous seq {}",
                         pred.seq
                     )));
                 }
                 if env.publisher.prev_declaration.as_deref() != Some(pred.hash.as_str()) {
                     return Err(Error::PublisherVerify(format!(
-                        "{domain} seq {seq}: prev_declaration does not match previous declaration hash"
+                        "WIST1-E08: {domain} seq {seq}: prev_declaration does not match previous declaration hash"
                     )));
                 }
                 let sealed = parse_timestamp(&domain, seq, sealed_at)?;
-                if verify_under_set(envelope, &pred.publisher.keys, &env.sig.key_id) {
-                    let pred_has_recovery = pred
-                        .publisher
-                        .recovery_keys
-                        .as_ref()
-                        .is_some_and(|rk| !rk.is_empty());
-                    if pred_has_recovery
-                        && recovery_keys_canon(&pred.publisher.recovery_keys)?
-                            != recovery_keys_canon(&env.publisher.recovery_keys)?
+                let signer = resolve_signer(
+                    envelope,
+                    &env.sig.key_id,
+                    Some(&pred.publisher),
+                    &env.publisher,
+                )
+                .map_err(|code| {
+                    Error::PublisherVerify(format!(
+                        "{code}: {domain} seq {seq}: signature does not verify under a usable previous or incoming signing binding"
+                    ))
+                })?;
+                // ADR-0023: continuity follows the authenticated public
+                // bytes, not the identifier they are named by.
+                let in_set = |keys: &[PublisherKey]| {
+                    keys.iter()
+                        .any(|k| k.public_key == signer.public_key && usable(k).is_some())
+                };
+                let admission = if in_set(&pred.publisher.keys) {
+                    Admission::Ordinary
+                } else if in_set(pred.publisher.recovery_keys.as_deref().unwrap_or(&[])) {
+                    Admission::Recovery
+                } else {
+                    Admission::FreshIdentity
+                };
+                if admission != Admission::Recovery {
+                    let protected = recovery_keys_canon(&pred.publisher.recovery_keys)?;
+                    if !protected.is_empty()
+                        && recovery_keys_canon(&env.publisher.recovery_keys)? != protected
                     {
                         return Err(Error::PublisherVerify(format!(
-                            "{domain} seq {seq}: ordinary rotation must carry recovery_keys byte-identical to predecessor's"
+                            "WIST1-E08: {domain} seq {seq}: recovery_keys altered by a declaration not signed by a recovery key"
                         )));
                     }
-                    (false, sealed, pred.window_end, false)
-                } else if verify_under_set(
-                    envelope,
-                    pred.publisher.recovery_keys.as_deref().unwrap_or(&[]),
-                    &env.sig.key_id,
-                ) {
-                    let window_end = sealed
-                        .checked_add(jiff::Span::new().hours(RECOVERY_WINDOW_DAYS * 24))
-                        .map_err(|e| {
-                            Error::PublisherVerify(format!(
-                                "{domain} seq {seq}: recovery window overflow: {e}"
-                            ))
-                        })?;
-                    (true, sealed, Some(window_end), false)
-                } else if verify_under_set(envelope, &env.publisher.keys, &env.sig.key_id) {
-                    (false, sealed, pred.window_end, true)
-                } else {
-                    return Err(Error::PublisherVerify(format!(
-                        "{domain} seq {seq}: signature does not verify under previous keys, recovery_keys, or its own keys"
-                    )));
                 }
+                let window_end = if admission == Admission::Recovery {
+                    Some(
+                        sealed
+                            .checked_add(jiff::Span::new().hours(RECOVERY_WINDOW_DAYS * 24))
+                            .map_err(|e| {
+                                Error::PublisherVerify(format!(
+                                    "{domain} seq {seq}: recovery window overflow: {e}"
+                                ))
+                            })?,
+                    )
+                } else {
+                    pred.window_end
+                };
+                (admission, sealed, window_end)
             }
         };
 
@@ -274,6 +341,8 @@ impl KeyHistory {
         // legitimately follows the recovery Declaration takes effect. An
         // ordinary or recovery rotation off the chain head is that chain; a
         // fresh identity is not, and is superseded at the window's end.
+        let recovery = admission == Admission::Recovery;
+        let fresh = admission == Admission::FreshIdentity;
         let inside_window = window_end.is_some_and(|end| sealed < end);
         let superseded = fresh && inside_window;
         entries.push(DeclRecord {
@@ -294,7 +363,7 @@ impl KeyHistory {
         });
         let floor = self.floors.entry(domain).or_insert(0);
         *floor = (*floor).max(seq);
-        Ok(())
+        Ok(admission)
     }
 
     fn resolve(&self, domain: &str, height: u64) -> Result<&DeclRecord> {
@@ -1076,12 +1145,15 @@ mod tests {
             2,
             Some(&hash1),
             vec![key_entry(&pky, "pky", "2026-08-09T00:00:00Z")],
-            None,
+            Some(vec![key_entry(&rk2, "rk2", "2026-08-09T00:00:00Z")]),
             &pky,
             "pky",
         );
-        kh.add_declaration(3, "2026-08-04T00:00:00Z", &decl2)
-            .unwrap();
+        assert_eq!(
+            kh.add_declaration(3, "2026-08-04T00:00:00Z", &decl2)
+                .unwrap(),
+            Admission::FreshIdentity
+        );
         let hash2 = publisher_hash(&decl2["publisher"]).unwrap();
 
         let via_pk2_at3 = delta_env(
