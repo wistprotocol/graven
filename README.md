@@ -95,10 +95,29 @@ fresh identity that cannot alter a protected recovery set and yields to a
 still-open recovery window. An invalid Declaration fails the sync. On cold start the Snapshot's `declaration` tuple supplies the
 accepted sequence floor every later Declaration must exceed, and a
 `recovery_window` tuple restores the recovery-chain head at its own height
-with the window end on it (WIST-3 §§7/8); the `auditor`, `observer`,
-`canary_commitment`, `escalation`, `coverage_failure` and `reputation_inputs`
-tuples are persisted in the store for the replays that will read them.
-Full recovery replay, roster and canary act replay, and materialization
+with the window end on it (WIST-3 §§7/8); the `escalation`,
+`coverage_failure` and `reputation_inputs` tuples are persisted in the
+store for the replays that will read them.
+
+Roster and canary acts replay through core's shared engines in every
+Block (WIST-4 §3.1, §5.1, ADR-0012). Only `aggregator_key_add` and
+`aggregator_key_remove` must verify under an Aggregator key for the Block
+to stand; every other Registry Update authenticates under its own rule
+(`auditor_admit` and `auditor_remove` under the Log key, `observer_register`
+and `observer_checkpoint` under the registered key, `canary_commitment` and
+`canary_reveal` under the planter's Declaration keys at that Block) and one
+that fails is ignored without failing the sync (WIST-4 §9.1). Admissions,
+removals, registrations and rotations, epoch rations, reveal timing and
+sealing opportunity follow the same batch rules a replaying Consumer
+applies, with each Block's canary and coverage parameters read from the
+accepted schedule and its verified Deltas registered for reveal binding.
+The `auditors`, `observers` and `canary_commitments` tables mirror the
+accepted acts at their sealing heights, and both engines persist in
+`replay_state` between syncs. A cold start seeds the engines from the
+Snapshot's `auditor`, `observer` and `canary_commitment` tuples at the
+anchor height; a reveal whose commitment or leaves were sealed below that
+height keeps the structural checks and skips the timing and opportunity
+tests the tuples cannot support. Full recovery replay and materialization
 preference among overlapping scoped Publishers remain separate validation
 requirements.
 

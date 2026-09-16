@@ -6,6 +6,7 @@ pub mod keyset;
 pub mod mcp;
 pub mod pack;
 pub mod registry;
+pub mod replay;
 pub mod store;
 pub mod sync;
 pub mod tier1;

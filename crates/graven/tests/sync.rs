@@ -2472,3 +2472,198 @@ fn sealed_deltas_are_checked_against_their_block_clock_and_accepted_allowance() 
         .unwrap();
     assert_eq!(tips, 0, "an ignored Delta moves no chain tip");
 }
+
+fn roster_act(
+    action: &str,
+    subject: &str,
+    details: serde_json::Value,
+    signer: &common::Signer,
+    signer_key_id: &str,
+    effective_at: &str,
+) -> serde_json::Value {
+    let update = serde_json::json!({
+        "wist_version": "1.0.0", "action": action, "subject": subject,
+        "effective_at": effective_at, "details": details,
+    });
+    let body =
+        wist_core::envelope::sign_envelope(&update, "update", signer_key_id, &signer.sk).unwrap();
+    serde_json::json!({"type": "registry_update", "body": body})
+}
+
+fn run_sync(fx: &common::Fixture, target: &std::path::Path) -> graven::sync::SyncReport {
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target,
+        true,
+        false,
+    )
+    .unwrap()
+}
+
+#[test]
+fn roster_and_canary_acts_replay_through_the_shared_engines_and_persist_between_syncs() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+    run_sync(&fx, target.path());
+
+    let auditor = common::Signer::new([7u8; 32]);
+    let observer = common::Signer::new([8u8; 32]);
+    let stranger = common::Signer::new([10u8; 32]);
+    let publisher = common::Signer::new([1u8; 32]);
+    let key = |signer: &common::Signer, key_id: &str| serde_json::json!({"key_id": key_id, "alg": "Ed25519", "public_key": signer.public_b64u()});
+    let (_, head_hash) = head_of(&fx);
+    let at = "2026-08-09T14:00:00Z";
+    let (_, hash, _) = seal_next(
+        &fx,
+        &head_hash,
+        at,
+        &[
+            roster_act(
+                "auditor_admit",
+                "audit.sample.net",
+                key(&auditor, "a1"),
+                &fx.log,
+                "log1",
+                at,
+            ),
+            roster_act(
+                "auditor_admit",
+                "forged.sample.net",
+                key(&auditor, "a2"),
+                &stranger,
+                "log1",
+                at,
+            ),
+            roster_act(
+                "observer_register",
+                "watch.sample.net",
+                key(&observer, "w1"),
+                &observer,
+                "w1",
+                at,
+            ),
+            roster_act(
+                "observer_register",
+                "spoof.sample.net",
+                key(&observer, "w2"),
+                &stranger,
+                "w2",
+                at,
+            ),
+            roster_act(
+                "canary_commitment",
+                "records.example",
+                serde_json::json!({"root": format!("sha256:{}", "3".repeat(64)), "leaves": 5}),
+                &publisher,
+                "pk1",
+                at,
+            ),
+            roster_act(
+                "canary_commitment",
+                "records.example",
+                serde_json::json!({"root": format!("sha256:{}", "4".repeat(64)), "leaves": 5}),
+                &stranger,
+                "pk1",
+                at,
+            ),
+        ],
+    );
+    let report = run_sync(&fx, target.path());
+    assert_eq!(report.head, 2);
+
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+    let auditors: Vec<(String, i64, Option<i64>)> = conn
+        .prepare(
+            "SELECT auditor_id, admitted_height, removed_height FROM auditors ORDER BY auditor_id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(auditors, vec![("audit.sample.net".to_string(), 2, None)]);
+    let observers: Vec<(String, i64, Option<i64>)> = conn
+        .prepare("SELECT observer_id, registered_height, ended_height FROM observers ORDER BY observer_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(observers, vec![("watch.sample.net".to_string(), 2, None)]);
+    let commitments: Vec<(String, String, i64, i64)> = conn
+        .prepare("SELECT planter, root, leaves, sealing_height FROM canary_commitments")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        commitments,
+        vec![(
+            "records.example".to_string(),
+            format!("sha256:{}", "3".repeat(64)),
+            5,
+            2
+        )]
+    );
+    let state: String = conn
+        .query_row("SELECT state FROM replay_state WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(state.contains("watch.sample.net"));
+    drop(conn);
+
+    let later = "2026-08-09T15:00:00Z";
+    let rotated = common::Signer::new([11u8; 32]);
+    seal_next(
+        &fx,
+        &hash,
+        later,
+        &[
+            roster_act(
+                "auditor_remove",
+                "audit.sample.net",
+                serde_json::json!({"key_id": "a1"}),
+                &fx.log,
+                "log1",
+                later,
+            ),
+            roster_act(
+                "observer_register",
+                "watch.sample.net",
+                key(&rotated, "w2"),
+                &rotated,
+                "w2",
+                later,
+            ),
+        ],
+    );
+    let report = run_sync(&fx, target.path());
+    assert_eq!(report.head, 3);
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+    let removed: Option<i64> = conn
+        .query_row(
+            "SELECT removed_height FROM auditors WHERE auditor_id = 'audit.sample.net'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(removed, Some(3));
+    let tenures: Vec<(String, i64, Option<i64>)> = conn
+        .prepare(
+            "SELECT key_id, registered_height, ended_height FROM observers WHERE observer_id = 'watch.sample.net' ORDER BY key_id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        tenures,
+        vec![("w1".to_string(), 2, Some(3)), ("w2".to_string(), 3, None)]
+    );
+}

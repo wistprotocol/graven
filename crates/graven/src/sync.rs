@@ -2,6 +2,9 @@ use crate::error::{Error, Result};
 use crate::fetch::{resolve, Client};
 use crate::keyset::{DeltaProfile, KeyHistory};
 use crate::registry::{self, LogEntry};
+use crate::replay::{
+    load_replay, mirror_act, save_replay, save_state, ActBlock, ActProfile, ActReplay,
+};
 use crate::store::{table_exists, CREATE_DECLARATIONS, CREATE_TIER1, CREATE_UNIQUE_INDEX};
 use crate::tier1;
 use reqwest::Url;
@@ -166,6 +169,13 @@ pub struct BlockEvent {
     /// `recovery_window_days` in force at `sealed_at`, which freezes the
     /// end of a recovery window opened in this Block (WIST-1 §5.2).
     pub recovery_window_days: i64,
+    /// Every Entry in canonical Block order, for the act replays.
+    pub entries: Vec<Value>,
+    /// The Log key that signed the Block, under which Log-signed acts verify.
+    pub log_key_id: String,
+    pub log_key: String,
+    /// The canary and coverage parameters in force at `sealed_at`.
+    pub act_profile: ActProfile,
     /// The `publisher_declaration` Entries in canonical Block order.
     pub declarations: Vec<Value>,
     pub withdrawals: Vec<String>,
@@ -459,9 +469,14 @@ pub fn walk_blocks(
             let body = entry
                 .get("body")
                 .ok_or_else(|| Error::Verify(format!("block {n}: registry_update missing body")))?;
-            let signer = keys.signer_of(body)?.clone();
-            verify_envelope(body, "update", &signer)?;
-            keys.apply(body)?;
+            if matches!(
+                body["update"]["action"].as_str(),
+                Some("aggregator_key_add" | "aggregator_key_remove")
+            ) {
+                let signer = keys.signer_of(body)?.clone();
+                verify_envelope(body, "update", &signer)?;
+                keys.apply(body)?;
+            }
         }
         let block_key_id = block_value["sig"]["key_id"]
             .as_str()
@@ -540,6 +555,7 @@ pub fn walk_blocks(
         }
         let profile = DeltaProfile::from_schedule(schedule, at);
         let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
+        let act_profile = ActProfile::from_schedule(schedule, at);
         chain.largest = largest;
         chain.prior_at = Some(at);
 
@@ -605,6 +621,13 @@ pub fn walk_blocks(
             sealed_at_s: at,
             profile,
             recovery_window_days,
+            entries: block_value["entries"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+            log_key_id: block_key_id.to_string(),
+            log_key: block_key.to_b64u(),
+            act_profile,
             declarations,
             withdrawals,
             delta_bodies,
@@ -925,6 +948,7 @@ pub fn apply_events(
     client: &Client,
     base: &Url,
     history: &mut KeyHistory,
+    replay: &mut ActReplay,
     events: &[BlockEvent],
     tier1: bool,
 ) -> Result<ApplyStats> {
@@ -961,6 +985,7 @@ pub fn apply_events(
                 &entry["body"],
             )?;
         }
+        let log_key = PublicKey::from_b64u(&event.log_key)?;
         for delta_id in &event.withdrawals {
             if remove_by_delta_id(conn, delta_id)? {
                 stats.withdrawn += 1;
@@ -984,6 +1009,7 @@ pub fn apply_events(
             let env: DeltaEnvelope = serde_json::from_value(body.clone())?;
             let id = verified.id;
             let publisher = verified.publisher;
+            replay.register_delta(&id, event.height, &publisher);
             // WIST-1 §3.5: a Delta whose prev is not the chain tip the
             // state carries is a fork, and moves nothing.
             if !tips.apply(&publisher, &env.delta.url, &id, env.delta.prev.as_deref()) {
@@ -1086,10 +1112,28 @@ pub fn apply_events(
                 }
             }
         }
+        let accepted = replay.apply_block(
+            ActBlock {
+                height: event.height,
+                block_hash: &event.block_hash,
+                sealed_at_s,
+                entries: &event.entries,
+                log_key_id: &event.log_key_id,
+                log_key: &log_key,
+                profile: event.act_profile,
+            },
+            history.declarations(),
+        )?;
+        for act in &accepted {
+            mirror_act(conn, act, event.height)?;
+        }
     }
     save_chain_tips(conn, &tips)?;
     save_sanctions(conn, &ledger)?;
     save_history(conn, history)?;
+    if let Some(last) = events.last() {
+        save_replay(conn, replay, last.height)?;
+    }
     Ok(stats)
 }
 
@@ -1402,10 +1446,11 @@ fn run_incremental(
     verify_checkpoint_binding(&checkpoint_value, &last_block_value)?;
 
     let mut history = load_history(&conn)?;
+    let mut replay = load_replay(&conn)?;
     let tx = conn.unchecked_transaction()?;
     tx.execute(CREATE_UNIQUE_INDEX, [])?;
     tx.execute(CREATE_DECLARATIONS, [])?;
-    let stats = apply_events(&tx, client, base, &mut history, &events, tier1)?;
+    let stats = apply_events(&tx, client, base, &mut history, &mut replay, &events, tier1)?;
     tx.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
     if tier1 {
         tx.execute(
@@ -1557,6 +1602,7 @@ fn run_cold_start(
     // already holds reads as a fork; without the recovery windows, an
     // in-window rotation by a thief is invisible.
     let mut history = KeyHistory::new();
+    let mut replay = ActReplay::new(log_id);
     conn.execute_batch(crate::store::CREATE_CHAIN_TIPS)?;
     let mut tips = ChainTips::new();
     let mut adopted_keys: Vec<(String, String, Option<u64>)> = Vec::new();
@@ -1595,6 +1641,12 @@ fn run_cold_start(
                 ));
             }
             StateEntry::Auditor(a) => {
+                replay.adopt_auditor(
+                    &a.auditor_id,
+                    &a.key_id,
+                    &a.public_key,
+                    a.removed_height.is_none(),
+                );
                 conn.execute(
                     "INSERT OR REPLACE INTO auditors(auditor_id, key_id, public_key, admitted_height, removed_height) VALUES (?1, ?2, ?3, ?4, ?5)",
                     (
@@ -1607,6 +1659,13 @@ fn run_cold_start(
                 )?;
             }
             StateEntry::Observer(o) => {
+                replay.adopt_observer(
+                    &o.observer_id,
+                    &o.key_id,
+                    &o.public_key,
+                    o.registered_height,
+                    o.ended_height.is_none(),
+                );
                 conn.execute(
                     "INSERT OR REPLACE INTO observers(observer_id, key_id, public_key, registered_height, ended_height) VALUES (?1, ?2, ?3, ?4, ?5)",
                     (
@@ -1619,6 +1678,13 @@ fn run_cold_start(
                 )?;
             }
             StateEntry::CanaryCommitment(c) => {
+                replay.adopt_commitment(
+                    &c.update_id,
+                    &c.planter,
+                    &c.root,
+                    c.leaves,
+                    c.sealing_height,
+                );
                 conn.execute(
                     "INSERT OR REPLACE INTO canary_commitments(update_id, planter, root, leaves, sealing_height) VALUES (?1, ?2, ?3, ?4, ?5)",
                     (
@@ -1675,6 +1741,12 @@ fn run_cold_start(
         history.adopt_window(domain, window_end, head, *head_height)?;
     }
     history.seed_head(manifest.log_position, &manifest.anchor_block_hash);
+    replay.seed_head(
+        manifest.log_position,
+        &manifest.anchor_block_hash,
+        ActProfile::default(),
+    )?;
+    save_state(&conn, &replay)?;
     for (_, _, head, head_height) in &adopted_windows {
         persist_declaration(
             &conn,
@@ -1740,7 +1812,15 @@ fn run_cold_start(
         }
     }
 
-    let stats = apply_events(&conn, client, base, &mut history, &events, tier1)?;
+    let stats = apply_events(
+        &conn,
+        client,
+        base,
+        &mut history,
+        &mut replay,
+        &events,
+        tier1,
+    )?;
     conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
     if tier1 {
         conn.execute(
