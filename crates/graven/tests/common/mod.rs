@@ -389,7 +389,30 @@ pub fn write_state(
     records: &[RecordFixture],
     log_position: u64,
 ) -> (Vec<u8>, String) {
-    let mut entries = Vec::new();
+    write_state_with(
+        path,
+        log,
+        cadence,
+        declarations,
+        records,
+        log_position,
+        Vec::new(),
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_state_with(
+    path: &Path,
+    log: &Signer,
+    cadence: i64,
+    declarations: &[(String, Value)],
+    records: &[RecordFixture],
+    log_position: u64,
+    extra: Vec<StateEntry>,
+    floor: u64,
+) -> (Vec<u8>, String) {
+    let mut entries = extra;
     entries.push(StateEntry::AggregatorKey(AggregatorKeyEntry {
         key_id: "log1".into(),
         public_key: log.public_b64u(),
@@ -406,7 +429,10 @@ pub fn write_state(
             domain: domain.clone(),
             declaration: declaration.clone(),
             sealing_height: 0,
-            highest_accepted_seq: declaration["publisher"]["seq"].as_u64().unwrap_or(0),
+            highest_accepted_seq: declaration["publisher"]["seq"]
+                .as_u64()
+                .unwrap_or(0)
+                .max(floor),
         }));
     }
     for r in records {
@@ -927,12 +953,36 @@ pub fn build_fixture_with_tier1() -> Fixture {
     build_fixture_full("graven-test-log", 9, true, false, true)
 }
 
+pub fn build_fixture_with_state(extra: Vec<StateEntry>, floor: u64) -> Fixture {
+    build_fixture_state("graven-test-log", 9, true, false, false, extra, floor)
+}
+
 fn build_fixture_full(
     log_id: &str,
     seed: u8,
     write_second_payload: bool,
     duplicate_tier0_record: bool,
     include_tier1: bool,
+) -> Fixture {
+    build_fixture_state(
+        log_id,
+        seed,
+        write_second_payload,
+        duplicate_tier0_record,
+        include_tier1,
+        Vec::new(),
+        0,
+    )
+}
+
+fn build_fixture_state(
+    log_id: &str,
+    seed: u8,
+    write_second_payload: bool,
+    duplicate_tier0_record: bool,
+    include_tier1: bool,
+    extra_state: Vec<StateEntry>,
+    floor: u64,
 ) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let log = Signer::new([seed; 32]);
@@ -992,13 +1042,15 @@ fn build_fixture_full(
     let content_digest_value =
         wist_core::snapshot::content_digest(&content_digest_projections).unwrap();
 
-    let (state_bytes, state_digest_value) = write_state(
+    let (state_bytes, state_digest_value) = write_state_with(
         &snapdir.join("state.json"),
         &log,
         3600,
         &[(domain.clone(), declaration_env.clone())],
         std::slice::from_ref(&record1),
         0,
+        extra_state,
+        floor,
     );
 
     if include_tier1 {

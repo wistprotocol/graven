@@ -1294,14 +1294,83 @@ fn run_cold_start(
     let mut adopted_keys: Vec<(String, String, Option<u64>)> = Vec::new();
     let mut adopted_sanctions: Vec<(String, u64)> = Vec::new();
     let mut adopted_exclusions: Vec<(String, String, u64)> = Vec::new();
+    let mut adopted_windows: Vec<(String, String, Value, u64)> = Vec::new();
+    conn.execute_batch(crate::store::CREATE_ADOPTED_STATE)?;
     for entry in &state_env.state.entries {
         match entry {
             StateEntry::Declaration(d) => {
                 history.add_baseline(d.sealing_height, &d.declaration)?;
+                history.adopt_floor(&d.domain, d.highest_accepted_seq);
                 persist_declaration(&conn, d.sealing_height, "", true, &d.declaration)?;
             }
             StateEntry::RecoveryWindow(w) => {
-                history.open_window(&w.domain, &w.window_end)?;
+                adopted_windows.push((
+                    w.domain.clone(),
+                    w.window_end.clone(),
+                    w.head.clone(),
+                    w.head_height,
+                ));
+            }
+            StateEntry::Auditor(a) => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO auditors(auditor_id, key_id, public_key, admitted_height, removed_height) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (
+                        &a.auditor_id,
+                        &a.key_id,
+                        &a.public_key,
+                        a.admitted_height as i64,
+                        a.removed_height.map(|h| h as i64),
+                    ),
+                )?;
+            }
+            StateEntry::Observer(o) => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO observers(observer_id, key_id, public_key, registered_height, ended_height) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (
+                        &o.observer_id,
+                        &o.key_id,
+                        &o.public_key,
+                        o.registered_height as i64,
+                        o.ended_height.map(|h| h as i64),
+                    ),
+                )?;
+            }
+            StateEntry::CanaryCommitment(c) => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO canary_commitments(update_id, planter, root, leaves, sealing_height) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (
+                        &c.update_id,
+                        &c.planter,
+                        &c.root,
+                        c.leaves as i64,
+                        c.sealing_height as i64,
+                    ),
+                )?;
+            }
+            StateEntry::Escalation(e) => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO escalations(domain, establishing_sealed_at) VALUES (?1, ?2)",
+                    (&e.domain, &e.establishing_sealed_at),
+                )?;
+            }
+            StateEntry::CoverageFailure(f) => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO coverage_failures(auditor_id, block_number) VALUES (?1, ?2)",
+                    (&f.auditor_id, f.block_number as i64),
+                )?;
+            }
+            StateEntry::ReputationInputs(r) => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO reputation_inputs(domain, first_accepted_sealed_at, reset_height, counted_total, counted_json, penalties_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (
+                        &r.domain,
+                        &r.first_accepted_sealed_at,
+                        r.reset_height.map(|h| h as i64),
+                        r.counted_total as i64,
+                        serde_json::to_string(&r.counted_url_digests)?,
+                        serde_json::to_string(&r.penalties)?,
+                    ),
+                )?;
             }
             StateEntry::Record(r) => tips.adopt(&r.publisher, &r.url, &r.delta_id),
             StateEntry::AggregatorKey(k) => {
@@ -1319,6 +1388,10 @@ fn run_cold_start(
             }
             _ => {}
         }
+    }
+    for (domain, window_end, head, head_height) in &adopted_windows {
+        history.adopt_window(domain, window_end, head, *head_height)?;
+        persist_declaration(&conn, *head_height, "", true, head)?;
     }
     save_chain_tips(&conn, &tips)?;
     let mut ledger = load_sanctions(&conn)?;

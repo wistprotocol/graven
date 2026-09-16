@@ -2012,3 +2012,97 @@ fn malformed_signed_publisher_does_not_abort_sync_or_advance_a_chain() {
         assert_eq!(count, 0);
     }
 }
+
+#[test]
+fn cold_start_enforces_the_adopted_sequence_floor() {
+    let fx = common::build_fixture_with_state(Vec::new(), 5);
+    let new_key = common::Signer::new([7u8; 32]);
+    common::extend_fixture_with_rotation(&fx, &new_key);
+    let target = tempfile::tempdir().unwrap();
+    let error = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        false,
+    )
+    .err()
+    .map(|e| e.to_string())
+    .unwrap_or_default();
+    assert!(
+        error.contains("accepted sequence floor 5"),
+        "a rotation to seq 1 must not pass a floor of 5: {error}"
+    );
+}
+
+#[test]
+fn cold_start_adopts_every_derived_state_kind() {
+    use wist_core::objects::{
+        AuditorEntry, CanaryCommitmentEntry, CoverageFailureEntry, EscalationEntry, ObserverEntry,
+        ReputationInputsEntry, StateEntry,
+    };
+    let extra = vec![
+        StateEntry::Auditor(AuditorEntry {
+            auditor_id: "audit.example.net".into(),
+            key_id: "a1".into(),
+            public_key: "A".repeat(43),
+            admitted_height: 0,
+            removed_height: None,
+        }),
+        StateEntry::Observer(ObserverEntry {
+            observer_id: "watch.sample.net".into(),
+            key_id: "w1".into(),
+            public_key: "B".repeat(43),
+            registered_height: 0,
+            ended_height: None,
+        }),
+        StateEntry::CanaryCommitment(CanaryCommitmentEntry {
+            update_id: format!("sha256:{}", "1".repeat(64)),
+            planter: "planter.example.org".into(),
+            root: format!("sha256:{}", "2".repeat(64)),
+            leaves: 4,
+            sealing_height: 0,
+        }),
+        StateEntry::Escalation(EscalationEntry {
+            domain: "records.example".into(),
+            establishing_sealed_at: "2026-08-09T12:00:00Z".into(),
+        }),
+        StateEntry::CoverageFailure(CoverageFailureEntry {
+            auditor_id: "audit.example.net".into(),
+            block_number: 0,
+        }),
+        StateEntry::ReputationInputs(ReputationInputsEntry {
+            domain: "records.example".into(),
+            first_accepted_sealed_at: "2026-08-09T12:00:00Z".into(),
+            reset_height: None,
+            counted_total: 1,
+            counted_url_digests: vec!["0".repeat(32)],
+            penalties: vec![("2026-08-09T12:00:00Z".into(), 2)],
+        }),
+    ];
+    let fx = common::build_fixture_with_state(extra, 0);
+    let target = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(count("SELECT COUNT(*) FROM auditors"), 1);
+    assert_eq!(count("SELECT COUNT(*) FROM observers"), 1);
+    assert_eq!(count("SELECT COUNT(*) FROM canary_commitments"), 1);
+    assert_eq!(count("SELECT COUNT(*) FROM escalations"), 1);
+    assert_eq!(count("SELECT COUNT(*) FROM coverage_failures"), 1);
+    assert_eq!(count("SELECT COUNT(*) FROM reputation_inputs"), 1);
+    let penalties: String = conn
+        .query_row("SELECT penalties_json FROM reputation_inputs", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(penalties, "[[\"2026-08-09T12:00:00Z\",2]]");
+}

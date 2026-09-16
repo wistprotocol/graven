@@ -32,6 +32,7 @@ struct DeclRecord {
 #[derive(Default)]
 pub struct KeyHistory {
     domains: HashMap<String, Vec<DeclRecord>>,
+    floors: HashMap<String, u64>,
 }
 
 pub fn url_authority(url: &Url) -> Option<String> {
@@ -111,6 +112,51 @@ impl KeyHistory {
         Ok(())
     }
 
+    /// WIST-1 §5.2 / WIST-3 §7: the highest accepted `seq` a Snapshot's
+    /// `declaration` tuple carries, which a settlement that restored a
+    /// lower-sequence head leaves above the current `seq`; every later
+    /// Declaration must exceed it.
+    pub fn adopt_floor(&mut self, domain: &str, seq: u64) {
+        let floor = self.floors.entry(domain.to_owned()).or_insert(0);
+        *floor = (*floor).max(seq);
+    }
+
+    /// WIST-3 §§7/8: restore an open recovery window from its tuple. The
+    /// recovery-chain head is baselined at its own height when it is not
+    /// the current Declaration, and the window end is set on it so
+    /// followers chain off the head and fresh identities inside the
+    /// window are superseded.
+    pub fn adopt_window(
+        &mut self,
+        domain: &str,
+        window_end: &str,
+        head: &Value,
+        head_height: u64,
+    ) -> Result<()> {
+        let head_hash = head
+            .get("publisher")
+            .ok_or_else(|| Error::PublisherVerify("window head envelope missing publisher".into()))
+            .and_then(publisher_hash)?;
+        let known = self
+            .domains
+            .get(domain)
+            .is_some_and(|entries| entries.iter().any(|e| e.hash == head_hash));
+        if !known {
+            self.add_baseline(head_height, head)?;
+        }
+        let end: jiff::Timestamp = window_end.parse().map_err(|e| {
+            Error::PublisherVerify(format!("{domain}: recovery window end {window_end}: {e}"))
+        })?;
+        if let Some(record) = self
+            .domains
+            .get_mut(domain)
+            .and_then(|entries| entries.iter_mut().find(|e| e.hash == head_hash))
+        {
+            record.window_end = Some(end);
+        }
+        Ok(())
+    }
+
     /// WIST-3 §8 step 10: restore an open recovery window a Snapshot
     /// carries, so a Declaration sealed inside it is superseded at the
     /// window's end exactly as it would be on a full replay.
@@ -140,6 +186,7 @@ impl KeyHistory {
         })?;
         let hash = publisher_hash(publisher_value)?;
         let domain = env.publisher.domain.clone();
+        let floor = self.floors.get(&domain).copied();
         let entries = self.domains.entry(domain.clone()).or_default();
 
         if entries.iter().any(|e| e.hash == hash) {
@@ -149,6 +196,13 @@ impl KeyHistory {
         disjoint_key_sets(&domain, &env.publisher)?;
 
         let seq = env.publisher.seq;
+        if let Some(floor) = floor {
+            if seq <= floor {
+                return Err(Error::PublisherVerify(format!(
+                    "{domain} seq {seq}: not greater than the accepted sequence floor {floor}"
+                )));
+            }
+        }
         let head = entries.iter().rev().find(|e| !e.superseded);
         let (recovery, sealed, window_end, fresh) = match head {
             None => {
@@ -238,6 +292,8 @@ impl KeyHistory {
             publisher: env.publisher,
             hash,
         });
+        let floor = self.floors.entry(domain).or_insert(0);
+        *floor = (*floor).max(seq);
         Ok(())
     }
 

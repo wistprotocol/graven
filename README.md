@@ -60,8 +60,15 @@ introducing them for the first time), and a declaration signed by a
 precedence over any ordinary declaration sealed inside it. A declaration
 under keys the history doesn't recognize is still accepted as a fresh
 identity, but yields to a still-open recovery window. An invalid Declaration
-fails the sync. Full recovery replay and materialization preference among
-overlapping scoped Publishers remain separate validation requirements.
+fails the sync. On cold start the Snapshot's `declaration` tuple supplies the
+accepted sequence floor every later Declaration must exceed, and a
+`recovery_window` tuple restores the recovery-chain head at its own height
+with the window end on it (WIST-3 §§7/8); the `auditor`, `observer`,
+`canary_commitment`, `escalation`, `coverage_failure` and `reputation_inputs`
+tuples are persisted in the store for the replays that will read them.
+Full recovery replay, roster and canary act replay, and materialization
+preference among overlapping scoped Publishers remain separate validation
+requirements.
 
 ## Companion packs
 
