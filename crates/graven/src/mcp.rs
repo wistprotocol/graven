@@ -370,6 +370,9 @@ mod tests {
                 head_number: 7,
                 head_hash: "sha256:deadbeef".into(),
                 content_digest: None,
+                schedule_first_s: None,
+                prior_sealed_at_s: None,
+                largest_block_bytes: 0,
             })
             .unwrap(),
         )

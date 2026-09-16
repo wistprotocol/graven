@@ -2106,3 +2106,233 @@ fn cold_start_adopts_every_derived_state_kind() {
         .unwrap();
     assert_eq!(penalties, "[[\"2026-08-09T12:00:00Z\",2]]");
 }
+
+fn spec_dir() -> std::path::PathBuf {
+    std::env::var_os("WIST_SPEC_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
+        })
+}
+
+fn head_of(fx: &common::Fixture) -> (u64, String) {
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fx.dir.path().join("log/checkpoint.json")).unwrap())
+            .unwrap();
+    (
+        doc["checkpoint"]["block_number"].as_u64().unwrap(),
+        doc["checkpoint"]["block_hash"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    )
+}
+
+fn parameter_change(
+    fx: &common::Fixture,
+    parameter: &str,
+    value: i64,
+    effective_at: &str,
+) -> serde_json::Value {
+    let update = serde_json::json!({
+        "wist_version": "1.0.0", "action": "parameter_change", "subject": parameter,
+        "details": {"parameter": parameter, "value": value}, "effective_at": effective_at,
+    });
+    let body = wist_core::envelope::sign_envelope(&update, "update", "log1", &fx.log.sk).unwrap();
+    serde_json::json!({"type": "registry_update", "body": body})
+}
+
+fn bulk_deltas(fx: &common::Fixture, count: usize) -> Vec<serde_json::Value> {
+    let publisher = common::Signer::new([1u8; 32]);
+    (0..count)
+        .map(|i| {
+            let (id, delta_env, payload) = common::build_delta(
+                &publisher,
+                "pk1",
+                &format!("https://records.example/bulk-{i}"),
+                &format!("Bulk title {i} {}", "x".repeat(120)),
+                Some(&"y".repeat(200)),
+                "bulk body",
+                None,
+            );
+            common::write_payload(fx.dir.path(), id.strip_prefix("sha256:").unwrap(), &payload);
+            serde_json::json!({"type": "publisher_delta", "body": delta_env})
+        })
+        .collect()
+}
+
+fn seal_next(
+    fx: &common::Fixture,
+    prev_hash: &str,
+    sealed_at: &str,
+    entries: &[serde_json::Value],
+) -> (u64, String, usize) {
+    let (head, _) = head_of(fx);
+    let number = head + 1;
+    let (block, hash) = common::build_block(&fx.log, number, prev_hash, sealed_at, entries);
+    common::write_block(fx.dir.path(), number, &block);
+    common::write_checkpoint(fx.dir.path(), &fx.log, number, &hash, sealed_at);
+    (number, hash, serde_json::to_vec(&block).unwrap().len())
+}
+
+fn cold_sync(fx: &common::Fixture) -> Result<(graven::sync::SyncReport, i64), String> {
+    let target = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        false,
+    )
+    .map(|report| {
+        let conn =
+            Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+        let accepted = conn
+            .query_row(
+                "SELECT COUNT(*) FROM parameters WHERE parameter = 'block_decompressed_cap_bytes'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (report, accepted)
+    })
+    .map_err(|e| e.to_string())
+}
+
+#[test]
+fn an_accepted_cap_reduction_rejects_a_later_block_above_it() {
+    let fx = common::build_fixture(true, false);
+    let (_, head_hash) = head_of(&fx);
+    let (_, hash, size) = seal_next(
+        &fx,
+        &head_hash,
+        "2026-08-09T14:00:00Z",
+        &[parameter_change(
+            &fx,
+            "block_decompressed_cap_bytes",
+            4096,
+            "2026-08-16T14:00:00Z",
+        )],
+    );
+    assert!(size <= 4096);
+    let (_, _, size) = seal_next(&fx, &hash, "2026-08-16T14:00:00Z", &bulk_deltas(&fx, 8));
+    assert!(size > 4096);
+    let error = cold_sync(&fx).unwrap_err();
+    assert!(
+        error.contains("exceeds the accepted size schedule"),
+        "the reduced cap applies at its effective instant: {error}"
+    );
+}
+
+#[test]
+fn a_cap_reduction_accepts_blocks_within_it() {
+    let fx = common::build_fixture(true, false);
+    let (_, head_hash) = head_of(&fx);
+    let (_, hash, _) = seal_next(
+        &fx,
+        &head_hash,
+        "2026-08-09T14:00:00Z",
+        &[parameter_change(
+            &fx,
+            "block_decompressed_cap_bytes",
+            4096,
+            "2026-08-16T14:00:00Z",
+        )],
+    );
+    let (head, _, size) = seal_next(&fx, &hash, "2026-08-16T14:00:00Z", &bulk_deltas(&fx, 1));
+    assert!(size <= 4096);
+    let (report, accepted) = cold_sync(&fx).unwrap();
+    assert_eq!(report.head, head);
+    assert_eq!(accepted, 1);
+}
+
+#[test]
+fn a_cap_below_a_sealed_block_is_not_accepted() {
+    let fx = common::build_fixture(true, false);
+    let (_, head_hash) = head_of(&fx);
+    let mut entries = bulk_deltas(&fx, 3);
+    entries.push(parameter_change(
+        &fx,
+        "block_decompressed_cap_bytes",
+        1024,
+        "2026-08-16T14:00:00Z",
+    ));
+    let (head, _, size) = seal_next(&fx, &head_hash, "2026-08-09T14:00:00Z", &entries);
+    assert!(size > 1024);
+    let (report, accepted) = cold_sync(&fx).unwrap();
+    assert_eq!(report.head, head);
+    assert_eq!(
+        accepted, 0,
+        "a cap below a sealed Block's size is WIST4-E03 and stays ignored"
+    );
+}
+
+#[test]
+fn a_fractional_block_timestamp_fails_the_sync() {
+    let fx = common::build_fixture(true, false);
+    let (_, head_hash) = head_of(&fx);
+    seal_next(&fx, &head_hash, "2026-08-09T14:00:00.5Z", &[]);
+    let error = cold_sync(&fx).unwrap_err();
+    assert!(
+        error.contains("timestamp must be whole-second UTC"),
+        "ADR-0022 strict timestamps: {error}"
+    );
+}
+
+#[test]
+fn an_off_grid_block_timestamp_fails_the_sync() {
+    let fx = common::build_fixture(true, false);
+    let (_, head_hash) = head_of(&fx);
+    seal_next(&fx, &head_hash, "2026-08-09T14:00:01Z", &[]);
+    let error = cold_sync(&fx).unwrap_err();
+    assert!(error.contains("off the accepted cadence grid"), "{error}");
+}
+
+#[test]
+fn a_block_file_with_two_frames_fails_the_sync() {
+    let fx = common::build_fixture(true, false);
+    let vector: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(spec_dir().join("vectors/wist3/block-frames.json")).unwrap(),
+    )
+    .unwrap();
+    let case = vector["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["label"] == "reject trailing empty")
+        .unwrap();
+    let raw: Vec<u8> = case["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|part| {
+            wist_core::crypto::hex_decode(
+                vector["fragments_hex"][part.as_str().unwrap()]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let (head, _) = head_of(&fx);
+    std::fs::write(
+        fx.dir
+            .path()
+            .join(format!("log/blocks/{:09}.json.zst", head + 1)),
+        raw,
+    )
+    .unwrap();
+    let block_hash = wist_core::block::block_hash(&vector["block"]["header"]).unwrap();
+    common::write_checkpoint(
+        fx.dir.path(),
+        &fx.log,
+        head + 1,
+        &block_hash,
+        "2026-08-09T14:00:00Z",
+    );
+    let error = cold_sync(&fx).unwrap_err();
+    assert!(
+        error.contains("WIST3-E03") && error.contains("frame"),
+        "ADR-0021 single-frame Blocks: {error}"
+    );
+}

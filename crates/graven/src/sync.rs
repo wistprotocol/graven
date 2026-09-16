@@ -21,8 +21,10 @@ use wist_core::objects::{
     Payload, PublisherEnvelope, SnapshotIndexEnvelope, SnapshotManifestEnvelope,
     SnapshotStateEnvelope, StateEntry,
 };
+use wist_core::parameters::{Amendment, Schedule};
 use wist_core::sanctions::Outcome;
 use wist_core::snapshot::{content_digest, state_digest};
+use wist_core::timestamp::log_seconds;
 
 #[derive(Debug, Clone)]
 pub struct SyncReport {
@@ -39,6 +41,117 @@ pub struct SyncState {
     pub head_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_first_s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_sealed_at_s: Option<i64>,
+    #[serde(default)]
+    pub largest_block_bytes: u64,
+}
+
+/// WIST-4 §9 and ADR-0020: the accepted parameter schedule, the largest
+/// Block seen and the previous Block's instant, carried across the walk
+/// and across restarts so amendments, size bounds and the cadence grid are
+/// checked as a replaying Consumer checks them.
+pub struct ChainState {
+    schedule: Option<Schedule>,
+    adopted: Vec<Amendment>,
+    largest: u64,
+    prior_at: Option<i64>,
+}
+
+impl ChainState {
+    pub fn fresh() -> Self {
+        Self {
+            schedule: None,
+            adopted: Vec::new(),
+            largest: 0,
+            prior_at: None,
+        }
+    }
+
+    /// The schedule a Snapshot's `parameter` tuples restore (WIST-3 §7):
+    /// accepted amendments whose sealing position the Snapshot does not
+    /// carry, adopted before the first walked Block.
+    pub fn from_tuples(tuples: &[(String, String, i64)]) -> Result<Self> {
+        let adopted = tuples
+            .iter()
+            .enumerate()
+            .map(|(index, (name, effective_at, value))| {
+                let effective_at_s = log_seconds(effective_at)
+                    .map_err(|e| Error::Verify(format!("parameter tuple {name}: {e}")))?;
+                Ok(Amendment {
+                    parameter: name.clone(),
+                    value: *value,
+                    block_number: 0,
+                    entry_index: index as u64,
+                    sealed_at_s: effective_at_s,
+                    effective_at_s,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            schedule: None,
+            adopted,
+            largest: 0,
+            prior_at: None,
+        })
+    }
+
+    pub fn restore(state: &SyncState, accepted: Vec<Amendment>) -> Self {
+        let schedule = state.schedule_first_s.map(|first| {
+            let mut schedule = Schedule::new(first);
+            for amendment in accepted {
+                schedule.adopt(amendment);
+            }
+            schedule
+        });
+        Self {
+            schedule,
+            adopted: Vec::new(),
+            largest: state.largest_block_bytes,
+            prior_at: state.prior_sealed_at_s,
+        }
+    }
+
+    fn schedule_at(&mut self, at: i64) -> &mut Schedule {
+        if self.schedule.is_none() {
+            let mut schedule = Schedule::new(at);
+            for amendment in self.adopted.drain(..) {
+                schedule.adopt(amendment);
+            }
+            self.schedule = Some(schedule);
+        }
+        self.schedule.as_mut().unwrap()
+    }
+
+    fn transport_bound(&self) -> u64 {
+        match (&self.schedule, self.prior_at) {
+            (Some(schedule), Some(at)) => schedule.block_size_bounds(at).1,
+            _ => wist_core::parameters::spec("block_decompressed_cap_bytes")
+                .and_then(|p| p.default)
+                .unwrap_or(0) as u64,
+        }
+    }
+
+    pub fn accepted(&self) -> Vec<Amendment> {
+        self.schedule
+            .as_ref()
+            .map(|s| s.accepted().to_vec())
+            .unwrap_or_default()
+    }
+
+    pub fn schedule_first_s(&self) -> Option<i64> {
+        self.schedule.as_ref().map(|s| s.first_block_s())
+    }
+
+    pub fn prior_at(&self) -> Option<i64> {
+        self.prior_at
+    }
+
+    pub fn largest(&self) -> u64 {
+        self.largest
+    }
 }
 
 pub struct BlockEvent {
@@ -300,6 +413,7 @@ pub fn walk_blocks(
     client: &Client,
     base: &Url,
     keys: &mut AggregatorKeys,
+    chain: &mut ChainState,
     start_number: u64,
     end_number: u64,
     start_hash: &str,
@@ -310,9 +424,14 @@ pub fn walk_blocks(
     for n in start_number..=end_number {
         let block_url = resolve(base, &format!("/log/blocks/{n:09}.json.zst"))?;
         let compressed = client.get_bytes(&block_url)?;
-        let decompressed = zstd::decode_all(compressed.as_slice())
-            .map_err(|e| Error::Verify(format!("zstd decode of block {n}: {e}")))?;
+        let decompressed = wist_core::block_frames::decode(&compressed, chain.transport_bound())
+            .map_err(|e| Error::Verify(format!("block {n}: {e}")))?;
         let block_value: Value = serde_json::from_slice(&decompressed)?;
+        if wist_core::jcs::canonicalize(&block_value)? != decompressed {
+            return Err(Error::Verify(format!(
+                "block {n}: WIST3-E03 Block file does not contain canonical JCS bytes"
+            )));
+        }
         for entry in block_value
             .get("entries")
             .and_then(Value::as_array)
@@ -346,6 +465,64 @@ pub fn walk_blocks(
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Verify(format!("block {n} missing header.sealed_at")))?
             .to_string();
+        let at = log_seconds(&sealed_at)
+            .map_err(|e| Error::Verify(format!("block {n}: WIST3-E03 {e}")))?;
+        if chain.prior_at.is_some_and(|prior| at <= prior) {
+            return Err(Error::Verify(format!(
+                "block {n}: WIST3-E03 Block timestamps are not strictly increasing"
+            )));
+        }
+        let cadence_at = chain.prior_at.unwrap_or(at);
+        let largest = chain.largest.max(decompressed.len() as u64);
+        let schedule = chain.schedule_at(at);
+        let cadence = schedule
+            .value_at("block_cadence_seconds", cadence_at)
+            .unwrap_or(1);
+        if at.rem_euclid(cadence) != 0 {
+            return Err(Error::Verify(format!(
+                "block {n}: WIST3-E03 Block timestamp is off the accepted cadence grid"
+            )));
+        }
+        for (index, entry) in block_value
+            .get("entries")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let update = &entry["body"]["update"];
+            if entry["type"] != "registry_update" || update["action"] != "parameter_change" {
+                continue;
+            }
+            let (Some(parameter), Some(value), Some(effective_at)) = (
+                update["details"]["parameter"].as_str(),
+                update["details"]["value"].as_i64(),
+                update["effective_at"].as_str(),
+            ) else {
+                continue;
+            };
+            let Ok(effective_at_s) = log_seconds(effective_at) else {
+                continue;
+            };
+            let _ = schedule.try_accept_with_block_size(
+                Amendment {
+                    parameter: parameter.to_owned(),
+                    value,
+                    block_number: n,
+                    entry_index: index as u64,
+                    sealed_at_s: at,
+                    effective_at_s,
+                },
+                largest,
+            );
+        }
+        if largest > schedule.block_size_bounds(at).0 {
+            return Err(Error::Verify(format!(
+                "block {n}: WIST3-E03 Block exceeds the accepted size schedule"
+            )));
+        }
+        chain.largest = largest;
+        chain.prior_at = Some(at);
 
         let mut declarations = Vec::new();
         let mut withdrawals = Vec::new();
@@ -409,6 +586,43 @@ pub fn walk_blocks(
         last_block_value = Some(block_value);
     }
     Ok((events, last_block_value))
+}
+
+fn save_parameters(conn: &Connection, chain: &ChainState) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_PARAMETERS)?;
+    conn.execute("DELETE FROM parameters", [])?;
+    for a in chain.accepted() {
+        conn.execute(
+            "INSERT INTO parameters(parameter, value, block_number, entry_index, sealed_at_s, effective_at_s) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                &a.parameter,
+                a.value,
+                a.block_number as i64,
+                a.entry_index as i64,
+                a.sealed_at_s,
+                a.effective_at_s,
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn load_parameters(conn: &Connection) -> Result<Vec<Amendment>> {
+    conn.execute_batch(crate::store::CREATE_PARAMETERS)?;
+    let mut stmt = conn.prepare(
+        "SELECT parameter, value, block_number, entry_index, sealed_at_s, effective_at_s FROM parameters ORDER BY block_number, entry_index",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Amendment {
+            parameter: r.get(0)?,
+            value: r.get(1)?,
+            block_number: r.get::<_, i64>(2)? as u64,
+            entry_index: r.get::<_, i64>(3)? as u64,
+            sealed_at_s: r.get(4)?,
+            effective_at_s: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 fn load_anchor(anchor: &str, client: &Client) -> Result<(PublicKey, String, String)> {
@@ -1121,14 +1335,17 @@ fn run_incremental(
     let index_sqlite_path = dir.join("index.sqlite");
     let conn = Connection::open(&index_sqlite_path)?;
     let mut aggregator_keys = load_aggregator_keys(&conn, genesis_key_id, trust_key)?;
+    let mut chain = ChainState::restore(&local, load_parameters(&conn)?);
     let (events, last_block_value) = walk_blocks(
         client,
         base,
         &mut aggregator_keys,
+        &mut chain,
         local.head_number + 1,
         checkpoint.block_number,
         &local.head_hash,
     )?;
+    save_parameters(&conn, &chain)?;
     verify_checkpoint_signature(&checkpoint_value, &aggregator_keys)?;
     save_aggregator_keys(&conn, &aggregator_keys)?;
     let last_block_value = last_block_value.ok_or_else(|| {
@@ -1155,6 +1372,9 @@ fn run_incremental(
         head_number: checkpoint.block_number,
         head_hash: checkpoint.block_hash.clone(),
         content_digest: local.content_digest.clone(),
+        schedule_first_s: chain.schedule_first_s(),
+        prior_sealed_at_s: chain.prior_at(),
+        largest_block_bytes: chain.largest(),
     };
     std::fs::write(sync_path, serde_json::to_vec(&sync_state)?)?;
 
@@ -1295,9 +1515,13 @@ fn run_cold_start(
     let mut adopted_sanctions: Vec<(String, u64)> = Vec::new();
     let mut adopted_exclusions: Vec<(String, String, u64)> = Vec::new();
     let mut adopted_windows: Vec<(String, String, Value, u64)> = Vec::new();
+    let mut adopted_parameters: Vec<(String, String, i64)> = Vec::new();
     conn.execute_batch(crate::store::CREATE_ADOPTED_STATE)?;
     for entry in &state_env.state.entries {
         match entry {
+            StateEntry::Parameter(p) => {
+                adopted_parameters.push((p.name.clone(), p.effective_at.clone(), p.value));
+            }
             StateEntry::Declaration(d) => {
                 history.add_baseline(d.sealing_height, &d.declaration)?;
                 history.adopt_floor(&d.domain, d.highest_accepted_seq);
@@ -1386,7 +1610,6 @@ fn run_cold_start(
                     e.excluded_since_height,
                 ));
             }
-            _ => {}
         }
     }
     for (domain, window_end, head, head_height) in &adopted_windows {
@@ -1421,14 +1644,17 @@ fn run_cold_start(
     for (key_id, public_key, removed_height) in &adopted_keys {
         aggregator_keys.admit(key_id, public_key, removed_height.is_some())?;
     }
+    let mut chain = ChainState::from_tuples(&adopted_parameters)?;
     let (events, last_block_value) = walk_blocks(
         client,
         base,
         &mut aggregator_keys,
+        &mut chain,
         manifest.log_position + 1,
         checkpoint.block_number,
         &manifest.anchor_block_hash,
     )?;
+    save_parameters(&conn, &chain)?;
     verify_checkpoint_signature(&checkpoint_value, &aggregator_keys)?;
     save_aggregator_keys(&conn, &aggregator_keys)?;
 
@@ -1464,6 +1690,9 @@ fn run_cold_start(
         head_number: checkpoint.block_number,
         head_hash: checkpoint.block_hash.clone(),
         content_digest: Some(manifest.content_digest.clone()),
+        schedule_first_s: chain.schedule_first_s(),
+        prior_sealed_at_s: chain.prior_at(),
+        largest_block_bytes: chain.largest(),
     };
     std::fs::write(sync_path, serde_json::to_vec(&sync_state)?)?;
 

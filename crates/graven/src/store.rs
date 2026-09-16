@@ -31,6 +31,10 @@ pub const CREATE_SANCTIONS: &str =
 /// so a resuming Consumer holds what a replaying one derives.
 pub const CREATE_ADOPTED_STATE: &str = "CREATE TABLE IF NOT EXISTS auditors(auditor_id TEXT NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, admitted_height INTEGER NOT NULL, removed_height INTEGER, PRIMARY KEY(auditor_id, key_id)); CREATE TABLE IF NOT EXISTS observers(observer_id TEXT NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, registered_height INTEGER NOT NULL, ended_height INTEGER, PRIMARY KEY(observer_id, key_id)); CREATE TABLE IF NOT EXISTS canary_commitments(update_id TEXT PRIMARY KEY, planter TEXT NOT NULL, root TEXT NOT NULL, leaves INTEGER NOT NULL, sealing_height INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS escalations(domain TEXT PRIMARY KEY, establishing_sealed_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS coverage_failures(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number)); CREATE TABLE IF NOT EXISTS reputation_inputs(domain TEXT PRIMARY KEY, first_accepted_sealed_at TEXT NOT NULL, reset_height INTEGER, counted_total INTEGER NOT NULL, counted_json TEXT NOT NULL, penalties_json TEXT NOT NULL)";
 
+/// WIST-4 §9: the accepted parameter amendments, so a restarted sync
+/// continues the schedule a replaying Consumer holds.
+pub const CREATE_PARAMETERS: &str = "CREATE TABLE IF NOT EXISTS parameters(parameter TEXT NOT NULL, value INTEGER NOT NULL, block_number INTEGER NOT NULL, entry_index INTEGER NOT NULL, sealed_at_s INTEGER NOT NULL, effective_at_s INTEGER NOT NULL, PRIMARY KEY(parameter, block_number, entry_index))";
+
 pub const CREATE_TIER1: &str = "CREATE TABLE IF NOT EXISTS extracts(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, extract TEXT NOT NULL, PRIMARY KEY(url, publisher)); CREATE VIRTUAL TABLE IF NOT EXISTS extracts_fts USING fts5(extract, content=extracts, content_rowid=rowid); CREATE TABLE IF NOT EXISTS links(source_url TEXT NOT NULL, target_url TEXT NOT NULL, position INTEGER NOT NULL)";
 
 pub const CREATE_EMBEDDINGS: &str = "CREATE TABLE IF NOT EXISTS embeddings(delta_id TEXT PRIMARY KEY, url TEXT NOT NULL, publisher TEXT NOT NULL, vector BLOB NOT NULL); CREATE TABLE IF NOT EXISTS pack_meta(id INTEGER PRIMARY KEY CHECK(id = 1), model_json TEXT NOT NULL, metric TEXT NOT NULL, dim INTEGER NOT NULL, imported_at TEXT NOT NULL, key_b64u TEXT NOT NULL)";
@@ -863,6 +867,9 @@ mod tests {
                 head_number: height,
                 head_hash: "sha256:deadbeef".into(),
                 content_digest: None,
+                schedule_first_s: None,
+                prior_sealed_at_s: None,
+                largest_block_bytes: 0,
             })
             .unwrap(),
         )
@@ -980,6 +987,9 @@ mod tests {
                 head_number: 1,
                 head_hash: "sha256:deadbeef".into(),
                 content_digest: None,
+                schedule_first_s: None,
+                prior_sealed_at_s: None,
+                largest_block_bytes: 0,
             })
             .unwrap(),
         )

@@ -39,9 +39,20 @@ cleanly if that sync then fails.
 Chain-level: every Block's signature, hash chain, and Merkle root; the
 checkpoint's signature and its binding to the head Block; on cold start,
 the snapshot index/manifest/state signatures and the recomputed
-`content_digest`/`state_digest` against the manifest's claims. Any
-mismatch fails the sync closed and, on an already-migrated directory,
-rolls the migration back.
+`content_digest`/`state_digest` against the manifest's claims. Each Block
+file must be one standard Zstandard frame whose declared size is present
+and within the accepted transport bound, decoded through core's shared
+decoder (WIST-3 §6, ADR-0021), and must carry canonical JCS bytes; each
+`sealed_at` must be a whole-second literal-`Z` Log timestamp on the
+accepted cadence grid, strictly increasing (WIST-3 §3.1, ADR-0022).
+Log-signed `parameter_change` acts replay through core's accepted-schedule
+rules (WIST-4 §9, ADR-0020): rejected amendments are ignored, an amendment
+cannot cut the cap below a Block already sealed, and a Block above the cap
+in force at its instant fails the sync. The accepted schedule, the largest
+Block seen and the previous instant persist in `sync.json` and the
+`parameters` table; a cold start seeds the schedule from the Snapshot's
+`parameter` tuples, so pending amendments survive. Any mismatch fails the
+sync closed and, on an already-migrated directory, rolls the migration back.
 
 Per-delta, independently of the above (WIST-1 §5.2): each delta's
 `sig.key_id` must resolve to a key in its publisher's key set as of the

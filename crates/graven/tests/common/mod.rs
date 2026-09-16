@@ -262,10 +262,9 @@ pub fn write_block(dir: &Path, block_number: u64, block: &Value) {
     let blocks_dir = dir.join("log/blocks");
     std::fs::create_dir_all(&blocks_dir).unwrap();
     let bytes = serde_json::to_vec(block).unwrap();
-    let compressed = zstd::encode_all(bytes.as_slice(), 0).unwrap();
     std::fs::write(
         blocks_dir.join(format!("{block_number:09}.json.zst")),
-        compressed,
+        block_frame(&bytes),
     )
     .unwrap();
 }
@@ -1139,4 +1138,14 @@ fn build_fixture_state(
         snapshot_date,
         base_url,
     }
+}
+
+pub fn block_frame(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+    encoder
+        .set_pledged_src_size(Some(bytes.len() as u64))
+        .unwrap();
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
 }
