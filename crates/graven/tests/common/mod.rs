@@ -406,6 +406,7 @@ pub fn write_state(
             domain: domain.clone(),
             declaration: declaration.clone(),
             sealing_height: 0,
+            highest_accepted_seq: declaration["publisher"]["seq"].as_u64().unwrap_or(0),
         }));
     }
     for r in records {
