@@ -2336,3 +2336,139 @@ fn a_block_file_with_two_frames_fails_the_sync() {
         "ADR-0021 single-frame Blocks: {error}"
     );
 }
+
+fn delta_observed(
+    publisher: &common::Signer,
+    url: &str,
+    observed_at: &str,
+    version: &str,
+) -> (String, serde_json::Value, serde_json::Value) {
+    let salt = wist_core::crypto::b64u_encode(&[7u8; 16]);
+    let content = serde_json::json!({
+        "extract": format!("body of {url}"),
+        "links": {"total": 0, "urls": []},
+        "summary": {"title": format!("Title of {url}")},
+    });
+    let payload = serde_json::json!({"wist_version": "1.0.0", "salt": salt, "content": content});
+    let delta = serde_json::json!({
+        "wist_version": version,
+        "publisher": "records.example",
+        "url": url,
+        "change_type": "new",
+        "observed_at": observed_at,
+        "payload": {
+            "commitment": wist_core::delta::make_commitment(&salt, &content).unwrap(),
+            "alg": "HMAC-SHA256",
+            "bytes": wist_core::delta::content_bytes(&content).unwrap(),
+        },
+        "meta": {"lang": "en"},
+    });
+    let envelope =
+        wist_core::envelope::sign_envelope(&delta, "delta", "pk1", &publisher.sk).unwrap();
+    (
+        wist_core::delta::delta_id(&delta).unwrap(),
+        envelope,
+        payload,
+    )
+}
+
+#[test]
+fn sealed_deltas_are_checked_against_their_block_clock_and_accepted_allowance() {
+    let fx = common::build_fixture(true, false);
+    let publisher = common::Signer::new([1u8; 32]);
+    let mut entries = vec![parameter_change(
+        &fx,
+        "clock_skew_seconds",
+        0,
+        "2026-08-16T14:00:00Z",
+    )];
+    let mut sealed = Vec::new();
+    for (url, observed_at, version) in [
+        (
+            "https://records.example/within-default",
+            "2026-08-09T14:10:00Z",
+            "1.0.0",
+        ),
+        (
+            "https://records.example/beyond-default",
+            "2026-08-09T14:10:00.000000000000000001Z",
+            "1.0.0",
+        ),
+        (
+            "https://records.example/patch-version",
+            "2026-08-09T13:00:00Z",
+            "1.7.3",
+        ),
+        (
+            "https://records.example/other-major",
+            "2026-08-09T13:00:00Z",
+            "2.0.0",
+        ),
+    ] {
+        let (id, envelope, payload) = delta_observed(&publisher, url, observed_at, version);
+        common::write_payload(fx.dir.path(), id.strip_prefix("sha256:").unwrap(), &payload);
+        sealed.push(url);
+        entries.push(serde_json::json!({"type": "publisher_delta", "body": envelope}));
+    }
+    let (_, head_hash) = head_of(&fx);
+    let (_, hash, _) = seal_next(&fx, &head_hash, "2026-08-09T14:00:00Z", &entries);
+    let mut entries = Vec::new();
+    for (url, observed_at) in [
+        (
+            "https://records.example/at-zero-allowance",
+            "2026-08-16T14:00:00Z",
+        ),
+        (
+            "https://records.example/past-zero-allowance",
+            "2026-08-16T14:00:00.5Z",
+        ),
+    ] {
+        let (id, envelope, payload) = delta_observed(&publisher, url, observed_at, "1.0.0");
+        common::write_payload(fx.dir.path(), id.strip_prefix("sha256:").unwrap(), &payload);
+        sealed.push(url);
+        entries.push(serde_json::json!({"type": "publisher_delta", "body": envelope}));
+    }
+    let (head, _, _) = seal_next(&fx, &hash, "2026-08-16T14:00:00Z", &entries);
+    let target = tempfile::tempdir().unwrap();
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.head, head);
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT url FROM records WHERE url LIKE 'https://records.example/%' ORDER BY url")
+        .unwrap();
+    let urls: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let materialized: Vec<&str> = sealed
+        .iter()
+        .copied()
+        .filter(|url| urls.iter().any(|u| u == url))
+        .collect();
+    assert_eq!(
+        materialized,
+        [
+            "https://records.example/within-default",
+            "https://records.example/patch-version",
+            "https://records.example/at-zero-allowance",
+        ],
+        "materialized {urls:?}"
+    );
+    let tips: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM chain_tips WHERE url IN ('https://records.example/beyond-default', 'https://records.example/other-major', 'https://records.example/past-zero-allowance')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tips, 0, "an ignored Delta moves no chain tip");
+}

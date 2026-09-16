@@ -324,13 +324,43 @@ impl KeyHistory {
         })
     }
 
-    pub fn verify_delta(&self, height: u64, entry_body: &Value) -> Result<VerifiedDelta> {
+    /// WIST-1 §7's precedence for a sealed Delta: complete field validation
+    /// and §3.1 major support, the presence and parameter-profile caps, the
+    /// §5.2 author binding and scope, then the §3.4 clock check against the
+    /// committing Block's `sealed_at` and the allowance accepted there.
+    pub fn verify_delta(
+        &self,
+        height: u64,
+        sealed_at_s: i64,
+        profile: &DeltaProfile,
+        entry_body: &Value,
+    ) -> Result<VerifiedDelta> {
+        let diagnostic = |code: &str, detail: &str| {
+            Error::PublisherVerify(format!("{code}: height {height}: {detail}"))
+        };
+        wist_core::delta_fields::validate_static(
+            entry_body,
+            profile.url_cap_bytes,
+            profile.commitment_cap_bytes,
+        )
+        .map_err(|code| diagnostic(code, "Delta field, version or static check failed"))?;
         let domain = wist_core::delta::publisher(&entry_body["delta"])?;
         let env: DeltaEnvelope = serde_json::from_value(entry_body.clone())?;
+        if wist_core::extract::normalize_url(&env.delta.url, &env.delta.url).as_deref()
+            != Some(env.delta.url.as_str())
+        {
+            return Err(diagnostic(
+                "WIST1-E03",
+                &format!("delta url {} is not a Normalized URL", env.delta.url),
+            ));
+        }
         let url = Url::parse(&env.delta.url)
-            .map_err(|e| Error::PublisherVerify(format!("delta url {}: {e}", env.delta.url)))?;
+            .map_err(|e| diagnostic("WIST1-E03", &format!("delta url {}: {e}", env.delta.url)))?;
         let host = url_authority(&url).ok_or_else(|| {
-            Error::PublisherVerify(format!("delta url {}: no authority", env.delta.url))
+            diagnostic(
+                "WIST1-E03",
+                &format!("delta url {}: no authority", env.delta.url),
+            )
         })?;
         let record = self.resolve(domain, height)?;
         if host != domain
@@ -340,37 +370,39 @@ impl KeyHistory {
                 .as_ref()
                 .is_some_and(|scope| scope.contains(&host))
         {
-            return Err(Error::PublisherVerify(format!(
-                "WIST1-E03: {host} outside signed Publisher {domain} scope"
-            )));
+            return Err(diagnostic(
+                "WIST1-E03",
+                &format!("{host} outside signed Publisher {domain} scope"),
+            ));
         }
         let domain = domain.to_string();
         let key = key_by_id(&record.publisher.keys, &env.sig.key_id).ok_or_else(|| {
-            Error::PublisherVerify(format!(
-                "{domain} height {height}: unknown key_id {}",
-                env.sig.key_id
-            ))
+            diagnostic(
+                "WIST1-E02",
+                &format!("{domain}: unknown key_id {}", env.sig.key_id),
+            )
         })?;
         let pk = PublicKey::from_b64u(&key.public_key)?;
         verify_envelope(entry_body, "delta", &pk)
-            .map_err(|e| Error::PublisherVerify(format!("{domain} height {height}: {e}")))?;
-        let observed_at: jiff::Timestamp = env.delta.observed_at.parse().map_err(|e| {
-            Error::PublisherVerify(format!(
-                "{domain} height {height}: observed_at {}: {e}",
-                env.delta.observed_at
-            ))
-        })?;
-        let valid_from: jiff::Timestamp = key.valid_from.parse().map_err(|e| {
-            Error::PublisherVerify(format!(
-                "{domain} height {height}: key valid_from {}: {e}",
-                key.valid_from
-            ))
-        })?;
-        if observed_at < valid_from {
-            return Err(Error::PublisherVerify(format!(
-                "{domain} height {height}: observed_at precedes key valid_from"
-            )));
+            .map_err(|e| diagnostic("WIST1-E01", &format!("{domain}: {e}")))?;
+        if !wist_core::publisher_time::compare(&env.delta.observed_at, &key.valid_from)
+            .is_some_and(|order| !order.is_lt())
+        {
+            return Err(diagnostic(
+                "WIST1-E02",
+                &format!("{domain}: observed_at precedes key valid_from"),
+            ));
         }
+        wist_core::delta_fields::verify_clock(entry_body, sealed_at_s, profile.clock_skew_seconds)
+            .map_err(|code| {
+                diagnostic(
+                    code,
+                    &format!(
+                        "{domain}: observed_at {} exceeds the sealing clock allowance",
+                        env.delta.observed_at
+                    ),
+                )
+            })?;
         Ok(VerifiedDelta {
             id: delta_id(&entry_body["delta"])?,
             materializes: domain == host || !self.self_declared_at(&host, height),
@@ -379,9 +411,55 @@ impl KeyHistory {
     }
 }
 
+/// The parameter profile a sealed Delta is validated under: the caps and
+/// clock allowance the accepted schedule holds at its Block's `sealed_at`
+/// (WIST-1 §§3.2/3.4/3.6, WIST-4 §9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaProfile {
+    pub url_cap_bytes: i64,
+    pub commitment_cap_bytes: i128,
+    pub clock_skew_seconds: i64,
+}
+
+impl DeltaProfile {
+    pub fn from_schedule(schedule: &wist_core::parameters::Schedule, at_s: i64) -> Self {
+        let value = |name: &str| schedule.value_at(name, at_s).unwrap();
+        Self {
+            url_cap_bytes: value("url_cap_bytes"),
+            commitment_cap_bytes: wist_core::delta_fields::commitment_cap(
+                value("extract_cap_bytes"),
+                value("links_cap_bytes"),
+                value("summary_cap_bytes"),
+            ),
+            clock_skew_seconds: value("clock_skew_seconds"),
+        }
+    }
+}
+
+impl Default for DeltaProfile {
+    fn default() -> Self {
+        let default = |name: &str| {
+            wist_core::parameters::spec(name)
+                .and_then(|p| p.default)
+                .unwrap()
+        };
+        Self {
+            url_cap_bytes: default("url_cap_bytes"),
+            commitment_cap_bytes: wist_core::delta_fields::commitment_cap(
+                default("extract_cap_bytes"),
+                default("links_cap_bytes"),
+                default("summary_cap_bytes"),
+            ),
+            clock_skew_seconds: default("clock_skew_seconds"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LATE_S: i64 = 1_800_000_000;
     use serde_json::Value;
     use wist_core::crypto::{b64u_encode, SigningKey};
     use wist_core::envelope::sign_envelope;
@@ -465,6 +543,7 @@ mod tests {
             "url": url,
             "change_type": "new",
             "observed_at": observed_at,
+            "payload": {"commitment": format!("hmac-sha256:{}", "0".repeat(64)), "alg": "HMAC-SHA256", "bytes": 0},
             "meta": {"lang": "en"},
         });
         sign_envelope(&delta, "delta", key_id, &signer.sk).unwrap()
@@ -490,7 +569,9 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        let verified = kh.verify_delta(1, &delta).unwrap();
+        let verified = kh
+            .verify_delta(1, LATE_S, &DeltaProfile::default(), &delta)
+            .unwrap();
         assert!(verified.id.starts_with("sha256:"));
         assert!(verified.materializes);
     }
@@ -515,7 +596,9 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        let err = kh.verify_delta(1, &delta).unwrap_err();
+        let err = kh
+            .verify_delta(1, LATE_S, &DeltaProfile::default(), &delta)
+            .unwrap_err();
         assert!(err.to_string().contains("key_id"), "{err}");
     }
 
@@ -540,7 +623,9 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(1, &delta).is_err());
+        assert!(kh
+            .verify_delta(1, LATE_S, &DeltaProfile::default(), &delta)
+            .is_err());
     }
 
     #[test]
@@ -563,7 +648,9 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T00:00:00Z",
         );
-        let err = kh.verify_delta(1, &delta).unwrap_err();
+        let err = kh
+            .verify_delta(1, LATE_S, &DeltaProfile::default(), &delta)
+            .unwrap_err();
         assert!(err.to_string().contains("valid_from"), "{err}");
     }
 
@@ -588,7 +675,9 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(3, &delta).is_err());
+        assert!(kh
+            .verify_delta(3, LATE_S, &DeltaProfile::default(), &delta)
+            .is_err());
     }
 
     #[test]
@@ -625,7 +714,9 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(3, &delta_early).is_ok());
+        assert!(kh
+            .verify_delta(3, LATE_S, &DeltaProfile::default(), &delta_early)
+            .is_ok());
 
         let delta_late_pk1 = delta_env(
             &pk1,
@@ -633,7 +724,9 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(6, &delta_late_pk1).is_err());
+        assert!(kh
+            .verify_delta(6, LATE_S, &DeltaProfile::default(), &delta_late_pk1)
+            .is_err());
 
         let delta_pk2 = delta_env(
             &pk2,
@@ -641,7 +734,9 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(6, &delta_pk2).is_ok());
+        assert!(kh
+            .verify_delta(6, LATE_S, &DeltaProfile::default(), &delta_pk2)
+            .is_ok());
     }
 
     #[test]
@@ -754,7 +849,9 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T14:00:00Z",
         );
-        assert!(kh.verify_delta(2, &delta).is_ok());
+        assert!(kh
+            .verify_delta(2, LATE_S, &DeltaProfile::default(), &delta)
+            .is_ok());
     }
 
     #[test]
@@ -842,14 +939,18 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(5, &via_pk3_at5).is_ok());
+        assert!(kh
+            .verify_delta(5, LATE_S, &DeltaProfile::default(), &via_pk3_at5)
+            .is_ok());
         let via_pk2_at5 = delta_env(
             &pk2,
             "pk2",
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(5, &via_pk2_at5).is_err());
+        assert!(kh
+            .verify_delta(5, LATE_S, &DeltaProfile::default(), &via_pk2_at5)
+            .is_err());
         // The attacker's ordinary rotation, sealed before the recovery, never
         // governs inside the window.
         let via_atk_at5 = delta_env(
@@ -858,7 +959,9 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(5, &via_atk_at5).is_err());
+        assert!(kh
+            .verify_delta(5, LATE_S, &DeltaProfile::default(), &via_atk_at5)
+            .is_err());
 
         let via_pk4_at7 = delta_env(
             &pk4,
@@ -866,14 +969,18 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(7, &via_pk4_at7).is_ok());
+        assert!(kh
+            .verify_delta(7, LATE_S, &DeltaProfile::default(), &via_pk4_at7)
+            .is_ok());
         let via_pk2_at7 = delta_env(
             &pk2,
             "pk2",
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(7, &via_pk2_at7).is_err());
+        assert!(kh
+            .verify_delta(7, LATE_S, &DeltaProfile::default(), &via_pk2_at7)
+            .is_err());
     }
 
     #[test]
@@ -910,8 +1017,12 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(1, &delta_old).is_ok());
-        assert!(kh.verify_delta(2, &delta_old).is_err());
+        assert!(kh
+            .verify_delta(1, LATE_S, &DeltaProfile::default(), &delta_old)
+            .is_ok());
+        assert!(kh
+            .verify_delta(2, LATE_S, &DeltaProfile::default(), &delta_old)
+            .is_err());
 
         let delta_new = delta_env(
             &pkx,
@@ -919,7 +1030,9 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T14:00:00Z",
         );
-        assert!(kh.verify_delta(2, &delta_new).is_ok());
+        assert!(kh
+            .verify_delta(2, LATE_S, &DeltaProfile::default(), &delta_new)
+            .is_ok());
     }
 
     #[test]
@@ -977,14 +1090,18 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(3, &via_pk2_at3).is_ok());
+        assert!(kh
+            .verify_delta(3, LATE_S, &DeltaProfile::default(), &via_pk2_at3)
+            .is_ok());
         let via_pky_at3 = delta_env(
             &pky,
             "pky",
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(3, &via_pky_at3).is_err());
+        assert!(kh
+            .verify_delta(3, LATE_S, &DeltaProfile::default(), &via_pky_at3)
+            .is_err());
 
         // The fresh identity is superseded, so its own successor chains off a
         // Declaration that never took effect and is rejected: after the
@@ -1020,14 +1137,18 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(4, &via_pkz_at4).is_ok());
+        assert!(kh
+            .verify_delta(4, LATE_S, &DeltaProfile::default(), &via_pkz_at4)
+            .is_ok());
         let via_pk2_at4 = delta_env(
             &pk2,
             "pk2",
             "https://records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(4, &via_pk2_at4).is_err());
+        assert!(kh
+            .verify_delta(4, LATE_S, &DeltaProfile::default(), &via_pk2_at4)
+            .is_err());
     }
 
     #[test]
@@ -1096,7 +1217,9 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T14:00:00Z",
         );
-        assert!(kh.verify_delta(2, &delta).is_ok());
+        assert!(kh
+            .verify_delta(2, LATE_S, &DeltaProfile::default(), &delta)
+            .is_ok());
     }
 
     #[test]
@@ -1133,7 +1256,9 @@ mod tests {
             "https://records.example/a",
             "2026-08-09T14:00:00Z",
         );
-        assert!(kh.verify_delta(2, &delta).is_ok());
+        assert!(kh
+            .verify_delta(2, LATE_S, &DeltaProfile::default(), &delta)
+            .is_ok());
     }
 
     #[test]
@@ -1154,7 +1279,9 @@ mod tests {
             "https://sub.records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        assert!(kh.verify_delta(1, &delta).is_ok());
+        assert!(kh
+            .verify_delta(1, LATE_S, &DeltaProfile::default(), &delta)
+            .is_ok());
     }
 
     #[test]
@@ -1175,7 +1302,9 @@ mod tests {
             "https://sub.records.example/a",
             "2026-08-09T12:00:00Z",
         );
-        let err = kh.verify_delta(1, &delta).unwrap_err();
+        let err = kh
+            .verify_delta(1, LATE_S, &DeltaProfile::default(), &delta)
+            .unwrap_err();
         assert!(err.to_string().contains("sub.records.example"), "{err}");
     }
     #[test]
@@ -1206,7 +1335,8 @@ mod tests {
                 }
                 for (index, envelope) in case["envelopes"].as_array().unwrap().iter().enumerate() {
                     let original = envelope.clone();
-                    let actual = history.verify_delta(1, envelope);
+                    let actual =
+                        history.verify_delta(1, LATE_S, &DeltaProfile::default(), envelope);
                     assert_eq!(
                         actual.is_ok(),
                         case["expected"][index] == "accepted",

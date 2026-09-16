@@ -54,13 +54,21 @@ Block seen and the previous instant persist in `sync.json` and the
 `parameter` tuples, so pending amendments survive. Any mismatch fails the
 sync closed and, on an already-migrated directory, rolls the migration back.
 
-Per-delta, independently of the above (WIST-1 §5.2): each delta's
-`sig.key_id` must resolve to a key in its publisher's key set as of the
-sealing height; that key's `valid_from` must not be after the delta's
-`observed_at`. Verification selects history by the canonical signed
-`publisher` and checks its literal URL scope; shared keys and reused
-identifiers in other domains cannot change authorship. Malformed or
-unauthorized Deltas are ignored without advancing their chains.
+Per-delta, independently of the above, in WIST-1 §7's order: complete
+field validation under `delta.schema.json` (`WIST1-E14`), wire major `1`
+support with same-major minor and patch values accepted (`WIST1-E15`,
+ADR-0030), the presence rules and the URL and commitment caps the accepted
+schedule holds at the Block's `sealed_at` (`WIST1-E09`/`E07`/`E11`/`E04`),
+then the WIST-1 §5.2 binding: `sig.key_id` must resolve to a key in its
+publisher's key set as of the sealing height, and that key's `valid_from`
+must not be after the delta's `observed_at` under the Publisher timestamp
+profile's exact fraction and offset arithmetic (ADR-0026). Verification
+selects history by the canonical signed `publisher` and checks its literal
+URL scope; shared keys and reused identifiers in other domains cannot
+change authorship. Last, WIST-1 §3.4's clock check uses the committing
+Block's `sealed_at` and the `clock_skew_seconds` accepted at that instant
+(`WIST1-E06`); no wall clock takes part. Deltas failing any of these are
+ignored without advancing their chains.
 
 The chain of Publisher Declarations that produced that
 key set must itself be well-formed — `seq` and `prev_declaration` strictly

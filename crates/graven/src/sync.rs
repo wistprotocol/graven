@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::fetch::{resolve, Client};
-use crate::keyset::KeyHistory;
+use crate::keyset::{DeltaProfile, KeyHistory};
 use crate::registry::{self, LogEntry};
 use crate::store::{table_exists, CREATE_DECLARATIONS, CREATE_TIER1, CREATE_UNIQUE_INDEX};
 use crate::tier1;
@@ -157,6 +157,10 @@ impl ChainState {
 pub struct BlockEvent {
     pub height: u64,
     pub sealed_at: String,
+    pub sealed_at_s: i64,
+    /// The caps and clock allowance accepted at `sealed_at`, under which
+    /// every Delta this Block seals is validated (WIST-1 §3.4).
+    pub profile: DeltaProfile,
     pub declarations: Vec<Value>,
     pub withdrawals: Vec<String>,
     pub delta_bodies: Vec<Value>,
@@ -521,6 +525,7 @@ pub fn walk_blocks(
                 "block {n}: WIST3-E03 Block exceeds the accepted size schedule"
             )));
         }
+        let profile = DeltaProfile::from_schedule(schedule, at);
         chain.largest = largest;
         chain.prior_at = Some(at);
 
@@ -578,6 +583,8 @@ pub fn walk_blocks(
         events.push(BlockEvent {
             height: n,
             sealed_at,
+            sealed_at_s: at,
+            profile,
             declarations,
             withdrawals,
             delta_bodies,
@@ -915,11 +922,7 @@ pub fn apply_events(
     let mut tips = load_chain_tips(conn)?;
     let mut ledger = load_sanctions(conn)?;
     for event in events {
-        let sealed_at_s = event
-            .sealed_at
-            .parse::<jiff::Timestamp>()
-            .map(|t| t.as_second())
-            .unwrap_or(0);
+        let sealed_at_s = event.sealed_at_s;
         for update in &event.governance {
             ledger.apply(event.height, sealed_at_s, update);
         }
@@ -938,14 +941,16 @@ pub fn apply_events(
             // WIST-3 §3.3: a sealed Delta that fails the Key Set its own
             // Block resolves is ignored exactly as a fork is — applied to
             // nothing, moving no chain tip — never a reason to abandon
-            // the sync.
-            let verified = match history.verify_delta(event.height, body) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("ignoring a Delta at height {}: {e}", event.height);
-                    continue;
-                }
-            };
+            // the sync; field, version, cap and clock failures share
+            // that disposition.
+            let verified =
+                match history.verify_delta(event.height, sealed_at_s, &event.profile, body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("ignoring a Delta at height {}: {e}", event.height);
+                        continue;
+                    }
+                };
             let env: DeltaEnvelope = serde_json::from_value(body.clone())?;
             let id = verified.id;
             let publisher = verified.publisher;
