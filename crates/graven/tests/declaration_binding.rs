@@ -16,12 +16,12 @@ fn outcome(stored: &Value, fetched: &Value) -> String {
     if !stored.is_null() {
         assert_eq!(
             history
-                .add_declaration(0, "2026-08-02T12:00:00Z", stored)
+                .add_declaration(0, "2026-08-02T12:00:00Z", 7, stored)
                 .unwrap(),
             Admission::Initial
         );
     }
-    match history.add_declaration(1, "2026-08-03T12:00:00Z", fetched) {
+    match history.add_declaration(1, "2026-08-03T12:00:00Z", 7, fetched) {
         Ok(Admission::Initial) => "initial".into(),
         Ok(Admission::Ordinary) => "ordinary_rotation".into(),
         Ok(Admission::Recovery) => "recovery_rotation".into(),
@@ -71,11 +71,11 @@ fn a_renamed_signing_key_keeps_its_identity_and_deltas_verify_under_the_alias() 
         .unwrap();
     let mut history = KeyHistory::new();
     history
-        .add_declaration(0, "2026-08-02T12:00:00Z", &case["stored"])
+        .add_declaration(0, "2026-08-02T12:00:00Z", 7, &case["stored"])
         .unwrap();
     assert_eq!(
         history
-            .add_declaration(3, "2026-08-03T12:00:00Z", &case["fetched"])
+            .add_declaration(3, "2026-08-03T12:00:00Z", 7, &case["fetched"])
             .unwrap(),
         Admission::Ordinary
     );

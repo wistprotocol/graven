@@ -3,12 +3,9 @@ use reqwest::Url;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use wist_core::crypto::{hex_encode, PublicKey};
+use wist_core::crypto::hex_encode;
 use wist_core::delta::delta_id;
-use wist_core::envelope::verify_envelope;
-use wist_core::objects::{DeltaEnvelope, Publisher, PublisherEnvelope, PublisherKey};
-
-pub const RECOVERY_WINDOW_DAYS: i64 = 7;
+use wist_core::objects::{DeltaEnvelope, Publisher, PublisherEnvelope};
 
 /// A sealed Delta that verifies: its ID, the domain of the Publisher
 /// whose key signed it — the record key WIST-3 §7 uses — and whether
@@ -37,6 +34,7 @@ struct DeclRecord {
     superseded: bool,
     window_end: Option<jiff::Timestamp>,
     publisher: Publisher,
+    envelope: Value,
     hash: String,
 }
 
@@ -57,83 +55,6 @@ pub fn url_authority(url: &Url) -> Option<String> {
 fn publisher_hash(publisher_value: &Value) -> Result<String> {
     let canon = wist_core::jcs::canonicalize(publisher_value)?;
     Ok(format!("sha256:{}", hex_encode(&Sha256::digest(&canon))))
-}
-
-fn key_by_id<'a>(keys: &'a [PublisherKey], key_id: &str) -> Option<&'a PublisherKey> {
-    keys.iter().find(|k| k.key_id == key_id)
-}
-
-fn usable(key: &PublisherKey) -> Option<PublicKey> {
-    (key.alg == "Ed25519")
-        .then(|| PublicKey::from_b64u(&key.public_key).ok())
-        .flatten()
-}
-
-/// ADR-0023: the signer is the named entry, among the usable previous
-/// signing and recovery bindings and the usable incoming signing bindings,
-/// whose key verifies the Envelope; `WIST1-E02` names no usable binding,
-/// `WIST1-E01` verifies under none.
-fn resolve_signer<'a>(
-    envelope: &Value,
-    key_id: &str,
-    previous: Option<&'a Publisher>,
-    incoming: &'a Publisher,
-) -> std::result::Result<&'a PublisherKey, &'static str> {
-    let candidates: Vec<(&PublisherKey, PublicKey)> = previous
-        .into_iter()
-        .flat_map(|p| p.keys.iter().chain(p.recovery_keys.iter().flatten()))
-        .chain(incoming.keys.iter())
-        .filter(|key| key.key_id == key_id)
-        .filter_map(|key| usable(key).map(|pk| (key, pk)))
-        .collect();
-    if candidates.is_empty() {
-        return Err("WIST1-E02");
-    }
-    candidates
-        .into_iter()
-        .find(|(_, pk)| verify_envelope(envelope, "publisher", pk).is_ok())
-        .map(|(key, _)| key)
-        .ok_or("WIST1-E01")
-}
-
-fn recovery_keys_canon(keys: &Option<Vec<PublisherKey>>) -> Result<Vec<u8>> {
-    match keys {
-        Some(keys) if !keys.is_empty() => {
-            let value = serde_json::to_value(keys)?;
-            Ok(wist_core::jcs::canonicalize(&value)?)
-        }
-        _ => Ok(Vec::new()),
-    }
-}
-
-/// WIST-1 §5.2 and ADR-0023: every key identifier occurs once across
-/// `keys` and `recovery_keys`, identical duplicates included, and the two
-/// sets share neither identifiers nor public bytes — a recovery key that is
-/// also a signing key is stolen with it. Every signed entry counts, usable
-/// or not.
-fn well_formed_key_sets(domain: &str, publisher: &Publisher) -> Result<()> {
-    let mut identifiers = std::collections::BTreeSet::new();
-    for key in publisher
-        .keys
-        .iter()
-        .chain(publisher.recovery_keys.iter().flatten())
-    {
-        if !identifiers.insert(&key.key_id) {
-            return Err(Error::PublisherVerify(format!(
-                "WIST1-E08: {domain} seq {}: duplicate key_id {} in Declaration",
-                publisher.seq, key.key_id
-            )));
-        }
-    }
-    for r in publisher.recovery_keys.iter().flatten() {
-        if publisher.keys.iter().any(|k| k.public_key == r.public_key) {
-            return Err(Error::PublisherVerify(format!(
-                "WIST1-E08: {domain} seq {}: key {} is named in both keys and recovery_keys",
-                publisher.seq, r.key_id
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn parse_timestamp(domain: &str, seq: u64, raw: &str) -> Result<jiff::Timestamp> {
@@ -159,6 +80,7 @@ impl KeyHistory {
             superseded: false,
             window_end: None,
             publisher: env.publisher,
+            envelope: envelope.clone(),
             hash,
         });
         Ok(())
@@ -226,12 +148,15 @@ impl KeyHistory {
         Ok(())
     }
 
-    /// Admits a sealed Declaration under WIST-1 §5.2 and ADR-0023 and says
-    /// how it relates to the accepted chain.
+    /// Admits a sealed Declaration under WIST-1 §5.2 and ADR-0023 through
+    /// core's shared rules and says how it relates to the accepted chain.
+    /// `recovery_window_days` is the value in force at the sealing Block,
+    /// which freezes a recovery window's end (WIST-1 §5.2).
     pub fn add_declaration(
         &mut self,
         height: u64,
         sealed_at: &str,
+        recovery_window_days: i64,
         envelope: &Value,
     ) -> Result<Admission> {
         let env: PublisherEnvelope = serde_json::from_value(envelope.clone())?;
@@ -240,90 +165,51 @@ impl KeyHistory {
         })?;
         let hash = publisher_hash(publisher_value)?;
         let domain = env.publisher.domain.clone();
-        let floor = self.floors.get(&domain).copied();
+        let seq = env.publisher.seq;
+        let floor = self.floors.get(&domain).copied().unwrap_or(0);
         let entries = self.domains.entry(domain.clone()).or_default();
-
         if entries.iter().any(|e| e.hash == hash) {
             return Ok(Admission::Duplicate);
         }
-
-        well_formed_key_sets(&domain, &env.publisher)?;
-
-        let seq = env.publisher.seq;
-        if let Some(floor) = floor {
-            if seq <= floor {
-                return Err(Error::PublisherVerify(format!(
-                    "WIST1-E08: {domain} seq {seq}: not greater than the accepted sequence floor {floor}"
-                )));
-            }
-        }
+        let rejection = |(code, detail): wist_core::declaration::Rejection| {
+            Error::PublisherVerify(format!("{code}: {domain} seq {seq}: {detail}"))
+        };
         let head = entries.iter().rev().find(|e| !e.superseded);
         let (admission, sealed, window_end) = match head {
             None => {
-                if seq != 0 || env.publisher.prev_declaration.is_some() {
+                wist_core::declaration::evaluate_initial(envelope).map_err(rejection)?;
+                if seq <= floor && self.floors.contains_key(&domain) {
                     return Err(Error::PublisherVerify(format!(
-                        "WIST1-E08: {domain} seq {seq}: first declaration for domain must have seq 0 and no predecessor"
+                        "WIST1-E08: {domain} seq {seq}: not greater than the accepted sequence floor {floor}"
                     )));
                 }
-                resolve_signer(envelope, &env.sig.key_id, None, &env.publisher).map_err(|code| {
-                    Error::PublisherVerify(format!(
-                        "{code}: {domain} seq {seq}: self-signature does not verify under its own usable keys"
-                    ))
-                })?;
-                let sealed = parse_timestamp(&domain, seq, sealed_at)?;
-                (Admission::Initial, sealed, None)
+                (
+                    Admission::Initial,
+                    parse_timestamp(&domain, seq, sealed_at)?,
+                    None,
+                )
             }
             Some(pred) => {
-                if seq <= pred.seq {
-                    return Err(Error::PublisherVerify(format!(
-                        "WIST1-E08: {domain} seq {seq}: not greater than previous seq {}",
-                        pred.seq
-                    )));
-                }
-                if env.publisher.prev_declaration.as_deref() != Some(pred.hash.as_str()) {
-                    return Err(Error::PublisherVerify(format!(
-                        "WIST1-E08: {domain} seq {seq}: prev_declaration does not match previous declaration hash"
-                    )));
-                }
-                let sealed = parse_timestamp(&domain, seq, sealed_at)?;
-                let signer = resolve_signer(
+                let decision = wist_core::declaration::evaluate_with_heads(
+                    &pred.envelope,
+                    None,
+                    floor.max(pred.seq),
                     envelope,
-                    &env.sig.key_id,
-                    Some(&pred.publisher),
-                    &env.publisher,
                 )
-                .map_err(|code| {
-                    Error::PublisherVerify(format!(
-                        "{code}: {domain} seq {seq}: signature does not verify under a usable previous or incoming signing binding"
-                    ))
-                })?;
-                // ADR-0023: continuity follows the authenticated public
-                // bytes, not the identifier they are named by.
-                let in_set = |keys: &[PublisherKey]| {
-                    keys.iter()
-                        .any(|k| k.public_key == signer.public_key && usable(k).is_some())
+                .map_err(rejection)?;
+                let sealed = parse_timestamp(&domain, seq, sealed_at)?;
+                let admission = match decision {
+                    wist_core::declaration::Decision::Unchanged => return Ok(Admission::Duplicate),
+                    wist_core::declaration::Decision::Ordinary => Admission::Ordinary,
+                    wist_core::declaration::Decision::Recovery => Admission::Recovery,
+                    wist_core::declaration::Decision::FreshIdentity => Admission::FreshIdentity,
                 };
-                let admission = if in_set(&pred.publisher.keys) {
-                    Admission::Ordinary
-                } else if in_set(pred.publisher.recovery_keys.as_deref().unwrap_or(&[])) {
-                    Admission::Recovery
-                } else {
-                    Admission::FreshIdentity
-                };
-                if admission != Admission::Recovery {
-                    let protected = recovery_keys_canon(&pred.publisher.recovery_keys)?;
-                    if !protected.is_empty()
-                        && recovery_keys_canon(&env.publisher.recovery_keys)? != protected
-                    {
-                        return Err(Error::PublisherVerify(format!(
-                            "WIST1-E08: {domain} seq {seq}: recovery_keys altered by a declaration not signed by a recovery key"
-                        )));
-                    }
-                }
                 let window_end = if admission == Admission::Recovery {
                     Some(
                         sealed
-                            .checked_add(jiff::Span::new().hours(RECOVERY_WINDOW_DAYS * 24))
+                            .checked_add(jiff::SignedDuration::from_secs(
+                                recovery_window_days.saturating_mul(86_400),
+                            ))
                             .map_err(|e| {
                                 Error::PublisherVerify(format!(
                                     "{domain} seq {seq}: recovery window overflow: {e}"
@@ -359,6 +245,7 @@ impl KeyHistory {
                 window_end
             },
             publisher: env.publisher,
+            envelope: envelope.clone(),
             hash,
         });
         let floor = self.floors.entry(domain).or_insert(0);
@@ -415,14 +302,6 @@ impl KeyHistory {
         .map_err(|code| diagnostic(code, "Delta field, version or static check failed"))?;
         let domain = wist_core::delta::publisher(&entry_body["delta"])?;
         let env: DeltaEnvelope = serde_json::from_value(entry_body.clone())?;
-        if wist_core::extract::normalize_url(&env.delta.url, &env.delta.url).as_deref()
-            != Some(env.delta.url.as_str())
-        {
-            return Err(diagnostic(
-                "WIST1-E03",
-                &format!("delta url {} is not a Normalized URL", env.delta.url),
-            ));
-        }
         let url = Url::parse(&env.delta.url)
             .map_err(|e| diagnostic("WIST1-E03", &format!("delta url {}: {e}", env.delta.url)))?;
         let host = url_authority(&url).ok_or_else(|| {
@@ -432,36 +311,17 @@ impl KeyHistory {
             )
         })?;
         let record = self.resolve(domain, height)?;
-        if host != domain
-            && !record
-                .publisher
-                .subdomain_scope
-                .as_ref()
-                .is_some_and(|scope| scope.contains(&host))
-        {
-            return Err(diagnostic(
-                "WIST1-E03",
-                &format!("{host} outside signed Publisher {domain} scope"),
-            ));
-        }
         let domain = domain.to_string();
-        let key = key_by_id(&record.publisher.keys, &env.sig.key_id).ok_or_else(|| {
-            diagnostic(
-                "WIST1-E02",
-                &format!("{domain}: unknown key_id {}", env.sig.key_id),
-            )
-        })?;
-        let pk = PublicKey::from_b64u(&key.public_key)?;
-        verify_envelope(entry_body, "delta", &pk)
-            .map_err(|e| diagnostic("WIST1-E01", &format!("{domain}: {e}")))?;
-        if !wist_core::publisher_time::compare(&env.delta.observed_at, &key.valid_from)
-            .is_some_and(|order| !order.is_lt())
-        {
-            return Err(diagnostic(
-                "WIST1-E02",
-                &format!("{domain}: observed_at precedes key valid_from"),
-            ));
-        }
+        wist_core::declaration::verify_delta_authority(&[&record.publisher], entry_body).map_err(
+            |code| {
+                diagnostic(
+                    code,
+                    &format!(
+                        "{domain}: Delta signing or scope authority failed at height {height}"
+                    ),
+                )
+            },
+        )?;
         wist_core::delta_fields::verify_clock(entry_body, sealed_at_s, profile.clock_skew_seconds)
             .map_err(|code| {
                 diagnostic(
@@ -668,7 +528,7 @@ mod tests {
         let err = kh
             .verify_delta(1, LATE_S, &DeltaProfile::default(), &delta)
             .unwrap_err();
-        assert!(err.to_string().contains("key_id"), "{err}");
+        assert!(err.to_string().contains("WIST1-E02"), "{err}");
     }
 
     #[test]
@@ -720,7 +580,7 @@ mod tests {
         let err = kh
             .verify_delta(1, LATE_S, &DeltaProfile::default(), &delta)
             .unwrap_err();
-        assert!(err.to_string().contains("valid_from"), "{err}");
+        assert!(err.to_string().contains("WIST1-E02"), "{err}");
     }
 
     #[test]
@@ -736,7 +596,7 @@ mod tests {
             &pk1,
             "pk1",
         );
-        kh.add_declaration(5, "2026-08-09T12:00:00Z", &decl0)
+        kh.add_declaration(5, "2026-08-09T12:00:00Z", 7, &decl0)
             .unwrap();
         let delta = delta_env(
             &pk1,
@@ -774,7 +634,7 @@ mod tests {
             &pk1,
             "pk1",
         );
-        kh.add_declaration(5, "2026-08-10T00:00:00Z", &decl1)
+        kh.add_declaration(5, "2026-08-10T00:00:00Z", 7, &decl1)
             .unwrap();
 
         let delta_early = delta_env(
@@ -834,7 +694,7 @@ mod tests {
             &pk1,
             "pk1",
         );
-        kh.add_declaration(1, "2026-08-09T12:00:00Z", &decl1)
+        kh.add_declaration(1, "2026-08-09T12:00:00Z", 7, &decl1)
             .unwrap();
         let decl1_dup = decl(
             "records.example",
@@ -846,7 +706,7 @@ mod tests {
             "pk1",
         );
         let err = kh
-            .add_declaration(2, "2026-08-09T13:00:00Z", &decl1_dup)
+            .add_declaration(2, "2026-08-09T13:00:00Z", 7, &decl1_dup)
             .unwrap_err();
         assert!(err.to_string().contains("seq"), "{err}");
     }
@@ -877,9 +737,9 @@ mod tests {
             "pk1",
         );
         let err = kh
-            .add_declaration(1, "2026-08-09T12:00:00Z", &decl1)
+            .add_declaration(1, "2026-08-09T12:00:00Z", 7, &decl1)
             .unwrap_err();
-        assert!(err.to_string().contains("prev_declaration"), "{err}");
+        assert!(err.to_string().contains("WIST1-E08"), "{err}");
     }
 
     #[test]
@@ -896,9 +756,9 @@ mod tests {
             &pk1,
             "pk1",
         );
-        kh.add_declaration(0, "2026-08-09T12:00:00Z", &decl0)
+        kh.add_declaration(0, "2026-08-09T12:00:00Z", 7, &decl0)
             .unwrap();
-        kh.add_declaration(0, "2026-08-09T12:00:00Z", &decl0)
+        kh.add_declaration(0, "2026-08-09T12:00:00Z", 7, &decl0)
             .unwrap();
         let hash0 = publisher_hash(&decl0["publisher"]).unwrap();
         let decl1 = decl(
@@ -910,7 +770,7 @@ mod tests {
             &pk1,
             "pk1",
         );
-        kh.add_declaration(1, "2026-08-09T13:00:00Z", &decl1)
+        kh.add_declaration(1, "2026-08-09T13:00:00Z", 7, &decl1)
             .unwrap();
         let delta = delta_env(
             &pk2,
@@ -956,7 +816,7 @@ mod tests {
             &pk1,
             "pk1",
         );
-        kh.add_declaration(2, "2026-08-02T00:00:00Z", &decl1)
+        kh.add_declaration(2, "2026-08-02T00:00:00Z", 7, &decl1)
             .unwrap();
         let hash1 = publisher_hash(&decl1["publisher"]).unwrap();
 
@@ -969,7 +829,7 @@ mod tests {
             &rk1,
             "rk1",
         );
-        kh.add_declaration(3, "2026-08-03T00:00:00Z", &decl2)
+        kh.add_declaration(3, "2026-08-03T00:00:00Z", 7, &decl2)
             .unwrap();
         let hash2 = publisher_hash(&decl2["publisher"]).unwrap();
 
@@ -982,7 +842,7 @@ mod tests {
             &pk2,
             "pk2",
         );
-        kh.add_declaration(4, "2026-08-04T00:00:00Z", &decl3)
+        kh.add_declaration(4, "2026-08-04T00:00:00Z", 7, &decl3)
             .unwrap();
         let hash3 = publisher_hash(&decl3["publisher"]).unwrap();
 
@@ -995,7 +855,7 @@ mod tests {
             &pk3,
             "pk3",
         );
-        kh.add_declaration(6, "2026-08-11T00:00:00Z", &decl4)
+        kh.add_declaration(6, "2026-08-11T00:00:00Z", 7, &decl4)
             .unwrap();
 
         // decl3 is signed by the recovery Declaration's own signing key, so it
@@ -1077,7 +937,7 @@ mod tests {
             &pkx,
             "pkx",
         );
-        kh.add_declaration(2, "2026-08-09T13:00:00Z", &decl1)
+        kh.add_declaration(2, "2026-08-09T13:00:00Z", 7, &decl1)
             .unwrap();
 
         let delta_old = delta_env(
@@ -1136,7 +996,7 @@ mod tests {
             &rk1,
             "rk1",
         );
-        kh.add_declaration(2, "2026-08-03T00:00:00Z", &decl1)
+        kh.add_declaration(2, "2026-08-03T00:00:00Z", 7, &decl1)
             .unwrap();
         let hash1 = publisher_hash(&decl1["publisher"]).unwrap();
 
@@ -1150,7 +1010,7 @@ mod tests {
             "pky",
         );
         assert_eq!(
-            kh.add_declaration(3, "2026-08-04T00:00:00Z", &decl2)
+            kh.add_declaration(3, "2026-08-04T00:00:00Z", 7, &decl2)
                 .unwrap(),
             Admission::FreshIdentity
         );
@@ -1188,7 +1048,7 @@ mod tests {
             "pky",
         );
         assert!(kh
-            .add_declaration(4, "2026-08-11T00:00:00Z", &orphan)
+            .add_declaration(4, "2026-08-11T00:00:00Z", 7, &orphan)
             .is_err());
 
         let continued = decl(
@@ -1200,7 +1060,7 @@ mod tests {
             &pk2,
             "pk2",
         );
-        kh.add_declaration(4, "2026-08-11T00:00:00Z", &continued)
+        kh.add_declaration(4, "2026-08-11T00:00:00Z", 7, &continued)
             .unwrap();
 
         let via_pkz_at4 = delta_env(
@@ -1250,7 +1110,7 @@ mod tests {
             "pk1",
         );
         let err = kh
-            .add_declaration(2, "2026-08-09T13:00:00Z", &decl1)
+            .add_declaration(2, "2026-08-09T13:00:00Z", 7, &decl1)
             .unwrap_err();
         assert!(err.to_string().contains("recovery_keys"), "{err}");
     }
@@ -1281,7 +1141,7 @@ mod tests {
             &pk1,
             "pk1",
         );
-        kh.add_declaration(2, "2026-08-09T13:00:00Z", &decl1)
+        kh.add_declaration(2, "2026-08-09T13:00:00Z", 7, &decl1)
             .unwrap();
         let delta = delta_env(
             &pk2,
@@ -1320,7 +1180,7 @@ mod tests {
             &pk1,
             "pk1",
         );
-        kh.add_declaration(2, "2026-08-09T13:00:00Z", &decl1)
+        kh.add_declaration(2, "2026-08-09T13:00:00Z", 7, &decl1)
             .unwrap();
         let delta = delta_env(
             &pk2,
@@ -1377,7 +1237,7 @@ mod tests {
         let err = kh
             .verify_delta(1, LATE_S, &DeltaProfile::default(), &delta)
             .unwrap_err();
-        assert!(err.to_string().contains("sub.records.example"), "{err}");
+        assert!(err.to_string().contains("WIST1-E03"), "{err}");
     }
     #[test]
     fn signed_publisher_attribution_vectors_select_only_the_named_author() {
@@ -1402,7 +1262,7 @@ mod tests {
                 let mut history = KeyHistory::new();
                 for declaration in declarations {
                     history
-                        .add_declaration(0, "2026-08-01T00:00:00Z", &declaration)
+                        .add_declaration(0, "2026-08-01T00:00:00Z", 7, &declaration)
                         .unwrap();
                 }
                 for (index, envelope) in case["envelopes"].as_array().unwrap().iter().enumerate() {

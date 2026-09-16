@@ -97,7 +97,7 @@ fn version_cases_keep_same_major_values_and_reject_other_majors() {
     let mut history = KeyHistory::new();
     for declaration in vector["cases"][0]["declarations"].as_array().unwrap() {
         history
-            .add_declaration(0, "2026-08-01T00:00:00Z", declaration)
+            .add_declaration(0, "2026-08-01T00:00:00Z", 7, declaration)
             .unwrap();
     }
     for case in vector["version_cases"].as_array().unwrap() {

@@ -10,7 +10,7 @@ pub const CREATE_UNIQUE_INDEX: &str =
     "CREATE UNIQUE INDEX IF NOT EXISTS records_url_publisher ON records(url, publisher)";
 
 pub const CREATE_DECLARATIONS: &str =
-    "CREATE TABLE IF NOT EXISTS declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, height INTEGER NOT NULL, sealed_at TEXT NOT NULL, baseline INTEGER NOT NULL, envelope TEXT NOT NULL, PRIMARY KEY(domain, seq, height))";
+    "CREATE TABLE IF NOT EXISTS declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, height INTEGER NOT NULL, sealed_at TEXT NOT NULL, baseline INTEGER NOT NULL, envelope TEXT NOT NULL, recovery_window_days INTEGER NOT NULL DEFAULT 7, PRIMARY KEY(domain, seq, height))";
 
 /// WIST-3 §7: the chain tip per (Publisher domain, Normalized URL). A
 /// deleted URL keeps its tip, because a chain never restarts.

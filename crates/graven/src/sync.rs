@@ -161,6 +161,9 @@ pub struct BlockEvent {
     /// The caps and clock allowance accepted at `sealed_at`, under which
     /// every Delta this Block seals is validated (WIST-1 §3.4).
     pub profile: DeltaProfile,
+    /// `recovery_window_days` in force at `sealed_at`, which freezes the
+    /// end of a recovery window opened in this Block (WIST-1 §5.2).
+    pub recovery_window_days: i64,
     pub declarations: Vec<Value>,
     pub withdrawals: Vec<String>,
     pub delta_bodies: Vec<Value>,
@@ -437,6 +440,12 @@ pub fn walk_blocks(
                 "block {n}: WIST3-E03 Block file does not contain canonical JCS bytes"
             )));
         }
+        wist_core::block::validate_entry_order(
+            block_value["entries"]
+                .as_array()
+                .map_or(&[][..], Vec::as_slice),
+        )
+        .map_err(|e| Error::Verify(format!("block {n}: {e}")))?;
         for entry in block_value
             .get("entries")
             .and_then(Value::as_array)
@@ -527,6 +536,7 @@ pub fn walk_blocks(
             )));
         }
         let profile = DeltaProfile::from_schedule(schedule, at);
+        let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
         chain.largest = largest;
         chain.prior_at = Some(at);
 
@@ -586,6 +596,7 @@ pub fn walk_blocks(
             sealed_at,
             sealed_at_s: at,
             profile,
+            recovery_window_days,
             declarations,
             withdrawals,
             delta_bodies,
@@ -646,16 +657,23 @@ fn load_anchor(anchor: &str, client: &Client) -> Result<(PublicKey, String, Stri
     ))
 }
 
+fn default_recovery_window_days() -> i64 {
+    wist_core::parameters::spec("recovery_window_days")
+        .and_then(|p| p.default)
+        .unwrap_or(7)
+}
+
 fn persist_declaration(
     conn: &Connection,
     height: u64,
     sealed_at: &str,
     baseline: bool,
+    recovery_window_days: i64,
     envelope: &Value,
 ) -> Result<()> {
     let env: PublisherEnvelope = serde_json::from_value(envelope.clone())?;
     conn.execute(
-        "INSERT INTO declarations(domain, seq, height, sealed_at, baseline, envelope) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO declarations(domain, seq, height, sealed_at, baseline, envelope, recovery_window_days) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         (
             env.publisher.domain,
             env.publisher.seq as i64,
@@ -663,6 +681,7 @@ fn persist_declaration(
             sealed_at,
             baseline as i64,
             serde_json::to_string(envelope)?,
+            recovery_window_days,
         ),
     )?;
     Ok(())
@@ -717,7 +736,7 @@ fn remove_by_url(conn: &Connection, url: &str, publisher: &str) -> Result<()> {
 
 pub fn load_history(conn: &Connection) -> Result<KeyHistory> {
     let mut stmt = conn.prepare(
-        "SELECT height, sealed_at, baseline, envelope FROM declarations ORDER BY height, seq",
+        "SELECT height, sealed_at, baseline, envelope, recovery_window_days FROM declarations ORDER BY height, seq",
     )?;
     let rows = stmt
         .query_map([], |row| {
@@ -726,18 +745,19 @@ pub fn load_history(conn: &Connection) -> Result<KeyHistory> {
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut history = KeyHistory::new();
-    for (height, sealed_at, baseline, envelope) in rows {
+    for (height, sealed_at, baseline, envelope, recovery_window_days) in rows {
         let value = wist_core::json::parse(envelope.as_bytes())?;
         let height = height as u64;
         if baseline != 0 {
             history.add_baseline(height, &value)?;
         } else {
-            history.add_declaration(height, &sealed_at, &value)?;
+            history.add_declaration(height, &sealed_at, recovery_window_days, &value)?;
         }
     }
     Ok(history)
@@ -928,8 +948,20 @@ pub fn apply_events(
             ledger.apply(event.height, sealed_at_s, update);
         }
         for declaration in &event.declarations {
-            history.add_declaration(event.height, &event.sealed_at, declaration)?;
-            persist_declaration(conn, event.height, &event.sealed_at, false, declaration)?;
+            history.add_declaration(
+                event.height,
+                &event.sealed_at,
+                event.recovery_window_days,
+                declaration,
+            )?;
+            persist_declaration(
+                conn,
+                event.height,
+                &event.sealed_at,
+                false,
+                event.recovery_window_days,
+                declaration,
+            )?;
         }
 
         for delta_id in &event.withdrawals {
@@ -1532,7 +1564,14 @@ fn run_cold_start(
             StateEntry::Declaration(d) => {
                 history.add_baseline(d.sealing_height, &d.declaration)?;
                 history.adopt_floor(&d.domain, d.highest_accepted_seq);
-                persist_declaration(&conn, d.sealing_height, "", true, &d.declaration)?;
+                persist_declaration(
+                    &conn,
+                    d.sealing_height,
+                    "",
+                    true,
+                    default_recovery_window_days(),
+                    &d.declaration,
+                )?;
             }
             StateEntry::RecoveryWindow(w) => {
                 adopted_windows.push((
@@ -1621,7 +1660,14 @@ fn run_cold_start(
     }
     for (domain, window_end, head, head_height) in &adopted_windows {
         history.adopt_window(domain, window_end, head, *head_height)?;
-        persist_declaration(&conn, *head_height, "", true, head)?;
+        persist_declaration(
+            &conn,
+            *head_height,
+            "",
+            true,
+            default_recovery_window_days(),
+            head,
+        )?;
     }
     save_chain_tips(&conn, &tips)?;
     let mut ledger = load_sanctions(&conn)?;

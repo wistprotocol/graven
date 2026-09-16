@@ -2030,7 +2030,7 @@ fn cold_start_enforces_the_adopted_sequence_floor() {
     .map(|e| e.to_string())
     .unwrap_or_default();
     assert!(
-        error.contains("accepted sequence floor 5"),
+        error.contains("WIST1-E08") && error.contains("does not exceed the accepted floor"),
         "a rotation to seq 1 must not pass a floor of 5: {error}"
     );
 }

@@ -231,6 +231,19 @@ pub fn build_block_as(
     sealed_at: &str,
     wrapped_entries: &[Value],
 ) -> (Value, String) {
+    let mut ordered: Vec<Value> = wrapped_entries.to_vec();
+    ordered.sort_by_key(|e| {
+        (
+            match e["type"].as_str().unwrap_or_default() {
+                "publisher_declaration" => 0,
+                "registry_update" => 1,
+                "publisher_delta" => 2,
+                _ => 3,
+            },
+            merkle::leaf_hash(&jcs::canonicalize(e).unwrap()),
+        )
+    });
+    let wrapped_entries = ordered.as_slice();
     let leaves: Vec<[u8; 32]> = wrapped_entries
         .iter()
         .map(|e| merkle::leaf_hash(&jcs::canonicalize(e).unwrap()))
