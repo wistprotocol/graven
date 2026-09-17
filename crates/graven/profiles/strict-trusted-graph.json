@@ -9,8 +9,30 @@
   "agreement_k": 1,
   "seeds": [],
   "distrust_seeds": [],
-  "weights": {"trust_floor": 0.0, "trust": 1.0, "inlinks": 0.0, "freshness": 0.1, "distrust": 1.0},
-  "filters": {"distrust_above": 0.25, "spam": true, "min_age_blocks": 0, "trusted_graph_only": true},
-  "propagation": {"alpha": 0.15, "iterations": 20, "decay_per_block": 0.999, "growth_window_blocks": 720, "growth_damping": 1.0},
+  "weights": {
+    "trust_floor": 0.0,
+    "trust": 1.0,
+    "inlinks": 0.0,
+    "freshness": 0.1,
+    "distrust": 1.0,
+    "mismatch": 0.5
+  },
+  "filters": {
+    "distrust_above": 0.25,
+    "spam": true,
+    "min_age_blocks": 0,
+    "trusted_graph_only": true
+  },
+  "propagation": {
+    "alpha": 0.15,
+    "iterations": 20,
+    "decay_per_block": 0.999,
+    "growth_window_blocks": 720,
+    "growth_damping": 1.0
+  },
+  "readings": {
+    "persistence_blocks": 2,
+    "labeler_inactive_blocks": 720
+  },
   "personalization": false
 }

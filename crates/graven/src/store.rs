@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS label_definitions(labeler TEXT NOT NULL, name TEXT NO
 pub const CREATE_RANKING: &str = "CREATE TABLE IF NOT EXISTS record_heights(url TEXT NOT NULL, publisher TEXT NOT NULL, height INTEGER NOT NULL, PRIMARY KEY(url, publisher)); \
 CREATE TABLE IF NOT EXISTS inlinks(source_url TEXT NOT NULL, source_host TEXT NOT NULL, target_url TEXT NOT NULL, target_host TEXT NOT NULL, height INTEGER NOT NULL, PRIMARY KEY(source_url, target_url)); \
 CREATE INDEX IF NOT EXISTS inlinks_target ON inlinks(target_host); \
-CREATE TABLE IF NOT EXISTS link_changes(target_host TEXT NOT NULL, height INTEGER NOT NULL, added INTEGER NOT NULL, removed INTEGER NOT NULL, PRIMARY KEY(target_host, height))";
+CREATE TABLE IF NOT EXISTS link_changes(target_host TEXT NOT NULL, height INTEGER NOT NULL, added INTEGER NOT NULL, removed INTEGER NOT NULL, PRIMARY KEY(target_host, height)); \
+CREATE TABLE IF NOT EXISTS identity_starts(domain TEXT PRIMARY KEY, height INTEGER NOT NULL)";
 
 /// WIST-4 §9: the accepted parameter amendments, so a restarted sync
 /// continues the schedule a replaying Consumer holds.

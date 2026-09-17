@@ -34,6 +34,32 @@ pub struct Weights {
     pub inlinks: f64,
     pub freshness: f64,
     pub distrust: f64,
+    /// How much a counted `wist:mismatch` or `wist:unavailable` Label
+    /// takes off the score.
+    #[serde(default)]
+    pub mismatch: f64,
+}
+
+/// WIST-4 §6's recommended readings of the Log, which a profile applies
+/// to the Labels it follows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Readings {
+    /// Consecutive Blocks through which a `wist:mismatch` or
+    /// `wist:unavailable` Label must have been live before it counts: one
+    /// Block's disagreement is the ordinary course of publication.
+    pub persistence_blocks: u64,
+    /// Blocks without a sealed Entry of any type after which a Labeler is
+    /// ignored.
+    pub labeler_inactive_blocks: u64,
+}
+
+impl Default for Readings {
+    fn default() -> Self {
+        Readings {
+            persistence_blocks: 2,
+            labeler_inactive_blocks: 720,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -75,6 +101,8 @@ pub struct Profile {
     pub weights: Weights,
     pub filters: Filters,
     pub propagation: Propagation,
+    #[serde(default)]
+    pub readings: Readings,
     pub personalization: bool,
 }
 
@@ -184,8 +212,12 @@ pub struct Signals {
     pub trust: f64,
     pub distrust: f64,
     pub spam: bool,
-    /// Blocks since the domain's first sealed Declaration, none when the
-    /// index holds no Declaration for it.
+    /// A `wist:mismatch` or `wist:unavailable` Label that the profile's
+    /// Labelers agree on and that has persisted long enough to count.
+    pub mismatch: bool,
+    /// Blocks since the domain's identity began — its first sealed
+    /// Declaration, or the activation height of a fresh identity — none
+    /// when the index holds no Declaration for it.
     pub age_blocks: Option<u64>,
     pub freshness: f64,
     /// Age-decayed in-links to the record's domain, normalized.
@@ -211,6 +243,8 @@ pub struct DomainState {
     pub distrust: HashMap<String, f64>,
     pub spam_hosts: BTreeSet<String>,
     pub spam_urls: BTreeSet<String>,
+    pub mismatch_hosts: BTreeSet<String>,
+    pub mismatch_urls: BTreeSet<String>,
     pub first_height: HashMap<String, u64>,
     pub inlinks: HashMap<String, f64>,
     pub growth: HashMap<String, (f64, f64)>,
@@ -292,6 +326,176 @@ fn agreed_subjects(
         .collect())
 }
 
+/// WIST-4 §6: the named Labelers with a sealed Entry inside the profile's
+/// inactivity window, the only ones whose Labels it reads.
+fn active_labelers(
+    conn: &Connection,
+    named: &BTreeSet<String>,
+    readings: &Readings,
+    head_height: u64,
+) -> Result<BTreeSet<String>> {
+    if named.is_empty() || !table_exists(conn, "labelers")? {
+        return Ok(named.clone());
+    }
+    let mut last: HashMap<String, u64> = HashMap::new();
+    let mut stmt = conn.prepare("SELECT labeler, last_sealed_height FROM labelers")?;
+    for row in stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })? {
+        let (labeler, height) = row?;
+        last.insert(labeler, height.max(0) as u64);
+    }
+    Ok(named
+        .iter()
+        .filter(|labeler| match last.get(*labeler) {
+            Some(height) => wist_core::label::labeler_active(
+                *height,
+                readings.labeler_inactive_blocks,
+                head_height,
+            ),
+            None => true,
+        })
+        .cloned()
+        .collect())
+}
+
+/// The subjects at least `k` of `labelers` carry a Label of one of `names`
+/// on that has been live through the profile's persistence window.
+fn counted_subjects(
+    conn: &Connection,
+    labelers: &BTreeSet<String>,
+    names: &[&str],
+    k: usize,
+    head_sealed_at: Option<&str>,
+    head_height: u64,
+    readings: &Readings,
+) -> Result<BTreeSet<String>> {
+    if labelers.is_empty() || !table_exists(conn, "labels")? {
+        return Ok(BTreeSet::new());
+    }
+    type Triple = (String, String, String);
+    // Ascending Log order, which WIST-2 §3.3 uses to break equal instants.
+    let mut events: HashMap<Triple, Vec<(u64, u64, String, bool)>> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT labeler, subject, name, height, asserted_at, retracted, entry_index FROM labels WHERE name = ?1",
+    )?;
+    for name in names {
+        for row in stmt.query_map([name], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })? {
+            let (labeler, subject, name, height, asserted_at, retracted, entry_index) = row?;
+            if !labelers.contains(&labeler) {
+                continue;
+            }
+            events.entry((labeler, subject, name)).or_default().push((
+                height.max(0) as u64,
+                entry_index.max(0) as u64,
+                asserted_at,
+                retracted != 0,
+            ));
+        }
+    }
+    // A Label's expiry is read against the head's Block instant; an expiry
+    // later than that is later than every earlier Block's too. The current
+    // Label is also an event in its own right: an index resumed from a
+    // Snapshot holds the tuple and none of the history behind it.
+    let mut expired: BTreeSet<Triple> = BTreeSet::new();
+    if table_exists(conn, "label_current")? {
+        let mut stmt = conn.prepare(
+            "SELECT labeler, subject, name, height, asserted_at, retracted, expires_at, entry_index FROM label_current",
+        )?;
+        for row in stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })? {
+            let (labeler, subject, name, height, asserted_at, retracted, expires_at, entry_index) =
+                row?;
+            if !names.contains(&name.as_str()) || !labelers.contains(&labeler) {
+                continue;
+            }
+            let triple = (labeler, subject, name);
+            if expires_at.as_deref().is_some_and(|expiry| {
+                head_sealed_at.is_some_and(|head| {
+                    wist_core::publisher_time::compare(expiry, head)
+                        != Some(std::cmp::Ordering::Greater)
+                })
+            }) {
+                expired.insert(triple.clone());
+            }
+            let event = (
+                height.max(0) as u64,
+                entry_index.max(0) as u64,
+                asserted_at,
+                retracted != 0,
+            );
+            let events = events.entry(triple).or_default();
+            if !events.contains(&event) {
+                events.push(event);
+            }
+        }
+    }
+    let mut votes: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for (triple, mut rows) in events {
+        rows.sort_by_key(|(height, entry_index, _, _)| (*height, *entry_index));
+        let events: Vec<wist_core::label::LabelEvent> = rows
+            .iter()
+            .map(
+                |(height, _, asserted_at, retracted)| wist_core::label::LabelEvent {
+                    height: *height,
+                    asserted_at,
+                    retracted: *retracted,
+                },
+            )
+            .collect();
+        let expires_at_height = expired.contains(&triple).then_some(head_height);
+        if counted(&events, expires_at_height, head_height, readings) {
+            votes.entry(triple.1).or_default().insert(triple.0);
+        }
+    }
+    Ok(votes
+        .into_iter()
+        .filter(|(_, voters)| voters.len() >= k)
+        .map(|(subject, _)| subject)
+        .collect())
+}
+
+/// WIST-4 §6's persistence reading, widened to the profile's window: the
+/// Label must be live at the head and through the `persistence_blocks - 1`
+/// heights before it.
+fn counted(
+    events: &[wist_core::label::LabelEvent<'_>],
+    expires_at_height: Option<u64>,
+    head_height: u64,
+    readings: &Readings,
+) -> bool {
+    match readings.persistence_blocks {
+        0 | 1 => wist_core::label::live_at(events, expires_at_height, head_height),
+        2 => wist_core::label::counted_at(events, expires_at_height, head_height),
+        blocks => {
+            head_height + 1 >= blocks
+                && (0..blocks).all(|back| {
+                    wist_core::label::live_at(events, expires_at_height, head_height - back)
+                })
+        }
+    }
+}
+
 impl DomainState {
     /// Derives the profile's domain state from the index at its synced
     /// head: the trusted and distrusted graph, the spam set, domain ages
@@ -303,11 +507,12 @@ impl DomainState {
         head_height: u64,
         head_sealed_at: Option<&str>,
     ) -> Result<DomainState> {
-        let labelers: BTreeSet<String> = if profile.labelers.is_empty() {
+        let named: BTreeSet<String> = if profile.labelers.is_empty() {
             subscriptions.clone()
         } else {
             profile.labelers.iter().cloned().collect()
         };
+        let labelers = active_labelers(conn, &named, &profile.readings, head_height)?;
         let list = suffix_list_in_force(conn)?;
         let unit_of: Box<dyn Fn(&str) -> String> = Box::new(move |host: &str| {
             wist_core::suffix_list::registrable_domain(host, list.as_ref()).domain
@@ -326,6 +531,23 @@ impl DomainState {
                 .collect();
         bad.extend(profile.distrust_seeds.iter().map(|s| unit_of(s)));
         let spam = agreed_subjects(conn, &labelers, "wist:spam", k, head_sealed_at)?;
+        let mut mismatch_hosts = BTreeSet::new();
+        let mut mismatch_urls = BTreeSet::new();
+        for subject in counted_subjects(
+            conn,
+            &labelers,
+            &["wist:mismatch", "wist:unavailable"],
+            k,
+            head_sealed_at,
+            head_height,
+            &profile.readings,
+        )? {
+            if subject.starts_with("https://") {
+                mismatch_urls.insert(subject);
+            } else {
+                mismatch_hosts.insert(unit_of(&subject));
+            }
+        }
         let mut spam_hosts = BTreeSet::new();
         let mut spam_urls = BTreeSet::new();
         for subject in spam {
@@ -421,11 +643,24 @@ impl DomainState {
                 first_height.insert(domain, height.max(0) as u64);
             }
         }
+        // WIST-4 §8: a domain that reset its identity is read from the
+        // activation height, not from the Declarations it superseded.
+        if table_exists(conn, "identity_starts")? {
+            let mut stmt = conn.prepare("SELECT domain, height FROM identity_starts")?;
+            for row in stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })? {
+                let (domain, height) = row?;
+                first_height.insert(domain, height.max(0) as u64);
+            }
+        }
         Ok(DomainState {
             trust,
             distrust,
             spam_hosts,
             spam_urls,
+            mismatch_hosts,
+            mismatch_urls,
             first_height,
             inlinks,
             growth,
@@ -511,6 +746,9 @@ pub fn rank(
         let spam = state.spam_urls.contains(&hit.url)
             || state.spam_hosts.contains(&unit)
             || state.spam_hosts.contains(&target_unit);
+        let mismatch = state.mismatch_urls.contains(&hit.url)
+            || state.mismatch_hosts.contains(&unit)
+            || state.mismatch_hosts.contains(&target_unit);
         let age_blocks = state
             .first_height
             .get(&hit.publisher)
@@ -552,6 +790,7 @@ pub fn rank(
             trust,
             distrust,
             spam,
+            mismatch,
             age_blocks,
             freshness,
             inlinks,
@@ -578,7 +817,13 @@ pub fn rank(
         let inlink_factor = 1.0 + w.inlinks * inlinks;
         let freshness_factor = 1.0 - w.freshness * (1.0 - freshness);
         let distrust_factor = 1.0 - w.distrust * distrust;
-        let score = relevance * trust_factor * inlink_factor * freshness_factor * distrust_factor;
+        let mismatch_factor = if mismatch { 1.0 - w.mismatch } else { 1.0 };
+        let score = relevance
+            * trust_factor
+            * inlink_factor
+            * freshness_factor
+            * distrust_factor
+            * mismatch_factor;
         explanation.push(format!("relevance {relevance:.3}"));
         if w.trust > 0.0 {
             explanation.push(format!(
@@ -601,8 +846,14 @@ pub fn rank(
                 "distrust {distrust:.3}, factor {distrust_factor:.3}"
             ));
         }
+        if w.mismatch > 0.0 && mismatch {
+            explanation.push(format!(
+                "a mismatch or unavailable Label counted after {} consecutive Blocks, factor {mismatch_factor:.3}",
+                profile.readings.persistence_blocks.max(1)
+            ));
+        }
         if let Some(age) = age_blocks {
-            explanation.push(format!("domain first sealed {age} blocks before the head"));
+            explanation.push(format!("identity began {age} blocks before the head"));
         }
         ranked.push(Ranked {
             hit,

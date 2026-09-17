@@ -658,6 +658,11 @@ pub fn apply_events(
             &event.declarations,
         )?;
         for entry in &event.declarations {
+            // WIST-4 §6 measures a Labeler's inactivity from its last sealed
+            // Entry of any type, a Declaration included.
+            if let Some(domain) = entry["body"]["publisher"]["domain"].as_str() {
+                super::persist::touch_labeler(conn, domain, event.height)?;
+            }
             persist_declaration(
                 conn,
                 event.height,
@@ -794,8 +799,26 @@ pub fn apply_events(
         apply_labels(conn, history, event, &mut stats)?;
     }
     save_chain_tips(conn, &tips)?;
+    record_identity_starts(conn, history)?;
     save_history(conn, history)?;
     Ok(stats)
+}
+
+/// WIST-4 §8: a domain's history restarts at a fresh identity's activation
+/// height, which a ranking policy reads in place of its first Entry.
+fn record_identity_starts(conn: &Connection, history: &KeyHistory) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_RANKING)?;
+    for (domain, state) in history.declarations().domains() {
+        let Some(reset) = state.reset() else {
+            continue;
+        };
+        conn.execute(
+            "INSERT INTO identity_starts(domain, height) VALUES (?1, ?2)
+             ON CONFLICT(domain) DO UPDATE SET height = excluded.height",
+            (domain, reset.block_number as i64),
+        )?;
+    }
+    Ok(())
 }
 
 /// WIST-2 §3.3 and WIST-3 §3.3: applies a Block's `label` and `dispute`

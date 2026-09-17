@@ -1075,6 +1075,91 @@ fn end_to_end() {
     );
     drop(mcp4);
 
+    // --- a one-Block mismatch Label is not counted yet ---
+    run(
+        &spake,
+        &[
+            "label",
+            "--out",
+            s(&labeler_site),
+            "--state",
+            s(&labeler_state),
+            "--subject",
+            &cited_url,
+            "--name",
+            "wist:mismatch",
+        ],
+    );
+    let mismatch_since = now_rfc3339();
+    for base in [&clave_base, &clave2_base] {
+        run(
+            &spake,
+            &[
+                "ping",
+                "--log",
+                base,
+                "--domain",
+                &labeler_host,
+                "--allow-http",
+                "--no-retry",
+            ],
+        );
+    }
+    wait_until_pulled_since(
+        &http,
+        &clave_base,
+        &labeler_host,
+        &mismatch_since,
+        &clave_stderr,
+    );
+    wait_until_pulled_since(
+        &http,
+        &clave2_base,
+        &labeler_host,
+        &mismatch_since,
+        &clave2_stderr,
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let eighth_seal = grid_instant(7);
+    for data in [&clave_data, &clave2_data] {
+        run(&clave, &["seal", "--data", s(data), "--at", &eighth_seal]);
+    }
+    run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+
+    let mut mcp5 = McpClient::start(&graven, &gdir);
+    let cited_mismatch = |hits: &[serde_json::Value]| -> bool {
+        hits.iter()
+            .find(|h| h["url"] == cited_url.as_str())
+            .map(|h| h["ranking"]["signals"]["mismatch"] == true)
+            .unwrap_or_else(|| panic!("no hit for {cited_url}: {hits:?}"))
+    };
+    let one_block = mcp5.tool_call(
+        "search",
+        serde_json::json!({"query": "orchard", "profile": "default"}),
+    );
+    assert!(
+        !cited_mismatch(one_block.as_array().expect("search returns an array")),
+        "a Label sealed one Block ago must not count yet: {one_block}"
+    );
+    drop(mcp5);
+
+    // The same Label, still live a Block later, counts.
+    let ninth_seal = grid_instant(8);
+    for data in [&clave_data, &clave2_data] {
+        run(&clave, &["seal", "--data", s(data), "--at", &ninth_seal]);
+    }
+    run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+    let mut mcp6 = McpClient::start(&graven, &gdir);
+    let two_blocks = mcp6.tool_call(
+        "search",
+        serde_json::json!({"query": "orchard", "profile": "default"}),
+    );
+    assert!(
+        cited_mismatch(two_blocks.as_array().expect("search returns an array")),
+        "a Label live through two consecutive Blocks must count: {two_blocks}"
+    );
+    drop(mcp6);
+
     validate_artifacts(&site, &clave_data);
 
     eprintln!("end_to_end completed in {:?}", harness_start.elapsed());

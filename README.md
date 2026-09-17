@@ -181,10 +181,16 @@ bad seed inherits it; a trust seed that links to distrusted or
 spam-labeled domains vouches for less. In-links are counted per domain
 with age decay and damped by their growth rate over
 `growth_window_blocks`, death rates are reported beside them, domain
-age is read from the first sealed Declaration and freshness from the
-record's seal height. The score is relevance × (`trust_floor` + `trust`
+age is read from the first sealed Declaration or, where a fresh identity
+has taken effect, from its activation height (WIST-4 §8), and freshness
+from the record's seal height. Two readings WIST-4 §6 recommends are
+profile fields: a `wist:mismatch` or `wist:unavailable` Label counts
+against a subject only once it has been live through
+`persistence_blocks` consecutive Blocks, two by default, and a Labeler
+with no sealed Entry within `labeler_inactive_blocks`, 720 by default,
+is ignored. The score is relevance × (`trust_floor` + `trust`
 × trust) × (1 + `inlinks` × in-links) × freshness × (1 − `distrust` ×
-distrust), after the filters: distrust above a threshold, spam labels,
+distrust) × (1 − `mismatch` where one counts), after the filters: distrust above a threshold, spam labels,
 domains younger than `min_age_blocks`, and, for a strict profile, any
 domain no trust reaches. Every hit carries its score, its signals and
 an explanation, so a profile and the synced heights in the hit's

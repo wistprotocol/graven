@@ -1,5 +1,7 @@
 mod common;
 
+use rusqlite::OptionalExtension;
+
 use graven::store::Store;
 use serde_json::Value;
 use wist_core::objects::{ParameterEntry, PendingDeclarationEntry, StateEntry};
@@ -126,13 +128,36 @@ fn a_fresh_identity_activates_at_the_delay_the_parameter_map_fixes() {
     let target = tempfile::tempdir().unwrap();
     let owner = owner();
     let thief = common::Signer::new([7u8; 32]);
-    append(&fx, &[declaration_entry(fresh_declaration(&fx, &thief))]);
+    let sealed = append(&fx, &[declaration_entry(fresh_declaration(&fx, &thief))]);
     let (activated_url, activated_delta) = delta(&fx, &thief, "activated-a");
     let (replaced_url, replaced_delta) = delta(&fx, &owner, "replaced-a");
-    append(&fx, &[activated_delta, replaced_delta]);
+    let activation = append(&fx, &[activated_delta, replaced_delta]);
+    assert_eq!(
+        activation,
+        sealed + 1,
+        "the parameter map fixes a one-Block delay"
+    );
     sync(&fx, target.path());
     assert!(present(target.path(), &activated_url));
     assert!(!present(target.path(), &replaced_url));
+    // WIST-4 §8: the domain's history restarts at the activation height, so
+    // a ranking policy reads its age from there and not from the
+    // Declarations the fresh identity superseded.
+    assert_eq!(identity_start(target.path(), &fx.domain), Some(activation));
+}
+
+/// The height the index records as the start of a domain's identity.
+fn identity_start(target: &std::path::Path, domain: &str) -> Option<u64> {
+    rusqlite::Connection::open(common::synced_log_dir(target).join("index.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT height FROM identity_starts WHERE domain = ?1",
+            [domain],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .unwrap()
+        .map(|height| height.max(0) as u64)
 }
 
 #[test]
