@@ -3,10 +3,10 @@ use super::SyncState;
 use crate::error::{Error, Result};
 use crate::keyset::KeyHistory;
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::BTreeSet;
 use wist_core::chain::ChainTips;
 use wist_core::crypto::PublicKey;
 use wist_core::parameters::Amendment;
+use wist_core::withdrawal::WithdrawalReplay;
 
 pub(super) fn load_aggregator_keys(
     conn: &Connection,
@@ -111,15 +111,24 @@ pub fn load_history(conn: &Connection) -> Result<KeyHistory> {
     }
 }
 
-/// WIST-3 §6.2: the withdrawn Delta IDs the store holds, from adopted
-/// tuples and walked withdrawals alike.
-pub(super) fn load_withdrawn(conn: &Connection) -> Result<BTreeSet<String>> {
+/// WIST-3 §6.2: the withdrawals the store holds, from adopted tuples and
+/// walked acts alike, as core's replay so a later act of the same Delta
+/// keeps the first height.
+pub(super) fn load_withdrawn(conn: &Connection) -> Result<WithdrawalReplay> {
     conn.execute_batch(crate::store::CREATE_WITHDRAWALS)?;
-    let mut stmt = conn.prepare("SELECT delta_id FROM withdrawals")?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
-    Ok(rows)
+    let mut stmt = conn.prepare("SELECT delta_id, publisher, height FROM withdrawals")?;
+    let mut replay = WithdrawalReplay::new();
+    for row in stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })? {
+        let (delta_id, publisher, height) = row?;
+        replay.adopt(&delta_id, &publisher, height.max(0) as u64);
+    }
+    Ok(replay)
 }
 
 pub(super) fn record_withdrawal(

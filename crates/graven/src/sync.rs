@@ -242,11 +242,13 @@ fn run_incremental(
 
     let mut aggregator_keys = load_aggregator_keys(&conn, genesis_key_id, trust_key)?;
     let mut chain = ChainState::restore(&local, load_parameters(&conn)?);
+    let mut withdrawals = load_withdrawn(&conn)?;
     let (events, last_block_value) = walk_blocks(
         client,
         base,
         &mut aggregator_keys,
         &mut chain,
+        &mut withdrawals,
         local.head_number + 1,
         checkpoint.block_number,
         &local.head_hash,
@@ -315,11 +317,13 @@ fn run_cold_start(
         ));
     }
 
+    let mut withdrawals = load_withdrawn(&installed.conn)?;
     let (events, last_block_value) = walk_blocks(
         client,
         base,
         &mut installed.aggregator_keys,
         &mut installed.chain,
+        &mut withdrawals,
         installed.log_position + 1,
         checkpoint.block_number,
         &installed.anchor_block_hash,

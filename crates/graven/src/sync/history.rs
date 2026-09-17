@@ -19,6 +19,7 @@ use wist_core::objects::{
 };
 use wist_core::parameters::{Amendment, Schedule};
 use wist_core::timestamp::log_seconds;
+use wist_core::withdrawal::{Disposition, SealedDelta, WithdrawalReplay};
 
 /// WIST-4 §9 and ADR-0020: the accepted parameter schedule, the largest
 /// Block seen and the previous Block's instant, carried across the walk
@@ -139,9 +140,10 @@ pub struct BlockEvent {
     pub recovery_window_days: i64,
     /// The `publisher_declaration` Entries in canonical Block order.
     pub declarations: Vec<Value>,
-    /// Each `payload_withdrawal` sealed in this Block, as the withdrawn
-    /// Delta ID and the Publisher domain the act names (WIST-3 §6.2).
-    pub withdrawals: Vec<(String, String)>,
+    /// Each `payload_withdrawal` this Block seals that core's replay
+    /// accepted (WIST-4 §5.1): the withdrawn Delta ID, its Publisher and
+    /// the earliest Block that withdrew it (WIST-3 §6.2).
+    pub withdrawals: Vec<(String, String, u64)>,
     pub delta_bodies: Vec<Value>,
 }
 
@@ -280,6 +282,7 @@ pub fn walk_blocks(
     base: &Url,
     keys: &mut AggregatorKeys,
     chain: &mut ChainState,
+    withdrawals_replay: &mut WithdrawalReplay,
     start_number: u64,
     end_number: u64,
     start_hash: &str,
@@ -287,6 +290,7 @@ pub fn walk_blocks(
     let mut prev_hash = start_hash.to_string();
     let mut last_block_value: Option<Value> = None;
     let mut events: Vec<BlockEvent> = Vec::new();
+    let mut walked_deltas: BTreeMap<String, (String, u64)> = BTreeMap::new();
     for n in start_number..=end_number {
         let block_url = resolve(base, &format!("/log/blocks/{n:09}.json.zst"))?;
         let compressed = client.get_bytes(&block_url)?;
@@ -405,7 +409,7 @@ pub fn walk_blocks(
         chain.prior_at = Some(at);
 
         let mut declarations = Vec::new();
-        let mut withdrawals = Vec::new();
+        let mut withdrawal_acts = Vec::new();
         let mut delta_bodies = Vec::new();
 
         for entry in block_value
@@ -428,15 +432,7 @@ pub fn walk_blocks(
                         Error::Verify(format!("block {n}: registry_update entry missing body"))
                     })?;
                     if body["update"]["action"] == "payload_withdrawal" {
-                        let withdrawn_id = body["update"]["details"]["delta_id"]
-                            .as_str()
-                            .ok_or_else(|| {
-                                Error::Verify(format!(
-                                    "block {n}: payload_withdrawal missing details.delta_id"
-                                ))
-                            })?;
-                        let publisher = body["update"]["subject"].as_str().unwrap_or_default();
-                        withdrawals.push((withdrawn_id.to_string(), publisher.to_string()));
+                        withdrawal_acts.push(body.clone());
                     }
                 }
                 Some("publisher_delta") => {
@@ -446,6 +442,43 @@ pub fn walk_blocks(
                     delta_bodies.push(body.clone());
                 }
                 _ => {}
+            }
+        }
+        for body in &delta_bodies {
+            if let (Ok(id), Some(publisher)) = (
+                wist_core::delta::delta_id(&body["delta"]),
+                body["delta"]["publisher"].as_str(),
+            ) {
+                walked_deltas
+                    .entry(id)
+                    .or_insert((publisher.to_string(), n));
+            }
+        }
+        let mut withdrawals = Vec::new();
+        for body in &withdrawal_acts {
+            let disposition = withdrawals_replay.apply(
+                n,
+                body,
+                |key_id| keys.key(key_id).cloned(),
+                |delta_id| match walked_deltas.get(delta_id) {
+                    Some((publisher, height)) => SealedDelta::Known {
+                        publisher: publisher.clone(),
+                        height: *height,
+                    },
+                    None => SealedDelta::Unverifiable,
+                },
+            );
+            match disposition {
+                Disposition::Accepted {
+                    delta_id,
+                    publisher,
+                    withdrawn_height,
+                    ..
+                } => withdrawals.push((delta_id, publisher, withdrawn_height)),
+                Disposition::Rejected(code) => {
+                    eprintln!("ignoring a payload_withdrawal at height {n}: {code}");
+                }
+                Disposition::NotWithdrawal => {}
             }
         }
 
@@ -584,9 +617,9 @@ pub fn apply_events(
                 &entry["body"],
             )?;
         }
-        for (delta_id, publisher) in &event.withdrawals {
-            record_withdrawal(conn, delta_id, publisher, event.height)?;
-            withdrawn.insert(delta_id.clone());
+        for (delta_id, publisher, height) in &event.withdrawals {
+            record_withdrawal(conn, delta_id, publisher, *height)?;
+            withdrawn.adopt(delta_id, publisher, *height);
             if remove_by_delta_id(conn, delta_id)? {
                 stats.withdrawn += 1;
             }
@@ -619,7 +652,7 @@ pub fn apply_events(
             }
             // WIST-3 §6.2: a withdrawn Delta's content never materializes,
             // even when the withdrawal sealed in the same Block.
-            if withdrawn.contains(&id) {
+            if withdrawn.is_withdrawn(&id) {
                 continue;
             }
 

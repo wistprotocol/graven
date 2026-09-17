@@ -114,10 +114,16 @@ and carried no further.
 Registry Updates carry four acts (WIST-4 §3). Only `aggregator_key_add`
 and `aggregator_key_remove` must verify under an Aggregator key for the
 Block to stand; a `parameter_change` replays through the accepted schedule
-above and a `payload_withdrawal` records the withdrawn Delta and removes
-its record, extracts, links and embeddings; a withdrawal sealed in the
-same Block as the Delta it names keeps that Delta from materializing at
-all. A `label` Entry is verified as part of the Block and otherwise left
+above and a `payload_withdrawal` replays through core's withdrawal
+engine under the Aggregator key valid at its Block — field, version and
+authenticity failures and a Delta of another Publisher or sealed above
+the act are ignored with their WIST-4 §5.1 code — then records the
+withdrawn Delta at the earliest Block that withdrew it and removes its
+record, extracts, links and embeddings; a withdrawal sealed in the same
+Block as the Delta it names keeps that Delta from materializing at all.
+A Delta sealed below the Blocks the sync walked cannot be checked
+against the act, since no Snapshot tuple names sealed Deltas, and such
+an act is read as consistent. A `label` Entry is verified as part of the Block and otherwise left
 alone. Full recovery replay and materialization preference among
 overlapping scoped Publishers remain separate validation requirements.
 
