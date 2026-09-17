@@ -116,6 +116,7 @@ pub(super) struct Installation {
     pub(super) history: KeyHistory,
     pub(super) aggregator_keys: AggregatorKeys,
     pub(super) chain: ChainState,
+    pub(super) suffix_lists: super::suffix::SuffixLists,
 }
 
 impl Installation {
@@ -259,6 +260,7 @@ pub(super) fn snapshot(
     // already holds reads as a fork; without the recovery windows, an
     // in-window rotation by a thief is invisible.
     let mut history = KeyHistory::new();
+    let mut suffix_lists = super::suffix::SuffixLists::load(&conn)?;
     conn.execute_batch(crate::store::CREATE_CHAIN_TIPS)?;
     let mut tips = ChainTips::new();
     let mut adopted_keys: Vec<(String, String, Option<u64>)> = Vec::new();
@@ -301,6 +303,9 @@ pub(super) fn snapshot(
                 super::history::remove_by_delta_id(&conn, &w.delta_id)?;
             }
             StateEntry::Label(_) => {}
+            StateEntry::SuffixList(s) => {
+                suffix_lists.adopt(client, base, &s.identifier, s.sealing_height)?;
+            }
             StateEntry::Record(r) => tips.adopt(&r.publisher, &r.url, &r.delta_id),
             StateEntry::AggregatorKey(k) => {
                 adopted_keys.push((k.key_id.clone(), k.public_key.clone(), k.removed_height));
@@ -338,6 +343,7 @@ pub(super) fn snapshot(
         history,
         aggregator_keys,
         chain,
+        suffix_lists,
     })
 }
 

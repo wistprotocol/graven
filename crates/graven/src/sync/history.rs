@@ -18,6 +18,7 @@ use wist_core::objects::{
     ChangeType, DeltaEnvelope, DeltaPayloadCommitment, Payload, PublisherEnvelope,
 };
 use wist_core::parameters::{Amendment, Schedule};
+use wist_core::suffix_list::BlockCaps;
 use wist_core::timestamp::log_seconds;
 use wist_core::withdrawal::{Disposition, SealedDelta, WithdrawalReplay};
 
@@ -277,12 +278,14 @@ pub(super) fn verify_checkpoint_signature(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn walk_blocks(
     client: &Client,
     base: &Url,
     keys: &mut AggregatorKeys,
     chain: &mut ChainState,
     withdrawals_replay: &mut WithdrawalReplay,
+    suffix_lists: &mut super::suffix::SuffixLists,
     start_number: u64,
     end_number: u64,
     start_hash: &str,
@@ -405,6 +408,30 @@ pub fn walk_blocks(
         }
         let profile = DeltaProfile::from_schedule(schedule, at);
         let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
+        let caps = BlockCaps {
+            domain_block_entries_max: schedule
+                .value_at("domain_block_entries_max", at)
+                .unwrap()
+                .max(0) as u64,
+            labeler_block_entries_max: schedule
+                .value_at("labeler_block_entries_max", at)
+                .unwrap()
+                .max(0) as u64,
+        };
+        suffix_lists.check_capacity(n, &block_value, caps)?;
+        for entry in block_value
+            .get("entries")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|e| e["type"] == "registry_update")
+        {
+            let body = &entry["body"];
+            if body["update"]["action"] == "suffix_list_update" {
+                suffix_lists
+                    .apply_act(client, base, n, body, |key_id| keys.key(key_id).cloned())?;
+            }
+        }
         chain.largest = largest;
         chain.prior_at = Some(at);
 

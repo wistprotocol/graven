@@ -28,6 +28,11 @@ pub const CREATE_AGGREGATOR_KEYS: &str =
 pub const CREATE_WITHDRAWALS: &str =
     "CREATE TABLE IF NOT EXISTS withdrawals(delta_id TEXT PRIMARY KEY, publisher TEXT NOT NULL, height INTEGER NOT NULL)";
 
+/// WIST-4 §3.1: every Public Suffix List snapshot the Log pinned, by its
+/// identifier, and the accepted acts that changed the snapshot in force,
+/// in Log order.
+pub const CREATE_SUFFIX_LISTS: &str = "CREATE TABLE IF NOT EXISTS suffix_lists(sha256 TEXT PRIMARY KEY, octets BLOB NOT NULL); CREATE TABLE IF NOT EXISTS suffix_list_acts(seq INTEGER PRIMARY KEY AUTOINCREMENT, height INTEGER NOT NULL, sha256 TEXT NOT NULL)";
+
 /// WIST-4 §9: the accepted parameter amendments, so a restarted sync
 /// continues the schedule a replaying Consumer holds.
 pub const CREATE_PARAMETERS: &str = "CREATE TABLE IF NOT EXISTS parameters(parameter TEXT NOT NULL, value INTEGER NOT NULL, block_number INTEGER NOT NULL, entry_index INTEGER NOT NULL, sealed_at_s INTEGER NOT NULL, effective_at_s INTEGER NOT NULL, PRIMARY KEY(parameter, block_number, entry_index))";

@@ -199,6 +199,7 @@ def main() -> int:
         print("FAIL blocks:none-found")
 
     last_header = {}
+    pinned = set()
 
     for block_path in block_files:
 
@@ -219,6 +220,16 @@ def main() -> int:
                 ve.b64u_decode(block["sig"]["value"]), signed_bytes
             )
             last_header[header["block_number"]] = header
+            for e in entries:
+                update = e.get("body", {}).get("update", {})
+                if e["type"] != "registry_update" or update.get("action") != "suffix_list_update":
+                    continue
+                identifier = update["details"]["sha256"]
+                served = clave_dir / "log" / "suffix-lists" / (identifier.split(":", 1)[1] + ".dat")
+                data = served.read_bytes()
+                assert "sha256:" + sha256_hex(data) == identifier, "suffix-list file does not hash to its name"
+                assert len(data) == update["details"]["bytes"], "suffix-list act bytes disagree with the file"
+                pinned.add(identifier)
 
         check(f"block:{block_path.name}", _block)
 
@@ -275,6 +286,11 @@ def main() -> int:
             assert digest == manifest_doc["manifest"]["state"]["state_digest"], (
                 "recomputed state_digest does not match the manifest"
             )
+            if pinned:
+                tuples = state_doc["state"]["entries"]
+                assert any(t[0] == "suffix_list" and t[1] in pinned for t in tuples), (
+                    "state carries no suffix_list tuple for a pinned snapshot"
+                )
 
         check(f"state:{entry['snapshot_date']}", _state)
 

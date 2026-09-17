@@ -1,12 +1,14 @@
 mod history;
 mod install;
 mod persist;
+mod suffix;
 
 use history::*;
 pub use history::{AggregatorKeys, ApplyStats, BlockEvent, ChainState};
 use install::*;
 use persist::*;
 pub use persist::{load_sync_state, save_sync_state, CREATE_SYNC_STATE};
+use suffix::SuffixLists;
 
 use crate::error::{Error, Result};
 
@@ -243,12 +245,14 @@ fn run_incremental(
     let mut aggregator_keys = load_aggregator_keys(&conn, genesis_key_id, trust_key)?;
     let mut chain = ChainState::restore(&local, load_parameters(&conn)?);
     let mut withdrawals = load_withdrawn(&conn)?;
+    let mut suffix_lists = SuffixLists::load(&conn)?;
     let (events, last_block_value) = walk_blocks(
         client,
         base,
         &mut aggregator_keys,
         &mut chain,
         &mut withdrawals,
+        &mut suffix_lists,
         local.head_number + 1,
         checkpoint.block_number,
         &local.head_hash,
@@ -262,6 +266,7 @@ fn run_incremental(
     let mut history = load_history(&conn)?;
     let tx = conn.unchecked_transaction()?;
     save_parameters(&tx, &chain)?;
+    suffix_lists.save(&tx)?;
     save_aggregator_keys(&tx, &aggregator_keys)?;
     tx.execute(CREATE_UNIQUE_INDEX, [])?;
     tx.execute(CREATE_DECLARATIONS, [])?;
@@ -324,11 +329,13 @@ fn run_cold_start(
         &mut installed.aggregator_keys,
         &mut installed.chain,
         &mut withdrawals,
+        &mut installed.suffix_lists,
         installed.log_position + 1,
         checkpoint.block_number,
         &installed.anchor_block_hash,
     )?;
     save_parameters(&installed.conn, &installed.chain)?;
+    installed.suffix_lists.save(&installed.conn)?;
     verify_checkpoint_signature(&checkpoint_value, &installed.aggregator_keys)?;
     save_aggregator_keys(&installed.conn, &installed.aggregator_keys)?;
 

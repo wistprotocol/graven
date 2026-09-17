@@ -1,0 +1,37 @@
+// Fixture excerpt of the Public Suffix List, https://publicsuffix.org/list/public_suffix_list.dat
+// (Mozilla Foundation, MPL-2.0): rules copied verbatim, section markers preserved, most rules omitted.
+
+// ===BEGIN ICANN DOMAINS===
+
+ac
+biz
+*.ck
+!www.ck
+cn
+com.cn
+公司.cn
+com
+dev
+io
+jp
+ac.jp
+kyoto.jp
+ide.kyoto.jp
+*.kobe.jp
+!city.kobe.jp
+*.mm
+net
+org
+us
+ak.us
+k12.ak.us
+中国
+
+// ===END ICANN DOMAINS===
+// ===BEGIN PRIVATE DOMAINS===
+
+uk.com
+pages.dev
+github.io
+
+// ===END PRIVATE DOMAINS===

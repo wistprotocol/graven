@@ -93,10 +93,20 @@ fn end_to_end() {
     let clave_data = tmp.path().join("clave-data");
     let gdir = tmp.path().join("graven-store");
 
+    let suffix_list =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/public-suffix-list.dat");
     let clave_host = free_loopback_addr();
     run(
         &clave,
-        &["init", "--log-id", &clave_host, "--data", s(&clave_data)],
+        &[
+            "init",
+            "--log-id",
+            &clave_host,
+            "--data",
+            s(&clave_data),
+            "--suffix-list",
+            s(&suffix_list),
+        ],
     );
     let (_clave_child, clave_bound_addr, clave_stderr) =
         spawn_clave_serve(&clave, &clave_data, &clave_host, &site_proxy);
@@ -110,7 +120,15 @@ fn end_to_end() {
     let clave2_host = free_loopback_addr();
     run(
         &clave,
-        &["init", "--log-id", &clave2_host, "--data", s(&clave2_data)],
+        &[
+            "init",
+            "--log-id",
+            &clave2_host,
+            "--data",
+            s(&clave2_data),
+            "--suffix-list",
+            s(&suffix_list),
+        ],
     );
     let (_clave2_child, clave2_bound_addr, clave2_stderr) =
         spawn_clave_serve(&clave, &clave2_data, &clave2_host, &site_proxy);

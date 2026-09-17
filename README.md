@@ -71,6 +71,20 @@ Block seen and the previous instant persist in the sync cursor and the
 `parameter` tuples, so pending amendments survive. Any mismatch fails the
 sync closed and, on an already-migrated directory, rolls the migration back.
 
+Log-signed `suffix_list_update` acts replay through core's suffix-list
+rules (WIST-4 §3.1): an accepted act's file is fetched from
+`/log/suffix-lists/<hex>.dat`, verified to hash to its identifier
+(`WIST3-E03`) and held in the `suffix_lists` table, a file no source
+serves fails the sync (`WIST3-E01`), and an act the Log key does not
+authenticate or whose `bytes` disagrees with the file is ignored with
+its code. Every walked Block's `publisher_delta`, `label` and `dispute`
+Entries are counted per Registrable Domain under the snapshot in force
+at it against `domain_block_entries_max`, and its `label` and `dispute`
+Entries against `labeler_block_entries_max` (WIST-3 §3.2); a Block over
+either fails the sync (`WIST3-E03`). Before the first accepted act every
+Canonical Host is its own unit. A cold start adopts the Snapshot's
+`suffix_list` tuple and obtains its file before the first walked Block.
+
 Per-delta, independently of the above, in WIST-1 §7's order: complete
 field validation under `delta.schema.json` (`WIST1-E14`), wire major `1`
 support with same-major minor and patch values accepted (`WIST1-E15`,
