@@ -11,7 +11,9 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use wist_core::crypto::PublicKey;
-use wist_core::suffix_list::{self, BlockCaps, Disposition, SuffixList, SuffixListReplay};
+use wist_core::suffix_list::{
+    self, BlockCaps, Disposition, HeldFile, SuffixList, SuffixListReplay,
+};
 
 pub struct SuffixLists {
     replay: SuffixListReplay,
@@ -152,17 +154,18 @@ impl SuffixLists {
     ) -> Result<()> {
         let fetched: RefCell<BTreeMap<String, Result<Vec<u8>>>> = RefCell::new(BTreeMap::new());
         let octets = &self.octets;
-        let held = |identifier: &str| -> Option<u64> {
+        let held = |identifier: &str| -> HeldFile {
             if let Some(file) = octets.get(identifier) {
-                return Some(file.len() as u64);
+                return HeldFile::Bytes(file.len() as u64);
             }
             let mut fetched = fetched.borrow_mut();
             fetched
                 .entry(identifier.to_string())
                 .or_insert_with(|| fetch(client, base, identifier))
                 .as_ref()
-                .ok()
-                .map(|file| file.len() as u64)
+                .map_or(HeldFile::Unobtainable, |file| {
+                    HeldFile::Bytes(file.len() as u64)
+                })
         };
         let disposition = self.replay.apply(height, body, log_key, held);
         let fetched = fetched.into_inner();
