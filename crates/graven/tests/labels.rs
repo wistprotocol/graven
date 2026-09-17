@@ -189,7 +189,23 @@ fn snapshot_label_and_dispute_tuples_are_adopted() {
         .disputes_for(&format!("sha256:{}", "a".repeat(64)))
         .unwrap();
     assert_eq!(disputes.len(), 1);
-    assert!(store.labelers().unwrap().is_empty());
+    // WIST-3 §7: adopting the Label tuple records the figures a resumed
+    // index can honestly hold — none of them a real count — but the
+    // dispute tuple's disputant gets no such row (only adopt_label_tuple
+    // seeds one).
+    let labelers = store.labelers().unwrap();
+    assert_eq!(labelers.len(), 1);
+    assert_eq!(labelers[0].labeler, "labels.sample.net");
+    assert_eq!(
+        (
+            labelers[0].label_count,
+            labelers[0].retraction_count,
+            labelers[0].first_seen_height,
+            labelers[0].last_sealed_height,
+        ),
+        (0, 0, 0, 0)
+    );
+    assert!(labelers[0].counts_from_resume);
 }
 
 /// The served tool list and a call reach the label tools through the

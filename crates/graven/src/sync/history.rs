@@ -940,6 +940,7 @@ fn remove_excluded_by_delta_id(conn: &Connection, delta_id: &str) -> Result<()> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn apply_events(
     conn: &Connection,
     client: &Client,
@@ -947,6 +948,7 @@ pub fn apply_events(
     history: &mut KeyHistory,
     events: &[BlockEvent],
     tier1: bool,
+    walk_floor: u64,
 ) -> Result<ApplyStats> {
     let mut stats = ApplyStats {
         applied: 0,
@@ -1190,7 +1192,7 @@ pub fn apply_events(
                 }
             }
         }
-        apply_labels(conn, history, event, &mut stats)?;
+        apply_labels(conn, history, event, walk_floor, &mut stats)?;
     }
     save_chain_tips(conn, &tips)?;
     record_identity_starts(conn, history)?;
@@ -1224,6 +1226,7 @@ pub(super) fn apply_labels(
     conn: &Connection,
     history: &KeyHistory,
     event: &BlockEvent,
+    walk_floor: u64,
     stats: &mut ApplyStats,
 ) -> Result<()> {
     for body in &event.delta_bodies {
@@ -1263,13 +1266,19 @@ pub(super) fn apply_labels(
             );
             continue;
         };
-        let sealed = |label_id: &str| {
-            super::persist::sealed_label_subject(conn, label_id)
-                .ok()
-                .flatten()
-                .map_or(wist_core::label::LabelLookup::Absent, |subject| {
-                    wist_core::label::LabelLookup::Known { subject }
-                })
+        // WIST-3 §7: a Snapshot carries only the current Label per (labeler,
+        // subject, name), so a miss naming a height at or below the walk
+        // floor cannot be told apart from a Label the Snapshot's tuples
+        // simply don't hold; only a miss above the floor is genuinely
+        // absent.
+        let dispute_height = body["dispute"]["height"].as_u64().unwrap_or(u64::MAX);
+        let sealed = |label_id: &str| match super::persist::sealed_label_subject(conn, label_id)
+            .ok()
+            .flatten()
+        {
+            Some(subject) => wist_core::label::LabelLookup::Known { subject },
+            None if dispute_height <= walk_floor => wist_core::label::LabelLookup::Unverifiable,
+            None => wist_core::label::LabelLookup::Absent,
         };
         match wist_core::label::validate_dispute(body, &declaration, sealed) {
             Ok(envelope) => {

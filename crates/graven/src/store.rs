@@ -42,13 +42,14 @@ pub const CREATE_SUFFIX_LISTS: &str = "CREATE TABLE IF NOT EXISTS suffix_lists(s
 /// WIST-2 §3.3 and WIST-3 §7: every sealed Label and dispute the sync
 /// walked, the current Label per (labeler, subject, name) and the current
 /// dispute per (Label ID, disputant) from adopted tuples and walked
-/// Entries alike, the labeler statistics over walked Entries, and the
-/// definitions fetched for subscribed Labelers.
+/// Entries alike, the labeler statistics (marking a Labeler this index
+/// only knows from an adopted tuple), and the definitions fetched for
+/// subscribed Labelers.
 pub const CREATE_LABELS: &str = "CREATE TABLE IF NOT EXISTS labels(label_id TEXT PRIMARY KEY, labeler TEXT NOT NULL, subject TEXT NOT NULL, name TEXT NOT NULL, value INTEGER, asserted_at TEXT NOT NULL, retracted INTEGER NOT NULL, expires_at TEXT, delta TEXT, height INTEGER NOT NULL, entry_index INTEGER NOT NULL); \
 CREATE TABLE IF NOT EXISTS disputes(dispute_id TEXT PRIMARY KEY, label_id TEXT NOT NULL, disputant TEXT NOT NULL, reason TEXT, asserted_at TEXT NOT NULL, height INTEGER NOT NULL, entry_index INTEGER NOT NULL); \
 CREATE TABLE IF NOT EXISTS label_current(labeler TEXT NOT NULL, subject TEXT NOT NULL, name TEXT NOT NULL, label_id TEXT, value INTEGER, asserted_at TEXT NOT NULL, retracted INTEGER NOT NULL, expires_at TEXT, delta TEXT, height INTEGER NOT NULL, entry_index INTEGER NOT NULL, PRIMARY KEY(labeler, subject, name)); \
 CREATE TABLE IF NOT EXISTS dispute_current(label_id TEXT NOT NULL, disputant TEXT NOT NULL, dispute_id TEXT, reason TEXT, asserted_at TEXT NOT NULL, height INTEGER NOT NULL, entry_index INTEGER NOT NULL, PRIMARY KEY(label_id, disputant)); \
-CREATE TABLE IF NOT EXISTS labelers(labeler TEXT PRIMARY KEY, label_count INTEGER NOT NULL, retraction_count INTEGER NOT NULL, first_seen_height INTEGER NOT NULL, last_sealed_height INTEGER NOT NULL); \
+CREATE TABLE IF NOT EXISTS labelers(labeler TEXT PRIMARY KEY, label_count INTEGER NOT NULL, retraction_count INTEGER NOT NULL, first_seen_height INTEGER NOT NULL, last_sealed_height INTEGER NOT NULL, adopted INTEGER NOT NULL DEFAULT 0); \
 CREATE TABLE IF NOT EXISTS labeler_subjects(labeler TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY(labeler, subject)); \
 CREATE TABLE IF NOT EXISTS label_definitions(labeler TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, treatment TEXT NOT NULL, asserted_at TEXT NOT NULL, PRIMARY KEY(labeler, name))";
 
@@ -93,8 +94,10 @@ pub struct DisputeRow {
 }
 
 /// One Labeler's statistics over the Entries this index walked (WIST-3
-/// §7's labeler table, recomputed locally; tuples adopted from a Snapshot
-/// carry no counts).
+/// §7's labeler table, recomputed locally). `counts_from_resume` marks a
+/// Labeler this index only knows through an adopted Snapshot tuple: its
+/// counts start from the resume height, not the Labeler's whole history
+/// (WIST-3 §7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct LabelerStats {
     pub labeler: String,
@@ -103,6 +106,7 @@ pub struct LabelerStats {
     pub distinct_subjects: u64,
     pub first_seen_height: u64,
     pub last_sealed_height: u64,
+    pub counts_from_resume: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,6 +400,10 @@ pub struct LabelerView {
     pub distinct_subjects: u64,
     pub first_seen_height: u64,
     pub last_sealed_height: u64,
+    /// Set when any log's copy of this Labeler's counts started from an
+    /// adopted Snapshot tuple rather than a walked Entry (WIST-3 §7): the
+    /// merged counts are not the Labeler's whole history either.
+    pub counts_from_resume: bool,
     pub subscribed: bool,
     pub provenance: Vec<ProvEntry>,
 }
@@ -630,6 +638,8 @@ impl MultiStore {
                             existing.first_seen_height.min(stats.first_seen_height);
                         existing.last_sealed_height =
                             existing.last_sealed_height.max(stats.last_sealed_height);
+                        existing.counts_from_resume =
+                            existing.counts_from_resume || stats.counts_from_resume;
                         existing.provenance.push(provenance.clone());
                     })
                     .or_insert_with(|| LabelerView {
@@ -640,6 +650,7 @@ impl MultiStore {
                         distinct_subjects: stats.distinct_subjects,
                         first_seen_height: stats.first_seen_height,
                         last_sealed_height: stats.last_sealed_height,
+                        counts_from_resume: stats.counts_from_resume,
                         provenance: vec![provenance],
                     });
             }
@@ -917,7 +928,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT l.labeler, l.label_count, l.retraction_count,
                     (SELECT COUNT(*) FROM labeler_subjects s WHERE s.labeler = l.labeler),
-                    l.first_seen_height, l.last_sealed_height
+                    l.first_seen_height, l.last_sealed_height, l.adopted
              FROM labelers l ORDER BY l.labeler",
         )?;
         let rows = stmt
@@ -929,6 +940,7 @@ impl Store {
                     distinct_subjects: row.get::<_, i64>(3)?.max(0) as u64,
                     first_seen_height: row.get::<_, i64>(4)?.max(0) as u64,
                     last_sealed_height: row.get::<_, i64>(5)?.max(0) as u64,
+                    counts_from_resume: row.get::<_, i64>(6)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

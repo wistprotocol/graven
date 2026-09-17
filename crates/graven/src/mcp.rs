@@ -350,9 +350,11 @@ records, never applied to them; pass every_labeler to see unsubscribed Labelers 
     }
 
     #[tool(
-        description = "Every Labeler whose Labels this index has walked, with how many \
-Labels it sealed, how many retract, how many distinct subjects it labeled, the heights \
-of its first and last sealed Entries, and whether it is subscribed — the behavior a \
+        description = "Every Labeler whose Labels this index has walked or adopted from a \
+Snapshot, with how many Labels it sealed, how many retract, how many distinct subjects it \
+labeled, the heights of its first and last sealed Entries, whether it is subscribed, and \
+counts_from_resume marking a Labeler this index only knows from an adopted Snapshot tuple, \
+whose counts start from the resume height rather than its whole history — the behavior a \
 subscription decision starts from, computed from the log without reading any Label's \
 meaning."
     )]

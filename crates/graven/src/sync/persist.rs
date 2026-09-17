@@ -378,7 +378,10 @@ pub(super) fn touch_labeler(conn: &Connection, domain: &str, height: u64) -> Res
 }
 
 /// WIST-3 §8 step 10: adopts a Snapshot's `label` tuple as the current
-/// Label of its triple, with the Label ID a later dispute names.
+/// Label of its triple, with the Label ID a later dispute names, and
+/// records the Labeler's first and last adopted tuple heights: the
+/// figures a resumed index can honestly hold, none of them a real count
+/// (WIST-3 §7).
 pub(super) fn adopt_label_tuple(
     conn: &Connection,
     entry: &wist_core::objects::LabelEntry,
@@ -398,6 +401,16 @@ pub(super) fn adopt_label_tuple(
             entry.delta,
             entry.sealing_height as i64
         ],
+    )?;
+    let (first, last): (i64, i64) = conn.query_row(
+        "SELECT MIN(height), MAX(height) FROM label_current WHERE labeler = ?1",
+        [&entry.labeler],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    conn.execute(
+        "INSERT INTO labelers(labeler, label_count, retraction_count, first_seen_height, last_sealed_height, adopted) VALUES (?1, 0, 0, ?2, ?3, 1)
+         ON CONFLICT(labeler) DO UPDATE SET first_seen_height = excluded.first_seen_height, last_sealed_height = excluded.last_sealed_height, adopted = 1",
+        rusqlite::params![entry.labeler, first, last],
     )?;
     Ok(())
 }

@@ -274,7 +274,15 @@ fn run_incremental(
     save_aggregator_keys(&tx, &aggregator_keys)?;
     tx.execute(CREATE_UNIQUE_INDEX, [])?;
     tx.execute(CREATE_DECLARATIONS, [])?;
-    let stats = apply_events(&tx, client, base, &mut history, &events, tier1)?;
+    let stats = apply_events(
+        &tx,
+        client,
+        base,
+        &mut history,
+        &events,
+        tier1,
+        local.log_position,
+    )?;
     fetch_definitions(&tx, client, &history, subscriptions)?;
     tx.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
     if tier1 {
@@ -365,6 +373,7 @@ fn run_cold_start(
         &mut installed.history,
         &events,
         tier1,
+        installed.log_position,
     )?;
     fetch_definitions(&installed.conn, client, &installed.history, subscriptions)?;
     installed
