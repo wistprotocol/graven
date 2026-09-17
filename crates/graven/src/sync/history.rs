@@ -592,23 +592,50 @@ pub(super) fn remove_derived(conn: &Connection, delta_id: &str, url: &str) -> Re
     Ok(())
 }
 
-pub(super) fn remove_by_delta_id(conn: &Connection, delta_id: &str) -> Result<bool> {
-    let url: Option<String> = conn
+/// WIST-3 §7: a removed record's ranking signals must not linger for a
+/// page that no longer materializes, and the links it withdraws count as
+/// in-link deaths at the height that removed it.
+fn remove_ranking_bookkeeping(
+    conn: &Connection,
+    url: &str,
+    publisher: &str,
+    height: u64,
+) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_RANKING)?;
+    conn.execute(
+        "DELETE FROM record_heights WHERE url = ?1 AND publisher = ?2",
+        (url, publisher),
+    )?;
+    super::persist::replace_inlinks(conn, url, publisher, &[], height)
+}
+
+pub(super) fn remove_by_delta_id(
+    conn: &Connection,
+    delta_id: &str,
+    height: u64,
+) -> Result<Option<String>> {
+    let row: Option<(String, String)> = conn
         .query_row(
-            "SELECT url FROM records WHERE delta_id = ?1",
+            "SELECT url, publisher FROM records WHERE delta_id = ?1",
             [delta_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some(url) = url else {
-        return Ok(false);
+    let Some((url, publisher)) = row else {
+        return Ok(None);
     };
     conn.execute("DELETE FROM records WHERE delta_id = ?1", [delta_id])?;
     remove_derived(conn, delta_id, &url)?;
-    Ok(true)
+    remove_ranking_bookkeeping(conn, &url, &publisher, height)?;
+    Ok(Some(url))
 }
 
-pub(super) fn remove_by_url(conn: &Connection, url: &str, publisher: &str) -> Result<()> {
+pub(super) fn remove_by_url(
+    conn: &Connection,
+    url: &str,
+    publisher: &str,
+    height: u64,
+) -> Result<()> {
     let delta_id: Option<String> = conn
         .query_row(
             "SELECT delta_id FROM records WHERE url = ?1 AND publisher = ?2",
@@ -623,6 +650,293 @@ pub(super) fn remove_by_url(conn: &Connection, url: &str, publisher: &str) -> Re
     if let Some(id) = delta_id {
         remove_derived(conn, &id, url)?;
     }
+    remove_ranking_bookkeeping(conn, url, publisher, height)?;
+    Ok(())
+}
+
+/// WIST-3 §7: the publishers holding a live or excluded record for `url`,
+/// the candidate set `wist_core::materialization::preferred` chooses among.
+fn candidates_for(conn: &Connection, url: &str) -> Result<Vec<String>> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    let mut stmt = conn.prepare("SELECT publisher FROM records WHERE url = ?1")?;
+    for row in stmt.query_map([url], |r| r.get::<_, String>(0))? {
+        set.insert(row?);
+    }
+    drop(stmt);
+    let mut stmt = conn.prepare("SELECT publisher FROM excluded_records WHERE url = ?1")?;
+    for row in stmt.query_map([url], |r| r.get::<_, String>(0))? {
+        set.insert(row?);
+    }
+    Ok(set.into_iter().collect())
+}
+
+struct ExcludedRow {
+    delta_id: String,
+    observed_at: String,
+    title: String,
+    abstract_text: Option<String>,
+    lang: String,
+    extract: Option<String>,
+    links: Option<String>,
+    height: u64,
+}
+
+fn fetch_excluded(conn: &Connection, url: &str, publisher: &str) -> Result<Option<ExcludedRow>> {
+    conn.query_row(
+        "SELECT delta_id, observed_at, title, abstract, lang, extract, links, height
+         FROM excluded_records WHERE url = ?1 AND publisher = ?2",
+        (url, publisher),
+        |row| {
+            Ok(ExcludedRow {
+                delta_id: row.get(0)?,
+                observed_at: row.get(1)?,
+                title: row.get(2)?,
+                abstract_text: row.get(3)?,
+                lang: row.get(4)?,
+                extract: row.get(5)?,
+                links: row.get(6)?,
+                height: row.get::<_, i64>(7)?.max(0) as u64,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_excluded(
+    conn: &Connection,
+    url: &str,
+    publisher: &str,
+    delta_id: &str,
+    observed_at: &str,
+    title: &str,
+    abstract_text: &Option<String>,
+    lang: &str,
+    extract: Option<&str>,
+    links: &[String],
+    height: u64,
+) -> Result<()> {
+    let links_json = serde_json::to_string(links)?;
+    conn.execute(
+        "INSERT INTO excluded_records(url, publisher, delta_id, observed_at, title, abstract, lang, extract, links, height)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(url, publisher) DO UPDATE SET
+            delta_id = excluded.delta_id, observed_at = excluded.observed_at, title = excluded.title,
+            abstract = excluded.abstract, lang = excluded.lang, extract = excluded.extract,
+            links = excluded.links, height = excluded.height",
+        (
+            url, publisher, delta_id, observed_at, title, abstract_text, lang, extract,
+            &links_json, height as i64,
+        ),
+    )?;
+    Ok(())
+}
+
+/// WIST-3 §7: when a Delta's Publisher takes over a URL another Publisher
+/// currently materializes, that Publisher's record moves into
+/// `excluded_records` — carrying its tier-1 extract and links and the
+/// height it was recorded at — before the winner's own record is written.
+fn shadow_into_excluded(
+    conn: &Connection,
+    url: &str,
+    publisher: &str,
+    tier1: bool,
+    at_height: u64,
+) -> Result<()> {
+    let record: Option<(String, String, String, Option<String>, String)> = conn
+        .query_row(
+            "SELECT delta_id, observed_at, title, abstract, lang FROM records WHERE url = ?1 AND publisher = ?2",
+            (url, publisher),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let Some((delta_id, observed_at, title, abstract_text, lang)) = record else {
+        return Ok(());
+    };
+    let height: u64 = conn
+        .query_row(
+            "SELECT height FROM record_heights WHERE url = ?1 AND publisher = ?2",
+            (url, publisher),
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0)
+        .max(0) as u64;
+    let extract: Option<String> = if tier1 {
+        conn.query_row(
+            "SELECT extract FROM extracts WHERE url = ?1 AND publisher = ?2",
+            (url, publisher),
+            |row| row.get(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    let links_json: Option<String> = if tier1 {
+        let mut stmt =
+            conn.prepare("SELECT target_url FROM links WHERE source_url = ?1 ORDER BY position")?;
+        let targets: Vec<String> = stmt
+            .query_map([url], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Some(serde_json::to_string(&targets)?)
+    } else {
+        None
+    };
+    conn.execute(
+        "INSERT INTO excluded_records(url, publisher, delta_id, observed_at, title, abstract, lang, extract, links, height)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(url, publisher) DO UPDATE SET
+            delta_id = excluded.delta_id, observed_at = excluded.observed_at, title = excluded.title,
+            abstract = excluded.abstract, lang = excluded.lang, extract = excluded.extract,
+            links = excluded.links, height = excluded.height",
+        (
+            url, publisher, &delta_id, &observed_at, &title, &abstract_text, &lang, &extract,
+            &links_json, height as i64,
+        ),
+    )?;
+    remove_by_url(conn, url, publisher, at_height)
+}
+
+fn restore_excluded_row(
+    conn: &Connection,
+    url: &str,
+    publisher: &str,
+    row: &ExcludedRow,
+    tier1: bool,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(url, publisher) DO UPDATE SET
+            delta_id = excluded.delta_id, observed_at = excluded.observed_at,
+            title = excluded.title, abstract = excluded.abstract, lang = excluded.lang",
+        (
+            url,
+            publisher,
+            &row.delta_id,
+            &row.observed_at,
+            &row.title,
+            &row.abstract_text,
+            &row.lang,
+        ),
+    )?;
+    super::persist::record_height(conn, url, publisher, row.height)?;
+    if tier1 {
+        if let Some(extract) = &row.extract {
+            conn.execute(
+                "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(url, publisher) DO UPDATE SET delta_id = excluded.delta_id, extract = excluded.extract",
+                (url, publisher, &row.delta_id, extract),
+            )?;
+        }
+        let links: Vec<String> = row
+            .links
+            .as_deref()
+            .map(|s| serde_json::from_str(s).unwrap_or_default())
+            .unwrap_or_default();
+        conn.execute("DELETE FROM links WHERE source_url = ?1", [url])?;
+        for (position, target_url) in links.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO links(source_url, target_url, position) VALUES (?1, ?2, ?3)",
+                (url, target_url, position as i64),
+            )?;
+        }
+        super::persist::replace_inlinks(conn, url, publisher, &links, row.height)?;
+    }
+    conn.execute(
+        "DELETE FROM excluded_records WHERE url = ?1 AND publisher = ?2",
+        (url, publisher),
+    )?;
+    Ok(())
+}
+
+/// WIST-3 §7: called whenever a live `records` row for `url` is removed —
+/// a delete Delta, a withdrawal or the declaration sweep — to bring the
+/// next-preferred Publisher's excluded record back, if any is held.
+fn recompute_and_restore(
+    conn: &Connection,
+    history: &KeyHistory,
+    url: &str,
+    tier1: bool,
+) -> Result<()> {
+    let host = wist_core::declaration::url_host(url);
+    let self_declared = history.declared(host);
+    let candidates = candidates_for(conn, url)?;
+    let Some(winner) = wist_core::materialization::preferred(
+        host,
+        self_declared,
+        candidates.iter().map(String::as_str),
+    ) else {
+        return Ok(());
+    };
+    let winner = winner.to_string();
+    let already_live: bool = conn
+        .query_row(
+            "SELECT 1 FROM records WHERE url = ?1 AND publisher = ?2",
+            (url, &winner),
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if already_live {
+        return Ok(());
+    }
+    let Some(row) = fetch_excluded(conn, url, &winner)? else {
+        return Ok(());
+    };
+    restore_excluded_row(conn, url, &winner, &row, tier1)
+}
+
+/// WIST-3 §7: at the height a domain's own `seq`-0 Declaration Entry
+/// seals, every other Publisher's record and excluded record for that
+/// domain's URLs is excluded exactly as a `delete` excludes it — a parent
+/// scope no longer reaches URLs the subdomain now declares for itself.
+/// Idempotent, so running it once per Declaration Entry of the domain in
+/// a Block is safe.
+fn sweep_declared_domain(
+    conn: &Connection,
+    history: &KeyHistory,
+    domain: &str,
+    tier1: bool,
+    height: u64,
+) -> Result<()> {
+    let prefix = format!("https://{domain}%");
+
+    let mut estmt =
+        conn.prepare("SELECT url, publisher FROM excluded_records WHERE url LIKE ?1")?;
+    let excluded_rows: Vec<(String, String)> = estmt
+        .query_map([&prefix], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(estmt);
+    for (url, publisher) in excluded_rows {
+        if publisher != domain && wist_core::declaration::url_host(&url) == domain {
+            conn.execute(
+                "DELETE FROM excluded_records WHERE url = ?1 AND publisher = ?2",
+                (&url, &publisher),
+            )?;
+        }
+    }
+
+    let mut stmt = conn.prepare("SELECT url, publisher FROM records WHERE url LIKE ?1")?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([&prefix], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    for (url, publisher) in rows {
+        if publisher != domain && wist_core::declaration::url_host(&url) == domain {
+            remove_by_url(conn, &url, &publisher, height)?;
+            recompute_and_restore(conn, history, &url, tier1)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_excluded_by_delta_id(conn: &Connection, delta_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM excluded_records WHERE delta_id = ?1",
+        [delta_id],
+    )?;
     Ok(())
 }
 
@@ -644,6 +958,7 @@ pub fn apply_events(
         conn.execute_batch(CREATE_TIER1)?;
     }
     conn.execute_batch(crate::store::CREATE_CHAIN_TIPS)?;
+    conn.execute_batch(crate::store::CREATE_EXCLUDED_RECORDS)?;
     let mut tips = load_chain_tips(conn)?;
     let mut withdrawn = load_withdrawn(conn)?;
     for event in events {
@@ -672,12 +987,21 @@ pub fn apply_events(
                 &entry["body"],
             )?;
         }
+        for entry in &event.declarations {
+            if let Some(domain) = entry["body"]["publisher"]["domain"].as_str() {
+                sweep_declared_domain(conn, history, domain, tier1, event.height)?;
+            }
+        }
         for (delta_id, publisher, height) in &event.withdrawals {
             record_withdrawal(conn, delta_id, publisher, *height)?;
             withdrawn.adopt(delta_id, publisher, *height);
-            if remove_by_delta_id(conn, delta_id)? {
+            if let Some(url) = remove_by_delta_id(conn, delta_id, *height)? {
                 stats.withdrawn += 1;
+                recompute_and_restore(conn, history, &url, tier1)?;
             }
+            // WIST-3 §7: withdrawn content never materializes, so an
+            // excluded record the same Delta ID names never returns either.
+            remove_excluded_by_delta_id(conn, delta_id)?;
         }
 
         for body in &event.delta_bodies {
@@ -702,7 +1026,10 @@ pub fn apply_events(
             if !tips.apply(&publisher, &env.delta.url, &id, env.delta.prev.as_deref()) {
                 continue;
             }
-            if !verified.materializes {
+            // WIST-3 §7: once a host's own Declaration stands, a parent's
+            // Deltas for its URLs move the chain tip but materialize
+            // nothing and are never shadowed.
+            if verified.self_declared && publisher != verified.host {
                 continue;
             }
             // WIST-3 §6.2: a withdrawn Delta's content never materializes,
@@ -720,15 +1047,113 @@ pub fn apply_events(
                     };
                     let title = fields.as_ref().map(|f| f.title.clone()).unwrap_or_default();
                     let abstract_text = fields.as_ref().and_then(|f| f.abstract_text.clone());
+                    let extract = fields.as_ref().and_then(|f| f.extract.clone());
+                    let links = fields.as_ref().map(|f| f.links.clone()).unwrap_or_default();
 
-                    conn.execute(
-                        "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                         ON CONFLICT(url, publisher) DO UPDATE SET
-                            delta_id = excluded.delta_id, observed_at = excluded.observed_at,
-                            title = excluded.title, abstract = excluded.abstract,
-                            lang = excluded.lang",
-                        (
+                    let mut candidates = candidates_for(conn, &env.delta.url)?;
+                    if !candidates.contains(&publisher) {
+                        candidates.push(publisher.clone());
+                    }
+                    let winner = wist_core::materialization::preferred(
+                        &verified.host,
+                        verified.self_declared,
+                        candidates.iter().map(String::as_str),
+                    )
+                    .map(str::to_string);
+
+                    if winner.as_deref() == Some(publisher.as_str()) {
+                        let holder: Option<String> = conn
+                            .query_row(
+                                "SELECT publisher FROM records WHERE url = ?1 LIMIT 1",
+                                [&env.delta.url],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+                        if let Some(holder) = &holder {
+                            if holder != &publisher {
+                                shadow_into_excluded(
+                                    conn,
+                                    &env.delta.url,
+                                    holder,
+                                    tier1,
+                                    event.height,
+                                )?;
+                            }
+                        }
+
+                        conn.execute(
+                            "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                             ON CONFLICT(url, publisher) DO UPDATE SET
+                                delta_id = excluded.delta_id, observed_at = excluded.observed_at,
+                                title = excluded.title, abstract = excluded.abstract,
+                                lang = excluded.lang",
+                            (
+                                &env.delta.url,
+                                &publisher,
+                                &id,
+                                &env.delta.observed_at,
+                                &title,
+                                &abstract_text,
+                                &env.delta.meta.lang,
+                            ),
+                        )?;
+                        super::persist::record_height(
+                            conn,
+                            &env.delta.url,
+                            &publisher,
+                            event.height,
+                        )?;
+                        conn.execute(
+                            "DELETE FROM excluded_records WHERE url = ?1 AND publisher = ?2",
+                            (&env.delta.url, &publisher),
+                        )?;
+                        stats.applied += 1;
+
+                        if tier1 {
+                            match &fields {
+                                Some(f) => {
+                                    if let Some(extract) = &f.extract {
+                                        conn.execute(
+                                            "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, ?2, ?3, ?4)
+                                             ON CONFLICT(url, publisher) DO UPDATE SET
+                                                delta_id = excluded.delta_id, extract = excluded.extract",
+                                            (&env.delta.url, &publisher, &id, extract),
+                                        )?;
+                                    }
+                                    conn.execute(
+                                        "DELETE FROM links WHERE source_url = ?1",
+                                        [&env.delta.url],
+                                    )?;
+                                    for (position, target_url) in f.links.iter().enumerate() {
+                                        conn.execute(
+                                            "INSERT INTO links(source_url, target_url, position) VALUES (?1, ?2, ?3)",
+                                            (&env.delta.url, target_url, position as i64),
+                                        )?;
+                                    }
+                                    super::persist::replace_inlinks(
+                                        conn,
+                                        &env.delta.url,
+                                        &publisher,
+                                        &f.links,
+                                        event.height,
+                                    )?;
+                                }
+                                None => {
+                                    conn.execute(
+                                        "DELETE FROM extracts WHERE url = ?1 AND publisher = ?2",
+                                        (&env.delta.url, &publisher),
+                                    )?;
+                                    conn.execute(
+                                        "DELETE FROM links WHERE source_url = ?1",
+                                        [&env.delta.url],
+                                    )?;
+                                }
+                            }
+                        }
+                    } else {
+                        write_excluded(
+                            conn,
                             &env.delta.url,
                             &publisher,
                             &id,
@@ -736,61 +1161,30 @@ pub fn apply_events(
                             &title,
                             &abstract_text,
                             &env.delta.meta.lang,
-                        ),
-                    )?;
-                    super::persist::record_height(conn, &env.delta.url, &publisher, event.height)?;
-                    stats.applied += 1;
-
-                    if tier1 {
-                        match &fields {
-                            Some(f) => {
-                                if let Some(extract) = &f.extract {
-                                    conn.execute(
-                                        "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, ?2, ?3, ?4)
-                                         ON CONFLICT(url, publisher) DO UPDATE SET
-                                            delta_id = excluded.delta_id, extract = excluded.extract",
-                                        (&env.delta.url, &publisher, &id, extract),
-                                    )?;
-                                }
-                                conn.execute(
-                                    "DELETE FROM links WHERE source_url = ?1",
-                                    [&env.delta.url],
-                                )?;
-                                for (position, target_url) in f.links.iter().enumerate() {
-                                    conn.execute(
-                                        "INSERT INTO links(source_url, target_url, position) VALUES (?1, ?2, ?3)",
-                                        (&env.delta.url, target_url, position as i64),
-                                    )?;
-                                }
-                                super::persist::replace_inlinks(
-                                    conn,
-                                    &env.delta.url,
-                                    &publisher,
-                                    &f.links,
-                                    event.height,
-                                )?;
-                            }
-                            None => {
-                                conn.execute(
-                                    "DELETE FROM extracts WHERE url = ?1 AND publisher = ?2",
-                                    (&env.delta.url, &publisher),
-                                )?;
-                                conn.execute(
-                                    "DELETE FROM links WHERE source_url = ?1",
-                                    [&env.delta.url],
-                                )?;
-                            }
-                        }
+                            extract.as_deref(),
+                            &links,
+                            event.height,
+                        )?;
                     }
                 }
                 ChangeType::Delete => {
-                    remove_by_url(conn, &env.delta.url, &publisher)?;
+                    remove_by_url(conn, &env.delta.url, &publisher, event.height)?;
+                    conn.execute(
+                        "DELETE FROM excluded_records WHERE url = ?1 AND publisher = ?2",
+                        (&env.delta.url, &publisher),
+                    )?;
+                    recompute_and_restore(conn, history, &env.delta.url, tier1)?;
                 }
                 ChangeType::Attest => {
                     // WIST-3 §7: an attest refreshes the record's
-                    // observed_at and leaves its anchor Delta in place.
+                    // observed_at and leaves its anchor Delta in place,
+                    // whichever of the two tables currently holds it.
                     conn.execute(
                         "UPDATE records SET observed_at = ?3 WHERE url = ?1 AND publisher = ?2",
+                        (&env.delta.url, &publisher, &env.delta.observed_at),
+                    )?;
+                    conn.execute(
+                        "UPDATE excluded_records SET observed_at = ?3 WHERE url = ?1 AND publisher = ?2",
                         (&env.delta.url, &publisher, &env.delta.observed_at),
                     )?;
                 }

@@ -28,6 +28,12 @@ pub const CREATE_AGGREGATOR_KEYS: &str =
 pub const CREATE_WITHDRAWALS: &str =
     "CREATE TABLE IF NOT EXISTS withdrawals(delta_id TEXT PRIMARY KEY, publisher TEXT NOT NULL, height INTEGER NOT NULL)";
 
+/// WIST-3 §7's one-URL-one-Publisher rule: the content of a record a
+/// nearer or self-declared Publisher excludes from `records`, kept so it
+/// can return when the preferred Publisher's own record leaves. Never
+/// joined into search, resolve, stats or the content digest.
+pub const CREATE_EXCLUDED_RECORDS: &str = "CREATE TABLE IF NOT EXISTS excluded_records(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, observed_at TEXT NOT NULL, title TEXT NOT NULL, abstract TEXT, lang TEXT, extract TEXT, links TEXT, height INTEGER NOT NULL, PRIMARY KEY(url, publisher))";
+
 /// WIST-4 §3.1: every Public Suffix List snapshot the Log pinned, by its
 /// identifier, and the accepted acts that changed the snapshot in force,
 /// in Log order.

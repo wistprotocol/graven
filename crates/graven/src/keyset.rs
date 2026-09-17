@@ -12,27 +12,22 @@ use wist_core::objects::PublisherEnvelope;
 use wist_core::objects::{DeltaEnvelope, Publisher};
 
 /// A sealed Delta that verifies under WIST-1 §5.2: its ID, the Publisher
-/// whose key signed it — the record key WIST-3 §7 uses — and whether
-/// §7's one-URL-one-Publisher rule lets it materialize.
+/// whose key signed it — the record key WIST-3 §7 uses — its URL's
+/// portless host, and whether that host's own `seq`-0 Declaration Entry is
+/// sealed, the two facts §7's one-URL-one-Publisher rule decides
+/// materialization from (`wist_core::materialization::preferred`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedDelta {
     pub id: String,
     pub publisher: String,
-    pub materializes: bool,
+    pub host: String,
+    pub self_declared: bool,
 }
 
 #[derive(Debug, Default)]
 pub struct KeyHistory {
     declarations: Declarations,
     publishers: HashMap<String, Publisher>,
-}
-
-pub fn url_authority(url: &Url) -> Option<String> {
-    let host = url.host_str()?;
-    Some(match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
-    })
 }
 
 fn history_error(e: wist_core::Error) -> Error {
@@ -266,14 +261,15 @@ impl KeyHistory {
         .map_err(|code| diagnostic(code, "Delta field, version or static check failed"))?;
         let domain = wist_core::delta::publisher(&entry_body["delta"])?.to_string();
         let env: DeltaEnvelope = serde_json::from_value(entry_body.clone())?;
-        let url = Url::parse(&env.delta.url)
+        let parsed = Url::parse(&env.delta.url)
             .map_err(|e| diagnostic("WIST1-E03", &format!("delta url {}: {e}", env.delta.url)))?;
-        let host = url_authority(&url).ok_or_else(|| {
-            diagnostic(
+        if parsed.host_str().is_none() {
+            return Err(diagnostic(
                 "WIST1-E03",
                 &format!("delta url {}: no authority", env.delta.url),
-            )
-        })?;
+            ));
+        }
+        let host = wist_core::declaration::url_host(&env.delta.url).to_string();
         let (hash, envelope) = {
             let state = self
                 .declarations
@@ -309,7 +305,8 @@ impl KeyHistory {
             })?;
         Ok(VerifiedDelta {
             id: delta_id(&entry_body["delta"])?,
-            materializes: domain == host || !self.declared(&host),
+            self_declared: self.declared(&host),
+            host,
             publisher: domain,
         })
     }
@@ -523,7 +520,8 @@ mod tests {
             .verify_delta(0, LATE_S, &DeltaProfile::default(), &ok)
             .unwrap();
         assert_eq!(verified.publisher, "records.example");
-        assert!(verified.materializes);
+        assert_eq!(verified.host, "records.example");
+        assert!(verified.self_declared);
         let unknown = delta_env(&pk9, &pk9.kid(), url, "2026-08-09T12:00:00Z");
         let err = chain
             .history
@@ -711,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_and_self_declaration_decide_materialization() {
+    fn scope_and_self_declaration_expose_the_facts_materialization_needs() {
         let pk1 = Signer::new([1u8; 32]);
         let pk2 = Signer::new([2u8; 32]);
         let mut chain = Chain::new();
@@ -735,7 +733,8 @@ mod tests {
             .history
             .verify_delta(0, LATE_S, &DeltaProfile::default(), &scoped)
             .unwrap();
-        assert!(verified.materializes);
+        assert_eq!(verified.host, "sub.records.example");
+        assert!(!verified.self_declared);
         let outside = delta_env(
             &pk1,
             &pk1.kid(),
@@ -761,9 +760,10 @@ mod tests {
             .history
             .verify_delta(1, LATE_S, &DeltaProfile::default(), &scoped)
             .unwrap();
-        assert!(
-            !verified.materializes,
-            "the subdomain's own Declaration takes its URLs"
+        assert!(verified.self_declared);
+        assert_ne!(
+            verified.publisher, verified.host,
+            "the subdomain's own Declaration takes its URLs from the parent"
         );
     }
 
