@@ -4,8 +4,14 @@ use std::time::Duration;
 
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
-fn is_loopback_host(host: &str) -> bool {
+/// A loopback literal, `localhost` or a name under `.localhost`, which
+/// RFC 6761 §6.3 resolves to loopback by definition.
+pub fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
+        || host
+            .to_ascii_lowercase()
+            .trim_end_matches('.')
+            .ends_with(".localhost")
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback())
@@ -57,6 +63,10 @@ impl Client {
         Client { allow_http, inner }
     }
 
+    pub fn allow_http(&self) -> bool {
+        self.allow_http
+    }
+
     pub fn get_bytes(&self, url: &Url) -> Result<Vec<u8>> {
         guard_scheme(url, self.allow_http)?;
         let resp = self
@@ -98,6 +108,11 @@ mod tests {
 
         let url = Url::parse("http://localhost:8080/x.json").unwrap();
         assert!(guard_scheme(&url, true).is_ok());
+        let url = Url::parse("http://labeler.localhost/x.json").unwrap();
+        assert!(guard_scheme(&url, true).is_ok());
+        assert!(guard_scheme(&url, false).is_err());
+        let url = Url::parse("http://localhost.example/x.json").unwrap();
+        assert!(guard_scheme(&url, true).is_err());
     }
 
     #[test]

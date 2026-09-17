@@ -1959,6 +1959,8 @@ fn cold_start_adopts_withdrawal_and_label_tuples() {
             name: "wist:spam".into(),
             value: None,
             asserted_at: "2026-08-09T12:00:00Z".into(),
+            expires_at: None,
+            delta: None,
             sealing_height: 0,
         }),
     ];

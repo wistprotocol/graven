@@ -1,6 +1,6 @@
 # graven
 
-The signed Delta format targets [WIST specification revision `d75bd49abcfbbe6a672e4fb695e078b489f51ba7`](https://github.com/wistprotocol/spec/tree/d75bd49abcfbbe6a672e4fb695e078b489f51ba7). Object version `1.0.0` alone does not identify a compatible draft.
+The signed Delta format targets [WIST specification revision `2d572b4d64e2f6fc01f57af87184b4e97be99b59`](https://github.com/wistprotocol/spec/tree/2d572b4d64e2f6fc01f57af87184b4e97be99b59). Object version `1.0.0` alone does not identify a compatible draft.
 
 WIST Protocol consumer and MCP server. Graven cold-syncs a verified Snapshot,
 then applies incremental Blocks to a separate SQLite index per Log (WIST-3 §8).
@@ -137,9 +137,33 @@ record, extracts, links and embeddings; a withdrawal sealed in the same
 Block as the Delta it names keeps that Delta from materializing at all.
 A Delta sealed below the Blocks the sync walked cannot be checked
 against the act, since no Snapshot tuple names sealed Deltas, and such
-an act is read as consistent. A `label` Entry is verified as part of the Block and otherwise left
-alone. Full recovery replay and materialization preference among
-overlapping scoped Publishers remain separate validation requirements.
+an act is read as consistent. A `label` or `dispute` Entry is validated under its signer's Declaration
+at the Block as the Aggregator validated it — fields, the registry name,
+self-labeling, the disputed Label's sealing and authority, the signature
+— and one that fails is ignored like a forked Delta (WIST-2 §3.3). The
+index keeps every walked Label and dispute, the current Label per
+(labeler, subject, name) and the current dispute per (Label ID,
+disputant) by `asserted_at` and Log order, a cold start adopting the
+Snapshot's `label` and `dispute` tuples, which carry no IDs, so a later
+dispute of a Label the index never walked is read as consistent. The
+`labelers` table counts each Labeler's walked Labels, retractions,
+distinct subjects and first and last sealed heights (WIST-3 §7's
+statistics, recomputed locally). `subscribe --labeler` names the
+Labelers the index applies, kept in `labelers.json`; each sync fetches
+their label definitions from `labels/definitions/<hex>.json`, keeping
+the newest that verifies, so `get_labels` reports the treatment a
+Labeler declares and `inform` where none does (WIST-4 §6). Full recovery
+replay and materialization preference among overlapping scoped
+Publishers remain separate validation requirements.
+
+## Labels through MCP
+
+`get_labels` returns the current, unretracted, unexpired Labels sealed
+about a subject by subscribed Labelers — with value, expiry, Delta
+binding, treatment and the labeled domain's disputes — and
+`every_labeler` widens it to every Labeler walked; `list_labelers`
+returns each Labeler's statistics and whether it is subscribed. Labels
+are transported beside the records and never applied to them.
 
 ## Companion packs
 

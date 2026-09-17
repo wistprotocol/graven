@@ -1,15 +1,16 @@
 use e2e::{
-    free_loopback_addr, graven_bin, grid_instant, now_rfc3339, resolve_sibling_bin, run, s,
-    serve_static, spawn_clave_serve, wait_until_pulled_since, wait_until_status_active,
-    workspace_root, McpClient,
+    free_loopback_addr, graven_bin, grid_instant, now_rfc3339, resolve_sibling_bin, run,
+    run_with_env, s, serve_sites, spawn_clave_serve, wait_until_pulled_since,
+    wait_until_status_active, workspace_root, McpClient,
 };
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-fn stage_fixture_site(tmp: &Path) -> PathBuf {
+fn stage_fixture_site(tmp: &Path, name: &str) -> PathBuf {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/site");
-    let dst = tmp.join("site");
+    let dst = tmp.join(name);
     std::fs::create_dir_all(&dst).expect("create staged site dir");
     for entry in std::fs::read_dir(&src).expect("read fixtures/site") {
         let entry = entry.expect("fixture dir entry");
@@ -83,13 +84,20 @@ fn end_to_end() {
     let graven = graven_bin();
 
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let site = stage_fixture_site(tmp.path());
-    let site_addr = serve_static(site.clone());
-    let site_proxy = format!("http://{site_addr}");
+    let site = stage_fixture_site(tmp.path(), "site");
     let site_host = "localhost".to_string();
     rewrite_sitemap_host(&site, &site_host);
+    let labeler_site = stage_fixture_site(tmp.path(), "labeler-site");
+    let labeler_host = "labeler.localhost".to_string();
+    rewrite_sitemap_host(&labeler_site, &labeler_host);
+    let (proxy_addr, _) = serve_sites(BTreeMap::from([
+        (site_host.clone(), site.clone()),
+        (labeler_host.clone(), labeler_site.clone()),
+    ]));
+    let site_proxy = format!("http://{proxy_addr}");
 
     let spake_state = tmp.path().join("spake-state");
+    let labeler_state = tmp.path().join("labeler-state");
     let clave_data = tmp.path().join("clave-data");
     let gdir = tmp.path().join("graven-store");
 
@@ -234,6 +242,85 @@ fn end_to_end() {
         ],
     );
 
+    run(
+        &spake,
+        &[
+            "init",
+            "--domain",
+            &labeler_host,
+            "--out",
+            s(&labeler_site),
+            "--state",
+            s(&labeler_state),
+        ],
+    );
+    run(
+        &spake,
+        &[
+            "build",
+            "--site",
+            s(&labeler_site),
+            "--domain",
+            &labeler_host,
+            "--out",
+            s(&labeler_site),
+            "--state",
+            s(&labeler_state),
+        ],
+    );
+    let labeled_url = format!("https://{site_host}/a.html");
+    let label_output = run(
+        &spake,
+        &[
+            "label",
+            "--out",
+            s(&labeler_site),
+            "--state",
+            s(&labeler_state),
+            "--subject",
+            &labeled_url,
+            "--name",
+            "wist:spam",
+            "--value",
+            "900000",
+        ],
+    );
+    let label_id = String::from_utf8_lossy(&label_output.stdout)
+        .trim()
+        .to_string();
+    assert!(label_id.starts_with("sha256:"), "{label_id}");
+    run(
+        &spake,
+        &[
+            "define",
+            "--out",
+            s(&labeler_site),
+            "--state",
+            s(&labeler_state),
+            "--name",
+            "wist:spam",
+            "--description",
+            &format!("https://{labeler_host}/labels/spam"),
+            "--treatment",
+            "warn",
+        ],
+    );
+    for base in [&clave_base, &clave2_base] {
+        run(
+            &spake,
+            &[
+                "ping",
+                "--log",
+                base,
+                "--domain",
+                &labeler_host,
+                "--allow-http",
+                "--no-retry",
+            ],
+        );
+        wait_until_status_active(&http, base, &labeler_host);
+    }
+
     mutate_fixture_page(&site);
     let since = now_rfc3339();
     run(
@@ -293,9 +380,113 @@ fn end_to_end() {
         &clave,
         &["seal", "--data", s(&clave2_data), "--at", &second_seal],
     );
-    run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+
+    let disputed_since = now_rfc3339();
+    run(
+        &spake,
+        &[
+            "dispute",
+            "--out",
+            s(&site),
+            "--state",
+            s(&spake_state),
+            "--label",
+            &label_id,
+            "--subject",
+            &labeled_url,
+            "--log",
+            "log.localhost",
+            "--height",
+            "0",
+        ],
+    );
+    for base in [&clave_base, &clave2_base] {
+        run(
+            &spake,
+            &[
+                "ping",
+                "--log",
+                base,
+                "--domain",
+                &site_host,
+                "--allow-http",
+                "--no-retry",
+            ],
+        );
+    }
+    wait_until_pulled_since(
+        &http,
+        &clave_base,
+        &site_host,
+        &disputed_since,
+        &clave_stderr,
+    );
+    wait_until_pulled_since(
+        &http,
+        &clave2_base,
+        &site_host,
+        &disputed_since,
+        &clave2_stderr,
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let third_seal = grid_instant(2);
+    run(
+        &clave,
+        &["seal", "--data", s(&clave_data), "--at", &third_seal],
+    );
+    run(
+        &clave,
+        &["seal", "--data", s(&clave2_data), "--at", &third_seal],
+    );
+    run(
+        &graven,
+        &["subscribe", "--dir", s(&gdir), "--labeler", &labeler_host],
+    );
+    run_with_env(
+        &graven,
+        &["sync", "--dir", s(&gdir), "--allow-http"],
+        &[
+            ("HTTP_PROXY", &site_proxy),
+            ("http_proxy", &site_proxy),
+            ("NO_PROXY", "127.0.0.1"),
+            ("no_proxy", "127.0.0.1"),
+        ],
+    );
 
     let mut mcp = McpClient::start(&graven, &gdir);
+    let labels = mcp.tool_call("get_labels", serde_json::json!({"subject": labeled_url}));
+    let labels = labels.as_array().expect("get_labels returns an array");
+    assert_eq!(labels.len(), 1, "{labels:?}");
+    let label = &labels[0];
+    assert_eq!(label["labeler"], labeler_host);
+    assert_eq!(label["name"], "wist:spam");
+    assert_eq!(label["value"], 900000);
+    assert_eq!(label["subscribed"], true);
+    assert_eq!(label["treatment"], "warn", "{label}");
+    assert_eq!(label["label_id"], label_id);
+    let disputes = label["disputes"].as_array().expect("disputes array");
+    assert_eq!(disputes.len(), 1, "{label}");
+    assert_eq!(disputes[0]["disputant"], site_host);
+    assert_eq!(
+        label["provenance"].as_array().map(Vec::len),
+        Some(2),
+        "{label}"
+    );
+    let labelers = mcp.tool_call("list_labelers", serde_json::json!({}));
+    let labelers = labelers.as_array().expect("list_labelers returns an array");
+    assert!(
+        labelers
+            .iter()
+            .any(|l| l["labeler"] == labeler_host && l["label_count"] == 1),
+        "{labelers:?}"
+    );
+    assert!(mcp
+        .tool_call(
+            "get_labels",
+            serde_json::json!({"subject": "https://localhost/b.html"})
+        )
+        .as_array()
+        .is_some_and(Vec::is_empty));
     let hits = mcp.search("changed");
     assert!(!hits.is_empty(), "search(\"changed\") returned no hits");
     let hit = hits
@@ -364,10 +555,10 @@ fn end_to_end() {
         ],
     );
     std::thread::sleep(Duration::from_secs(2));
-    let third_seal = grid_instant(2);
+    let fourth_seal = grid_instant(3);
     run(
         &clave,
-        &["seal", "--data", s(&clave_data), "--at", &third_seal],
+        &["seal", "--data", s(&clave_data), "--at", &fourth_seal],
     );
     run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
 

@@ -146,11 +146,16 @@ pub struct BlockEvent {
     /// the earliest Block that withdrew it (WIST-3 §6.2).
     pub withdrawals: Vec<(String, String, u64)>,
     pub delta_bodies: Vec<Value>,
+    /// The `label` Entries with their canonical Entry index (WIST-2 §3.3).
+    pub labels: Vec<(u64, Value)>,
+    /// The `dispute` Entries with their canonical Entry index.
+    pub disputes: Vec<(u64, Value)>,
 }
 
 pub struct ApplyStats {
     pub applied: u64,
     pub withdrawn: u64,
+    pub labels: u64,
 }
 
 pub(super) struct PayloadFields {
@@ -438,14 +443,19 @@ pub fn walk_blocks(
         let mut declarations = Vec::new();
         let mut withdrawal_acts = Vec::new();
         let mut delta_bodies = Vec::new();
+        let mut labels = Vec::new();
+        let mut disputes = Vec::new();
 
-        for entry in block_value
+        for (index, entry) in block_value
             .get("entries")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
+            .enumerate()
         {
             match entry.get("type").and_then(Value::as_str) {
+                Some("label") => labels.push((index as u64, entry["body"].clone())),
+                Some("dispute") => disputes.push((index as u64, entry["body"].clone())),
                 Some("publisher_declaration") => {
                     if entry.get("body").is_none() {
                         return Err(Error::Verify(format!(
@@ -523,6 +533,8 @@ pub fn walk_blocks(
             declarations,
             withdrawals,
             delta_bodies,
+            labels,
+            disputes,
         });
         last_block_value = Some(block_value);
     }
@@ -617,7 +629,9 @@ pub fn apply_events(
     let mut stats = ApplyStats {
         applied: 0,
         withdrawn: 0,
+        labels: 0,
     };
+    conn.execute_batch(crate::store::CREATE_LABELS)?;
     if tier1 {
         conn.execute_batch(CREATE_TIER1)?;
     }
@@ -760,8 +774,86 @@ pub fn apply_events(
                 }
             }
         }
+        apply_labels(conn, history, event, &mut stats)?;
     }
     save_chain_tips(conn, &tips)?;
     save_history(conn, history)?;
     Ok(stats)
+}
+
+/// WIST-2 §3.3 and WIST-3 §3.3: applies a Block's `label` and `dispute`
+/// Entries after its Deltas, each validated under its signer's Declaration
+/// as the Aggregator validated it; one that fails is ignored like a
+/// forked Delta. Every sealed Entry of a Labeler moves its last sealed
+/// height (WIST-4 §6).
+pub(super) fn apply_labels(
+    conn: &Connection,
+    history: &KeyHistory,
+    event: &BlockEvent,
+    stats: &mut ApplyStats,
+) -> Result<()> {
+    for body in &event.delta_bodies {
+        if let Some(publisher) = body["delta"]["publisher"].as_str() {
+            super::persist::touch_labeler(conn, publisher, event.height)?;
+        }
+    }
+    for (index, body) in &event.labels {
+        let labeler = body["label"]["labeler"].as_str().unwrap_or_default();
+        let Some(declaration) = history.declaration_for(labeler) else {
+            eprintln!(
+                "ignoring a Label at height {}: no Declaration for {labeler}",
+                event.height
+            );
+            continue;
+        };
+        match wist_core::label::validate_label(body, &declaration, event.profile.url_cap_bytes) {
+            Ok(envelope) => {
+                let id = wist_core::label::label_id(&body["label"])
+                    .map_err(|r| Error::Verify(format!("label id: {r:?}")))?;
+                super::persist::record_label(conn, &envelope.label, &id, event.height, *index)?;
+                stats.labels += 1;
+            }
+            Err(rejection) => eprintln!(
+                "ignoring a Label at height {}: {}",
+                event.height,
+                rejection.code()
+            ),
+        }
+    }
+    for (index, body) in &event.disputes {
+        let disputant = body["dispute"]["disputant"].as_str().unwrap_or_default();
+        let Some(declaration) = history.declaration_for(disputant) else {
+            eprintln!(
+                "ignoring a dispute at height {}: no Declaration for {disputant}",
+                event.height
+            );
+            continue;
+        };
+        // A Label adopted from a Snapshot tuple carries no ID, so a dispute
+        // naming a Label this index never walked cannot be checked when the
+        // index resumed from a Snapshot; it is read as consistent.
+        let resumed = super::persist::holds_adopted_labels(conn)?;
+        let sealed = |label_id: &str| match super::persist::sealed_label_subject(conn, label_id)
+            .ok()
+            .flatten()
+        {
+            Some(subject) => wist_core::label::LabelLookup::Known { subject },
+            None if resumed => wist_core::label::LabelLookup::Unverifiable,
+            None => wist_core::label::LabelLookup::Absent,
+        };
+        match wist_core::label::validate_dispute(body, &declaration, sealed) {
+            Ok(envelope) => {
+                let id = wist_core::label::dispute_id(&body["dispute"])
+                    .map_err(|r| Error::Verify(format!("dispute id: {r:?}")))?;
+                super::persist::record_dispute(conn, &envelope.dispute, &id, event.height, *index)?;
+                stats.labels += 1;
+            }
+            Err(rejection) => eprintln!(
+                "ignoring a dispute at height {}: {}",
+                event.height,
+                rejection.code()
+            ),
+        }
+    }
+    Ok(())
 }

@@ -75,8 +75,15 @@ pub fn s(p: &Path) -> &str {
 }
 
 pub fn run(bin: &Path, args: &[&str]) -> std::process::Output {
+    run_with_env(bin, args, &[])
+}
+
+/// Runs a command to completion with extra environment variables, such
+/// as the proxy through which a loopback site stands in for a domain.
+pub fn run_with_env(bin: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let output = Command::new(bin)
         .args(args)
+        .envs(env.iter().copied())
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn {} {args:?}: {e}", bin.display()));
     assert!(

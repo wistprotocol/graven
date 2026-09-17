@@ -302,7 +302,8 @@ pub(super) fn snapshot(
                 record_withdrawal(&conn, &w.delta_id, &w.publisher, w.sealing_height)?;
                 super::history::remove_by_delta_id(&conn, &w.delta_id)?;
             }
-            StateEntry::Label(_) => {}
+            StateEntry::Label(l) => super::persist::adopt_label_tuple(&conn, l)?,
+            StateEntry::Dispute(d) => super::persist::adopt_dispute_tuple(&conn, d)?,
             StateEntry::SuffixList(s) => {
                 suffix_lists.adopt(client, base, &s.identifier, s.sealing_height)?;
             }

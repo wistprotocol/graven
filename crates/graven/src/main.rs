@@ -45,6 +45,21 @@ enum Command {
         #[command(subcommand)]
         command: PackCommand,
     },
+    /// Adds a Labeler to the subscription list this index applies
+    /// (WIST-4 §6); without --labeler, lists the subscriptions.
+    Subscribe {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        labeler: Option<String>,
+    },
+    /// Removes a Labeler from the subscription list.
+    Unsubscribe {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        labeler: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -105,6 +120,21 @@ fn main() -> Result<(), graven::Error> {
         Command::Serve { dir } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(graven::mcp::serve_stdio(&dir))?;
+        }
+        Command::Subscribe { dir, labeler } => {
+            let mut labelers = graven::store::load_subscriptions(&dir)?;
+            if let Some(labeler) = labeler {
+                labelers.insert(labeler);
+                graven::store::save_subscriptions(&dir, &labelers)?;
+            }
+            for labeler in &labelers {
+                println!("{labeler}");
+            }
+        }
+        Command::Unsubscribe { dir, labeler } => {
+            let mut labelers = graven::store::load_subscriptions(&dir)?;
+            labelers.remove(&labeler);
+            graven::store::save_subscriptions(&dir, &labelers)?;
         }
         Command::Pack { command } => match command {
             PackCommand::Import {

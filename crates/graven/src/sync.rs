@@ -172,6 +172,7 @@ fn run_registered(
         synced = true;
     }
 
+    let subscriptions = crate::store::load_subscriptions(dir)?;
     if synced {
         run_incremental(
             client,
@@ -182,6 +183,7 @@ fn run_registered(
             &log_dir,
             &sync_path,
             effective_tier1,
+            &subscriptions,
         )
     } else {
         run_cold_start(
@@ -193,6 +195,7 @@ fn run_registered(
             &log_dir,
             &sync_path,
             effective_tier1,
+            &subscriptions,
         )
     }
 }
@@ -207,6 +210,7 @@ fn run_incremental(
     dir: &Path,
     sync_path: &Path,
     tier1: bool,
+    subscriptions: &std::collections::BTreeSet<String>,
 ) -> Result<SyncReport> {
     let index_sqlite_path = dir.join("index.sqlite");
     let conn = Connection::open(&index_sqlite_path)?;
@@ -271,6 +275,7 @@ fn run_incremental(
     tx.execute(CREATE_UNIQUE_INDEX, [])?;
     tx.execute(CREATE_DECLARATIONS, [])?;
     let stats = apply_events(&tx, client, base, &mut history, &events, tier1)?;
+    fetch_definitions(&tx, client, &history, subscriptions)?;
     tx.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
     if tier1 {
         tx.execute(
@@ -309,6 +314,7 @@ fn run_cold_start(
     dir: &Path,
     sync_path: &Path,
     tier1: bool,
+    subscriptions: &std::collections::BTreeSet<String>,
 ) -> Result<SyncReport> {
     let mut installed = install::snapshot(client, base, trust_key, genesis_key_id, dir, tier1)?;
     let checkpoint_url = resolve(base, "/log/checkpoint.json")?;
@@ -360,6 +366,7 @@ fn run_cold_start(
         &events,
         tier1,
     )?;
+    fetch_definitions(&installed.conn, client, &installed.history, subscriptions)?;
     installed
         .conn
         .execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;

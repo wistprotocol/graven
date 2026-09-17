@@ -214,3 +214,292 @@ pub fn save_sync_state(conn: &Connection, state: &SyncState) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// WIST-2 §3.3: records one walked Label, keeps the current Label of its
+/// (labeler, subject, name) by asserted_at and Log order, and counts it
+/// in the labeler statistics.
+pub(super) fn record_label(
+    conn: &Connection,
+    label: &wist_core::objects::Label,
+    label_id: &str,
+    height: u64,
+    entry_index: u64,
+) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_LABELS)?;
+    let retracted = label.retracted == Some(true);
+    conn.execute(
+        "INSERT OR IGNORE INTO labels(label_id, labeler, subject, name, value, asserted_at, retracted, expires_at, delta, height, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            label_id,
+            label.labeler,
+            label.subject,
+            label.name,
+            label.value,
+            label.asserted_at,
+            retracted,
+            label.expires_at,
+            label.delta,
+            height as i64,
+            entry_index as i64
+        ],
+    )?;
+    let current: Option<(String, i64, i64)> = conn
+        .query_row(
+            "SELECT asserted_at, height, entry_index FROM label_current WHERE labeler = ?1 AND subject = ?2 AND name = ?3",
+            (&label.labeler, &label.subject, &label.name),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if supersedes(current, &label.asserted_at, height, entry_index) {
+        conn.execute(
+            "INSERT INTO label_current(labeler, subject, name, label_id, value, asserted_at, retracted, expires_at, delta, height, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(labeler, subject, name) DO UPDATE SET label_id = excluded.label_id, value = excluded.value, asserted_at = excluded.asserted_at, retracted = excluded.retracted, expires_at = excluded.expires_at, delta = excluded.delta, height = excluded.height, entry_index = excluded.entry_index",
+            rusqlite::params![
+                label.labeler,
+                label.subject,
+                label.name,
+                label_id,
+                label.value,
+                label.asserted_at,
+                retracted,
+                label.expires_at,
+                label.delta,
+                height as i64,
+                entry_index as i64
+            ],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO labelers(labeler, label_count, retraction_count, first_seen_height, last_sealed_height) VALUES (?1, 1, ?2, ?3, ?3)
+         ON CONFLICT(labeler) DO UPDATE SET label_count = label_count + 1, retraction_count = retraction_count + ?2, first_seen_height = MIN(first_seen_height, ?3), last_sealed_height = MAX(last_sealed_height, ?3)",
+        rusqlite::params![label.labeler, i64::from(retracted), height as i64],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO labeler_subjects(labeler, subject) VALUES (?1, ?2)",
+        (&label.labeler, &label.subject),
+    )?;
+    Ok(())
+}
+
+/// WIST-2 §3.3: the greater asserted_at, then the later Log position.
+fn supersedes(
+    current: Option<(String, i64, i64)>,
+    asserted_at: &str,
+    height: u64,
+    entry_index: u64,
+) -> bool {
+    match current {
+        None => true,
+        Some((held_at, held_height, held_index)) => {
+            wist_core::publisher_time::compare(asserted_at, &held_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then((height as i64).cmp(&held_height))
+                .then((entry_index as i64).cmp(&held_index))
+                == std::cmp::Ordering::Greater
+        }
+    }
+}
+
+/// WIST-2 §3.3: records one walked dispute and keeps the current dispute
+/// of its (Label ID, disputant).
+pub(super) fn record_dispute(
+    conn: &Connection,
+    dispute: &wist_core::objects::Dispute,
+    dispute_id: &str,
+    height: u64,
+    entry_index: u64,
+) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_LABELS)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO disputes(dispute_id, label_id, disputant, reason, asserted_at, height, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            dispute_id,
+            dispute.label,
+            dispute.disputant,
+            dispute.reason,
+            dispute.asserted_at,
+            height as i64,
+            entry_index as i64
+        ],
+    )?;
+    let current: Option<(String, i64, i64)> = conn
+        .query_row(
+            "SELECT asserted_at, height, entry_index FROM dispute_current WHERE label_id = ?1 AND disputant = ?2",
+            (&dispute.label, &dispute.disputant),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if supersedes(current, &dispute.asserted_at, height, entry_index) {
+        conn.execute(
+            "INSERT INTO dispute_current(label_id, disputant, dispute_id, reason, asserted_at, height, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(label_id, disputant) DO UPDATE SET dispute_id = excluded.dispute_id, reason = excluded.reason, asserted_at = excluded.asserted_at, height = excluded.height, entry_index = excluded.entry_index",
+            rusqlite::params![
+                dispute.label,
+                dispute.disputant,
+                dispute_id,
+                dispute.reason,
+                dispute.asserted_at,
+                height as i64,
+                entry_index as i64
+            ],
+        )?;
+    }
+    touch_labeler(conn, &dispute.disputant, height)
+}
+
+/// The subject of a Label this index holds sealed, for a dispute's check
+/// (WIST-2 §3.3); a Label adopted from a tuple has no ID and matches none.
+pub(super) fn sealed_label_subject(conn: &Connection, label_id: &str) -> Result<Option<String>> {
+    if !crate::store::table_exists(conn, "labels")? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT subject FROM labels WHERE label_id = ?1",
+        [label_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// WIST-4 §6: a Labeler's last sealed Entry of any type, for the
+/// recommended inactivity reading.
+pub(super) fn touch_labeler(conn: &Connection, domain: &str, height: u64) -> Result<()> {
+    if !crate::store::table_exists(conn, "labelers")? {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE labelers SET last_sealed_height = MAX(last_sealed_height, ?2) WHERE labeler = ?1",
+        rusqlite::params![domain, height as i64],
+    )?;
+    Ok(())
+}
+
+/// WIST-3 §8 step 10: adopts a Snapshot's `label` tuple as the current
+/// Label of its triple; the tuple carries no Label ID.
+pub(super) fn adopt_label_tuple(
+    conn: &Connection,
+    entry: &wist_core::objects::LabelEntry,
+) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_LABELS)?;
+    conn.execute(
+        "INSERT INTO label_current(labeler, subject, name, label_id, value, asserted_at, retracted, expires_at, delta, height, entry_index) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 0, ?6, ?7, ?8, 0)
+         ON CONFLICT(labeler, subject, name) DO UPDATE SET label_id = NULL, value = excluded.value, asserted_at = excluded.asserted_at, retracted = 0, expires_at = excluded.expires_at, delta = excluded.delta, height = excluded.height, entry_index = 0",
+        rusqlite::params![
+            entry.labeler,
+            entry.subject,
+            entry.name,
+            entry.value.map(|v| v as i64),
+            entry.asserted_at,
+            entry.expires_at,
+            entry.delta,
+            entry.sealing_height as i64
+        ],
+    )?;
+    Ok(())
+}
+
+/// WIST-3 §8 step 10: adopts a Snapshot's `dispute` tuple as the current
+/// dispute of its pair.
+pub(super) fn adopt_dispute_tuple(
+    conn: &Connection,
+    entry: &wist_core::objects::DisputeEntry,
+) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_LABELS)?;
+    conn.execute(
+        "INSERT INTO dispute_current(label_id, disputant, dispute_id, reason, asserted_at, height, entry_index) VALUES (?1, ?2, NULL, ?3, ?4, ?5, 0)
+         ON CONFLICT(label_id, disputant) DO UPDATE SET dispute_id = NULL, reason = excluded.reason, asserted_at = excluded.asserted_at, height = excluded.height, entry_index = 0",
+        rusqlite::params![
+            entry.label_id,
+            entry.disputant,
+            entry.reason,
+            entry.asserted_at,
+            entry.sealing_height as i64
+        ],
+    )?;
+    Ok(())
+}
+
+/// WIST-2 §3.3 and WIST-4 §6: fetches the definition of every name a
+/// subscribed Labeler has used, keeping the newest that verifies under
+/// the Labeler's Declaration; a name with none reads as `inform`.
+pub(super) fn fetch_definitions(
+    conn: &Connection,
+    client: &crate::fetch::Client,
+    history: &crate::keyset::KeyHistory,
+    subscriptions: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    if subscriptions.is_empty() || !crate::store::table_exists(conn, "label_current")? {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare("SELECT DISTINCT labeler, name FROM label_current")?;
+    let names = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (labeler, name) in names {
+        if !subscriptions.contains(&labeler) {
+            continue;
+        }
+        let Some(declaration) = history.declaration_for(&labeler) else {
+            continue;
+        };
+        let scheme = if client.allow_http() && crate::fetch::is_loopback_host(&labeler) {
+            "http"
+        } else {
+            "https"
+        };
+        let url = format!(
+            "{scheme}://{labeler}/.well-known/wist/{}",
+            wist_core::label::definition_path(&name)
+        );
+        let Ok(parsed) = reqwest::Url::parse(&url) else {
+            continue;
+        };
+        let Ok((_, doc)) = client.get_json(&parsed) else {
+            continue;
+        };
+        let Ok(envelope) = wist_core::label::validate_definition(&doc, &declaration) else {
+            continue;
+        };
+        let definition = envelope.definition;
+        let newer = conn
+            .query_row(
+                "SELECT asserted_at FROM label_definitions WHERE labeler = ?1 AND name = ?2",
+                (&labeler, &name),
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .is_none_or(|held| {
+                wist_core::publisher_time::compare(&definition.asserted_at, &held)
+                    == Some(std::cmp::Ordering::Greater)
+            });
+        if newer {
+            let treatment = match definition.treatment {
+                wist_core::objects::Treatment::Hide => "hide",
+                wist_core::objects::Treatment::Warn => "warn",
+                wist_core::objects::Treatment::Inform => "inform",
+            };
+            conn.execute(
+                "INSERT INTO label_definitions(labeler, name, description, treatment, asserted_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(labeler, name) DO UPDATE SET description = excluded.description, treatment = excluded.treatment, asserted_at = excluded.asserted_at",
+                rusqlite::params![labeler, name, definition.description, treatment, definition.asserted_at],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the index adopted Label tuples from a Snapshot, which carry
+/// no Label IDs (WIST-3 §7).
+pub(super) fn holds_adopted_labels(conn: &Connection) -> Result<bool> {
+    if !crate::store::table_exists(conn, "label_current")? {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM label_current WHERE label_id IS NULL)",
+        [],
+        |row| row.get(0),
+    )?)
+}

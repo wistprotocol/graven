@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use wist_core::declarations::{Declarations, Effects, Position};
 use wist_core::delta::delta_id;
+use wist_core::objects::PublisherEnvelope;
 use wist_core::objects::{DeltaEnvelope, Publisher};
 
 /// A sealed Delta that verifies under WIST-1 §5.2: its ID, the Publisher
@@ -171,6 +172,15 @@ impl KeyHistory {
             self.publishers.insert(hash.to_owned(), publisher);
         }
         Ok(&self.publishers[hash])
+    }
+
+    /// WIST-2 §3.3: the Declaration a Label or dispute of `domain` is
+    /// validated under at the current projection — the one a Delta is
+    /// sealed under, none inside an open recovery window.
+    pub fn declaration_for(&self, domain: &str) -> Option<PublisherEnvelope> {
+        let state = self.declarations.domains().get(domain)?;
+        let source = state.delta_sealing_source()?;
+        serde_json::from_value(source.envelope().clone()).ok()
     }
 
     /// WIST-1 §7's precedence for a sealed Delta: complete field validation

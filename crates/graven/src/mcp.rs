@@ -1,5 +1,7 @@
 use crate::error::Error;
-use crate::store::{DomainCoverage, MergedHit, MultiStore, ProvEntry, SimilarHit};
+use crate::store::{
+    DomainCoverage, LabelView, LabelerView, MergedHit, MultiStore, ProvEntry, SimilarHit,
+};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -93,6 +95,18 @@ pub struct GetRecordParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LabelsParams {
+    /// A Normalized URL or a Canonical Host.
+    pub subject: String,
+    /// Include Labels from Labelers this index does not subscribe to.
+    #[serde(default)]
+    pub every_labeler: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LabelersParams {}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SimilarParams {
     pub url: String,
     #[serde(default = "default_k")]
@@ -102,7 +116,6 @@ pub struct SimilarParams {
 #[derive(Clone)]
 pub struct GravenServer {
     store: Arc<Mutex<MultiStore>>,
-    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
@@ -110,7 +123,7 @@ impl GravenServer {
     pub fn new(store: MultiStore) -> Self {
         Self {
             store: Arc::new(Mutex::new(store)),
-            tool_router: Self::tool_router(),
+            tool_router: Self::tool_router() + Self::label_router(),
         }
     }
 
@@ -245,7 +258,50 @@ single log, never across logs. Use search for keyword matching."
     }
 }
 
-#[tool_handler]
+#[tool_router(router = label_router)]
+impl GravenServer {
+    #[tool(
+        description = "The current Labels sealed about one subject — a page URL or a \
+domain — by the Labelers this index subscribes to: each Labeler's own signed statement \
+under a registry name such as wist:spam, with its value, expiry, the publication it is \
+bound to, the treatment the Labeler's definition declares (inform where none), and any \
+disputes the labeled domain sealed in answer. Labels are opinions carried beside the \
+records, never applied to them; pass every_labeler to see unsubscribed Labelers too."
+    )]
+    fn get_labels(
+        &self,
+        Parameters(LabelsParams {
+            subject,
+            every_labeler,
+        }): Parameters<LabelsParams>,
+    ) -> std::result::Result<Json<Vec<LabelView>>, ErrorData> {
+        let rows = self
+            .store()
+            .labels(&subject, every_labeler)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(Json(rows))
+    }
+
+    #[tool(
+        description = "Every Labeler whose Labels this index has walked, with how many \
+Labels it sealed, how many retract, how many distinct subjects it labeled, the heights \
+of its first and last sealed Entries, and whether it is subscribed — the behavior a \
+subscription decision starts from, computed from the log without reading any Label's \
+meaning."
+    )]
+    fn list_labelers(
+        &self,
+        Parameters(LabelersParams {}): Parameters<LabelersParams>,
+    ) -> std::result::Result<Json<Vec<LabelerView>>, ErrorData> {
+        let rows = self
+            .store()
+            .labelers()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(Json(rows))
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for GravenServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
@@ -394,6 +450,21 @@ mod tests {
         setup_server_dir(dir);
         let store = MultiStore::open_read_only(dir).unwrap();
         GravenServer::new(store)
+    }
+
+    #[test]
+    fn label_tools_are_routed() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = test_server(dir.path());
+        let names: Vec<String> = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for tool in ["search", "get_labels", "list_labelers"] {
+            assert!(names.iter().any(|n| n == tool), "{names:?}");
+        }
     }
 
     fn test_server_with_tier1(dir: &Path) -> GravenServer {

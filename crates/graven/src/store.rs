@@ -33,6 +33,19 @@ pub const CREATE_WITHDRAWALS: &str =
 /// in Log order.
 pub const CREATE_SUFFIX_LISTS: &str = "CREATE TABLE IF NOT EXISTS suffix_lists(sha256 TEXT PRIMARY KEY, octets BLOB NOT NULL); CREATE TABLE IF NOT EXISTS suffix_list_acts(seq INTEGER PRIMARY KEY AUTOINCREMENT, height INTEGER NOT NULL, sha256 TEXT NOT NULL)";
 
+/// WIST-2 §3.3 and WIST-3 §7: every sealed Label and dispute the sync
+/// walked, the current Label per (labeler, subject, name) and the current
+/// dispute per (Label ID, disputant) — from adopted tuples, which carry
+/// no ID, and walked Entries alike — the labeler statistics over walked
+/// Entries, and the definitions fetched for subscribed Labelers.
+pub const CREATE_LABELS: &str = "CREATE TABLE IF NOT EXISTS labels(label_id TEXT PRIMARY KEY, labeler TEXT NOT NULL, subject TEXT NOT NULL, name TEXT NOT NULL, value INTEGER, asserted_at TEXT NOT NULL, retracted INTEGER NOT NULL, expires_at TEXT, delta TEXT, height INTEGER NOT NULL, entry_index INTEGER NOT NULL); \
+CREATE TABLE IF NOT EXISTS disputes(dispute_id TEXT PRIMARY KEY, label_id TEXT NOT NULL, disputant TEXT NOT NULL, reason TEXT, asserted_at TEXT NOT NULL, height INTEGER NOT NULL, entry_index INTEGER NOT NULL); \
+CREATE TABLE IF NOT EXISTS label_current(labeler TEXT NOT NULL, subject TEXT NOT NULL, name TEXT NOT NULL, label_id TEXT, value INTEGER, asserted_at TEXT NOT NULL, retracted INTEGER NOT NULL, expires_at TEXT, delta TEXT, height INTEGER NOT NULL, entry_index INTEGER NOT NULL, PRIMARY KEY(labeler, subject, name)); \
+CREATE TABLE IF NOT EXISTS dispute_current(label_id TEXT NOT NULL, disputant TEXT NOT NULL, dispute_id TEXT, reason TEXT, asserted_at TEXT NOT NULL, height INTEGER NOT NULL, entry_index INTEGER NOT NULL, PRIMARY KEY(label_id, disputant)); \
+CREATE TABLE IF NOT EXISTS labelers(labeler TEXT PRIMARY KEY, label_count INTEGER NOT NULL, retraction_count INTEGER NOT NULL, first_seen_height INTEGER NOT NULL, last_sealed_height INTEGER NOT NULL); \
+CREATE TABLE IF NOT EXISTS labeler_subjects(labeler TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY(labeler, subject)); \
+CREATE TABLE IF NOT EXISTS label_definitions(labeler TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, treatment TEXT NOT NULL, asserted_at TEXT NOT NULL, PRIMARY KEY(labeler, name))";
+
 /// WIST-4 §9: the accepted parameter amendments, so a restarted sync
 /// continues the schedule a replaying Consumer holds.
 pub const CREATE_PARAMETERS: &str = "CREATE TABLE IF NOT EXISTS parameters(parameter TEXT NOT NULL, value INTEGER NOT NULL, block_number INTEGER NOT NULL, entry_index INTEGER NOT NULL, sealed_at_s INTEGER NOT NULL, effective_at_s INTEGER NOT NULL, PRIMARY KEY(parameter, block_number, entry_index))";
@@ -40,6 +53,42 @@ pub const CREATE_PARAMETERS: &str = "CREATE TABLE IF NOT EXISTS parameters(param
 pub const CREATE_TIER1: &str = "CREATE TABLE IF NOT EXISTS extracts(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, extract TEXT NOT NULL, PRIMARY KEY(url, publisher)); CREATE VIRTUAL TABLE IF NOT EXISTS extracts_fts USING fts5(extract, content=extracts, content_rowid=rowid); CREATE TABLE IF NOT EXISTS links(source_url TEXT NOT NULL, target_url TEXT NOT NULL, position INTEGER NOT NULL)";
 
 pub const CREATE_EMBEDDINGS: &str = "CREATE TABLE IF NOT EXISTS embeddings(delta_id TEXT PRIMARY KEY, url TEXT NOT NULL, publisher TEXT NOT NULL, vector BLOB NOT NULL); CREATE TABLE IF NOT EXISTS pack_meta(id INTEGER PRIMARY KEY CHECK(id = 1), model_json TEXT NOT NULL, metric TEXT NOT NULL, dim INTEGER NOT NULL, imported_at TEXT NOT NULL, key_b64u TEXT NOT NULL)";
+
+/// One current Label as the index holds it (WIST-2 §3.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct LabelRow {
+    pub labeler: String,
+    pub subject: String,
+    pub name: String,
+    pub value: Option<i64>,
+    pub asserted_at: String,
+    pub expires_at: Option<String>,
+    pub delta: Option<String>,
+    pub height: u64,
+}
+
+/// One current dispute of a Label (WIST-2 §3.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct DisputeRow {
+    pub label_id: String,
+    pub disputant: String,
+    pub reason: Option<String>,
+    pub asserted_at: String,
+    pub height: u64,
+}
+
+/// One Labeler's statistics over the Entries this index walked (WIST-3
+/// §7's labeler table, recomputed locally; tuples adopted from a Snapshot
+/// carry no counts).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct LabelerStats {
+    pub labeler: String,
+    pub label_count: u64,
+    pub retraction_count: u64,
+    pub distinct_subjects: u64,
+    pub first_seen_height: u64,
+    pub last_sealed_height: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordHit {
@@ -266,10 +315,6 @@ pub fn synced_state(dir: &Path) -> Result<SyncState> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn read_synced_height(dir: &Path) -> Result<u64> {
-    Ok(synced_state(dir)?.head_number)
-}
-
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct DomainCoverage {
     pub domain: String,
@@ -282,11 +327,72 @@ pub struct DomainCoverage {
 pub struct LogHandle {
     pub log_id: String,
     pub synced_height: u64,
+    /// The head Block's `sealed_at`, against which a Label's expiry is read.
+    pub head_sealed_at: Option<String>,
     pub store: Store,
 }
 
 pub struct MultiStore {
     logs: Vec<LogHandle>,
+    subscriptions: std::collections::BTreeSet<String>,
+}
+
+/// A current Label with the Consumer's reading of it: whether its Labeler
+/// is subscribed, the treatment the Labeler's definition declares
+/// (`inform` where none verified, WIST-4 §6), and the current disputes.
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct LabelView {
+    pub labeler: String,
+    pub subject: String,
+    pub name: String,
+    pub value: Option<i64>,
+    pub asserted_at: String,
+    pub expires_at: Option<String>,
+    pub delta: Option<String>,
+    pub label_id: Option<String>,
+    pub subscribed: bool,
+    pub treatment: String,
+    pub disputes: Vec<DisputeRow>,
+    pub provenance: Vec<ProvEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct LabelerView {
+    pub labeler: String,
+    pub label_count: u64,
+    pub retraction_count: u64,
+    pub distinct_subjects: u64,
+    pub first_seen_height: u64,
+    pub last_sealed_height: u64,
+    pub subscribed: bool,
+    pub provenance: Vec<ProvEntry>,
+}
+
+/// The Labelers a Consumer applies, kept in `labelers.json` beside the
+/// registry (WIST-4 §6: which Labelers a Consumer believes is its own
+/// subscription).
+pub fn load_subscriptions(dir: &Path) -> Result<std::collections::BTreeSet<String>> {
+    let path = dir.join("labelers.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let doc: serde_json::Value = serde_json::from_slice(&bytes)?;
+            Ok(doc["labelers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn save_subscriptions(dir: &Path, labelers: &std::collections::BTreeSet<String>) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let doc = serde_json::json!({"labelers": labelers.iter().collect::<Vec<_>>()});
+    std::fs::write(dir.join("labelers.json"), serde_json::to_vec_pretty(&doc)?)?;
+    Ok(())
 }
 
 impl MultiStore {
@@ -311,14 +417,128 @@ impl MultiStore {
             crate::registry::validate_log_id(&entry.log_id)?;
             let log_dir = crate::registry::log_dir(dir, &entry.log_id);
             let store = Store::open_read_only(&log_dir)?;
-            let synced_height = read_synced_height(&log_dir)?;
+            let state = synced_state(&log_dir)?;
+            let head_sealed_at = state
+                .prior_sealed_at_s
+                .and_then(|s| wist_core::timestamp::instant(s).ok());
             logs.push(LogHandle {
                 log_id: entry.log_id,
-                synced_height,
+                synced_height: state.head_number,
+                head_sealed_at,
                 store,
             });
         }
-        Ok(MultiStore { logs })
+        let subscriptions = load_subscriptions(dir)?;
+        Ok(MultiStore {
+            logs,
+            subscriptions,
+        })
+    }
+
+    pub fn subscriptions(&self) -> &std::collections::BTreeSet<String> {
+        &self.subscriptions
+    }
+
+    /// The current Labels about `subject` across every log, one per
+    /// (labeler, name) with the later `asserted_at` prevailing, restricted
+    /// to subscribed Labelers unless `every_labeler` is set.
+    pub fn labels(&self, subject: &str, every_labeler: bool) -> Result<Vec<LabelView>> {
+        let mut views: BTreeMap<(String, String), LabelView> = BTreeMap::new();
+        for handle in &self.logs {
+            for row in handle
+                .store
+                .labels_for(subject, handle.head_sealed_at.as_deref())?
+            {
+                let subscribed = self.subscriptions.contains(&row.labeler);
+                if !subscribed && !every_labeler {
+                    continue;
+                }
+                let label_id = handle.store.label_id_of(&row)?;
+                let disputes = match &label_id {
+                    Some(id) => handle.store.disputes_for(id)?,
+                    None => Vec::new(),
+                };
+                let treatment = handle
+                    .store
+                    .treatment(&row.labeler, &row.name)?
+                    .unwrap_or_else(|| "inform".to_string());
+                let provenance = ProvEntry {
+                    log_id: handle.log_id.clone(),
+                    synced_height: handle.synced_height,
+                };
+                let key = (row.labeler.clone(), row.name.clone());
+                match views.get_mut(&key) {
+                    Some(existing)
+                        if wist_core::publisher_time::compare(
+                            &existing.asserted_at,
+                            &row.asserted_at,
+                        ) != Some(std::cmp::Ordering::Less) =>
+                    {
+                        existing.provenance.push(provenance);
+                    }
+                    _ => {
+                        views.insert(
+                            key,
+                            LabelView {
+                                labeler: row.labeler,
+                                subject: row.subject,
+                                name: row.name,
+                                value: row.value,
+                                asserted_at: row.asserted_at,
+                                expires_at: row.expires_at,
+                                delta: row.delta,
+                                label_id,
+                                subscribed,
+                                treatment,
+                                disputes,
+                                provenance: vec![provenance],
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        Ok(views.into_values().collect())
+    }
+
+    /// Every Labeler any log walked and whether it is subscribed. The same
+    /// Labels reach every Log the Labeler pings, so the counts are the
+    /// largest any one log holds rather than a sum across logs.
+    pub fn labelers(&self) -> Result<Vec<LabelerView>> {
+        let mut views: BTreeMap<String, LabelerView> = BTreeMap::new();
+        for handle in &self.logs {
+            for stats in handle.store.labelers()? {
+                let provenance = ProvEntry {
+                    log_id: handle.log_id.clone(),
+                    synced_height: handle.synced_height,
+                };
+                views
+                    .entry(stats.labeler.clone())
+                    .and_modify(|existing| {
+                        existing.label_count = existing.label_count.max(stats.label_count);
+                        existing.retraction_count =
+                            existing.retraction_count.max(stats.retraction_count);
+                        existing.distinct_subjects =
+                            existing.distinct_subjects.max(stats.distinct_subjects);
+                        existing.first_seen_height =
+                            existing.first_seen_height.min(stats.first_seen_height);
+                        existing.last_sealed_height =
+                            existing.last_sealed_height.max(stats.last_sealed_height);
+                        existing.provenance.push(provenance.clone());
+                    })
+                    .or_insert_with(|| LabelerView {
+                        subscribed: self.subscriptions.contains(&stats.labeler),
+                        labeler: stats.labeler,
+                        label_count: stats.label_count,
+                        retraction_count: stats.retraction_count,
+                        distinct_subjects: stats.distinct_subjects,
+                        first_seen_height: stats.first_seen_height,
+                        last_sealed_height: stats.last_sealed_height,
+                        provenance: vec![provenance],
+                    });
+            }
+        }
+        Ok(views.into_values().collect())
     }
 
     pub fn logs(&self) -> &[LogHandle] {
@@ -456,6 +676,119 @@ impl Store {
             }
         }
         Ok(rows)
+    }
+
+    /// The current, unretracted Labels about `subject`; an expired one is
+    /// dropped when `head_sealed_at` is given (WIST-2 §3.3).
+    pub fn labels_for(&self, subject: &str, head_sealed_at: Option<&str>) -> Result<Vec<LabelRow>> {
+        if !table_exists(&self.conn, "label_current")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT labeler, subject, name, value, asserted_at, expires_at, delta, height
+             FROM label_current WHERE subject = ?1 AND retracted = 0 ORDER BY labeler, name",
+        )?;
+        let rows = stmt
+            .query_map([subject], |row| {
+                Ok(LabelRow {
+                    labeler: row.get(0)?,
+                    subject: row.get(1)?,
+                    name: row.get(2)?,
+                    value: row.get(3)?,
+                    asserted_at: row.get(4)?,
+                    expires_at: row.get(5)?,
+                    delta: row.get(6)?,
+                    height: row.get::<_, i64>(7)?.max(0) as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                !(row.expires_at.as_deref().zip(head_sealed_at)).is_some_and(|(expiry, head)| {
+                    wist_core::publisher_time::compare(expiry, head)
+                        != Some(std::cmp::Ordering::Greater)
+                })
+            })
+            .collect())
+    }
+
+    /// The Label ID of a walked Label, none for one adopted from a tuple.
+    pub fn label_id_of(&self, row: &LabelRow) -> Result<Option<String>> {
+        if !table_exists(&self.conn, "label_current")? {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(
+                "SELECT label_id FROM label_current WHERE labeler = ?1 AND subject = ?2 AND name = ?3",
+                (&row.labeler, &row.subject, &row.name),
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(Into::into)
+    }
+
+    pub fn disputes_for(&self, label_id: &str) -> Result<Vec<DisputeRow>> {
+        if !table_exists(&self.conn, "dispute_current")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT label_id, disputant, reason, asserted_at, height FROM dispute_current WHERE label_id = ?1 ORDER BY disputant",
+        )?;
+        let rows = stmt
+            .query_map([label_id], |row| {
+                Ok(DisputeRow {
+                    label_id: row.get(0)?,
+                    disputant: row.get(1)?,
+                    reason: row.get(2)?,
+                    asserted_at: row.get(3)?,
+                    height: row.get::<_, i64>(4)?.max(0) as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn labelers(&self) -> Result<Vec<LabelerStats>> {
+        if !table_exists(&self.conn, "labelers")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT l.labeler, l.label_count, l.retraction_count,
+                    (SELECT COUNT(*) FROM labeler_subjects s WHERE s.labeler = l.labeler),
+                    l.first_seen_height, l.last_sealed_height
+             FROM labelers l ORDER BY l.labeler",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(LabelerStats {
+                    labeler: row.get(0)?,
+                    label_count: row.get::<_, i64>(1)?.max(0) as u64,
+                    retraction_count: row.get::<_, i64>(2)?.max(0) as u64,
+                    distinct_subjects: row.get::<_, i64>(3)?.max(0) as u64,
+                    first_seen_height: row.get::<_, i64>(4)?.max(0) as u64,
+                    last_sealed_height: row.get::<_, i64>(5)?.max(0) as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The treatment a Labeler's definition declares for `name`, none
+    /// where no definition verified (WIST-4 §6).
+    pub fn treatment(&self, labeler: &str, name: &str) -> Result<Option<String>> {
+        if !table_exists(&self.conn, "label_definitions")? {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(
+                "SELECT treatment FROM label_definitions WHERE labeler = ?1 AND name = ?2",
+                (labeler, name),
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn coverage(&self, domain: Option<&str>) -> Result<Vec<DomainCoverage>> {
