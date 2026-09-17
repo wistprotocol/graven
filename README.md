@@ -165,6 +165,44 @@ binding, treatment and the labeled domain's disputes — and
 returns each Labeler's statistics and whether it is subscribed. Labels
 are transported beside the records and never applied to them.
 
+## Ranking profiles
+
+A search is ranked by a profile: a JSON file naming the signals it reads
+and how it combines them. Text relevance comes from FTS5's BM25 over
+titles, abstracts and extracts, normalized within the result set; trust
+is propagated from seed domains — the domains the profile's Labelers
+(its `labelers`, or the subscription list when empty) agree on with
+`wist:trust-seed`, at least `agreement_k` of them, plus the profile's
+own `seeds` — along the signed link graph between Registrable Domains
+under the suffix-list snapshot in force, each link weighted by its age
+at the head; distrust is propagated backward from `wist:distrust-seed`
+domains and the profile's `distrust_seeds`, so a domain that links to a
+bad seed inherits it; a trust seed that links to distrusted or
+spam-labeled domains vouches for less. In-links are counted per domain
+with age decay and damped by their growth rate over
+`growth_window_blocks`, death rates are reported beside them, domain
+age is read from the first sealed Declaration and freshness from the
+record's seal height. The score is relevance × (`trust_floor` + `trust`
+× trust) × (1 + `inlinks` × in-links) × freshness × (1 − `distrust` ×
+distrust), after the filters: distrust above a threshold, spam labels,
+domains younger than `min_age_blocks`, and, for a strict profile, any
+domain no trust reaches. Every hit carries its score, its signals and
+an explanation, so a profile and the synced heights in the hit's
+provenance reproduce the rank.
+
+Four profiles ship in the binary: `default` (relevance scaled by seeded
+trust, distrust, spam and age as filters, freshness, no
+personalization), `text-only`, `personal-seeds` (the default with the
+operator's own seeds, edited in a copy under `profiles/`) and
+`strict-trusted-graph`. `graven profile list|show|use` selects the
+profile an install answers with, `profiles/<name>.json` in the store
+directory overrides or adds one, and `search`'s `profile` parameter
+selects one per query; `list_profiles` reports them with author,
+license and `superseded_by`. The ranking index — record seal heights,
+in-links with the height each was sealed at and the in-links each
+domain gained and lost per height — is kept by the sync from tier-1
+links, so link signals need the extract tier.
+
 ## Companion packs
 
 A pack is a signed envelope, `{"pack": {...}, "sig": {...}}` (verified the

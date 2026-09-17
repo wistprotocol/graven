@@ -60,6 +60,32 @@ enum Command {
         #[arg(long)]
         labeler: String,
     },
+    /// Ranking profiles: list them, show one, or select the one queries
+    /// use when they name none.
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileCommand {
+    List {
+        #[arg(long)]
+        dir: PathBuf,
+    },
+    Show {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        name: String,
+    },
+    Use {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -136,6 +162,28 @@ fn main() -> Result<(), graven::Error> {
             labelers.remove(&labeler);
             graven::store::save_subscriptions(&dir, &labelers)?;
         }
+        Command::Profile { command } => match command {
+            ProfileCommand::List { dir } => {
+                for profile in graven::ranking::list_profiles(&dir)? {
+                    println!(
+                        "{}{} — {} ({}, {})",
+                        if profile.active { "* " } else { "  " },
+                        profile.name,
+                        profile.description,
+                        profile.author,
+                        profile.license
+                    );
+                }
+            }
+            ProfileCommand::Show { dir, name } => {
+                let profile = graven::ranking::load_profile(&dir, &name)?;
+                println!("{}", serde_json::to_string_pretty(&profile)?);
+            }
+            ProfileCommand::Use { dir, name } => {
+                graven::ranking::set_active_profile(&dir, &name)?;
+                println!("queries without a profile now use {name}");
+            }
+        },
         Command::Pack { command } => match command {
             PackCommand::Import {
                 dir,

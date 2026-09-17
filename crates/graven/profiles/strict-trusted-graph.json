@@ -1,0 +1,16 @@
+{
+  "name": "strict-trusted-graph",
+  "description": "Only records on domains reached by trust propagated from the seeds, ranked by relevance times trust; everything outside the trusted graph, distrusted or spam-labeled is dropped.",
+  "author": "WIST Protocol",
+  "license": "CC0-1.0",
+  "issues_url": "https://github.com/wistprotocol/graven/issues",
+  "superseded_by": null,
+  "labelers": [],
+  "agreement_k": 1,
+  "seeds": [],
+  "distrust_seeds": [],
+  "weights": {"trust_floor": 0.0, "trust": 1.0, "inlinks": 0.0, "freshness": 0.1, "distrust": 1.0},
+  "filters": {"distrust_above": 0.25, "spam": true, "min_age_blocks": 0, "trusted_graph_only": true},
+  "propagation": {"alpha": 0.15, "iterations": 20, "decay_per_block": 0.999, "growth_window_blocks": 720, "growth_damping": 1.0},
+  "personalization": false
+}

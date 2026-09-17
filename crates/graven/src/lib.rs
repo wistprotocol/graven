@@ -5,6 +5,7 @@ pub mod fetch;
 pub mod keyset;
 pub mod mcp;
 pub mod pack;
+pub mod ranking;
 pub mod registry;
 pub mod store;
 pub mod sync;

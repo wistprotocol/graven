@@ -1,4 +1,5 @@
 use crate::error::Error;
+use crate::ranking::ProfileSummary;
 use crate::store::{
     DomainCoverage, LabelView, LabelerView, MergedHit, MultiStore, ProvEntry, SimilarHit,
 };
@@ -10,6 +11,16 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// How a search hit was ranked: the profile, its score and the signals
+/// and explanation behind it; absent on a record fetched by URL.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct RankingOut {
+    pub profile: String,
+    pub score: f64,
+    pub signals: crate::ranking::Signals,
+    pub explanation: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct RecordOut {
     pub url: String,
@@ -19,6 +30,8 @@ pub struct RecordOut {
     pub title: String,
     pub r#abstract: Option<String>,
     pub provenance: Vec<ProvEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ranking: Option<RankingOut>,
 }
 
 fn to_record_out(hit: MergedHit) -> RecordOut {
@@ -30,6 +43,7 @@ fn to_record_out(hit: MergedHit) -> RecordOut {
         title: hit.title,
         r#abstract: hit.r#abstract,
         provenance: hit.provenance,
+        ranking: None,
     }
 }
 
@@ -80,7 +94,14 @@ pub struct SearchParams {
     pub query: String,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// The ranking profile to order the hits by; omit for the profile
+    /// the install selected, `default` where none is.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProfilesParams {}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CoverageParams {
@@ -148,13 +169,59 @@ signed."
     )]
     fn search(
         &self,
-        Parameters(SearchParams { query, limit }): Parameters<SearchParams>,
+        Parameters(SearchParams {
+            query,
+            limit,
+            profile,
+        }): Parameters<SearchParams>,
     ) -> std::result::Result<Json<Vec<RecordOut>>, ErrorData> {
-        let hits = self
-            .store()
-            .search(&query, limit)
+        let store = self.store();
+        let name = match profile {
+            Some(name) => name,
+            None => crate::ranking::active_profile_name(store.dir())
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+        };
+        let profile = crate::ranking::load_profile(store.dir(), &name)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let hits = store
+            .search_ranked(&query, limit, &profile)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(Json(hits.into_iter().map(to_record_out).collect()))
+        Ok(Json(
+            hits.into_iter()
+                .map(|hit| RecordOut {
+                    url: hit.url,
+                    publisher: hit.publisher,
+                    delta_id: hit.delta_id,
+                    observed_at: hit.observed_at,
+                    title: hit.title,
+                    r#abstract: hit.r#abstract,
+                    provenance: hit.provenance,
+                    ranking: Some(RankingOut {
+                        profile: name.clone(),
+                        score: hit.score,
+                        signals: hit.signals,
+                        explanation: hit.explanation,
+                    }),
+                })
+                .collect(),
+        ))
+    }
+
+    #[tool(
+        description = "The ranking profiles this index can order search hits by: the shipped \
+default (relevance scaled by trust from the subscribed Labelers' seeds, distrust and spam \
+filtered, freshness), text-only, personal-seeds and strict-trusted-graph, and any file \
+under profiles/, each with its author, license and whether it is the active one. Pass a \
+name as search's profile to order one query by it; a profile and a synced height reproduce \
+a ranking."
+    )]
+    fn list_profiles(
+        &self,
+        Parameters(ProfilesParams {}): Parameters<ProfilesParams>,
+    ) -> std::result::Result<Json<Vec<ProfileSummary>>, ErrorData> {
+        let rows = crate::ranking::list_profiles(self.store().dir())
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(Json(rows))
     }
 
     #[tool(
@@ -462,7 +529,7 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        for tool in ["search", "get_labels", "list_labelers"] {
+        for tool in ["search", "get_labels", "list_labelers", "list_profiles"] {
             assert!(names.iter().any(|n| n == tool), "{names:?}");
         }
     }
@@ -526,6 +593,7 @@ mod tests {
             .search(Parameters(SearchParams {
                 query: "Alpha".into(),
                 limit: 10,
+                profile: None,
             }))
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -552,6 +620,7 @@ mod tests {
             .search(Parameters(SearchParams {
                 query: "Title".into(),
                 limit: default_limit(),
+                profile: None,
             }))
             .unwrap();
         assert_eq!(results.len(), 2);
@@ -560,6 +629,7 @@ mod tests {
             .search(Parameters(SearchParams {
                 query: "alpha AND".into(),
                 limit: 10,
+                profile: None,
             }))
             .unwrap();
         assert!(results.is_empty());
@@ -683,6 +753,7 @@ mod tests {
             .search(Parameters(SearchParams {
                 query: "alpha body".into(),
                 limit: 10,
+                profile: None,
             }))
             .unwrap();
         assert_eq!(results.len(), 1);

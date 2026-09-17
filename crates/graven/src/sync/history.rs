@@ -724,6 +724,7 @@ pub fn apply_events(
                             &env.delta.meta.lang,
                         ),
                     )?;
+                    super::persist::record_height(conn, &env.delta.url, &publisher, event.height)?;
                     stats.applied += 1;
 
                     if tier1 {
@@ -747,6 +748,13 @@ pub fn apply_events(
                                         (&env.delta.url, target_url, position as i64),
                                     )?;
                                 }
+                                super::persist::replace_inlinks(
+                                    conn,
+                                    &env.delta.url,
+                                    &publisher,
+                                    &f.links,
+                                    event.height,
+                                )?;
                             }
                             None => {
                                 conn.execute(

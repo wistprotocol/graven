@@ -46,6 +46,14 @@ CREATE TABLE IF NOT EXISTS labelers(labeler TEXT PRIMARY KEY, label_count INTEGE
 CREATE TABLE IF NOT EXISTS labeler_subjects(labeler TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY(labeler, subject)); \
 CREATE TABLE IF NOT EXISTS label_definitions(labeler TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, treatment TEXT NOT NULL, asserted_at TEXT NOT NULL, PRIMARY KEY(labeler, name))";
 
+/// The ranking index a profile reads: each record's seal height, the
+/// in-links between hosts with the height each link was sealed at, and
+/// the in-links each target host gained and lost per height.
+pub const CREATE_RANKING: &str = "CREATE TABLE IF NOT EXISTS record_heights(url TEXT NOT NULL, publisher TEXT NOT NULL, height INTEGER NOT NULL, PRIMARY KEY(url, publisher)); \
+CREATE TABLE IF NOT EXISTS inlinks(source_url TEXT NOT NULL, source_host TEXT NOT NULL, target_url TEXT NOT NULL, target_host TEXT NOT NULL, height INTEGER NOT NULL, PRIMARY KEY(source_url, target_url)); \
+CREATE INDEX IF NOT EXISTS inlinks_target ON inlinks(target_host); \
+CREATE TABLE IF NOT EXISTS link_changes(target_host TEXT NOT NULL, height INTEGER NOT NULL, added INTEGER NOT NULL, removed INTEGER NOT NULL, PRIMARY KEY(target_host, height))";
+
 /// WIST-4 §9: the accepted parameter amendments, so a restarted sync
 /// continues the schedule a replaying Consumer holds.
 pub const CREATE_PARAMETERS: &str = "CREATE TABLE IF NOT EXISTS parameters(parameter TEXT NOT NULL, value INTEGER NOT NULL, block_number INTEGER NOT NULL, entry_index INTEGER NOT NULL, sealed_at_s INTEGER NOT NULL, effective_at_s INTEGER NOT NULL, PRIMARY KEY(parameter, block_number, entry_index))";
@@ -335,6 +343,23 @@ pub struct LogHandle {
 pub struct MultiStore {
     logs: Vec<LogHandle>,
     subscriptions: std::collections::BTreeSet<String>,
+    dir: std::path::PathBuf,
+}
+
+/// One ranked hit across logs: the record, its score under the profile,
+/// the signals behind it and the logs that hold it.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct RankedHit {
+    pub url: String,
+    pub publisher: String,
+    pub delta_id: String,
+    pub observed_at: String,
+    pub title: String,
+    pub r#abstract: Option<String>,
+    pub score: f64,
+    pub signals: crate::ranking::Signals,
+    pub explanation: Vec<String>,
+    pub provenance: Vec<ProvEntry>,
 }
 
 /// A current Label with the Consumer's reading of it: whether its Labeler
@@ -432,7 +457,81 @@ impl MultiStore {
         Ok(MultiStore {
             logs,
             subscriptions,
+            dir: dir.to_path_buf(),
         })
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Ranks the text matches of `q` under a profile, per log, and merges
+    /// them by (URL, Publisher) keeping the best score; the profile and
+    /// each log's synced height reproduce the order.
+    pub fn search_ranked(
+        &self,
+        q: &str,
+        limit: usize,
+        profile: &crate::ranking::Profile,
+    ) -> Result<Vec<RankedHit>> {
+        let mut merged: BTreeMap<(String, String), RankedHit> = BTreeMap::new();
+        for handle in &self.logs {
+            let scored = handle.store.search_scored(q, limit.max(1) * 4)?;
+            if scored.is_empty() {
+                continue;
+            }
+            let state = crate::ranking::DomainState::derive(
+                &handle.store.conn,
+                profile,
+                &self.subscriptions,
+                handle.synced_height,
+                handle.head_sealed_at.as_deref(),
+            )?;
+            for ranked in crate::ranking::rank(&handle.store.conn, profile, &state, scored)? {
+                let provenance = ProvEntry {
+                    log_id: handle.log_id.clone(),
+                    synced_height: handle.synced_height,
+                };
+                let key = (ranked.hit.url.clone(), ranked.hit.publisher.clone());
+                match merged.get_mut(&key) {
+                    Some(existing) if existing.score >= ranked.score => {
+                        existing.provenance.push(provenance);
+                    }
+                    _ => {
+                        let mut previous = merged
+                            .remove(&key)
+                            .map(|e| e.provenance)
+                            .unwrap_or_default();
+                        previous.push(provenance);
+                        previous.sort_by(|a, b| a.log_id.cmp(&b.log_id));
+                        merged.insert(
+                            key,
+                            RankedHit {
+                                url: ranked.hit.url,
+                                publisher: ranked.hit.publisher,
+                                delta_id: ranked.hit.delta_id,
+                                observed_at: ranked.hit.observed_at,
+                                title: ranked.hit.title,
+                                r#abstract: ranked.hit.r#abstract,
+                                score: ranked.score,
+                                signals: ranked.signals,
+                                explanation: ranked.explanation,
+                                provenance: previous,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        let mut rows: Vec<RankedHit> = merged.into_values().collect();
+        rows.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.url.cmp(&b.url))
+        });
+        rows.truncate(limit);
+        Ok(rows)
     }
 
     pub fn subscriptions(&self) -> &std::collections::BTreeSet<String> {
@@ -644,6 +743,60 @@ impl Store {
         }
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Store { conn })
+    }
+
+    /// The text matches of `q` with a relevance in `(0, 1]` derived from
+    /// FTS5's BM25 over titles, abstracts and extracts, normalized within
+    /// the result set.
+    pub fn search_scored(&self, q: &str, limit: usize) -> Result<Vec<(RecordHit, f64)>> {
+        let phrase = quote_phrase(q);
+        let mut scored: Vec<(RecordHit, f64)> = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT r.url, r.publisher, r.delta_id, r.observed_at, r.title, r.abstract, bm25(records_fts)
+             FROM records_fts f JOIN records r ON r.rowid = f.rowid
+             WHERE records_fts MATCH ?1 ORDER BY bm25(records_fts) LIMIT ?2",
+        )?;
+        for row in stmt.query_map((phrase.as_str(), limit as i64), |row| {
+            Ok((row_to_hit(row)?, row.get::<_, f64>(6)?))
+        })? {
+            scored.push(row?);
+        }
+        if table_exists(&self.conn, "extracts")? {
+            let mut estmt = self.conn.prepare(
+                "SELECT r.url, r.publisher, r.delta_id, r.observed_at, r.title, r.abstract, bm25(extracts_fts)
+                 FROM extracts_fts f JOIN extracts e ON e.rowid = f.rowid
+                 JOIN records r ON r.url = e.url AND r.publisher = e.publisher
+                 WHERE extracts_fts MATCH ?1 ORDER BY bm25(extracts_fts) LIMIT ?2",
+            )?;
+            for row in estmt.query_map((phrase.as_str(), limit as i64), |row| {
+                Ok((row_to_hit(row)?, row.get::<_, f64>(6)?))
+            })? {
+                let (hit, bm25) = row?;
+                match scored.iter_mut().find(|(h, _)| h.delta_id == hit.delta_id) {
+                    Some((_, best)) => *best = best.min(bm25),
+                    None => scored.push((hit, bm25)),
+                }
+            }
+        }
+        // BM25 in SQLite is lower for a better match and negative for any
+        // match; the worst match in the set scores just above zero.
+        let best = scored.iter().map(|(_, b)| *b).fold(f64::INFINITY, f64::min);
+        let worst = scored
+            .iter()
+            .map(|(_, b)| *b)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let span = (worst - best).max(0.0);
+        Ok(scored
+            .into_iter()
+            .map(|(hit, bm25)| {
+                let relevance = if span > 0.0 {
+                    ((worst - bm25) / span * 0.9 + 0.1).clamp(0.1, 1.0)
+                } else {
+                    1.0
+                };
+                (hit, relevance)
+            })
+            .collect())
     }
 
     pub fn search(&self, q: &str, limit: usize) -> Result<Vec<RecordHit>> {

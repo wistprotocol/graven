@@ -328,6 +328,7 @@ pub(super) fn snapshot(
         )?;
     }
     save_chain_tips(&conn, &tips)?;
+    super::persist::seed_ranking_index(&conn, manifest.log_position)?;
 
     let mut aggregator_keys = load_aggregator_keys(&conn, genesis_key_id, trust_key)?;
     for (key_id, public_key, removed_height) in &adopted_keys {

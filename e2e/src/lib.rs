@@ -530,6 +530,14 @@ impl McpClient {
             .unwrap_or_default()
     }
 
+    /// Searches under a named ranking profile.
+    pub fn search_with_profile(&mut self, query: &str, profile: &str) -> Vec<Value> {
+        self.tool_call("search", json!({"query": query, "profile": profile}))
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn get_record(&mut self, url: &str) -> Value {
         self.tool_call("get_record", json!({"url": url}))
     }

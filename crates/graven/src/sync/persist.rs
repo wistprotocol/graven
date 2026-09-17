@@ -493,3 +493,99 @@ pub(super) fn fetch_definitions(
     }
     Ok(())
 }
+
+fn host_of(url: &str) -> String {
+    url.strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .map_or(url, |rest| rest.split('/').next().unwrap_or(rest))
+        .to_string()
+}
+
+/// The seal height of a record's Delta, read by a ranking profile for
+/// freshness and link age.
+pub(super) fn record_height(
+    conn: &Connection,
+    url: &str,
+    publisher: &str,
+    height: u64,
+) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_RANKING)?;
+    conn.execute(
+        "INSERT INTO record_heights(url, publisher, height) VALUES (?1, ?2, ?3)
+         ON CONFLICT(url, publisher) DO UPDATE SET height = excluded.height",
+        (url, publisher, height as i64),
+    )?;
+    Ok(())
+}
+
+/// Replaces the in-links a page declares with the links its newest Delta
+/// carries, recording per target host what the change added and removed
+/// at `height` so a profile can read in-link growth and death rates.
+pub(super) fn replace_inlinks(
+    conn: &Connection,
+    source_url: &str,
+    source_host: &str,
+    targets: &[String],
+    height: u64,
+) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_RANKING)?;
+    let mut stmt = conn.prepare("SELECT target_url FROM inlinks WHERE source_url = ?1")?;
+    let previous: std::collections::BTreeSet<String> = stmt
+        .query_map([source_url], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let current: std::collections::BTreeSet<String> = targets.iter().cloned().collect();
+    let mut changes: std::collections::BTreeMap<String, (i64, i64)> = Default::default();
+    for target in previous.difference(&current) {
+        changes.entry(host_of(target)).or_default().1 += 1;
+    }
+    for target in current.difference(&previous) {
+        changes.entry(host_of(target)).or_default().0 += 1;
+    }
+    conn.execute("DELETE FROM inlinks WHERE source_url = ?1", [source_url])?;
+    for target in &current {
+        conn.execute(
+            "INSERT OR REPLACE INTO inlinks(source_url, source_host, target_url, target_host, height) VALUES (?1, ?2, ?3, ?4, ?5)",
+            (source_url, source_host, target, host_of(target), height as i64),
+        )?;
+    }
+    for (target_host, (added, removed)) in changes {
+        conn.execute(
+            "INSERT INTO link_changes(target_host, height, added, removed) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(target_host, height) DO UPDATE SET added = added + excluded.added, removed = removed + excluded.removed",
+            (target_host, height as i64, added, removed),
+        )?;
+    }
+    Ok(())
+}
+
+/// Seeds the ranking index from an adopted Snapshot: every record and
+/// every tier-1 link is read as sealed at `log_position`, the height the
+/// Snapshot stands at.
+pub(super) fn seed_ranking_index(conn: &Connection, log_position: u64) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_RANKING)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO record_heights(url, publisher, height) SELECT url, publisher, ?1 FROM records",
+        [log_position as i64],
+    )?;
+    if crate::store::table_exists(conn, "links")? {
+        let mut stmt = conn.prepare("SELECT source_url, target_url FROM links")?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (source_url, target_url) in rows {
+            let source_host = conn
+                .query_row(
+                    "SELECT publisher FROM records WHERE url = ?1 LIMIT 1",
+                    [&source_url],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .unwrap_or_else(|| host_of(&source_url));
+            conn.execute(
+                "INSERT OR IGNORE INTO inlinks(source_url, source_host, target_url, target_host, height) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (&source_url, source_host, &target_url, host_of(&target_url), log_position as i64),
+            )?;
+        }
+    }
+    Ok(())
+}

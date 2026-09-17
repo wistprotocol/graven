@@ -25,6 +25,39 @@ fn rewrite_sitemap_host(site: &Path, host: &str) {
     std::fs::write(&path, content.replace("__HOST__", host)).expect("write sitemap.xml");
 }
 
+/// Stages a one-page site for a host: a sitemap naming the page and the
+/// page's HTML with the given title, body text and outbound links.
+fn stage_page_site(
+    tmp: &Path,
+    host: &str,
+    page: &str,
+    title: &str,
+    body: &str,
+    links: &[String],
+) -> PathBuf {
+    let dir = tmp.join(format!("site-{host}"));
+    std::fs::create_dir_all(&dir).expect("create page site dir");
+    let anchors: String = links
+        .iter()
+        .map(|l| format!("<p><a href=\"{l}\">{l}</a></p>"))
+        .collect();
+    std::fs::write(
+        dir.join(page),
+        format!(
+            "<!doctype html><html><head><title>{title}</title><meta name=\"description\" content=\"{title}\"></head><body><p>{body}</p>{anchors}</body></html>"
+        ),
+    )
+    .expect("write page");
+    std::fs::write(
+        dir.join("sitemap.xml"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"><url><loc>https://{host}/{page}</loc></url></urlset>"
+        ),
+    )
+    .expect("write sitemap");
+    dir
+}
+
 fn mutate_fixture_page(site: &Path) {
     let path = site.join("a.html");
     let content = std::fs::read_to_string(&path).expect("read a.html");
@@ -90,10 +123,61 @@ fn end_to_end() {
     let labeler_site = stage_fixture_site(tmp.path(), "labeler-site");
     let labeler_host = "labeler.localhost".to_string();
     rewrite_sitemap_host(&labeler_site, &labeler_host);
-    let (proxy_addr, _) = serve_sites(BTreeMap::from([
+    let cited_url = "https://cited.localhost/notes.html".to_string();
+    let farmed_url = "https://farmed.localhost/farmed.html".to_string();
+    let mut graph_sites: Vec<(String, PathBuf)> = vec![
+        (
+            "seed.localhost".into(),
+            stage_page_site(
+                tmp.path(),
+                "seed.localhost",
+                "home.html",
+                "Seed home",
+                "A curated page of trustworthy sources on orchards.",
+                std::slice::from_ref(&cited_url),
+            ),
+        ),
+        (
+            "cited.localhost".into(),
+            stage_page_site(
+                tmp.path(),
+                "cited.localhost",
+                "notes.html",
+                "Cited orchard notes",
+                "The orchard is mentioned once among many other words about apples and pears.",
+                &[],
+            ),
+        ),
+        (
+            "farmed.localhost".into(),
+            stage_page_site(
+                tmp.path(),
+                "farmed.localhost",
+                "farmed.html",
+                "Orchard orchard orchard",
+                "orchard orchard orchard orchard orchard orchard orchard orchard",
+                &[],
+            ),
+        ),
+    ];
+    for n in 1..=3 {
+        let host = format!("f{n}.localhost");
+        let dir = stage_page_site(
+            tmp.path(),
+            &host,
+            "x.html",
+            &format!("Farm page {n}"),
+            "boosting the farmed page",
+            std::slice::from_ref(&farmed_url),
+        );
+        graph_sites.push((host, dir));
+    }
+    let mut sites: BTreeMap<String, PathBuf> = BTreeMap::from([
         (site_host.clone(), site.clone()),
         (labeler_host.clone(), labeler_site.clone()),
-    ]));
+    ]);
+    sites.extend(graph_sites.iter().cloned());
+    let (proxy_addr, _) = serve_sites(sites);
     let site_proxy = format!("http://{proxy_addr}");
 
     let spake_state = tmp.path().join("spake-state");
@@ -305,6 +389,20 @@ fn end_to_end() {
             "warn",
         ],
     );
+    run(
+        &spake,
+        &[
+            "label",
+            "--out",
+            s(&labeler_site),
+            "--state",
+            s(&labeler_state),
+            "--subject",
+            "seed.localhost",
+            "--name",
+            "wist:trust-seed",
+        ],
+    );
     for base in [&clave_base, &clave2_base] {
         run(
             &spake,
@@ -319,6 +417,48 @@ fn end_to_end() {
             ],
         );
         wait_until_status_active(&http, base, &labeler_host);
+    }
+    for (host, dir) in &graph_sites {
+        let state = tmp.path().join(format!("state-{host}"));
+        run(
+            &spake,
+            &[
+                "init",
+                "--domain",
+                host,
+                "--out",
+                s(dir),
+                "--state",
+                s(&state),
+            ],
+        );
+        run(
+            &spake,
+            &[
+                "build",
+                "--site",
+                s(dir),
+                "--domain",
+                host,
+                "--out",
+                s(dir),
+                "--state",
+                s(&state),
+            ],
+        );
+        run(
+            &spake,
+            &[
+                "ping",
+                "--log",
+                &clave_base,
+                "--domain",
+                host,
+                "--allow-http",
+                "--no-retry",
+            ],
+        );
+        wait_until_status_active(&http, &clave_base, host);
     }
 
     mutate_fixture_page(&site);
@@ -472,12 +612,56 @@ fn end_to_end() {
         Some(2),
         "{label}"
     );
+    let ranked = mcp.tool_call(
+        "search",
+        serde_json::json!({"query": "orchard", "profile": "default"}),
+    );
+    let ranked = ranked.as_array().expect("search returns an array");
+    let order: Vec<&str> = ranked
+        .iter()
+        .map(|h| h["url"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        order,
+        [cited_url.as_str(), farmed_url.as_str()],
+        "{ranked:?}"
+    );
+    assert_eq!(ranked[0]["ranking"]["profile"], "default");
+    assert!(
+        ranked[0]["ranking"]["signals"]["trust"]
+            .as_f64()
+            .unwrap_or(0.0)
+            > 0.0,
+        "{ranked:?}"
+    );
+    assert!(ranked[0]["ranking"]["explanation"]
+        .as_array()
+        .is_some_and(|e| !e.is_empty()));
+    let text_only = mcp.tool_call(
+        "search",
+        serde_json::json!({"query": "orchard", "profile": "text-only"}),
+    );
+    let text_only = text_only.as_array().expect("search returns an array");
+    let order: Vec<&str> = text_only
+        .iter()
+        .map(|h| h["url"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        order,
+        [farmed_url.as_str(), cited_url.as_str()],
+        "{text_only:?}"
+    );
+    let profiles = mcp.tool_call("list_profiles", serde_json::json!({}));
+    assert!(
+        profiles.as_array().is_some_and(|p| p.len() >= 4),
+        "{profiles}"
+    );
     let labelers = mcp.tool_call("list_labelers", serde_json::json!({}));
     let labelers = labelers.as_array().expect("list_labelers returns an array");
     assert!(
         labelers
             .iter()
-            .any(|l| l["labeler"] == labeler_host && l["label_count"] == 1),
+            .any(|l| l["labeler"] == labeler_host && l["label_count"] == 2),
         "{labelers:?}"
     );
     assert!(mcp
@@ -487,7 +671,13 @@ fn end_to_end() {
         )
         .as_array()
         .is_some_and(Vec::is_empty));
-    let hits = mcp.search("changed");
+    // The subscribed Labeler marked the page as spam, so the default
+    // profile drops it; the text-only profile ranks it by relevance alone.
+    assert!(
+        mcp.search("changed").is_empty(),
+        "the default profile did not drop the spam-labeled page"
+    );
+    let hits = mcp.search_with_profile("changed", "text-only");
     assert!(!hits.is_empty(), "search(\"changed\") returned no hits");
     let hit = hits
         .iter()
@@ -563,7 +753,7 @@ fn end_to_end() {
     run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
 
     let mut mcp2 = McpClient::start(&graven, &gdir);
-    let hits2 = mcp2.search("changed");
+    let hits2 = mcp2.search_with_profile("changed", "text-only");
     let hit2 = hits2
         .iter()
         .find(|h| h["url"].as_str().unwrap_or_default().ends_with("/a.html"))
