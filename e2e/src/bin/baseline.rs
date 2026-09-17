@@ -148,6 +148,38 @@ fn wait_all_pulled(
     start.elapsed().as_secs_f64()
 }
 
+/// Pings `host` until the aggregator admits it, retrying a 503 the
+/// admission gate answers when every pending slot is taken (WIST-2 §4
+/// has the Publisher honor the refusal); returns the refusals.
+fn ping_until_admitted(spake: &Path, clave_base: &str, host: &str) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut refused = 0;
+    loop {
+        let output = Command::new(spake)
+            .args([
+                "ping",
+                "--log",
+                clave_base,
+                "--domain",
+                host,
+                "--allow-http",
+                "--no-retry",
+            ])
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", spake.display()));
+        if output.status.success() {
+            return refused;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("503") && Instant::now() < deadline,
+            "ping {host} failed: {stderr}"
+        );
+        refused += 1;
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn main() {
     let args = args();
     let spake = resolve_sibling_bin("SPAKE_BIN", "spake");
@@ -244,20 +276,10 @@ fn main() {
     let http = reqwest::blocking::Client::new();
 
     let since = now_rfc3339();
+    let mut refused = 0u64;
     let ((), ping_s) = timed(|| {
         for host in &hosts {
-            run(
-                &spake,
-                &[
-                    "ping",
-                    "--log",
-                    &clave_base,
-                    "--domain",
-                    host,
-                    "--allow-http",
-                    "--no-retry",
-                ],
-            );
+            refused += ping_until_admitted(&spake, &clave_base, host);
         }
     });
     let ingest_s = wait_all_pulled(
@@ -270,6 +292,7 @@ fn main() {
     let requests_after_ingest: u64 = counters.values().map(|c| c.load(Ordering::Relaxed)).sum();
     report["stages"]["ingest"] = json!({
         "ping_seconds": ping_s,
+        "pings_refused": refused,
         "seconds_until_all_pulled": ingest_s,
         "site_requests": requests_after_ingest,
         "requests_per_delta": requests_after_ingest as f64 / (args.domains * args.pages) as f64,
@@ -331,6 +354,7 @@ fn main() {
     }
     let since = now_rfc3339();
     let requests_before = requests_after_ingest;
+    let mut update_refused = 0u64;
     let ((), rebuild_s) = timed(|| {
         for (host, dir) in &sites {
             let state = tmp.path().join("state").join(host);
@@ -349,18 +373,7 @@ fn main() {
                     "--allow-http",
                 ],
             );
-            run(
-                &spake,
-                &[
-                    "ping",
-                    "--log",
-                    &clave_base,
-                    "--domain",
-                    host,
-                    "--allow-http",
-                    "--no-retry",
-                ],
-            );
+            update_refused += ping_until_admitted(&spake, &clave_base, host);
         }
     });
     let update_ingest_s = wait_all_pulled(
@@ -374,6 +387,7 @@ fn main() {
     report["stages"]["update"] = json!({
         "changed_deltas": args.domains * changed,
         "rebuild_and_ping_seconds": rebuild_s,
+        "pings_refused": update_refused,
         "seconds_until_all_pulled": update_ingest_s,
         "site_requests": requests_after_update - requests_before,
     });
