@@ -103,7 +103,6 @@ fn a_payload_with_a_repeated_member_never_materializes_its_fields() {
     let publisher = common::Signer::new([1u8; 32]);
     let (beta_id, _, _) = common::build_delta(
         &publisher,
-        "pk1",
         "https://records.example/beta",
         "Beta Title",
         Some("Beta abstract"),
@@ -137,7 +136,6 @@ fn a_pack_with_a_repeated_member_imports_nothing() {
     let publisher = common::Signer::new([1u8; 32]);
     let (alpha_id, _, _) = common::build_delta(
         &publisher,
-        "pk1",
         "https://records.example/alpha",
         "Alpha Title",
         Some("Alpha abstract"),

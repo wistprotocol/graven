@@ -18,16 +18,15 @@ fn vector(name: &str) -> Value {
         .unwrap()
 }
 
-fn baseline(domain: &str, key_id: &str, public_key: &Value, valid_from: &str) -> KeyHistory {
+fn baseline(domain: &str, public_key: &Value, not_before: u64) -> KeyHistory {
+    let key = wist_core::objects::PublisherKey::new(public_key.as_str().unwrap(), not_before, None);
     let mut history = KeyHistory::new();
     history
         .adopt_domain(
             domain,
             &json!({
-                "publisher": {"wist_version": "1.0.0", "domain": domain, "seq": 0,
-                    "keys": [{"key_id": key_id, "alg": "Ed25519", "public_key": public_key,
-                        "valid_from": valid_from}]},
-                "sig": {"key_id": key_id, "alg": "Ed25519", "value": b64u_encode(&[0; 64])},
+                "publisher": {"wist_version": "1.0.0", "domain": domain, "seq": 0, "keys": [key]},
+                "sig": {"key_id": key.kid, "alg": "Ed25519", "value": b64u_encode(&[0; 64])},
             }),
             0,
             0,
@@ -49,9 +48,8 @@ fn signed_field_vectors_are_rejected_before_any_semantic_check() {
     let vector = vector("delta-fields.json");
     let mut history = baseline(
         "example.com",
-        "test-k1",
         &vector["author_key"],
-        "2026-08-01T00:00:00Z",
+        wist_core::timestamp::log_seconds("2026-08-01T00:00:00Z").unwrap() as u64,
     );
     for case in vector["cases"].as_array().unwrap() {
         let doc = &case["envelope"];
@@ -112,6 +110,7 @@ fn version_cases_keep_same_major_values_and_reject_other_majors() {
             "h0",
             "2026-08-01T00:00:00Z",
             7,
+            24,
             &entries,
         )
         .unwrap();
@@ -142,12 +141,7 @@ fn version_cases_keep_same_major_values_and_reject_other_majors() {
 #[test]
 fn historical_clock_probes_use_the_committing_block_and_its_allowance() {
     let vector = vector("delta-clock-time.json");
-    let mut history = baseline(
-        "example.com",
-        "test-k1",
-        &vector["public_key"],
-        "0000-01-01T00:00:00+23:59",
-    );
+    let mut history = baseline("example.com", &vector["public_key"], 0);
     for probe in vector["probes"]
         .as_array()
         .unwrap()
@@ -161,9 +155,16 @@ fn historical_clock_probes_use_the_committing_block_and_its_allowance() {
             ..DeltaProfile::default()
         };
         let outcome = history.verify_delta(1, sealed_at_s, &profile, &probe["envelope"]);
+        let observed_at = probe["envelope"]["delta"]["observed_at"].as_str().unwrap();
+        let before_epoch = !wist_core::publisher_time::at_or_after(observed_at, 0).unwrap();
+        let expected = if before_epoch {
+            json!("WIST1-E02")
+        } else {
+            probe["expected"].clone()
+        };
         assert_eq!(
             json!(outcome.as_ref().err().map(code)),
-            probe["expected"],
+            expected,
             "{}: {outcome:?}",
             probe["name"]
         );

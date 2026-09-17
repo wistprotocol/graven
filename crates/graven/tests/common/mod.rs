@@ -42,6 +42,19 @@ impl Signer {
                 .to_bytes(),
         )
     }
+
+    pub fn kid(&self) -> String {
+        wist_core::objects::publisher::thumbprint(&self.public_b64u())
+    }
+}
+
+pub fn key_entry(signer: &Signer, not_before: &str) -> Value {
+    serde_json::to_value(wist_core::objects::PublisherKey::new(
+        &signer.public_b64u(),
+        wist_core::timestamp::log_seconds(not_before).unwrap() as u64,
+        None,
+    ))
+    .unwrap()
 }
 
 #[derive(Clone)]
@@ -83,22 +96,14 @@ pub fn write_anchor(path: &Path, log: &Signer, log_id: &str) {
 
 pub fn build_declaration_full(
     signing: &Signer,
-    signing_key_id: &str,
     domain: &str,
     seq: u64,
     prev: Option<&str>,
-    keys: &[(&str, &Signer, &str)],
+    keys: &[(&Signer, &str)],
 ) -> Value {
     let key_entries: Vec<Value> = keys
         .iter()
-        .map(|(key_id, signer, valid_from)| {
-            serde_json::json!({
-                "key_id": key_id,
-                "alg": "Ed25519",
-                "public_key": signer.public_b64u(),
-                "valid_from": valid_from,
-            })
-        })
+        .map(|(signer, not_before)| key_entry(signer, not_before))
         .collect();
     let mut doc = serde_json::json!({
         "wist_version": "1.0.0",
@@ -109,17 +114,16 @@ pub fn build_declaration_full(
     if let Some(p) = prev {
         doc["prev_declaration"] = p.into();
     }
-    sign_envelope(&doc, "publisher", signing_key_id, &signing.sk).unwrap()
+    sign_envelope(&doc, "publisher", &signing.kid(), &signing.sk).unwrap()
 }
 
-pub fn build_declaration(publisher: &Signer, key_id: &str, domain: &str) -> Value {
+pub fn build_declaration(publisher: &Signer, domain: &str) -> Value {
     build_declaration_full(
         publisher,
-        key_id,
         domain,
         0,
         None,
-        &[(key_id, publisher, "2026-08-09T00:00:00Z")],
+        &[(publisher, "2026-08-09T00:00:00Z")],
     )
 }
 
@@ -130,29 +134,18 @@ pub fn declaration_hash(envelope: &Value) -> String {
 
 pub fn build_delta(
     publisher: &Signer,
-    key_id: &str,
     url: &str,
     title: &str,
     abstract_text: Option<&str>,
     extract: &str,
     prev: Option<&str>,
 ) -> (String, Value, Value) {
-    build_delta_with_links(
-        publisher,
-        key_id,
-        url,
-        title,
-        abstract_text,
-        extract,
-        &[],
-        prev,
-    )
+    build_delta_with_links(publisher, url, title, abstract_text, extract, &[], prev)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_delta_with_links(
     publisher: &Signer,
-    key_id: &str,
     url: &str,
     title: &str,
     abstract_text: Option<&str>,
@@ -190,7 +183,7 @@ pub fn build_delta_with_links(
         delta["prev"] = p.into();
     }
     let id = wist_core::delta::delta_id(&delta).unwrap();
-    let env = sign_envelope(&delta, "delta", key_id, &publisher.sk).unwrap();
+    let env = sign_envelope(&delta, "delta", &publisher.kid(), &publisher.sk).unwrap();
     (id, env, payload)
 }
 
@@ -664,7 +657,6 @@ pub fn extend_fixture(fx: &Fixture) -> String {
     let url = format!("https://records.example/extra-{next_number}");
     let (id, delta_env, payload) = build_delta(
         &publisher,
-        "pk1",
         &url,
         "Extra Title",
         Some("Extra abstract"),
@@ -689,12 +681,7 @@ pub fn extend_fixture(fx: &Fixture) -> String {
     url
 }
 
-pub fn build_delete_delta(
-    publisher: &Signer,
-    key_id: &str,
-    url: &str,
-    prev: &str,
-) -> (String, Value) {
+pub fn build_delete_delta(publisher: &Signer, url: &str, prev: &str) -> (String, Value) {
     let delta = serde_json::json!({
         "wist_version": "1.0.0",
         "publisher": reqwest::Url::parse(url).unwrap().host_str().unwrap(),
@@ -707,7 +694,7 @@ pub fn build_delete_delta(
     let id = wist_core::delta::delta_id(&delta).unwrap();
     (
         id,
-        sign_envelope(&delta, "delta", key_id, &publisher.sk).unwrap(),
+        sign_envelope(&delta, "delta", &publisher.kid(), &publisher.sk).unwrap(),
     )
 }
 
@@ -748,7 +735,7 @@ pub fn extend_fixture_with_delete(fx: &Fixture, url: &str, prev: &str) {
         .to_string();
     let next_number = prev_number + 1;
 
-    let (_id, delta_env) = build_delete_delta(&publisher, "pk1", url, prev);
+    let (_id, delta_env) = build_delete_delta(&publisher, url, prev);
     let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
 
     let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
@@ -777,7 +764,6 @@ pub fn extend_fixture_with_forged_delta(fx: &Fixture) {
     let url = format!("https://records.example/extra-{next_number}");
     let (_id, delta_env, _payload) = build_delta(
         &attacker,
-        "pk1",
         &url,
         "Extra Title",
         Some("Extra abstract"),
@@ -808,17 +794,16 @@ pub fn extend_fixture_with_rotation(fx: &Fixture, new_key: &Signer) -> String {
         .unwrap()
         .to_string();
 
-    let decl0 = build_declaration(&old, "pk1", &fx.domain);
+    let decl0 = build_declaration(&old, &fx.domain);
     let hash0 = declaration_hash(&decl0);
 
     let rotation_number = prev_number + 1;
     let rotation_decl = build_declaration_full(
         &old,
-        "pk1",
         &fx.domain,
         1,
         Some(&hash0),
-        &[("pk2", new_key, "2026-08-09T00:00:00Z")],
+        &[(new_key, "2026-08-09T00:00:00Z")],
     );
     let wrapped_decl = serde_json::json!({"type": "publisher_declaration", "body": rotation_decl});
     let sealed_at1 = format!("2026-08-09T{:02}:00:00Z", 14 + rotation_number);
@@ -836,7 +821,6 @@ pub fn extend_fixture_with_rotation(fx: &Fixture, new_key: &Signer) -> String {
     let url = format!("https://records.example/extra-{delta_number}");
     let (id, delta_env, payload) = build_delta(
         new_key,
-        "pk2",
         &url,
         "Rotated Title",
         Some("Rotated abstract"),
@@ -1003,13 +987,12 @@ fn build_fixture_state(
 
     write_anchor(&dir.path().join("anchor.json"), &log, log_id);
 
-    let declaration_env = build_declaration(&publisher, "pk1", &domain);
+    let declaration_env = build_declaration(&publisher, &domain);
     let wrapped_declaration =
         serde_json::json!({"type": "publisher_declaration", "body": declaration_env});
 
     let (id1, delta1_env, payload1) = build_delta(
         &publisher,
-        "pk1",
         "https://records.example/alpha",
         "Alpha Title",
         Some("Alpha abstract"),
@@ -1114,7 +1097,6 @@ fn build_fixture_state(
 
     let (id2, delta2_env, payload2) = build_delta(
         &publisher,
-        "pk1",
         "https://records.example/beta",
         "Beta Title",
         Some("Beta abstract"),

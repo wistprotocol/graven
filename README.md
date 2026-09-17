@@ -1,6 +1,6 @@
 # graven
 
-The signed Delta format targets [WIST specification revision `daf4dbeb50dc946e18c29fcaa09fb8fd314bde1a`](https://github.com/wistprotocol/spec/tree/daf4dbeb50dc946e18c29fcaa09fb8fd314bde1a). Object version `1.0.0` alone does not identify a compatible draft.
+The signed Delta format targets [WIST specification revision `5eccdedc156c8e13e6784b690a08d27da414faec`](https://github.com/wistprotocol/spec/tree/5eccdedc156c8e13e6784b690a08d27da414faec). Object version `1.0.0` alone does not identify a compatible draft.
 
 WIST Protocol consumer and MCP server. Graven cold-syncs a verified Snapshot,
 then applies incremental Blocks to a separate SQLite index per Log (WIST-3 §8).

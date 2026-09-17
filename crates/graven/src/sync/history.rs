@@ -139,6 +139,10 @@ pub struct BlockEvent {
     /// `recovery_window_days` in force at `sealed_at`, which freezes the
     /// end of a recovery window opened in this Block (WIST-1 §5.2).
     pub recovery_window_days: i64,
+    /// `declaration_activation_blocks` in force at `sealed_at`, which
+    /// fixes the activation height of a fresh identity this Block seals
+    /// (WIST-1 §5.2).
+    pub declaration_activation_blocks: i64,
     /// The `publisher_declaration` Entries in canonical Block order.
     pub declarations: Vec<Value>,
     /// Each `payload_withdrawal` this Block seals that core's replay
@@ -413,6 +417,9 @@ pub fn walk_blocks(
         }
         let profile = DeltaProfile::from_schedule(schedule, at);
         let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
+        let declaration_activation_blocks = schedule
+            .value_at("declaration_activation_blocks", at)
+            .unwrap();
         let caps = BlockCaps {
             domain_block_entries_max: schedule
                 .value_at("domain_block_entries_max", at)
@@ -530,6 +537,7 @@ pub fn walk_blocks(
             sealed_at_s: at,
             profile,
             recovery_window_days,
+            declaration_activation_blocks,
             declarations,
             withdrawals,
             delta_bodies,
@@ -646,6 +654,7 @@ pub fn apply_events(
             &event.block_hash,
             &event.sealed_at,
             event.recovery_window_days,
+            event.declaration_activation_blocks,
             &event.declarations,
         )?;
         for entry in &event.declarations {

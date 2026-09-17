@@ -41,7 +41,7 @@ fn site(seed: u8, domain: &'static str) -> Site {
 }
 
 fn declaration(site: &Site) -> Value {
-    json!({"type": "publisher_declaration", "body": common::build_declaration(&site.signer, "k1", site.domain)})
+    json!({"type": "publisher_declaration", "body": common::build_declaration(&site.signer, site.domain)})
 }
 
 fn page(
@@ -54,7 +54,7 @@ fn page(
 ) -> Value {
     let url = format!("https://{}/{path}", site.domain);
     let (id, envelope, payload) =
-        common::build_delta_with_links(&site.signer, "k1", &url, title, None, extract, links, None);
+        common::build_delta_with_links(&site.signer, &url, title, None, extract, links, None);
     common::write_payload(fx.dir.path(), id.strip_prefix("sha256:").unwrap(), &payload);
     json!({"type": "publisher_delta", "body": envelope})
 }
@@ -128,7 +128,7 @@ fn a_profile_and_a_height_reproduce_a_ranking() {
         ));
     }
     let label = json!({"wist_version": "1.0.0", "labeler": "labels.example", "subject": "seed.example", "name": "wist:trust-seed", "asserted_at": "2026-08-09T12:30:00Z"});
-    entries.push(json!({"type": "label", "body": sign_envelope(&label, "label", "k1", &labeler.signer.sk).unwrap()}));
+    entries.push(json!({"type": "label", "body": sign_envelope(&label, "label", &labeler.signer.kid(), &labeler.signer.sk).unwrap()}));
     let height = append_block(&fx, &entries);
     sync(&fx, target.path());
     let mut subscriptions = std::collections::BTreeSet::new();

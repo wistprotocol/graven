@@ -265,6 +265,7 @@ pub(super) fn snapshot(
     let mut tips = ChainTips::new();
     let mut adopted_keys: Vec<(String, String, Option<u64>)> = Vec::new();
     let mut adopted_windows: Vec<(String, String, Value, u64)> = Vec::new();
+    let mut adopted_pending: Vec<(String, Value, u64, u64)> = Vec::new();
     let mut adopted_parameters: Vec<(String, String, i64)> = Vec::new();
     for entry in &state_env.state.entries {
         match entry {
@@ -295,6 +296,14 @@ pub(super) fn snapshot(
                     w.head_height,
                 ));
             }
+            StateEntry::PendingDeclaration(p) => {
+                adopted_pending.push((
+                    p.domain.clone(),
+                    p.head.clone(),
+                    p.sealing_height,
+                    p.activation_height,
+                ));
+            }
             // WIST-3 §6.2 and §7: a Consumer resuming above a withdrawal's
             // Block never sees its Entry, so the tuple is what excludes
             // the content from every later materialization.
@@ -316,11 +325,22 @@ pub(super) fn snapshot(
     for (domain, window_end, head, head_height) in &adopted_windows {
         history.adopt_window(domain, window_end, head, *head_height)?;
     }
+    for (domain, head, head_height, activation_height) in &adopted_pending {
+        history.adopt_pending(domain, head, *head_height, *activation_height)?;
+    }
     history.seed_head(manifest.log_position, &manifest.anchor_block_hash);
-    for (_, _, head, head_height) in &adopted_windows {
+    for (head, head_height) in adopted_windows
+        .iter()
+        .map(|(_, _, head, height)| (head, *height))
+        .chain(
+            adopted_pending
+                .iter()
+                .map(|(_, head, height, _)| (head, *height)),
+        )
+    {
         persist_declaration(
             &conn,
-            *head_height,
+            head_height,
             "",
             true,
             default_recovery_window_days(),

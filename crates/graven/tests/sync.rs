@@ -411,13 +411,12 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
 
     common::write_anchor(&dir.path().join("anchor.json"), &log, "graven-test-log");
 
-    let declaration_env = common::build_declaration(&publisher, "pk1", &domain);
+    let declaration_env = common::build_declaration(&publisher, &domain);
     let wrapped_declaration =
         serde_json::json!({"type": "publisher_declaration", "body": declaration_env});
 
     let (id1, delta1_env, payload1) = common::build_delta(
         &publisher,
-        "pk1",
         &url,
         "Alpha Title",
         Some("Alpha abstract"),
@@ -492,7 +491,6 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
 
     let (id2, delta2_env, payload2) = common::build_delta(
         &publisher,
-        "pk1",
         &url,
         "Alpha Title",
         Some("Alpha abstract updated"),
@@ -595,17 +593,16 @@ fn delta_after_rotation_signed_by_old_key_is_ignored_like_a_fork() {
         .unwrap()
         .to_string();
 
-    let decl0 = common::build_declaration(&old, "pk1", &fx.domain);
+    let decl0 = common::build_declaration(&old, &fx.domain);
     let hash0 = common::declaration_hash(&decl0);
 
     let rotation_number = prev_number + 1;
     let rotation_decl = common::build_declaration_full(
         &old,
-        "pk1",
         &fx.domain,
         1,
         Some(&hash0),
-        &[("pk2", &new_key, "2026-08-09T00:00:00Z")],
+        &[(&new_key, "2026-08-09T00:00:00Z")],
     );
     let wrapped_decl = serde_json::json!({"type": "publisher_declaration", "body": rotation_decl});
     let sealed_at1 = format!("2026-08-09T{:02}:00:00Z", 14 + rotation_number);
@@ -622,7 +619,7 @@ fn delta_after_rotation_signed_by_old_key_is_ignored_like_a_fork() {
     let delta_number = rotation_number + 1;
     let url = format!("https://records.example/extra-{delta_number}");
     let (_id, delta_env, _payload) =
-        common::build_delta(&old, "pk1", &url, "Stale Title", None, "stale body", None);
+        common::build_delta(&old, &url, "Stale Title", None, "stale body", None);
     let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
     let sealed_at2 = format!("2026-08-09T{:02}:00:00Z", 14 + delta_number);
     let (block2, hash2) =
@@ -711,7 +708,6 @@ fn withdrawal_removes_record_from_local_index() {
     let publisher = common::Signer::new([1u8; 32]);
     let (alpha_id, _, _) = common::build_delta(
         &publisher,
-        "pk1",
         "https://records.example/alpha",
         "Alpha Title",
         Some("Alpha abstract"),
@@ -788,7 +784,6 @@ fn delete_delta_removes_record() {
     let publisher = common::Signer::new([1u8; 32]);
     let (alpha_id, _, _) = common::build_delta(
         &publisher,
-        "pk1",
         "https://records.example/alpha",
         "Alpha Title",
         Some("Alpha abstract"),
@@ -820,7 +815,6 @@ fn cold_start_applies_withdrawals_after_snapshot_position() {
     let publisher = common::Signer::new([1u8; 32]);
     let (alpha_id, _, _) = common::build_delta(
         &publisher,
-        "pk1",
         "https://records.example/alpha",
         "Alpha Title",
         Some("Alpha abstract"),
@@ -864,7 +858,6 @@ fn withdrawal_removes_tier1_and_embedding_rows_when_present() {
     let publisher = common::Signer::new([1u8; 32]);
     let (alpha_id, _, _) = common::build_delta(
         &publisher,
-        "pk1",
         "https://records.example/alpha",
         "Alpha Title",
         Some("Alpha abstract"),
@@ -1512,7 +1505,6 @@ fn incremental_sync_with_tier1_replaces_links_and_extract_on_update() {
     let publisher = common::Signer::new([1u8; 32]);
     let (alpha_id, _, _) = common::build_delta(
         &publisher,
-        "pk1",
         "https://records.example/alpha",
         "Alpha Title",
         Some("Alpha abstract"),
@@ -1532,7 +1524,6 @@ fn incremental_sync_with_tier1_replaces_links_and_extract_on_update() {
 
     let (id2, delta2_env, payload2) = common::build_delta_with_links(
         &publisher,
-        "pk1",
         "https://records.example/alpha",
         "Alpha Title",
         Some("Alpha abstract"),
@@ -1618,7 +1609,6 @@ fn incremental_sync_leaves_tier1_absent_when_payload_fetch_fails() {
     let url = "https://records.example/no-payload".to_string();
     let (_id, delta_env, _payload) = common::build_delta(
         &publisher,
-        "pk1",
         &url,
         "No Payload Title",
         None,
@@ -1682,7 +1672,6 @@ fn incremental_sync_purges_stale_tier1_rows_when_update_payload_fetch_fails() {
     let publisher = common::Signer::new([1u8; 32]);
     let (alpha_id, _, _) = common::build_delta(
         &publisher,
-        "pk1",
         "https://records.example/alpha",
         "Alpha Title",
         Some("Alpha abstract"),
@@ -1702,7 +1691,6 @@ fn incremental_sync_purges_stale_tier1_rows_when_update_payload_fetch_fails() {
 
     let (id2, delta2_env, _payload2) = common::build_delta(
         &publisher,
-        "pk1",
         "https://records.example/alpha",
         "Alpha Title",
         Some("Alpha abstract"),
@@ -1860,7 +1848,6 @@ fn malformed_signed_publisher_does_not_abort_sync_or_advance_a_chain() {
         let signer = common::Signer::new([1u8; 32]);
         let (_, envelope, _) = common::build_delta(
             &signer,
-            "pk1",
             "https://records.example/malformed",
             "Malformed",
             None,
@@ -1875,7 +1862,7 @@ fn malformed_signed_publisher_does_not_abort_sync_or_advance_a_chain() {
             }
         }
         let signed =
-            wist_core::envelope::sign_envelope(&inner, "delta", "pk1", &signer.sk).unwrap();
+            wist_core::envelope::sign_envelope(&inner, "delta", &signer.kid(), &signer.sk).unwrap();
         let wrapped = serde_json::json!({"type":"publisher_delta", "body":signed});
         let at = "2026-08-09T18:00:00Z";
         let (block, hash) = common::build_block(&fx.log, height, previous, at, &[wrapped]);
@@ -1940,7 +1927,6 @@ fn cold_start_adopts_withdrawal_and_label_tuples() {
     let publisher = common::Signer::new([1u8; 32]);
     let (alpha_id, _, _) = common::build_delta(
         &publisher,
-        "pk1",
         "https://records.example/alpha",
         "Alpha Title",
         Some("Alpha abstract"),
@@ -2015,15 +2001,8 @@ fn a_withdrawal_sealed_beside_its_delta_keeps_the_delta_out_of_the_index() {
 
     let publisher = common::Signer::new([1u8; 32]);
     let url = "https://records.example/gamma";
-    let (gamma_id, delta_env, payload) = common::build_delta(
-        &publisher,
-        "pk1",
-        url,
-        "Gamma Title",
-        None,
-        "gamma body",
-        None,
-    );
+    let (gamma_id, delta_env, payload) =
+        common::build_delta(&publisher, url, "Gamma Title", None, "gamma body", None);
     common::write_payload(
         fx.dir.path(),
         gamma_id.trim_start_matches("sha256:"),
@@ -2111,7 +2090,6 @@ fn bulk_deltas(fx: &common::Fixture, count: usize) -> Vec<serde_json::Value> {
         .map(|i| {
             let (id, delta_env, payload) = common::build_delta(
                 &publisher,
-                "pk1",
                 &format!("https://records.example/bulk-{i}"),
                 &format!("Bulk title {i} {}", "x".repeat(120)),
                 Some(&"y".repeat(200)),
@@ -2327,7 +2305,8 @@ fn delta_observed(
         "meta": {"lang": "en"},
     });
     let envelope =
-        wist_core::envelope::sign_envelope(&delta, "delta", "pk1", &publisher.sk).unwrap();
+        wist_core::envelope::sign_envelope(&delta, "delta", &publisher.kid(), &publisher.sk)
+            .unwrap();
     (
         wist_core::delta::delta_id(&delta).unwrap(),
         envelope,

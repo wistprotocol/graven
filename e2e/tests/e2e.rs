@@ -58,6 +58,57 @@ fn stage_page_site(
     dir
 }
 
+fn read_json(path: &Path) -> serde_json::Value {
+    serde_json::from_slice(
+        &std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
+    )
+    .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+}
+
+/// The tuples of the newest Snapshot the aggregator published.
+fn snapshot_state_entries(clave_data: &Path) -> Vec<serde_json::Value> {
+    let index = read_json(&clave_data.join("snapshots/index.json"));
+    let manifest_url = index["index"]["snapshots"][0]["manifest_url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no snapshot in {index}"))
+        .trim_start_matches('/')
+        .to_string();
+    let manifest_path = clave_data.join(&manifest_url);
+    let manifest = read_json(&manifest_path);
+    let state_path = manifest_path
+        .parent()
+        .expect("manifest has a directory")
+        .join(
+            manifest["manifest"]["state"]["path"]
+                .as_str()
+                .expect("state path"),
+        );
+    read_json(&state_path)["state"]["entries"]
+        .as_array()
+        .expect("state entries")
+        .clone()
+}
+
+/// The tuple of the given kind keyed by `domain`, if the Snapshot carries one.
+fn state_tuple(
+    entries: &[serde_json::Value],
+    kind: &str,
+    domain: &str,
+) -> Option<serde_json::Value> {
+    entries
+        .iter()
+        .find(|entry| entry[0] == kind && entry[1] == domain)
+        .cloned()
+}
+
+fn revise_fixture_page(site: &Path, from: &str, to: &str) {
+    let path = site.join("b.html");
+    let content = std::fs::read_to_string(&path).expect("read b.html");
+    let revised = content.replacen(from, to, 1);
+    assert_ne!(content, revised, "revision did not change b.html");
+    std::fs::write(&path, revised).expect("write revised b.html");
+}
+
 fn mutate_fixture_page(site: &Path) {
     let path = site.join("a.html");
     let content = std::fs::read_to_string(&path).expect("read a.html");
@@ -771,6 +822,258 @@ fn end_to_end() {
         "expected surviving provenance to be log 2, got {hit2}"
     );
     drop(mcp2);
+
+    // --- a signing key rotates while the outgoing key keeps an overlap ---
+    run(
+        &spake,
+        &[
+            "rotate",
+            "--out",
+            s(&site),
+            "--state",
+            s(&spake_state),
+            "--overlap-seconds",
+            "86400",
+        ],
+    );
+    let rotated = read_json(&site.join(".well-known/wist/publisher.json"));
+    let keys = rotated["publisher"]["keys"]
+        .as_array()
+        .unwrap_or_else(|| panic!("keys is not an array: {rotated}"));
+    assert_eq!(keys.len(), 2, "the outgoing key stays listed: {rotated}");
+    assert!(
+        keys[0]["exp"].is_u64(),
+        "the outgoing key expires at the end of the overlap: {rotated}"
+    );
+    assert!(
+        keys[1].get("exp").is_none(),
+        "the incoming key does not expire: {rotated}"
+    );
+    assert_eq!(
+        rotated["sig"]["key_id"], keys[0]["kid"],
+        "the rotation is signed by the key it replaces: {rotated}"
+    );
+
+    revise_fixture_page(
+        &site,
+        "beta page body content",
+        "beta page body content rotated",
+    );
+    run(
+        &spake,
+        &[
+            "build",
+            "--site",
+            s(&site),
+            "--domain",
+            &site_host,
+            "--out",
+            s(&site),
+            "--state",
+            s(&spake_state),
+        ],
+    );
+    let rotated_since = now_rfc3339();
+    for base in [&clave_base, &clave2_base] {
+        run(
+            &spake,
+            &[
+                "ping",
+                "--log",
+                base,
+                "--domain",
+                &site_host,
+                "--allow-http",
+                "--no-retry",
+            ],
+        );
+    }
+    wait_until_pulled_since(
+        &http,
+        &clave_base,
+        &site_host,
+        &rotated_since,
+        &clave_stderr,
+    );
+    wait_until_pulled_since(
+        &http,
+        &clave2_base,
+        &site_host,
+        &rotated_since,
+        &clave2_stderr,
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let fifth_seal = grid_instant(4);
+    for data in [&clave_data, &clave2_data] {
+        run(&clave, &["seal", "--data", s(data), "--at", &fifth_seal]);
+    }
+    run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+
+    let mut mcp3 = McpClient::start(&graven, &gdir);
+    let rotated_hits = mcp3.search_with_profile("rotated", "text-only");
+    assert!(
+        rotated_hits
+            .iter()
+            .any(|h| h["url"].as_str().unwrap_or_default().ends_with("/b.html")),
+        "a Delta signed under the incoming key did not reach the index: {rotated_hits:?}"
+    );
+    drop(mcp3);
+
+    // --- a Declaration published from the web host alone is reversed ---
+    let owner = read_json(&site.join(".well-known/wist/publisher.json"));
+    let owner_seq = owner["publisher"]["seq"].as_u64().expect("owner seq");
+    let thief = wist_core::crypto::SigningKey::from_seed(&[42u8; 32]);
+    let thief_entry = wist_core::objects::PublisherKey::new(
+        &thief.public().to_b64u(),
+        u64::try_from(jiff::Timestamp::now().as_second() - 3600).expect("epoch second"),
+        None,
+    );
+    let hijacked = wist_core::envelope::sign_envelope(
+        &serde_json::json!({
+            "wist_version": "1.0.0",
+            "domain": site_host,
+            "seq": owner_seq + 1,
+            "prev_declaration": wist_core::declaration::inner_hash(&owner).expect("owner hash"),
+            "keys": [thief_entry.clone()],
+        }),
+        "publisher",
+        &thief_entry.kid,
+        &thief,
+    )
+    .expect("sign the hijacked Declaration");
+    std::fs::write(
+        site.join(".well-known/wist/publisher.json"),
+        serde_json::to_vec(&hijacked).expect("serialize the hijacked Declaration"),
+    )
+    .expect("serve the hijacked Declaration");
+
+    let hijacked_since = now_rfc3339();
+    for base in [&clave_base, &clave2_base] {
+        run(
+            &spake,
+            &[
+                "ping",
+                "--log",
+                base,
+                "--domain",
+                &site_host,
+                "--allow-http",
+                "--no-retry",
+            ],
+        );
+    }
+    wait_until_pulled_since(
+        &http,
+        &clave_base,
+        &site_host,
+        &hijacked_since,
+        &clave_stderr,
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let sixth_seal = grid_instant(5);
+    run(
+        &clave,
+        &["seal", "--data", s(&clave_data), "--at", &sixth_seal],
+    );
+
+    let entries = snapshot_state_entries(&clave_data);
+    let declaration_tuple = state_tuple(&entries, "declaration", &site_host)
+        .unwrap_or_else(|| panic!("no declaration tuple for {site_host}: {entries:?}"));
+    assert_eq!(
+        declaration_tuple[2], owner,
+        "the hijacked Declaration must not take the Declaration in force"
+    );
+    let pending_tuple = state_tuple(&entries, "pending_declaration", &site_host)
+        .unwrap_or_else(|| panic!("no pending_declaration tuple: {entries:?}"));
+    assert_eq!(
+        pending_tuple[2], hijacked,
+        "the hijack is sealed as pending"
+    );
+    assert!(
+        pending_tuple[4].as_u64() > pending_tuple[3].as_u64(),
+        "the activation height follows the sealing height: {pending_tuple}"
+    );
+
+    // The owner still holds a listed key and answers from the Declaration
+    // its own state directory retained, above the floor the hijack raised.
+    run(
+        &spake,
+        &[
+            "rotate",
+            "--out",
+            s(&site),
+            "--state",
+            s(&spake_state),
+            "--restore",
+            "--seq",
+            &(owner_seq + 2).to_string(),
+            "--overlap-seconds",
+            "86400",
+        ],
+    );
+    run(
+        &spake,
+        &[
+            "build",
+            "--site",
+            s(&site),
+            "--domain",
+            &site_host,
+            "--out",
+            s(&site),
+            "--state",
+            s(&spake_state),
+        ],
+    );
+    let reversed = read_json(&site.join(".well-known/wist/publisher.json"));
+    let reversed_since = now_rfc3339();
+    run(
+        &spake,
+        &[
+            "ping",
+            "--log",
+            &clave_base,
+            "--domain",
+            &site_host,
+            "--allow-http",
+            "--no-retry",
+        ],
+    );
+    wait_until_pulled_since(
+        &http,
+        &clave_base,
+        &site_host,
+        &reversed_since,
+        &clave_stderr,
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let seventh_seal = grid_instant(6);
+    run(
+        &clave,
+        &["seal", "--data", s(&clave_data), "--at", &seventh_seal],
+    );
+
+    let entries = snapshot_state_entries(&clave_data);
+    assert_eq!(
+        state_tuple(&entries, "declaration", &site_host).map(|t| t[2].clone()),
+        Some(reversed),
+        "the reversal takes the Declaration in force"
+    );
+    assert!(
+        state_tuple(&entries, "pending_declaration", &site_host).is_none(),
+        "the reversed Declaration is discarded: {entries:?}"
+    );
+
+    run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+    let mut mcp4 = McpClient::start(&graven, &gdir);
+    let surviving = mcp4.search_with_profile("rotated", "text-only");
+    assert!(
+        surviving
+            .iter()
+            .any(|h| h["url"].as_str().unwrap_or_default().ends_with("/b.html")),
+        "the domain's records did not survive the reversal: {surviving:?}"
+    );
+    drop(mcp4);
 
     validate_artifacts(&site, &clave_data);
 

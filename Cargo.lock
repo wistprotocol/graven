@@ -507,6 +507,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tempfile",
+ "wist-core",
  "zerovec",
  "zstd",
 ]

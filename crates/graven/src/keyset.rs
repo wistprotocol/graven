@@ -86,6 +86,7 @@ impl KeyHistory {
                 0,
                 highest_accepted_seq,
                 None,
+                None,
             )
             .map_err(history_error)
     }
@@ -102,9 +103,50 @@ impl KeyHistory {
         head_height: u64,
     ) -> Result<()> {
         let end_s = i128::from(wist_core::timestamp::log_seconds(window_end)?);
+        let window = Some((
+            head.clone(),
+            Position {
+                block_number: head_height,
+                entry_index: 0,
+            },
+            0,
+            end_s,
+        ));
+        self.readopt(domain, "recovery window", window, None)
+    }
+
+    /// WIST-3 §§7/8: restores a pending fresh identity from its tuple —
+    /// the pending head, its sealing height and the activation height at
+    /// which WIST-1 §5.2 makes it current unless a reversal arrives first.
+    pub fn adopt_pending(
+        &mut self,
+        domain: &str,
+        head: &Value,
+        head_height: u64,
+        activation_height: u64,
+    ) -> Result<()> {
+        let pending = Some((
+            head.clone(),
+            Position {
+                block_number: head_height,
+                entry_index: 0,
+            },
+            0,
+            activation_height,
+        ));
+        self.readopt(domain, "pending declaration", None, pending)
+    }
+
+    fn readopt(
+        &mut self,
+        domain: &str,
+        tuple: &str,
+        window: Option<(Value, Position, i64, i128)>,
+        pending: Option<(Value, Position, i64, u64)>,
+    ) -> Result<()> {
         let current = self.declarations.domains().get(domain).ok_or_else(|| {
             Error::PublisherVerify(format!(
-                "{domain}: recovery window tuple without a declaration tuple"
+                "{domain}: {tuple} tuple without a declaration tuple"
             ))
         })?;
         let (envelope, position, sealed_at_s, floor) = (
@@ -113,6 +155,26 @@ impl KeyHistory {
             current.current().sealed_at_s(),
             current.highest_accepted_seq(),
         );
+        let window = window.or_else(|| {
+            current.window().map(|w| {
+                (
+                    w.head().envelope().clone(),
+                    w.head().position(),
+                    w.head().sealed_at_s(),
+                    w.end_s(),
+                )
+            })
+        });
+        let pending = pending.or_else(|| {
+            current.pending().map(|p| {
+                (
+                    p.head().envelope().clone(),
+                    p.head().position(),
+                    p.head().sealed_at_s(),
+                    p.activation_height(),
+                )
+            })
+        });
         self.declarations
             .adopt(
                 domain,
@@ -120,23 +182,17 @@ impl KeyHistory {
                 position,
                 sealed_at_s,
                 floor,
-                Some((
-                    head.clone(),
-                    Position {
-                        block_number: head_height,
-                        entry_index: 0,
-                    },
-                    0,
-                    end_s,
-                )),
+                window,
+                pending,
             )
             .map_err(history_error)
     }
 
     /// Applies one sealed Block's `publisher_declaration` Entries under
-    /// WIST-1 §5.2 with the `recovery_window_days` in force at its
-    /// `sealed_at`; a Block whose Declarations the shared rules reject
-    /// fails the sync.
+    /// WIST-1 §5.2 with the `recovery_window_days` and
+    /// `declaration_activation_blocks` in force at its `sealed_at`; a
+    /// Block whose Declarations the shared rules reject fails the sync.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_block(
         &mut self,
         block_number: u64,
@@ -144,6 +200,7 @@ impl KeyHistory {
         block_hash: &str,
         sealed_at: &str,
         recovery_window_days: i64,
+        declaration_activation_blocks: i64,
         entries: &[Value],
     ) -> Result<Effects> {
         self.declarations
@@ -153,6 +210,7 @@ impl KeyHistory {
                 block_hash,
                 sealed_at,
                 recovery_window_days,
+                declaration_activation_blocks,
                 entries,
             )
             .map_err(history_error)
@@ -329,15 +387,19 @@ mod tests {
                     .to_bytes(),
             )
         }
+
+        fn kid(&self) -> String {
+            wist_core::objects::publisher::thumbprint(&self.public_b64u())
+        }
     }
 
-    fn key_entry(signer: &Signer, key_id: &str, valid_from: &str) -> Value {
-        serde_json::json!({
-            "key_id": key_id,
-            "alg": "Ed25519",
-            "public_key": signer.public_b64u(),
-            "valid_from": valid_from,
-        })
+    fn key_entry(signer: &Signer, not_before: &str) -> Value {
+        serde_json::to_value(wist_core::objects::PublisherKey::new(
+            &signer.public_b64u(),
+            wist_core::timestamp::log_seconds(not_before).unwrap() as u64,
+            None,
+        ))
+        .unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -349,7 +411,6 @@ mod tests {
         recovery_keys: Option<Vec<Value>>,
         scope: Option<Vec<&str>>,
         sign: &Signer,
-        sign_key_id: &str,
     ) -> Value {
         let mut doc = serde_json::json!({
             "wist_version": "1.0.0",
@@ -366,7 +427,7 @@ mod tests {
         if let Some(scope) = scope {
             doc["subdomain_scope"] = serde_json::json!(scope);
         }
-        sign_envelope(&doc, "publisher", sign_key_id, &sign.sk).unwrap()
+        sign_envelope(&doc, "publisher", &sign.kid(), &sign.sk).unwrap()
     }
 
     fn hash_of(declaration: &Value) -> String {
@@ -390,13 +451,19 @@ mod tests {
     struct Chain {
         history: KeyHistory,
         height: Option<u64>,
+        activation_blocks: i64,
     }
 
     impl Chain {
         fn new() -> Self {
+            Chain::with_activation(0)
+        }
+
+        fn with_activation(activation_blocks: i64) -> Self {
             Chain {
                 history: KeyHistory::new(),
                 height: None,
+                activation_blocks,
             }
         }
 
@@ -415,6 +482,7 @@ mod tests {
                 &format!("h{height}"),
                 sealed_at,
                 7,
+                self.activation_blocks,
                 &entries,
             )?;
             self.height = Some(height);
@@ -442,34 +510,33 @@ mod tests {
             "records.example",
             0,
             None,
-            vec![key_entry(&pk1, "pk1", "2026-08-09T00:00:00Z")],
+            vec![key_entry(&pk1, "2026-08-09T00:00:00Z")],
             None,
             None,
             &pk1,
-            "pk1",
         );
         chain.seal("2026-08-09T12:00:00Z", &[&decl0]).unwrap();
         let url = "https://records.example/a";
-        let ok = delta_env(&pk1, "pk1", url, "2026-08-09T12:00:00Z");
+        let ok = delta_env(&pk1, &pk1.kid(), url, "2026-08-09T12:00:00Z");
         let verified = chain
             .history
             .verify_delta(0, LATE_S, &DeltaProfile::default(), &ok)
             .unwrap();
         assert_eq!(verified.publisher, "records.example");
         assert!(verified.materializes);
-        let unknown = delta_env(&pk9, "pk9", url, "2026-08-09T12:00:00Z");
+        let unknown = delta_env(&pk9, &pk9.kid(), url, "2026-08-09T12:00:00Z");
         let err = chain
             .history
             .verify_delta(0, LATE_S, &DeltaProfile::default(), &unknown)
             .unwrap_err();
         assert!(err.to_string().contains("WIST1-E02"), "{err}");
-        let forged = delta_env(&pk9, "pk1", url, "2026-08-09T12:00:00Z");
+        let forged = delta_env(&pk9, &pk1.kid(), url, "2026-08-09T12:00:00Z");
         let err = chain
             .history
             .verify_delta(0, LATE_S, &DeltaProfile::default(), &forged)
             .unwrap_err();
         assert!(err.to_string().contains("WIST1-E01"), "{err}");
-        let early = delta_env(&pk1, "pk1", url, "2026-08-08T00:00:00Z");
+        let early = delta_env(&pk1, &pk1.kid(), url, "2026-08-08T00:00:00Z");
         let err = chain
             .history
             .verify_delta(0, LATE_S, &DeltaProfile::default(), &early)
@@ -486,41 +553,38 @@ mod tests {
             "records.example",
             0,
             None,
-            vec![key_entry(&pk1, "pk1", "2026-08-09T00:00:00Z")],
+            vec![key_entry(&pk1, "2026-08-09T00:00:00Z")],
             None,
             None,
             &pk1,
-            "pk1",
         );
         chain.seal("2026-08-09T12:00:00Z", &[&decl0]).unwrap();
         let url = "https://records.example/a";
-        assert!(chain.verifies(&delta_env(&pk1, "pk1", url, "2026-08-09T12:00:00Z")));
+        assert!(chain.verifies(&delta_env(&pk1, &pk1.kid(), url, "2026-08-09T12:00:00Z")));
         let decl1 = decl(
             "records.example",
             1,
             Some(&hash_of(&decl0)),
-            vec![key_entry(&pk2, "pk2", "2026-08-09T00:00:00Z")],
+            vec![key_entry(&pk2, "2026-08-09T00:00:00Z")],
             None,
             None,
             &pk1,
-            "pk1",
         );
         let effects = chain.seal("2026-08-10T00:00:00Z", &[&decl1]).unwrap();
         assert_eq!(
             effects.installations[0].decision,
             Some(wist_core::declaration::Decision::Ordinary)
         );
-        assert!(!chain.verifies(&delta_env(&pk1, "pk1", url, "2026-08-09T12:00:00Z")));
-        assert!(chain.verifies(&delta_env(&pk2, "pk2", url, "2026-08-09T12:00:00Z")));
+        assert!(!chain.verifies(&delta_env(&pk1, &pk1.kid(), url, "2026-08-09T12:00:00Z")));
+        assert!(chain.verifies(&delta_env(&pk2, &pk2.kid(), url, "2026-08-09T12:00:00Z")));
         let stale = decl(
             "records.example",
             1,
             Some(&hash_of(&decl0)),
-            vec![key_entry(&pk1, "pk1", "2026-08-09T00:00:00Z")],
+            vec![key_entry(&pk1, "2026-08-09T00:00:00Z")],
             None,
             None,
             &pk1,
-            "pk1",
         );
         let err = chain.seal("2026-08-11T00:00:00Z", &[&stale]).unwrap_err();
         assert!(err.to_string().contains("WIST1-E08"), "{err}");
@@ -541,68 +605,63 @@ mod tests {
             domain,
             0,
             None,
-            vec![key_entry(&pk1, "pk1", "2026-08-01T00:00:00Z")],
-            Some(vec![key_entry(&rk1, "rk1", "2026-08-01T00:00:00Z")]),
+            vec![key_entry(&pk1, "2026-08-01T00:00:00Z")],
+            Some(vec![key_entry(&rk1, "2026-08-01T00:00:00Z")]),
             None,
             &pk1,
-            "pk1",
         );
         chain.seal("2026-08-01T00:00:00Z", &[&decl0]).unwrap();
         let theft = decl(
             domain,
             1,
             Some(&hash_of(&decl0)),
-            vec![key_entry(&atk, "atk", "2026-08-01T00:00:00Z")],
-            Some(vec![key_entry(&rk1, "rk1", "2026-08-01T00:00:00Z")]),
+            vec![key_entry(&atk, "2026-08-01T00:00:00Z")],
+            Some(vec![key_entry(&rk1, "2026-08-01T00:00:00Z")]),
             None,
             &pk1,
-            "pk1",
         );
         chain.seal("2026-08-02T00:00:00Z", &[&theft]).unwrap();
-        assert!(chain.verifies(&delta_env(&atk, "atk", url, "2026-08-02T00:00:00Z")));
+        assert!(chain.verifies(&delta_env(&atk, &atk.kid(), url, "2026-08-02T00:00:00Z")));
         let recovery = decl(
             domain,
             2,
             Some(&hash_of(&theft)),
-            vec![key_entry(&pk2, "pk2", "2026-08-01T00:00:00Z")],
-            Some(vec![key_entry(&rk2, "rk2", "2026-08-01T00:00:00Z")]),
+            vec![key_entry(&pk2, "2026-08-01T00:00:00Z")],
+            Some(vec![key_entry(&rk2, "2026-08-01T00:00:00Z")]),
             None,
             &rk1,
-            "rk1",
         );
         let effects = chain.seal("2026-08-03T00:00:00Z", &[&recovery]).unwrap();
         assert!(effects.installations[0].opens_window);
-        assert!(!chain.verifies(&delta_env(&pk2, "pk2", url, "2026-08-03T00:00:00Z")));
-        assert!(!chain.verifies(&delta_env(&atk, "atk", url, "2026-08-03T00:00:00Z")));
+        assert!(!chain.verifies(&delta_env(&pk2, &pk2.kid(), url, "2026-08-03T00:00:00Z")));
+        assert!(!chain.verifies(&delta_env(&atk, &atk.kid(), url, "2026-08-03T00:00:00Z")));
         let follower = decl(
             domain,
             3,
             Some(&hash_of(&recovery)),
-            vec![key_entry(&pk3, "pk3", "2026-08-01T00:00:00Z")],
-            Some(vec![key_entry(&rk2, "rk2", "2026-08-01T00:00:00Z")]),
+            vec![key_entry(&pk3, "2026-08-01T00:00:00Z")],
+            Some(vec![key_entry(&rk2, "2026-08-01T00:00:00Z")]),
             None,
             &pk2,
-            "pk2",
         );
         chain.seal("2026-08-04T00:00:00Z", &[&follower]).unwrap();
         let competitor = decl(
             domain,
             4,
             Some(&hash_of(&follower)),
-            vec![key_entry(&atk, "atk2", "2026-08-01T00:00:00Z")],
-            Some(vec![key_entry(&rk2, "rk2", "2026-08-01T00:00:00Z")]),
+            vec![key_entry(&atk, "2026-08-01T00:00:00Z")],
+            Some(vec![key_entry(&rk2, "2026-08-01T00:00:00Z")]),
             None,
             &atk,
-            "atk2",
         );
         chain.seal("2026-08-05T00:00:00Z", &[&competitor]).unwrap();
         let effects = chain.seal("2026-08-11T00:00:00Z", &[]).unwrap();
         assert_eq!(effects.settlements.len(), 1);
         assert_eq!(effects.settlements[0].restored.hash(), hash_of(&follower));
         assert_eq!(effects.settlements[0].superseded.len(), 1);
-        assert!(chain.verifies(&delta_env(&pk3, "pk3", url, "2026-08-11T00:00:00Z")));
-        assert!(!chain.verifies(&delta_env(&pk2, "pk2", url, "2026-08-11T00:00:00Z")));
-        assert!(!chain.verifies(&delta_env(&atk, "atk2", url, "2026-08-11T00:00:00Z")));
+        assert!(chain.verifies(&delta_env(&pk3, &pk3.kid(), url, "2026-08-11T00:00:00Z")));
+        assert!(!chain.verifies(&delta_env(&pk2, &pk2.kid(), url, "2026-08-11T00:00:00Z")));
+        assert!(!chain.verifies(&delta_env(&atk, &atk.kid(), url, "2026-08-11T00:00:00Z")));
     }
 
     #[test]
@@ -617,22 +676,20 @@ mod tests {
             domain,
             0,
             None,
-            vec![key_entry(&pk1, "pk1", "2026-08-01T00:00:00Z")],
-            Some(vec![key_entry(&rk1, "rk1", "2026-08-01T00:00:00Z")]),
+            vec![key_entry(&pk1, "2026-08-01T00:00:00Z")],
+            Some(vec![key_entry(&rk1, "2026-08-01T00:00:00Z")]),
             None,
             &pk1,
-            "pk1",
         );
         chain.seal("2026-08-01T00:00:00Z", &[&decl0]).unwrap();
         let altered = decl(
             domain,
             1,
             Some(&hash_of(&decl0)),
-            vec![key_entry(&pky, "pky", "2026-08-01T00:00:00Z")],
+            vec![key_entry(&pky, "2026-08-01T00:00:00Z")],
             None,
             None,
             &pky,
-            "pky",
         );
         let err = chain.seal("2026-08-02T00:00:00Z", &[&altered]).unwrap_err();
         assert!(err.to_string().contains("WIST1-E08"), "{err}");
@@ -642,16 +699,15 @@ mod tests {
             domain,
             1,
             Some(&hash_of(&decl0)),
-            vec![key_entry(&pky, "pky", "2026-08-01T00:00:00Z")],
-            Some(vec![key_entry(&rk1, "rk1", "2026-08-01T00:00:00Z")]),
+            vec![key_entry(&pky, "2026-08-01T00:00:00Z")],
+            Some(vec![key_entry(&rk1, "2026-08-01T00:00:00Z")]),
             None,
             &pky,
-            "pky",
         );
         let effects = chain.seal("2026-08-02T00:00:00Z", &[&fresh]).unwrap();
         assert!(effects.installations[0].resets_identity);
-        assert!(chain.verifies(&delta_env(&pky, "pky", url, "2026-08-02T00:00:00Z")));
-        assert!(!chain.verifies(&delta_env(&pk1, "pk1", url, "2026-08-02T00:00:00Z")));
+        assert!(chain.verifies(&delta_env(&pky, &pky.kid(), url, "2026-08-02T00:00:00Z")));
+        assert!(!chain.verifies(&delta_env(&pk1, &pk1.kid(), url, "2026-08-02T00:00:00Z")));
     }
 
     #[test]
@@ -663,16 +719,15 @@ mod tests {
             "records.example",
             0,
             None,
-            vec![key_entry(&pk1, "pk1", "2026-08-09T00:00:00Z")],
+            vec![key_entry(&pk1, "2026-08-09T00:00:00Z")],
             None,
             Some(vec!["sub.records.example"]),
             &pk1,
-            "pk1",
         );
         chain.seal("2026-08-09T12:00:00Z", &[&parent]).unwrap();
         let scoped = delta_env(
             &pk1,
-            "pk1",
+            &pk1.kid(),
             "https://sub.records.example/a",
             "2026-08-09T12:00:00Z",
         );
@@ -683,7 +738,7 @@ mod tests {
         assert!(verified.materializes);
         let outside = delta_env(
             &pk1,
-            "pk1",
+            &pk1.kid(),
             "https://other.records.example/a",
             "2026-08-09T12:00:00Z",
         );
@@ -696,11 +751,10 @@ mod tests {
             "sub.records.example",
             0,
             None,
-            vec![key_entry(&pk2, "pk2", "2026-08-09T00:00:00Z")],
+            vec![key_entry(&pk2, "2026-08-09T00:00:00Z")],
             None,
             None,
             &pk2,
-            "pk2",
         );
         chain.seal("2026-08-09T13:00:00Z", &[&own]).unwrap();
         let verified = chain
@@ -721,11 +775,10 @@ mod tests {
             "records.example",
             0,
             None,
-            vec![key_entry(&pk1, "pk1", "2026-08-09T00:00:00Z")],
+            vec![key_entry(&pk1, "2026-08-09T00:00:00Z")],
             None,
             None,
             &pk1,
-            "pk1",
         );
         let mut history = KeyHistory::new();
         history
@@ -737,11 +790,10 @@ mod tests {
             "records.example",
             1,
             Some(&hash_of(&decl0)),
-            vec![key_entry(&pk2, "pk2", "2026-08-09T00:00:00Z")],
+            vec![key_entry(&pk2, "2026-08-09T00:00:00Z")],
             None,
             None,
             &pk1,
-            "pk1",
         );
         let entry = serde_json::json!({"type": "publisher_declaration", "body": decl1});
         assert!(history
@@ -751,6 +803,7 @@ mod tests {
                 "h6",
                 "2026-08-10T00:00:00Z",
                 7,
+                24,
                 std::slice::from_ref(&entry)
             )
             .is_err());
@@ -761,6 +814,7 @@ mod tests {
                 "h5",
                 "2026-08-10T00:00:00Z",
                 7,
+                24,
                 &[entry],
             )
             .unwrap();
@@ -770,7 +824,7 @@ mod tests {
                 5,
                 LATE_S,
                 &DeltaProfile::default(),
-                &delta_env(&pk2, "pk2", url, "2026-08-09T12:00:00Z")
+                &delta_env(&pk2, &pk2.kid(), url, "2026-08-09T12:00:00Z")
             )
             .is_ok());
     }

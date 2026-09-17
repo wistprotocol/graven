@@ -120,16 +120,24 @@ def main() -> int:
 
     def _publisher():
         schema_validate("publisher", publisher_doc)
-        pub = publisher_doc["publisher"]["keys"][0]["public_key"]
-        ve.verify_envelope(publisher_doc, "publisher", ve.b64u_decode(pub))
+        signer = next(
+            key for key in publisher_doc["publisher"]["keys"]
+            if key["kid"] == publisher_doc["sig"]["key_id"]
+        )
+        ve.verify_envelope(publisher_doc, "publisher", ve.b64u_decode(signer["x"]))
 
     check("publisher.json", _publisher)
-    pub_spake = ve.b64u_decode(publisher_doc["publisher"]["keys"][0]["public_key"])
+
+    def spake_key(doc):
+        return ve.b64u_decode(next(
+            key["x"] for key in publisher_doc["publisher"]["keys"]
+            if key["kid"] == doc["sig"]["key_id"]
+        ))
 
     def _feed():
         doc = read_json(wk / "feed.json")
         schema_validate("feed", doc)
-        ve.verify_envelope(doc, "feed", pub_spake)
+        ve.verify_envelope(doc, "feed", spake_key(doc))
 
     check("feed.json", _feed)
 
@@ -143,7 +151,7 @@ def main() -> int:
         def _delta(delta_path=delta_path):
             doc = read_json(delta_path)
             schema_validate("delta", doc)
-            ve.verify_envelope(doc, "delta", pub_spake)
+            ve.verify_envelope(doc, "delta", spake_key(doc))
             expected_id = delta_id_of(doc["delta"])
             assert delta_path.stem == expected_id.removeprefix("sha256:"), (
                 f"filename {delta_path.name} does not match recomputed "

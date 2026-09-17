@@ -30,9 +30,9 @@ fn append_block(fx: &common::Fixture, entries: &[Value]) -> u64 {
     next
 }
 
-fn label_entry(signer: &common::Signer, key_id: &str, inner: Value) -> (String, Value) {
+fn label_entry(signer: &common::Signer, inner: Value) -> (String, Value) {
     let id = wist_core::label::label_id(&inner).unwrap();
-    let body = sign_envelope(&inner, "label", key_id, &signer.sk).unwrap();
+    let body = sign_envelope(&inner, "label", &signer.kid(), &signer.sk).unwrap();
     (id, json!({"type": "label", "body": body}))
 }
 
@@ -55,12 +55,10 @@ fn walked_labels_and_disputes_reach_the_index() {
     let labeler = common::Signer::new([1u8; 32]);
     let (label_id, entry) = label_entry(
         &labeler,
-        "pk1",
         json!({"wist_version": "1.0.0", "labeler": "records.example", "subject": SUBJECT, "name": "wist:spam", "value": 250000, "asserted_at": "2026-08-09T12:30:00Z", "expires_at": "2027-01-01T00:00:00Z"}),
     );
     let (_, self_label) = label_entry(
         &labeler,
-        "pk1",
         json!({"wist_version": "1.0.0", "labeler": "records.example", "subject": "https://records.example/alpha", "name": "wist:spam", "asserted_at": "2026-08-09T12:30:00Z"}),
     );
     let height = append_block(&fx, &[entry, self_label]);
@@ -95,12 +93,12 @@ fn walked_labels_and_disputes_reach_the_index() {
     );
 
     let disputant = common::Signer::new([4u8; 32]);
-    let declaration = common::build_declaration(&disputant, "d1", "other.example");
+    let declaration = common::build_declaration(&disputant, "other.example");
     let dispute_inner = json!({"wist_version": "1.0.0", "disputant": "other.example", "label": label_id, "log": "log.example", "height": height, "reason": "https://other.example/why", "asserted_at": "2026-08-09T13:00:00Z"});
     let dispute_id = wist_core::label::dispute_id(&dispute_inner).unwrap();
-    let dispute = json!({"type": "dispute", "body": sign_envelope(&dispute_inner, "dispute", "d1", &disputant.sk).unwrap()});
+    let dispute = json!({"type": "dispute", "body": sign_envelope(&dispute_inner, "dispute", &disputant.kid(), &disputant.sk).unwrap()});
     let unknown = json!({"wist_version": "1.0.0", "disputant": "other.example", "label": format!("sha256:{}", "f".repeat(64)), "log": "log.example", "height": height, "asserted_at": "2026-08-09T13:00:00Z"});
-    let unknown_dispute = json!({"type": "dispute", "body": sign_envelope(&unknown, "dispute", "d1", &disputant.sk).unwrap()});
+    let unknown_dispute = json!({"type": "dispute", "body": sign_envelope(&unknown, "dispute", &disputant.kid(), &disputant.sk).unwrap()});
     append_block(
         &fx,
         &[
@@ -138,12 +136,10 @@ fn walked_labels_and_disputes_reach_the_index() {
 
     let (_, retraction) = label_entry(
         &labeler,
-        "pk1",
         json!({"wist_version": "1.0.0", "labeler": "records.example", "subject": SUBJECT, "name": "wist:spam", "asserted_at": "2026-08-09T14:00:00Z", "retracted": true}),
     );
     let (_, stale) = label_entry(
         &labeler,
-        "pk1",
         json!({"wist_version": "1.0.0", "labeler": "records.example", "subject": SUBJECT, "name": "wist:spam", "asserted_at": "2026-08-09T11:00:00Z"}),
     );
     append_block(&fx, &[retraction, stale]);

@@ -52,7 +52,7 @@ fn suffix_act(fx: &common::Fixture, identifier: &str, bytes: usize) -> Value {
 
 fn delta_entry(url: &str) -> Value {
     let publisher = common::Signer::new([7u8; 32]);
-    let (_, envelope, _) = common::build_delta(&publisher, "pk1", url, "T", None, "body", None);
+    let (_, envelope, _) = common::build_delta(&publisher, url, "T", None, "body", None);
     serde_json::json!({"type": "publisher_delta", "body": envelope})
 }
 

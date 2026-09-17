@@ -33,6 +33,7 @@ fn outcome(stored: &Value, fetched: &Value) -> String {
                 "h0",
                 "2026-08-02T12:00:00Z",
                 7,
+                24,
                 &[entry(stored)],
             )
             .unwrap();
@@ -49,6 +50,7 @@ fn outcome(stored: &Value, fetched: &Value) -> String {
         "h1",
         "2026-08-03T12:00:00Z",
         7,
+        24,
         &[entry(fetched)],
     ) {
         Ok(effects) => match effects.installations.first().and_then(|i| i.decision) {
@@ -84,39 +86,53 @@ fn declaration_binding_and_key_eligibility_vectors_select_the_documented_outcome
 }
 
 #[test]
-fn a_renamed_signing_key_keeps_its_identity() {
+fn an_ordinary_rotation_keeps_the_identity_and_a_fresh_one_waits_for_activation() {
     let vector: Value = serde_json::from_slice(
         &std::fs::read(spec_dir().join("vectors/wist1/declaration-binding.json")).unwrap(),
     )
     .unwrap();
-    let case = vector["cases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "renamed signing key preserves identity")
-        .unwrap();
-    let mut history = KeyHistory::new();
-    history
-        .apply_block(
-            0,
-            "sha256:genesis",
-            "h0",
-            "2026-08-02T12:00:00Z",
-            7,
-            &[entry(&case["stored"])],
-        )
-        .unwrap();
-    let effects = history
-        .apply_block(
-            1,
-            "h0",
-            "h1",
-            "2026-08-03T12:00:00Z",
-            7,
-            &[entry(&case["fetched"])],
-        )
-        .unwrap();
-    assert_eq!(effects.installations[0].decision, Some(Decision::Ordinary));
-    assert!(!effects.installations[0].resets_identity);
-    assert!(history.declared("example.com"));
+    for (expected, decision, pending) in [
+        ("ordinary_rotation", Decision::Ordinary, false),
+        ("fresh_identity", Decision::FreshIdentity, true),
+    ] {
+        let case = vector["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["expected"] == expected)
+            .unwrap();
+        let mut history = KeyHistory::new();
+        history
+            .apply_block(
+                0,
+                "sha256:genesis",
+                "h0",
+                "2026-08-02T12:00:00Z",
+                7,
+                24,
+                &[entry(&case["stored"])],
+            )
+            .unwrap();
+        let effects = history
+            .apply_block(
+                1,
+                "h0",
+                "h1",
+                "2026-08-03T12:00:00Z",
+                7,
+                24,
+                &[entry(&case["fetched"])],
+            )
+            .unwrap();
+        assert_eq!(effects.installations[0].decision, Some(decision));
+        assert!(!effects.installations[0].resets_identity);
+        assert_eq!(effects.installations[0].pending, pending);
+        assert!(history.declared("example.com"));
+        let domain = &history.declarations().domains()["example.com"];
+        assert_eq!(domain.pending().is_some(), pending);
+        assert_eq!(
+            domain.pending().map(|p| p.activation_height()),
+            pending.then_some(25)
+        );
+    }
 }

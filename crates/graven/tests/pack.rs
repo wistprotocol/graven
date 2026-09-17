@@ -23,7 +23,6 @@ fn alpha_beta_ids() -> (String, String) {
     let publisher = common::Signer::new([1u8; 32]);
     let (alpha_id, _, _) = common::build_delta(
         &publisher,
-        "pk1",
         "https://records.example/alpha",
         "Alpha Title",
         Some("Alpha abstract"),
@@ -32,7 +31,6 @@ fn alpha_beta_ids() -> (String, String) {
     );
     let (beta_id, _, _) = common::build_delta(
         &publisher,
-        "pk1",
         "https://records.example/beta",
         "Beta Title",
         Some("Beta abstract"),
