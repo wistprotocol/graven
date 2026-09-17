@@ -35,9 +35,9 @@ pub const CREATE_SUFFIX_LISTS: &str = "CREATE TABLE IF NOT EXISTS suffix_lists(s
 
 /// WIST-2 §3.3 and WIST-3 §7: every sealed Label and dispute the sync
 /// walked, the current Label per (labeler, subject, name) and the current
-/// dispute per (Label ID, disputant) — from adopted tuples, which carry
-/// no ID, and walked Entries alike — the labeler statistics over walked
-/// Entries, and the definitions fetched for subscribed Labelers.
+/// dispute per (Label ID, disputant) from adopted tuples and walked
+/// Entries alike, the labeler statistics over walked Entries, and the
+/// definitions fetched for subscribed Labelers.
 pub const CREATE_LABELS: &str = "CREATE TABLE IF NOT EXISTS labels(label_id TEXT PRIMARY KEY, labeler TEXT NOT NULL, subject TEXT NOT NULL, name TEXT NOT NULL, value INTEGER, asserted_at TEXT NOT NULL, retracted INTEGER NOT NULL, expires_at TEXT, delta TEXT, height INTEGER NOT NULL, entry_index INTEGER NOT NULL); \
 CREATE TABLE IF NOT EXISTS disputes(dispute_id TEXT PRIMARY KEY, label_id TEXT NOT NULL, disputant TEXT NOT NULL, reason TEXT, asserted_at TEXT NOT NULL, height INTEGER NOT NULL, entry_index INTEGER NOT NULL); \
 CREATE TABLE IF NOT EXISTS label_current(labeler TEXT NOT NULL, subject TEXT NOT NULL, name TEXT NOT NULL, label_id TEXT, value INTEGER, asserted_at TEXT NOT NULL, retracted INTEGER NOT NULL, expires_at TEXT, delta TEXT, height INTEGER NOT NULL, entry_index INTEGER NOT NULL, PRIMARY KEY(labeler, subject, name)); \
@@ -713,7 +713,7 @@ impl Store {
             .collect())
     }
 
-    /// The Label ID of a walked Label, none for one adopted from a tuple.
+    /// The current Label's ID, walked or adopted from its tuple.
     pub fn label_id_of(&self, row: &LabelRow) -> Result<Option<String>> {
         if !table_exists(&self.conn, "label_current")? {
             return Ok(None);

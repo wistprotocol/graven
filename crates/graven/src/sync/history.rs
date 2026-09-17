@@ -829,17 +829,13 @@ pub(super) fn apply_labels(
             );
             continue;
         };
-        // A Label adopted from a Snapshot tuple carries no ID, so a dispute
-        // naming a Label this index never walked cannot be checked when the
-        // index resumed from a Snapshot; it is read as consistent.
-        let resumed = super::persist::holds_adopted_labels(conn)?;
-        let sealed = |label_id: &str| match super::persist::sealed_label_subject(conn, label_id)
-            .ok()
-            .flatten()
-        {
-            Some(subject) => wist_core::label::LabelLookup::Known { subject },
-            None if resumed => wist_core::label::LabelLookup::Unverifiable,
-            None => wist_core::label::LabelLookup::Absent,
+        let sealed = |label_id: &str| {
+            super::persist::sealed_label_subject(conn, label_id)
+                .ok()
+                .flatten()
+                .map_or(wist_core::label::LabelLookup::Absent, |subject| {
+                    wist_core::label::LabelLookup::Known { subject }
+                })
         };
         match wist_core::label::validate_dispute(body, &declaration, sealed) {
             Ok(envelope) => {

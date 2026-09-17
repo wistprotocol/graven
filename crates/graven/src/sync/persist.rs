@@ -348,13 +348,15 @@ pub(super) fn record_dispute(
 }
 
 /// The subject of a Label this index holds sealed, for a dispute's check
-/// (WIST-2 §3.3); a Label adopted from a tuple has no ID and matches none.
+/// (WIST-2 §3.3): one it walked, or the current Label a Snapshot tuple
+/// carried with its ID.
 pub(super) fn sealed_label_subject(conn: &Connection, label_id: &str) -> Result<Option<String>> {
     if !crate::store::table_exists(conn, "labels")? {
         return Ok(None);
     }
     conn.query_row(
-        "SELECT subject FROM labels WHERE label_id = ?1",
+        "SELECT subject FROM labels WHERE label_id = ?1
+         UNION ALL SELECT subject FROM label_current WHERE label_id = ?1 LIMIT 1",
         [label_id],
         |row| row.get(0),
     )
@@ -376,19 +378,20 @@ pub(super) fn touch_labeler(conn: &Connection, domain: &str, height: u64) -> Res
 }
 
 /// WIST-3 §8 step 10: adopts a Snapshot's `label` tuple as the current
-/// Label of its triple; the tuple carries no Label ID.
+/// Label of its triple, with the Label ID a later dispute names.
 pub(super) fn adopt_label_tuple(
     conn: &Connection,
     entry: &wist_core::objects::LabelEntry,
 ) -> Result<()> {
     conn.execute_batch(crate::store::CREATE_LABELS)?;
     conn.execute(
-        "INSERT INTO label_current(labeler, subject, name, label_id, value, asserted_at, retracted, expires_at, delta, height, entry_index) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 0, ?6, ?7, ?8, 0)
-         ON CONFLICT(labeler, subject, name) DO UPDATE SET label_id = NULL, value = excluded.value, asserted_at = excluded.asserted_at, retracted = 0, expires_at = excluded.expires_at, delta = excluded.delta, height = excluded.height, entry_index = 0",
+        "INSERT INTO label_current(labeler, subject, name, label_id, value, asserted_at, retracted, expires_at, delta, height, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, 0)
+         ON CONFLICT(labeler, subject, name) DO UPDATE SET label_id = excluded.label_id, value = excluded.value, asserted_at = excluded.asserted_at, retracted = 0, expires_at = excluded.expires_at, delta = excluded.delta, height = excluded.height, entry_index = 0",
         rusqlite::params![
             entry.labeler,
             entry.subject,
             entry.name,
+            entry.label_id,
             entry.value.map(|v| v as i64),
             entry.asserted_at,
             entry.expires_at,
@@ -489,17 +492,4 @@ pub(super) fn fetch_definitions(
         }
     }
     Ok(())
-}
-
-/// Whether the index adopted Label tuples from a Snapshot, which carry
-/// no Label IDs (WIST-3 §7).
-pub(super) fn holds_adopted_labels(conn: &Connection) -> Result<bool> {
-    if !crate::store::table_exists(conn, "label_current")? {
-        return Ok(false);
-    }
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM label_current WHERE label_id IS NULL)",
-        [],
-        |row| row.get(0),
-    )?)
 }

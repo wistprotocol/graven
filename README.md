@@ -1,6 +1,6 @@
 # graven
 
-The signed Delta format targets [WIST specification revision `2d572b4d64e2f6fc01f57af87184b4e97be99b59`](https://github.com/wistprotocol/spec/tree/2d572b4d64e2f6fc01f57af87184b4e97be99b59). Object version `1.0.0` alone does not identify a compatible draft.
+The signed Delta format targets [WIST specification revision `daf4dbeb50dc946e18c29fcaa09fb8fd314bde1a`](https://github.com/wistprotocol/spec/tree/daf4dbeb50dc946e18c29fcaa09fb8fd314bde1a). Object version `1.0.0` alone does not identify a compatible draft.
 
 WIST Protocol consumer and MCP server. Graven cold-syncs a verified Snapshot,
 then applies incremental Blocks to a separate SQLite index per Log (WIST-3 §8).
@@ -144,8 +144,8 @@ self-labeling, the disputed Label's sealing and authority, the signature
 index keeps every walked Label and dispute, the current Label per
 (labeler, subject, name) and the current dispute per (Label ID,
 disputant) by `asserted_at` and Log order, a cold start adopting the
-Snapshot's `label` and `dispute` tuples, which carry no IDs, so a later
-dispute of a Label the index never walked is read as consistent. The
+Snapshot's `label` and `dispute` tuples with the Label IDs they carry,
+so a later dispute of an adopted Label is checked as a walked one is. The
 `labelers` table counts each Labeler's walked Labels, retractions,
 distinct subjects and first and last sealed heights (WIST-3 §7's
 statistics, recomputed locally). `subscribe --labeler` names the

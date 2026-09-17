@@ -159,6 +159,7 @@ fn walked_labels_and_disputes_reach_the_index() {
 
 #[test]
 fn snapshot_label_and_dispute_tuples_are_adopted() {
+    let adopted_id = format!("sha256:{}", "b".repeat(64));
     let label = StateEntry::Label(LabelEntry {
         labeler: "labels.sample.net".into(),
         subject: SUBJECT.into(),
@@ -167,6 +168,7 @@ fn snapshot_label_and_dispute_tuples_are_adopted() {
         asserted_at: "2026-08-01T00:00:00Z".into(),
         expires_at: None,
         delta: None,
+        label_id: adopted_id.clone(),
         sealing_height: 0,
     });
     let dispute = StateEntry::Dispute(DisputeEntry {
@@ -183,7 +185,10 @@ fn snapshot_label_and_dispute_tuples_are_adopted() {
     let labels = store.labels_for(SUBJECT, None).unwrap();
     assert_eq!(labels.len(), 1);
     assert_eq!(labels[0].labeler, "labels.sample.net");
-    assert_eq!(store.label_id_of(&labels[0]).unwrap(), None);
+    assert_eq!(
+        store.label_id_of(&labels[0]).unwrap().as_deref(),
+        Some(adopted_id.as_str())
+    );
     let disputes = store
         .disputes_for(&format!("sha256:{}", "a".repeat(64)))
         .unwrap();
