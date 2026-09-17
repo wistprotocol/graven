@@ -42,7 +42,6 @@ fn cold_sync_verifies_chain_and_populates_store() {
     let alpha = store.get("https://records.example/alpha").unwrap().unwrap();
     assert_eq!(alpha.title, "Alpha Title");
     assert_eq!(alpha.publisher, fx.domain);
-    assert_eq!(alpha.weight, "full");
 
     let beta = store.get("https://records.example/beta").unwrap().unwrap();
     assert_eq!(beta.title, "Beta Title");
@@ -443,7 +442,6 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
         publisher: domain.clone(),
         delta_id: id1.clone(),
         observed_at: "2026-08-09T12:00:00Z".into(),
-        weight: "full".into(),
         title: "Alpha Title".into(),
         abstract_text: Some("Alpha abstract".into()),
         lang: "en".into(),
@@ -459,7 +457,6 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
         "publisher": record1.publisher,
         "delta_id": record1.delta_id,
         "observed_at": record1.observed_at,
-        "weight": record1.weight,
     })])
     .unwrap();
 
@@ -1846,104 +1843,6 @@ fn a_log_that_rotates_its_aggregator_key_stays_syncable() {
     assert_eq!(report.head, after);
 }
 
-fn sanction_update(domain: &str, level: u64) -> serde_json::Value {
-    serde_json::json!({
-        "wist_version": "1.0.0",
-        "action": "sanction",
-        "subject": domain,
-        "details": {"level": level, "severity": 1},
-        "evidence": [format!("sha256:{}", "1".repeat(64)), format!("sha256:{}", "2".repeat(64))],
-        "effective_at": "2026-08-09T15:00:00Z",
-    })
-}
-
-fn seal_sanction_then_delta(fx: &common::Fixture, level: u64) -> String {
-    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
-    let doc: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
-    let prev_hash = doc["checkpoint"]["block_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let n = prev_number + 1;
-    let update = sanction_update("records.example", level);
-    let envelope =
-        wist_core::envelope::sign_envelope(&update, "update", "log1", &fx.log.sk).unwrap();
-    let publisher = common::Signer::new([1u8; 32]);
-    let url = format!("https://records.example/sanctioned-{n}");
-    let (_id, delta_env, payload) = common::build_delta(
-        &publisher,
-        "pk1",
-        &url,
-        "Sanctioned Title",
-        None,
-        "sanctioned body",
-        None,
-    );
-    let hex = wist_core::delta::delta_id(&delta_env["delta"])
-        .unwrap()
-        .trim_start_matches("sha256:")
-        .to_string();
-    common::write_payload(fx.dir.path(), &hex, &payload);
-    let entries = vec![
-        serde_json::json!({"type": "registry_update", "body": envelope}),
-        serde_json::json!({"type": "publisher_delta", "body": delta_env}),
-    ];
-    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + n);
-    let (block, hash) = common::build_block(&fx.log, n, &prev_hash, &sealed_at, &entries);
-    common::write_block(fx.dir.path(), n, &block);
-    common::write_checkpoint(fx.dir.path(), &fx.log, n, &hash, &sealed_at);
-    url
-}
-
-#[test]
-fn a_level_two_sanction_marks_the_domains_records_reduced_weight() {
-    let fx = common::build_fixture(true, false);
-    let url = seal_sanction_then_delta(&fx, 2);
-    let dir = tempfile::tempdir().unwrap();
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        dir.path(),
-        true,
-        false,
-    )
-    .unwrap();
-    let conn = Connection::open(common::synced_log_dir(dir.path()).join("index.sqlite")).unwrap();
-    let weight: String = conn
-        .query_row("SELECT weight FROM records WHERE url = ?1", [&url], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(weight, "reduced");
-}
-
-#[test]
-fn a_level_four_sanction_removes_the_domains_records() {
-    let fx = common::build_fixture(true, false);
-    seal_sanction_then_delta(&fx, 4);
-    let dir = tempfile::tempdir().unwrap();
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        dir.path(),
-        true,
-        false,
-    )
-    .unwrap();
-    let conn = Connection::open(common::synced_log_dir(dir.path()).join("index.sqlite")).unwrap();
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM records WHERE publisher = 'records.example'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 0);
-}
-
 #[test]
 fn malformed_signed_publisher_does_not_abort_sync_or_advance_a_chain() {
     for field in [
@@ -2036,48 +1935,31 @@ fn cold_start_enforces_the_adopted_sequence_floor() {
 }
 
 #[test]
-fn cold_start_adopts_every_derived_state_kind() {
-    use wist_core::objects::{
-        AuditorEntry, CanaryCommitmentEntry, CoverageFailureEntry, EscalationEntry, ObserverEntry,
-        ReputationInputsEntry, StateEntry,
-    };
+fn cold_start_adopts_withdrawal_and_label_tuples() {
+    use wist_core::objects::{LabelEntry, StateEntry, WithdrawalEntry};
+    let publisher = common::Signer::new([1u8; 32]);
+    let (alpha_id, _, _) = common::build_delta(
+        &publisher,
+        "pk1",
+        "https://records.example/alpha",
+        "Alpha Title",
+        Some("Alpha abstract"),
+        "alpha body",
+        None,
+    );
     let extra = vec![
-        StateEntry::Auditor(AuditorEntry {
-            auditor_id: "audit.example.net".into(),
-            key_id: "a1".into(),
-            public_key: "A".repeat(43),
-            admitted_height: 0,
-            removed_height: None,
-        }),
-        StateEntry::Observer(ObserverEntry {
-            observer_id: "watch.sample.net".into(),
-            key_id: "w1".into(),
-            public_key: "B".repeat(43),
-            registered_height: 0,
-            ended_height: None,
-        }),
-        StateEntry::CanaryCommitment(CanaryCommitmentEntry {
-            update_id: format!("sha256:{}", "1".repeat(64)),
-            planter: "planter.example.org".into(),
-            root: format!("sha256:{}", "2".repeat(64)),
-            leaves: 4,
+        StateEntry::Withdrawal(WithdrawalEntry {
+            delta_id: alpha_id.clone(),
+            publisher: "records.example".into(),
             sealing_height: 0,
         }),
-        StateEntry::Escalation(EscalationEntry {
-            domain: "records.example".into(),
-            establishing_sealed_at: "2026-08-09T12:00:00Z".into(),
-        }),
-        StateEntry::CoverageFailure(CoverageFailureEntry {
-            auditor_id: "audit.example.net".into(),
-            block_number: 0,
-        }),
-        StateEntry::ReputationInputs(ReputationInputsEntry {
-            domain: "records.example".into(),
-            first_accepted_sealed_at: "2026-08-09T12:00:00Z".into(),
-            reset_height: None,
-            counted_total: 1,
-            counted_url_digests: vec!["0".repeat(32)],
-            penalties: vec![("2026-08-09T12:00:00Z".into(), 2)],
+        StateEntry::Label(LabelEntry {
+            labeler: "labeler.example.net".into(),
+            subject: "https://records.example/alpha".into(),
+            name: "wist:spam".into(),
+            value: None,
+            asserted_at: "2026-08-09T12:00:00Z".into(),
+            sealing_height: 0,
         }),
     ];
     let fx = common::build_fixture_with_state(extra, 0);
@@ -2092,19 +1974,97 @@ fn cold_start_adopts_every_derived_state_kind() {
     .unwrap();
     let conn =
         Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
-    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
-    assert_eq!(count("SELECT COUNT(*) FROM auditors"), 1);
-    assert_eq!(count("SELECT COUNT(*) FROM observers"), 1);
-    assert_eq!(count("SELECT COUNT(*) FROM canary_commitments"), 1);
-    assert_eq!(count("SELECT COUNT(*) FROM escalations"), 1);
-    assert_eq!(count("SELECT COUNT(*) FROM coverage_failures"), 1);
-    assert_eq!(count("SELECT COUNT(*) FROM reputation_inputs"), 1);
-    let penalties: String = conn
-        .query_row("SELECT penalties_json FROM reputation_inputs", [], |r| {
+    let withdrawn: Vec<(String, String, i64)> = conn
+        .prepare("SELECT delta_id, publisher, height FROM withdrawals")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        withdrawn,
+        vec![(alpha_id, "records.example".to_string(), 0)]
+    );
+    drop(conn);
+    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
+    assert!(
+        store
+            .get("https://records.example/alpha")
+            .unwrap()
+            .is_none(),
+        "a withdrawn Delta's content leaves the adopted index"
+    );
+    assert!(store.get("https://records.example/beta").unwrap().is_some());
+}
+
+#[test]
+fn a_withdrawal_sealed_beside_its_delta_keeps_the_delta_out_of_the_index() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        false,
+    )
+    .unwrap();
+
+    let publisher = common::Signer::new([1u8; 32]);
+    let url = "https://records.example/gamma";
+    let (gamma_id, delta_env, payload) = common::build_delta(
+        &publisher,
+        "pk1",
+        url,
+        "Gamma Title",
+        None,
+        "gamma body",
+        None,
+    );
+    common::write_payload(
+        fx.dir.path(),
+        gamma_id.trim_start_matches("sha256:"),
+        &payload,
+    );
+    let update = serde_json::json!({
+        "wist_version": "1.0.0",
+        "action": "payload_withdrawal",
+        "subject": fx.domain,
+        "details": {"delta_id": gamma_id, "legal_basis": "court order", "jurisdiction": "EU"},
+        "effective_at": "2026-08-09T14:00:00Z",
+    });
+    let withdrawal =
+        wist_core::envelope::sign_envelope(&update, "update", "log1", &fx.log.sk).unwrap();
+    let (_, head_hash) = head_of(&fx);
+    seal_next(
+        &fx,
+        &head_hash,
+        "2026-08-09T14:00:00Z",
+        &[
+            serde_json::json!({"type": "registry_update", "body": withdrawal}),
+            serde_json::json!({"type": "publisher_delta", "body": delta_env}),
+        ],
+    );
+
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.head, 2);
+    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
+    assert!(store.get(url).unwrap().is_none());
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+    let tip: String = conn
+        .query_row("SELECT tip FROM chain_tips WHERE url = ?1", [url], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(penalties, "[[\"2026-08-09T12:00:00Z\",2]]");
+    assert_eq!(tip, gamma_id, "a withdrawn Delta still moves its chain tip");
 }
 
 fn spec_dir() -> std::path::PathBuf {
@@ -2471,201 +2431,6 @@ fn sealed_deltas_are_checked_against_their_block_clock_and_accepted_allowance() 
         )
         .unwrap();
     assert_eq!(tips, 0, "an ignored Delta moves no chain tip");
-}
-
-fn roster_act(
-    action: &str,
-    subject: &str,
-    details: serde_json::Value,
-    signer: &common::Signer,
-    signer_key_id: &str,
-    effective_at: &str,
-) -> serde_json::Value {
-    let update = serde_json::json!({
-        "wist_version": "1.0.0", "action": action, "subject": subject,
-        "effective_at": effective_at, "details": details,
-    });
-    let body =
-        wist_core::envelope::sign_envelope(&update, "update", signer_key_id, &signer.sk).unwrap();
-    serde_json::json!({"type": "registry_update", "body": body})
-}
-
-fn run_sync(fx: &common::Fixture, target: &std::path::Path) -> graven::sync::SyncReport {
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target,
-        true,
-        false,
-    )
-    .unwrap()
-}
-
-#[test]
-fn roster_and_canary_acts_replay_through_the_shared_engines_and_persist_between_syncs() {
-    let fx = common::build_fixture(true, false);
-    let target = tempfile::tempdir().unwrap();
-    run_sync(&fx, target.path());
-
-    let auditor = common::Signer::new([7u8; 32]);
-    let observer = common::Signer::new([8u8; 32]);
-    let stranger = common::Signer::new([10u8; 32]);
-    let publisher = common::Signer::new([1u8; 32]);
-    let key = |signer: &common::Signer, key_id: &str| serde_json::json!({"key_id": key_id, "alg": "Ed25519", "public_key": signer.public_b64u()});
-    let (_, head_hash) = head_of(&fx);
-    let at = "2026-08-09T14:00:00Z";
-    let (_, hash, _) = seal_next(
-        &fx,
-        &head_hash,
-        at,
-        &[
-            roster_act(
-                "auditor_admit",
-                "audit.sample.net",
-                key(&auditor, "a1"),
-                &fx.log,
-                "log1",
-                at,
-            ),
-            roster_act(
-                "auditor_admit",
-                "forged.sample.net",
-                key(&auditor, "a2"),
-                &stranger,
-                "log1",
-                at,
-            ),
-            roster_act(
-                "observer_register",
-                "watch.sample.net",
-                key(&observer, "w1"),
-                &observer,
-                "w1",
-                at,
-            ),
-            roster_act(
-                "observer_register",
-                "spoof.sample.net",
-                key(&observer, "w2"),
-                &stranger,
-                "w2",
-                at,
-            ),
-            roster_act(
-                "canary_commitment",
-                "records.example",
-                serde_json::json!({"root": format!("sha256:{}", "3".repeat(64)), "leaves": 5}),
-                &publisher,
-                "pk1",
-                at,
-            ),
-            roster_act(
-                "canary_commitment",
-                "records.example",
-                serde_json::json!({"root": format!("sha256:{}", "4".repeat(64)), "leaves": 5}),
-                &stranger,
-                "pk1",
-                at,
-            ),
-        ],
-    );
-    let report = run_sync(&fx, target.path());
-    assert_eq!(report.head, 2);
-
-    let conn =
-        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
-    let auditors: Vec<(String, i64, Option<i64>)> = conn
-        .prepare(
-            "SELECT auditor_id, admitted_height, removed_height FROM auditors ORDER BY auditor_id",
-        )
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(auditors, vec![("audit.sample.net".to_string(), 2, None)]);
-    let observers: Vec<(String, i64, Option<i64>)> = conn
-        .prepare("SELECT observer_id, registered_height, ended_height FROM observers ORDER BY observer_id")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(observers, vec![("watch.sample.net".to_string(), 2, None)]);
-    let commitments: Vec<(String, String, i64, i64)> = conn
-        .prepare("SELECT planter, root, leaves, sealing_height FROM canary_commitments")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(
-        commitments,
-        vec![(
-            "records.example".to_string(),
-            format!("sha256:{}", "3".repeat(64)),
-            5,
-            2
-        )]
-    );
-    let state: String = conn
-        .query_row("SELECT state FROM replay_state WHERE id = 1", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert!(state.contains("watch.sample.net"));
-    drop(conn);
-
-    let later = "2026-08-09T15:00:00Z";
-    let rotated = common::Signer::new([11u8; 32]);
-    seal_next(
-        &fx,
-        &hash,
-        later,
-        &[
-            roster_act(
-                "auditor_remove",
-                "audit.sample.net",
-                serde_json::json!({"key_id": "a1"}),
-                &fx.log,
-                "log1",
-                later,
-            ),
-            roster_act(
-                "observer_register",
-                "watch.sample.net",
-                key(&rotated, "w2"),
-                &rotated,
-                "w2",
-                later,
-            ),
-        ],
-    );
-    let report = run_sync(&fx, target.path());
-    assert_eq!(report.head, 3);
-    let conn =
-        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
-    let removed: Option<i64> = conn
-        .query_row(
-            "SELECT removed_height FROM auditors WHERE auditor_id = 'audit.sample.net'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(removed, Some(3));
-    let tenures: Vec<(String, i64, Option<i64>)> = conn
-        .prepare(
-            "SELECT key_id, registered_height, ended_height FROM observers WHERE observer_id = 'watch.sample.net' ORDER BY key_id",
-        )
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(
-        tenures,
-        vec![("w1".to_string(), 2, Some(3)), ("w2".to_string(), 3, None)]
-    );
 }
 
 fn synced_state(target: &std::path::Path) -> graven::sync::SyncState {

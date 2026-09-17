@@ -50,7 +50,6 @@ pub struct RecordFixture {
     pub publisher: String,
     pub delta_id: String,
     pub observed_at: String,
-    pub weight: String,
     pub title: String,
     pub abstract_text: Option<String>,
     pub lang: String,
@@ -62,7 +61,6 @@ fn record_projection(r: &RecordFixture) -> Value {
         "publisher": r.publisher,
         "delta_id": r.delta_id,
         "observed_at": r.observed_at,
-        "weight": r.weight,
     })
 }
 
@@ -320,14 +318,14 @@ pub fn write_tier0(path: &Path, records: &[RecordFixture]) -> Vec<u8> {
     }
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
-        "CREATE TABLE records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, weight TEXT, title TEXT, abstract TEXT, lang TEXT);
+        "CREATE TABLE records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, title TEXT, abstract TEXT, lang TEXT);
          CREATE VIRTUAL TABLE records_fts USING fts5(title, abstract, content=records, content_rowid=rowid);",
     )
     .unwrap();
     for r in records {
         conn.execute(
-            "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            (&r.url, &r.publisher, &r.delta_id, &r.observed_at, &r.weight, &r.title, &r.abstract_text, &r.lang),
+            "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (&r.url, &r.publisher, &r.delta_id, &r.observed_at, &r.title, &r.abstract_text, &r.lang),
         )
         .unwrap();
     }
@@ -1036,7 +1034,6 @@ fn build_fixture_state(
         publisher: domain.clone(),
         delta_id: id1.clone(),
         observed_at: "2026-08-09T12:00:00Z".into(),
-        weight: "full".into(),
         title: "Alpha Title".into(),
         abstract_text: Some("Alpha abstract".into()),
         lang: "en".into(),

@@ -283,7 +283,7 @@ def main() -> int:
             conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
             try:
                 rows = conn.execute(
-                    "SELECT url, publisher, delta_id, observed_at, weight FROM records"
+                    "SELECT url, publisher, delta_id, observed_at FROM records"
                 ).fetchall()
             finally:
                 conn.close()
@@ -293,7 +293,6 @@ def main() -> int:
                     "publisher": r[1],
                     "delta_id": r[2],
                     "observed_at": r[3],
-                    "weight": r[4],
                 }
                 for r in rows
             ]

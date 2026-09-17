@@ -14,8 +14,6 @@ use crate::fetch::{resolve, Client};
 
 use crate::registry::{self, LogEntry};
 
-use crate::replay::load_replay;
-
 use crate::store::{CREATE_DECLARATIONS, CREATE_UNIQUE_INDEX};
 
 use reqwest::Url;
@@ -260,13 +258,12 @@ fn run_incremental(
     verify_checkpoint_binding(&checkpoint_value, &last_block_value)?;
 
     let mut history = load_history(&conn)?;
-    let mut replay = load_replay(&conn)?;
     let tx = conn.unchecked_transaction()?;
     save_parameters(&tx, &chain)?;
     save_aggregator_keys(&tx, &aggregator_keys)?;
     tx.execute(CREATE_UNIQUE_INDEX, [])?;
     tx.execute(CREATE_DECLARATIONS, [])?;
-    let stats = apply_events(&tx, client, base, &mut history, &mut replay, &events, tier1)?;
+    let stats = apply_events(&tx, client, base, &mut history, &events, tier1)?;
     tx.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
     if tier1 {
         tx.execute(
@@ -306,8 +303,7 @@ fn run_cold_start(
     sync_path: &Path,
     tier1: bool,
 ) -> Result<SyncReport> {
-    let mut installed =
-        install::snapshot(client, base, trust_key, genesis_key_id, log_id, dir, tier1)?;
+    let mut installed = install::snapshot(client, base, trust_key, genesis_key_id, dir, tier1)?;
     let checkpoint_url = resolve(base, "/log/checkpoint.json")?;
     let (_, checkpoint_value) = client.get_json(&checkpoint_url)?;
     let checkpoint_env: CheckpointEnvelope = serde_json::from_value(checkpoint_value.clone())?;
@@ -350,7 +346,6 @@ fn run_cold_start(
         client,
         base,
         &mut installed.history,
-        &mut installed.replay,
         &events,
         tier1,
     )?;

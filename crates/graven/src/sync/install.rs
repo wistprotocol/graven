@@ -1,13 +1,12 @@
 use super::history::{
     default_recovery_window_days, persist_declaration, AggregatorKeys, ChainState,
 };
-use super::persist::{load_aggregator_keys, load_sanctions, save_chain_tips, save_sanctions};
+use super::persist::{load_aggregator_keys, record_withdrawal, save_chain_tips};
 use crate::error::{Error, Result};
 use crate::fetch::resolve;
 use crate::fetch::Client;
 use crate::keyset::KeyHistory;
 use crate::registry::{self};
-use crate::replay::{save_state, ActProfile, ActReplay};
 use crate::store::{CREATE_DECLARATIONS, CREATE_TIER1, CREATE_UNIQUE_INDEX};
 use crate::tier1;
 use reqwest::Url;
@@ -77,8 +76,7 @@ pub(super) fn load_anchor_bytes(spec: &str, client: &Client) -> Result<Vec<u8>> 
 
 pub(super) fn recompute_content_digest(sqlite_path: &Path) -> Result<String> {
     let conn = Connection::open(sqlite_path)?;
-    let mut stmt =
-        conn.prepare("SELECT url, publisher, delta_id, observed_at, weight FROM records")?;
+    let mut stmt = conn.prepare("SELECT url, publisher, delta_id, observed_at FROM records")?;
     let records = stmt
         .query_map([], |row| {
             Ok(serde_json::json!({
@@ -86,7 +84,6 @@ pub(super) fn recompute_content_digest(sqlite_path: &Path) -> Result<String> {
                 "publisher": row.get::<_, String>(1)?,
                 "delta_id": row.get::<_, String>(2)?,
                 "observed_at": row.get::<_, String>(3)?,
-                "weight": row.get::<_, String>(4)?,
             }))
         })?
         .collect::<rusqlite::Result<Vec<Value>>>()?;
@@ -117,7 +114,6 @@ pub(super) struct Installation {
     pub(super) anchor_block_hash: String,
     pub(super) content_digest: String,
     pub(super) history: KeyHistory,
-    pub(super) replay: ActReplay,
     pub(super) aggregator_keys: AggregatorKeys,
     pub(super) chain: ChainState,
 }
@@ -148,7 +144,6 @@ pub(super) fn snapshot(
     base: &Url,
     trust_key: &PublicKey,
     genesis_key_id: &str,
-    log_id: &str,
     dir: &Path,
     tier1: bool,
 ) -> Result<Installation> {
@@ -264,15 +259,11 @@ pub(super) fn snapshot(
     // already holds reads as a fork; without the recovery windows, an
     // in-window rotation by a thief is invisible.
     let mut history = KeyHistory::new();
-    let mut replay = ActReplay::new(log_id);
     conn.execute_batch(crate::store::CREATE_CHAIN_TIPS)?;
     let mut tips = ChainTips::new();
     let mut adopted_keys: Vec<(String, String, Option<u64>)> = Vec::new();
-    let mut adopted_sanctions: Vec<(String, u64)> = Vec::new();
-    let mut adopted_exclusions: Vec<(String, String, u64)> = Vec::new();
     let mut adopted_windows: Vec<(String, String, Value, u64)> = Vec::new();
     let mut adopted_parameters: Vec<(String, String, i64)> = Vec::new();
-    conn.execute_batch(crate::store::CREATE_ADOPTED_STATE)?;
     for entry in &state_env.state.entries {
         match entry {
             StateEntry::Parameter(p) => {
@@ -302,100 +293,17 @@ pub(super) fn snapshot(
                     w.head_height,
                 ));
             }
-            StateEntry::Auditor(a) => {
-                replay.adopt_auditor(
-                    &a.auditor_id,
-                    &a.key_id,
-                    &a.public_key,
-                    a.removed_height.is_none(),
-                );
-                conn.execute(
-                    "INSERT OR REPLACE INTO auditors(auditor_id, key_id, public_key, admitted_height, removed_height) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    (
-                        &a.auditor_id,
-                        &a.key_id,
-                        &a.public_key,
-                        a.admitted_height as i64,
-                        a.removed_height.map(|h| h as i64),
-                    ),
-                )?;
+            // WIST-3 §6.2 and §7: a Consumer resuming above a withdrawal's
+            // Block never sees its Entry, so the tuple is what excludes
+            // the content from every later materialization.
+            StateEntry::Withdrawal(w) => {
+                record_withdrawal(&conn, &w.delta_id, &w.publisher, w.sealing_height)?;
+                super::history::remove_by_delta_id(&conn, &w.delta_id)?;
             }
-            StateEntry::Observer(o) => {
-                replay.adopt_observer(
-                    &o.observer_id,
-                    &o.key_id,
-                    &o.public_key,
-                    o.registered_height,
-                    o.ended_height.is_none(),
-                );
-                conn.execute(
-                    "INSERT OR REPLACE INTO observers(observer_id, key_id, public_key, registered_height, ended_height) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    (
-                        &o.observer_id,
-                        &o.key_id,
-                        &o.public_key,
-                        o.registered_height as i64,
-                        o.ended_height.map(|h| h as i64),
-                    ),
-                )?;
-            }
-            StateEntry::CanaryCommitment(c) => {
-                replay.adopt_commitment(
-                    &c.update_id,
-                    &c.planter,
-                    &c.root,
-                    c.leaves,
-                    c.sealing_height,
-                );
-                conn.execute(
-                    "INSERT OR REPLACE INTO canary_commitments(update_id, planter, root, leaves, sealing_height) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    (
-                        &c.update_id,
-                        &c.planter,
-                        &c.root,
-                        c.leaves as i64,
-                        c.sealing_height as i64,
-                    ),
-                )?;
-            }
-            StateEntry::Escalation(e) => {
-                conn.execute(
-                    "INSERT OR REPLACE INTO escalations(domain, establishing_sealed_at) VALUES (?1, ?2)",
-                    (&e.domain, &e.establishing_sealed_at),
-                )?;
-            }
-            StateEntry::CoverageFailure(f) => {
-                conn.execute(
-                    "INSERT OR REPLACE INTO coverage_failures(auditor_id, block_number) VALUES (?1, ?2)",
-                    (&f.auditor_id, f.block_number as i64),
-                )?;
-            }
-            StateEntry::ReputationInputs(r) => {
-                conn.execute(
-                    "INSERT OR REPLACE INTO reputation_inputs(domain, first_accepted_sealed_at, reset_height, counted_total, counted_json, penalties_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    (
-                        &r.domain,
-                        &r.first_accepted_sealed_at,
-                        r.reset_height.map(|h| h as i64),
-                        r.counted_total as i64,
-                        serde_json::to_string(&r.counted_url_digests)?,
-                        serde_json::to_string(&r.penalties)?,
-                    ),
-                )?;
-            }
+            StateEntry::Label(_) => {}
             StateEntry::Record(r) => tips.adopt(&r.publisher, &r.url, &r.delta_id),
             StateEntry::AggregatorKey(k) => {
                 adopted_keys.push((k.key_id.clone(), k.public_key.clone(), k.removed_height));
-            }
-            StateEntry::SanctionState(state) => {
-                adopted_sanctions.push((state.domain.clone(), state.level));
-            }
-            StateEntry::Exclusion(e) => {
-                adopted_exclusions.push((
-                    e.publisher.clone(),
-                    e.url.clone(),
-                    e.excluded_since_height,
-                ));
             }
         }
     }
@@ -403,12 +311,6 @@ pub(super) fn snapshot(
         history.adopt_window(domain, window_end, head, *head_height)?;
     }
     history.seed_head(manifest.log_position, &manifest.anchor_block_hash);
-    replay.seed_head(
-        manifest.log_position,
-        &manifest.anchor_block_hash,
-        ActProfile::default(),
-    )?;
-    save_state(&conn, &replay)?;
     for (_, _, head, head_height) in &adopted_windows {
         persist_declaration(
             &conn,
@@ -420,17 +322,6 @@ pub(super) fn snapshot(
         )?;
     }
     save_chain_tips(&conn, &tips)?;
-    let mut ledger = load_sanctions(&conn)?;
-    for (domain, level) in &adopted_sanctions {
-        let entry = ledger.domains.entry(domain.clone()).or_default();
-        entry.level = (*level).clamp(0, 4) as u8;
-    }
-    for (publisher, url, since) in &adopted_exclusions {
-        ledger
-            .exclusions
-            .insert((publisher.clone(), url.clone()), *since);
-    }
-    save_sanctions(&conn, &ledger)?;
 
     let mut aggregator_keys = load_aggregator_keys(&conn, genesis_key_id, trust_key)?;
     for (key_id, public_key, removed_height) in &adopted_keys {
@@ -445,7 +336,6 @@ pub(super) fn snapshot(
         anchor_block_hash: manifest.anchor_block_hash.clone(),
         content_digest: manifest.content_digest.clone(),
         history,
-        replay,
         aggregator_keys,
         chain,
     })

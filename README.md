@@ -1,6 +1,6 @@
 # graven
 
-The signed Delta format targets [WIST specification revision `b96e21fe97b591075c369db17346df81292a8158`](https://github.com/wistprotocol/spec/tree/b96e21fe97b591075c369db17346df81292a8158). Object version `1.0.0` alone does not identify a compatible draft.
+The signed Delta format targets [WIST specification revision `d75bd49abcfbbe6a672e4fb695e078b489f51ba7`](https://github.com/wistprotocol/spec/tree/d75bd49abcfbbe6a672e4fb695e078b489f51ba7). Object version `1.0.0` alone does not identify a compatible draft.
 
 WIST Protocol consumer and MCP server. Graven cold-syncs a verified Snapshot,
 then applies incremental Blocks to a separate SQLite index per Log (WIST-3 §8).
@@ -28,9 +28,9 @@ where `--tier1` is on, `extracts`/`links`/FTS tables) whose `sync_state`
 row is the sync cursor (`log_position`, head block number/hash,
 `content_digest`, the schedule position); `sync.json` beside it mirrors
 that row for readers of the file and is rewritten after each commit.
-Publisher declarations, chain tips, Aggregator keys, parameters and the
-replay engines' state are persisted in `index.sqlite` too, so an
-incremental sync reloads them without re-walking the chain from genesis.
+Publisher declarations, chain tips, Aggregator keys, parameters and
+withdrawals are persisted in `index.sqlite` too, so an incremental sync
+reloads them without re-walking the chain from genesis.
 Every incremental sync commits the cursor, keys, parameters and index
 rows in one transaction, so a sync that cannot commit leaves all of them
 at the previous head; a cold start builds the whole index, cursor
@@ -105,31 +105,21 @@ fresh identity that cannot alter a protected recovery set and yields to a
 still-open recovery window. An invalid Declaration fails the sync. On cold start the Snapshot's `declaration` tuple supplies the
 accepted sequence floor every later Declaration must exceed, and a
 `recovery_window` tuple restores the recovery-chain head at its own height
-with the window end on it (WIST-3 §§7/8); the `escalation`,
-`coverage_failure` and `reputation_inputs` tuples are persisted in the
-store for the replays that will read them.
+with the window end on it (WIST-3 §§7/8); a `withdrawal` tuple is recorded
+in the `withdrawals` table and removes the content it names from the
+adopted index, so a Consumer resuming above the withdrawal's Block excludes
+it exactly as a replaying one does (WIST-3 §6.2); a `label` tuple is parsed
+and carried no further.
 
-Roster and canary acts replay through core's shared engines in every
-Block (WIST-4 §3.1, §5.1, ADR-0012). Only `aggregator_key_add` and
-`aggregator_key_remove` must verify under an Aggregator key for the Block
-to stand; every other Registry Update authenticates under its own rule
-(`auditor_admit` and `auditor_remove` under the Log key, `observer_register`
-and `observer_checkpoint` under the registered key, `canary_commitment` and
-`canary_reveal` under the planter's Declaration keys at that Block) and one
-that fails is ignored without failing the sync (WIST-4 §9.1). Admissions,
-removals, registrations and rotations, epoch rations, reveal timing and
-sealing opportunity follow the same batch rules a replaying Consumer
-applies, with each Block's canary and coverage parameters read from the
-accepted schedule and its verified Deltas registered for reveal binding.
-The `auditors`, `observers` and `canary_commitments` tables mirror the
-accepted acts at their sealing heights, and both engines persist in
-`replay_state` between syncs. A cold start seeds the engines from the
-Snapshot's `auditor`, `observer` and `canary_commitment` tuples at the
-anchor height; a reveal whose commitment or leaves were sealed below that
-height keeps the structural checks and skips the timing and opportunity
-tests the tuples cannot support. Full recovery replay and materialization
-preference among overlapping scoped Publishers remain separate validation
-requirements.
+Registry Updates carry four acts (WIST-4 §3). Only `aggregator_key_add`
+and `aggregator_key_remove` must verify under an Aggregator key for the
+Block to stand; a `parameter_change` replays through the accepted schedule
+above and a `payload_withdrawal` records the withdrawn Delta and removes
+its record, extracts, links and embeddings; a withdrawal sealed in the
+same Block as the Delta it names keeps that Delta from materializing at
+all. A `label` Entry is verified as part of the Block and otherwise left
+alone. Full recovery replay and materialization preference among
+overlapping scoped Publishers remain separate validation requirements.
 
 ## Companion packs
 
@@ -162,8 +152,7 @@ text), `get_links` (declared outbound links, Tier 1), `similar_records`
 (nearest neighbors by an imported companion pack). Merging across logs
 happens at query time, in two steps: rows sharing one `delta_id` collapse
 into one, with `provenance` listing every log that carries it (`log_id`,
-`synced_height`, `weight` — `weight` is never merged, since it's derived
-per log from that log's own sanction/reputation state); rows for the same
+`synced_height`); rows for the same
 URL and publisher but different `delta_id` (logs that diverged, or synced
 to different heights) resolve to whichever has the later `observed_at`,
 `delta_id` breaking ties (WIST-3 §8).

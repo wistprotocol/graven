@@ -1,12 +1,12 @@
-use super::history::{AggregatorKeys, ChainState, DomainSanction, SanctionLedger};
+use super::history::{AggregatorKeys, ChainState};
 use super::SyncState;
 use crate::error::{Error, Result};
 use crate::keyset::KeyHistory;
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::BTreeSet;
 use wist_core::chain::ChainTips;
 use wist_core::crypto::PublicKey;
 use wist_core::parameters::Amendment;
-use wist_core::sanctions::Outcome;
 
 pub(super) fn load_aggregator_keys(
     conn: &Connection,
@@ -111,91 +111,28 @@ pub fn load_history(conn: &Connection) -> Result<KeyHistory> {
     }
 }
 
-pub(super) fn load_sanctions(conn: &Connection) -> Result<SanctionLedger> {
-    conn.execute_batch(crate::store::CREATE_SANCTIONS)?;
-    let mut ledger = SanctionLedger::default();
-    let mut stmt = conn.prepare(
-        "SELECT domain, level, since_height, notice_at, appeal_at, ruling, ruling_at FROM sanctions",
-    )?;
+/// WIST-3 §6.2: the withdrawn Delta IDs the store holds, from adopted
+/// tuples and walked withdrawals alike.
+pub(super) fn load_withdrawn(conn: &Connection) -> Result<BTreeSet<String>> {
+    conn.execute_batch(crate::store::CREATE_WITHDRAWALS)?;
+    let mut stmt = conn.prepare("SELECT delta_id FROM withdrawals")?;
     let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (domain, level, since, notice_at, appeal_at, ruling, ruling_at) in rows {
-        let ruling = match (ruling.as_deref(), ruling_at) {
-            (Some("overturned"), Some(at)) => Some((Outcome::Overturned, at)),
-            (Some("upheld"), Some(at)) => Some((Outcome::Upheld, at)),
-            (Some("unappealed"), Some(at)) => Some((Outcome::Unappealed, at)),
-            _ => None,
-        };
-        ledger.domains.insert(
-            domain,
-            DomainSanction {
-                level: level.clamp(0, 4) as u8,
-                since_height: since.max(0) as u64,
-                notice_at,
-                appeal_at,
-                ruling,
-            },
-        );
-    }
-    let mut stmt = conn.prepare("SELECT publisher, url, since_height FROM exclusions")?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (publisher, url, since) in rows {
-        ledger
-            .exclusions
-            .insert((publisher, url), since.max(0) as u64);
-    }
-    Ok(ledger)
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    Ok(rows)
 }
 
-pub(super) fn save_sanctions(conn: &Connection, ledger: &SanctionLedger) -> Result<()> {
-    conn.execute_batch(crate::store::CREATE_SANCTIONS)?;
-    for (domain, state) in &ledger.domains {
-        let (ruling, ruling_at) = match state.ruling {
-            Some((Outcome::Overturned, at)) => (Some("overturned"), Some(at)),
-            Some((Outcome::Upheld, at)) => (Some("upheld"), Some(at)),
-            Some((Outcome::Unappealed, at)) => (Some("unappealed"), Some(at)),
-            None => (None, None),
-        };
-        conn.execute(
-            "INSERT INTO sanctions(domain, level, since_height, notice_at, appeal_at, ruling, ruling_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(domain) DO UPDATE SET level = excluded.level, since_height = excluded.since_height, notice_at = excluded.notice_at, appeal_at = excluded.appeal_at, ruling = excluded.ruling, ruling_at = excluded.ruling_at",
-            (
-                domain,
-                state.level as i64,
-                state.since_height as i64,
-                state.notice_at,
-                state.appeal_at,
-                ruling,
-                ruling_at,
-            ),
-        )?;
-    }
-    for ((publisher, url), since) in &ledger.exclusions {
-        conn.execute(
-            "INSERT INTO exclusions(publisher, url, since_height) VALUES (?1, ?2, ?3)
-             ON CONFLICT(publisher, url) DO UPDATE SET since_height = excluded.since_height",
-            (publisher, url, *since as i64),
-        )?;
-    }
+pub(super) fn record_withdrawal(
+    conn: &Connection,
+    delta_id: &str,
+    publisher: &str,
+    height: u64,
+) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_WITHDRAWALS)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO withdrawals(delta_id, publisher, height) VALUES (?1, ?2, ?3)",
+        (delta_id, publisher, height as i64),
+    )?;
     Ok(())
 }
 

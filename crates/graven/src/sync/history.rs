@@ -1,11 +1,10 @@
 use super::persist::{
-    load_chain_tips, load_sanctions, save_chain_tips, save_history, save_sanctions,
+    load_chain_tips, load_withdrawn, record_withdrawal, save_chain_tips, save_history,
 };
 use super::SyncState;
 use crate::error::{Error, Result};
 use crate::fetch::{resolve, Client};
 use crate::keyset::{DeltaProfile, KeyHistory};
-use crate::replay::{mirror_act, save_replay, ActBlock, ActProfile, ActReplay};
 use crate::store::{table_exists, CREATE_TIER1};
 use reqwest::Url;
 use rusqlite::{Connection, OptionalExtension};
@@ -19,7 +18,6 @@ use wist_core::objects::{
     ChangeType, DeltaEnvelope, DeltaPayloadCommitment, Payload, PublisherEnvelope,
 };
 use wist_core::parameters::{Amendment, Schedule};
-use wist_core::sanctions::Outcome;
 use wist_core::timestamp::log_seconds;
 
 /// WIST-4 §9 and ADR-0020: the accepted parameter schedule, the largest
@@ -139,21 +137,12 @@ pub struct BlockEvent {
     /// `recovery_window_days` in force at `sealed_at`, which freezes the
     /// end of a recovery window opened in this Block (WIST-1 §5.2).
     pub recovery_window_days: i64,
-    /// Every Entry in canonical Block order, for the act replays.
-    pub entries: Vec<Value>,
-    /// The Log key that signed the Block, under which Log-signed acts verify.
-    pub log_key_id: String,
-    pub log_key: String,
-    /// The canary and coverage parameters in force at `sealed_at`.
-    pub act_profile: ActProfile,
     /// The `publisher_declaration` Entries in canonical Block order.
     pub declarations: Vec<Value>,
-    pub withdrawals: Vec<String>,
+    /// Each `payload_withdrawal` sealed in this Block, as the withdrawn
+    /// Delta ID and the Publisher domain the act names (WIST-3 §6.2).
+    pub withdrawals: Vec<(String, String)>,
     pub delta_bodies: Vec<Value>,
-    /// WIST-4 §7 governance acts, from which the sanction ladder is
-    /// derived; WIST-3 §7 reads levels 2, 3 and 4 as materialization
-    /// inputs.
-    pub governance: Vec<Value>,
 }
 
 pub struct ApplyStats {
@@ -412,14 +401,12 @@ pub fn walk_blocks(
         }
         let profile = DeltaProfile::from_schedule(schedule, at);
         let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
-        let act_profile = ActProfile::from_schedule(schedule, at);
         chain.largest = largest;
         chain.prior_at = Some(at);
 
         let mut declarations = Vec::new();
         let mut withdrawals = Vec::new();
         let mut delta_bodies = Vec::new();
-        let mut governance = Vec::new();
 
         for entry in block_value
             .get("entries")
@@ -440,12 +427,6 @@ pub fn walk_blocks(
                     let body = entry.get("body").ok_or_else(|| {
                         Error::Verify(format!("block {n}: registry_update entry missing body"))
                     })?;
-                    if matches!(
-                        body["update"]["action"].as_str(),
-                        Some("sanction" | "sanction_lift" | "notice" | "appeal" | "appeal_ruling")
-                    ) {
-                        governance.push(body["update"].clone());
-                    }
                     if body["update"]["action"] == "payload_withdrawal" {
                         let withdrawn_id = body["update"]["details"]["delta_id"]
                             .as_str()
@@ -454,7 +435,8 @@ pub fn walk_blocks(
                                     "block {n}: payload_withdrawal missing details.delta_id"
                                 ))
                             })?;
-                        withdrawals.push(withdrawn_id.to_string());
+                        let publisher = body["update"]["subject"].as_str().unwrap_or_default();
+                        withdrawals.push((withdrawn_id.to_string(), publisher.to_string()));
                     }
                 }
                 Some("publisher_delta") => {
@@ -478,17 +460,9 @@ pub fn walk_blocks(
             sealed_at_s: at,
             profile,
             recovery_window_days,
-            entries: block_value["entries"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
-            log_key_id: block_key_id.to_string(),
-            log_key: block_key.to_b64u(),
-            act_profile,
             declarations,
             withdrawals,
             delta_bodies,
-            governance,
         });
         last_block_value = Some(block_value);
     }
@@ -572,85 +546,11 @@ pub(super) fn remove_by_url(conn: &Connection, url: &str, publisher: &str) -> Re
     Ok(())
 }
 
-#[derive(Debug, Clone, Default)]
-pub(super) struct DomainSanction {
-    pub(super) level: u8,
-    pub(super) since_height: u64,
-    pub(super) notice_at: Option<i64>,
-    pub(super) appeal_at: Option<i64>,
-    pub(super) ruling: Option<(Outcome, i64)>,
-}
-
-/// WIST-4 §7 as WIST-3 §7 reads it: level 2 marks a domain's records
-/// reduced-weight, level 3 stops its later Deltas from materializing
-/// from the height it takes effect, level 4 removes its records. A
-/// lapsed T, a lapsed ruling deadline and an "overturned" ruling void
-/// the level-3 and level-4 states, leaving the rungs below in force.
-#[derive(Default)]
-pub(super) struct SanctionLedger {
-    pub(super) domains: BTreeMap<String, DomainSanction>,
-    pub(super) exclusions: BTreeMap<(String, String), u64>,
-}
-
-impl SanctionLedger {
-    fn apply(&mut self, height: u64, sealed_at_s: i64, update: &Value) {
-        let Some(domain) = update["subject"].as_str() else {
-            return;
-        };
-        let entry = self.domains.entry(domain.to_string()).or_default();
-        match update["action"].as_str() {
-            Some("sanction") => {
-                if let Some(level) = update["details"]["level"].as_u64() {
-                    entry.level = level.clamp(0, 4) as u8;
-                    entry.since_height = height;
-                }
-            }
-            Some("sanction_lift") => *entry = DomainSanction::default(),
-            Some("notice") if update["details"]["kind"] == "sanction" => {
-                entry.notice_at = Some(sealed_at_s);
-            }
-            Some("appeal") => entry.appeal_at = Some(sealed_at_s),
-            Some("appeal_ruling") => {
-                let outcome = match update["details"]["outcome"].as_str() {
-                    Some("overturned") => Outcome::Overturned,
-                    Some("upheld") => Outcome::Upheld,
-                    _ => Outcome::Unappealed,
-                };
-                entry.ruling = Some((outcome, sealed_at_s));
-            }
-            _ => {}
-        }
-    }
-
-    fn level_at(&self, domain: &str, now_s: i64) -> (u8, u64) {
-        let Some(state) = self.domains.get(domain) else {
-            return (0, 0);
-        };
-        if state.level >= 3 {
-            if let Some(void_at) =
-                wist_core::sanctions::state_void_at(state.notice_at, state.appeal_at, state.ruling)
-            {
-                if now_s >= void_at {
-                    return (state.level.clamp(1, 2), state.since_height);
-                }
-            }
-        }
-        (state.level, state.since_height)
-    }
-
-    fn excluded(&self, publisher: &str, url: &str, height: u64) -> bool {
-        self.exclusions
-            .get(&(publisher.to_string(), url.to_string()))
-            .is_some_and(|since| height >= *since)
-    }
-}
-
 pub fn apply_events(
     conn: &Connection,
     client: &Client,
     base: &Url,
     history: &mut KeyHistory,
-    replay: &mut ActReplay,
     events: &[BlockEvent],
     tier1: bool,
 ) -> Result<ApplyStats> {
@@ -663,12 +563,9 @@ pub fn apply_events(
     }
     conn.execute_batch(crate::store::CREATE_CHAIN_TIPS)?;
     let mut tips = load_chain_tips(conn)?;
-    let mut ledger = load_sanctions(conn)?;
+    let mut withdrawn = load_withdrawn(conn)?;
     for event in events {
         let sealed_at_s = event.sealed_at_s;
-        for update in &event.governance {
-            ledger.apply(event.height, sealed_at_s, update);
-        }
         history.apply_block(
             event.height,
             &event.prev_block_hash,
@@ -687,8 +584,9 @@ pub fn apply_events(
                 &entry["body"],
             )?;
         }
-        let log_key = PublicKey::from_b64u(&event.log_key)?;
-        for delta_id in &event.withdrawals {
+        for (delta_id, publisher) in &event.withdrawals {
+            record_withdrawal(conn, delta_id, publisher, event.height)?;
+            withdrawn.insert(delta_id.clone());
             if remove_by_delta_id(conn, delta_id)? {
                 stats.withdrawn += 1;
             }
@@ -711,7 +609,6 @@ pub fn apply_events(
             let env: DeltaEnvelope = serde_json::from_value(body.clone())?;
             let id = verified.id;
             let publisher = verified.publisher;
-            replay.register_delta(&id, event.height, &publisher);
             // WIST-1 §3.5: a Delta whose prev is not the chain tip the
             // state carries is a fork, and moves nothing.
             if !tips.apply(&publisher, &env.delta.url, &id, env.delta.prev.as_deref()) {
@@ -720,21 +617,11 @@ pub fn apply_events(
             if !verified.materializes {
                 continue;
             }
-            let (level, since_height) = ledger.level_at(&publisher, sealed_at_s);
-            // WIST-3 §7: level 4 removes the domain's records, level 3
-            // stops its later Deltas from materializing at all, and
-            // level 2 marks what does materialize reduced-weight.
-            if level == 4 {
-                conn.execute("DELETE FROM records WHERE publisher = ?1", [&publisher])?;
+            // WIST-3 §6.2: a withdrawn Delta's content never materializes,
+            // even when the withdrawal sealed in the same Block.
+            if withdrawn.contains(&id) {
                 continue;
             }
-            if level == 3 && event.height >= since_height {
-                continue;
-            }
-            if ledger.excluded(&publisher, &env.delta.url, event.height) {
-                continue;
-            }
-            let weight = if level == 2 { "reduced" } else { "full" };
 
             match env.delta.change_type {
                 ChangeType::New | ChangeType::Update => {
@@ -747,18 +634,17 @@ pub fn apply_events(
                     let abstract_text = fields.as_ref().and_then(|f| f.abstract_text.clone());
 
                     conn.execute(
-                        "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                        "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                          ON CONFLICT(url, publisher) DO UPDATE SET
                             delta_id = excluded.delta_id, observed_at = excluded.observed_at,
-                            weight = excluded.weight, title = excluded.title,
-                            abstract = excluded.abstract, lang = excluded.lang",
+                            title = excluded.title, abstract = excluded.abstract,
+                            lang = excluded.lang",
                         (
                             &env.delta.url,
                             &publisher,
                             &id,
                             &env.delta.observed_at,
-                            weight,
                             &title,
                             &abstract_text,
                             &env.delta.meta.lang,
@@ -814,27 +700,8 @@ pub fn apply_events(
                 }
             }
         }
-        let accepted = replay.apply_block(
-            ActBlock {
-                height: event.height,
-                block_hash: &event.block_hash,
-                sealed_at_s,
-                entries: &event.entries,
-                log_key_id: &event.log_key_id,
-                log_key: &log_key,
-                profile: event.act_profile,
-            },
-            history.declarations(),
-        )?;
-        for act in &accepted {
-            mirror_act(conn, act, event.height)?;
-        }
     }
     save_chain_tips(conn, &tips)?;
-    save_sanctions(conn, &ledger)?;
     save_history(conn, history)?;
-    if let Some(last) = events.last() {
-        save_replay(conn, replay, last.height)?;
-    }
     Ok(stats)
 }

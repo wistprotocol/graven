@@ -22,14 +22,11 @@ pub const CREATE_CHAIN_TIPS: &str =
 pub const CREATE_AGGREGATOR_KEYS: &str =
     "CREATE TABLE IF NOT EXISTS aggregator_keys(key_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, removed INTEGER NOT NULL)";
 
-/// WIST-4 §7's ladder as the Log states it, and WIST-4 §5's exclusions,
-/// both of which WIST-3 §7 reads when materializing.
-pub const CREATE_SANCTIONS: &str =
-    "CREATE TABLE IF NOT EXISTS sanctions(domain TEXT PRIMARY KEY, level INTEGER NOT NULL, since_height INTEGER NOT NULL, notice_at INTEGER, appeal_at INTEGER, ruling TEXT, ruling_at INTEGER); CREATE TABLE IF NOT EXISTS exclusions(publisher TEXT NOT NULL, url TEXT NOT NULL, since_height INTEGER NOT NULL, PRIMARY KEY(publisher, url))";
-
-/// WIST-3 §7's remaining state kinds, adopted from a Snapshot on cold start
-/// so a resuming Consumer holds what a replaying one derives.
-pub const CREATE_ADOPTED_STATE: &str = "CREATE TABLE IF NOT EXISTS auditors(auditor_id TEXT NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, admitted_height INTEGER NOT NULL, removed_height INTEGER, PRIMARY KEY(auditor_id, key_id)); CREATE TABLE IF NOT EXISTS observers(observer_id TEXT NOT NULL, key_id TEXT NOT NULL, public_key TEXT NOT NULL, registered_height INTEGER NOT NULL, ended_height INTEGER, PRIMARY KEY(observer_id, key_id)); CREATE TABLE IF NOT EXISTS canary_commitments(update_id TEXT PRIMARY KEY, planter TEXT NOT NULL, root TEXT NOT NULL, leaves INTEGER NOT NULL, sealing_height INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS escalations(domain TEXT PRIMARY KEY, establishing_sealed_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS coverage_failures(auditor_id TEXT NOT NULL, block_number INTEGER NOT NULL, PRIMARY KEY(auditor_id, block_number)); CREATE TABLE IF NOT EXISTS reputation_inputs(domain TEXT PRIMARY KEY, first_accepted_sealed_at TEXT NOT NULL, reset_height INTEGER, counted_total INTEGER NOT NULL, counted_json TEXT NOT NULL, penalties_json TEXT NOT NULL)";
+/// WIST-3 §6.2: every withdrawn Delta, adopted from the Snapshot's
+/// `withdrawal` tuples and extended by each walked `payload_withdrawal`,
+/// so its content never materializes again.
+pub const CREATE_WITHDRAWALS: &str =
+    "CREATE TABLE IF NOT EXISTS withdrawals(delta_id TEXT PRIMARY KEY, publisher TEXT NOT NULL, height INTEGER NOT NULL)";
 
 /// WIST-4 §9: the accepted parameter amendments, so a restarted sync
 /// continues the schedule a replaying Consumer holds.
@@ -45,7 +42,6 @@ pub struct RecordHit {
     pub publisher: String,
     pub delta_id: String,
     pub observed_at: String,
-    pub weight: String,
     pub title: String,
     pub r#abstract: Option<String>,
 }
@@ -56,9 +52,8 @@ fn row_to_hit(row: &rusqlite::Row) -> rusqlite::Result<RecordHit> {
         publisher: row.get(1)?,
         delta_id: row.get(2)?,
         observed_at: row.get(3)?,
-        weight: row.get(4)?,
-        title: row.get(5)?,
-        r#abstract: row.get(6)?,
+        title: row.get(4)?,
+        r#abstract: row.get(5)?,
     })
 }
 
@@ -66,7 +61,6 @@ fn row_to_hit(row: &rusqlite::Row) -> rusqlite::Result<RecordHit> {
 pub struct ProvEntry {
     pub log_id: String,
     pub synced_height: u64,
-    pub weight: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,20 +85,17 @@ struct ExtractRow {
     extract: String,
     delta_id: String,
     observed_at: String,
-    weight: String,
 }
 
 fn merge_extract(rows: Vec<(String, u64, ExtractRow)>) -> Option<(String, Vec<ProvEntry>)> {
     let mut by_delta: BTreeMap<String, (ExtractRow, Vec<ProvEntry>)> = BTreeMap::new();
     for (log_id, synced_height, row) in rows {
-        let weight = row.weight.clone();
         let entry = by_delta
             .entry(row.delta_id.clone())
             .or_insert_with(|| (row, Vec::new()));
         entry.1.push(ProvEntry {
             log_id,
             synced_height,
-            weight,
         });
     }
 
@@ -202,7 +193,6 @@ struct SimilarCandidate {
     url: String,
     publisher: String,
     observed_at: String,
-    weight: String,
     title: String,
     r#abstract: Option<String>,
 }
@@ -214,23 +204,20 @@ fn row_to_similar_candidate(row: &rusqlite::Row) -> rusqlite::Result<SimilarCand
         url: row.get(2)?,
         publisher: row.get(3)?,
         observed_at: row.get(4)?,
-        weight: row.get(5)?,
-        title: row.get(6)?,
-        r#abstract: row.get(7)?,
+        title: row.get(5)?,
+        r#abstract: row.get(6)?,
     })
 }
 
 fn merge(rows: Vec<(String, u64, RecordHit)>) -> Vec<MergedHit> {
     let mut by_delta: BTreeMap<String, (RecordHit, Vec<ProvEntry>)> = BTreeMap::new();
     for (log_id, synced_height, hit) in rows {
-        let weight = hit.weight.clone();
         let entry = by_delta
             .entry(hit.delta_id.clone())
             .or_insert_with(|| (hit, Vec::new()));
         entry.1.push(ProvEntry {
             log_id,
             synced_height,
-            weight,
         });
     }
 
@@ -437,7 +424,7 @@ impl Store {
     pub fn search(&self, q: &str, limit: usize) -> Result<Vec<RecordHit>> {
         let phrase = quote_phrase(q);
         let mut stmt = self.conn.prepare(
-            "SELECT r.url, r.publisher, r.delta_id, r.observed_at, r.weight, r.title, r.abstract
+            "SELECT r.url, r.publisher, r.delta_id, r.observed_at, r.title, r.abstract
              FROM records_fts f JOIN records r ON r.rowid = f.rowid
              WHERE records_fts MATCH ?1 LIMIT ?2",
         )?;
@@ -447,7 +434,7 @@ impl Store {
 
         if table_exists(&self.conn, "extracts")? {
             let mut estmt = self.conn.prepare(
-                "SELECT r.url, r.publisher, r.delta_id, r.observed_at, r.weight, r.title, r.abstract
+                "SELECT r.url, r.publisher, r.delta_id, r.observed_at, r.title, r.abstract
                  FROM extracts_fts f JOIN extracts e ON e.rowid = f.rowid
                  JOIN records r ON r.url = e.url AND r.publisher = e.publisher
                  WHERE extracts_fts MATCH ?1 LIMIT ?2",
@@ -491,7 +478,7 @@ impl Store {
     pub fn get(&self, url: &str) -> Result<Option<RecordHit>> {
         self.conn
             .query_row(
-                "SELECT url, publisher, delta_id, observed_at, weight, title, abstract
+                "SELECT url, publisher, delta_id, observed_at, title, abstract
                  FROM records WHERE url = ?1 LIMIT 1",
                 [url],
                 row_to_hit,
@@ -506,7 +493,7 @@ impl Store {
         }
         self.conn
             .query_row(
-                "SELECT e.extract, e.delta_id, r.observed_at, r.weight
+                "SELECT e.extract, e.delta_id, r.observed_at
                  FROM extracts e JOIN records r ON r.url = e.url AND r.publisher = e.publisher
                  WHERE e.url = ?1 LIMIT 1",
                 [url],
@@ -515,7 +502,6 @@ impl Store {
                         extract: row.get(0)?,
                         delta_id: row.get(1)?,
                         observed_at: row.get(2)?,
-                        weight: row.get(3)?,
                     })
                 },
             )
@@ -570,7 +556,7 @@ impl Store {
         let target_vec = blob_to_vec(&target_blob)?;
 
         let mut stmt = self.conn.prepare(
-            "SELECT e.delta_id, e.vector, r.url, r.publisher, r.observed_at, r.weight, r.title, r.abstract
+            "SELECT e.delta_id, e.vector, r.url, r.publisher, r.observed_at, r.title, r.abstract
              FROM embeddings e JOIN records r ON r.delta_id = e.delta_id",
         )?;
         let candidates = stmt
@@ -608,7 +594,6 @@ impl Store {
                         provenance: vec![ProvEntry {
                             log_id: log_id.to_string(),
                             synced_height,
-                            weight: candidate.weight,
                         }],
                     },
                     score,
@@ -625,18 +610,17 @@ mod tests {
     fn seed(dir: &Path) {
         let conn = Connection::open(dir.join("index.sqlite")).unwrap();
         conn.execute_batch(
-            "CREATE TABLE records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, weight TEXT, title TEXT, abstract TEXT, lang TEXT);
+            "CREATE TABLE records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, title TEXT, abstract TEXT, lang TEXT);
              CREATE VIRTUAL TABLE records_fts USING fts5(title, abstract, content=records, content_rowid=rowid);",
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
                 "https://example.com/alpha",
                 "example.com",
                 "sha256:a",
                 "2026-08-09T00:00:00Z",
-                "full",
                 "Alpha Title",
                 Some("Alpha abstract text"),
                 "en",
@@ -676,7 +660,7 @@ mod tests {
         assert!(store.get("https://example.com/nope").unwrap().is_none());
         let hit = store.get("https://example.com/alpha").unwrap().unwrap();
         assert_eq!(hit.publisher, "example.com");
-        assert_eq!(hit.weight, "full");
+        assert_eq!(hit.delta_id, "sha256:a");
     }
 
     #[test]
@@ -709,13 +693,12 @@ mod tests {
         assert!(store.get("https://example.com/alpha").unwrap().is_some());
     }
 
-    fn hit(url: &str, delta_id: &str, observed_at: &str, weight: &str) -> RecordHit {
+    fn hit(url: &str, delta_id: &str, observed_at: &str) -> RecordHit {
         RecordHit {
             url: url.into(),
             publisher: "example.com".into(),
             delta_id: delta_id.into(),
             observed_at: observed_at.into(),
-            weight: weight.into(),
             title: "T".into(),
             r#abstract: None,
         }
@@ -731,7 +714,6 @@ mod tests {
                     "https://example.com/a",
                     "sha256:same",
                     "2026-08-09T12:00:00Z",
-                    "reduced",
                 ),
             ),
             (
@@ -741,7 +723,6 @@ mod tests {
                     "https://example.com/a",
                     "sha256:same",
                     "2026-08-09T12:00:00Z",
-                    "full",
                 ),
             ),
         ];
@@ -751,10 +732,8 @@ mod tests {
         assert_eq!(m.provenance.len(), 2);
         assert_eq!(m.provenance[0].log_id, "log-a");
         assert_eq!(m.provenance[0].synced_height, 3);
-        assert_eq!(m.provenance[0].weight, "full");
         assert_eq!(m.provenance[1].log_id, "log-b");
         assert_eq!(m.provenance[1].synced_height, 5);
-        assert_eq!(m.provenance[1].weight, "reduced");
     }
 
     #[test]
@@ -767,7 +746,6 @@ mod tests {
                     "https://example.com/a",
                     "sha256:stale",
                     "2026-08-09T12:00:00Z",
-                    "full",
                 ),
             ),
             (
@@ -777,7 +755,6 @@ mod tests {
                     "https://example.com/a",
                     "sha256:fresh",
                     "2026-08-09T13:00:00Z",
-                    "full",
                 ),
             ),
         ];
@@ -799,7 +776,6 @@ mod tests {
                     "https://example.com/a",
                     "sha256:aaa",
                     "2026-08-09T12:00:00Z",
-                    "full",
                 ),
             ),
             (
@@ -809,7 +785,6 @@ mod tests {
                     "https://example.com/a",
                     "sha256:bbb",
                     "2026-08-09T12:00:00Z",
-                    "full",
                 ),
             ),
         ];
@@ -818,24 +793,17 @@ mod tests {
         assert_eq!(merged[0].delta_id, "sha256:bbb");
     }
 
-    fn seed_row(
-        log_dir: &Path,
-        url: &str,
-        delta_id: &str,
-        observed_at: &str,
-        weight: &str,
-        title: &str,
-    ) {
+    fn seed_row(log_dir: &Path, url: &str, delta_id: &str, observed_at: &str, title: &str) {
         std::fs::create_dir_all(log_dir).unwrap();
         let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, weight TEXT, title TEXT, abstract TEXT, lang TEXT);
+            "CREATE TABLE IF NOT EXISTS records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, title TEXT, abstract TEXT, lang TEXT);
              CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(title, abstract, content=records, content_rowid=rowid);",
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang) VALUES (?1, 'example.com', ?2, ?3, ?4, ?5, NULL, 'en')",
-            (url, delta_id, observed_at, weight, title),
+            "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang) VALUES (?1, 'example.com', ?2, ?3, ?4, NULL, 'en')",
+            (url, delta_id, observed_at, title),
         )
         .unwrap();
         conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])
@@ -911,7 +879,6 @@ mod tests {
             "https://example.com/alpha",
             "sha256:same",
             "2026-08-09T00:00:00Z",
-            "full",
             "Alpha Title",
         );
         seed_sync(&log_a, 3);
@@ -920,7 +887,6 @@ mod tests {
             "https://example.com/alpha",
             "sha256:same",
             "2026-08-09T00:00:00Z",
-            "reduced",
             "Alpha Title",
         );
         seed_sync(&log_b, 5);
@@ -931,9 +897,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].provenance.len(), 2);
         assert_eq!(hits[0].provenance[0].log_id, "log-a");
-        assert_eq!(hits[0].provenance[0].weight, "full");
         assert_eq!(hits[0].provenance[1].log_id, "log-b");
-        assert_eq!(hits[0].provenance[1].weight, "reduced");
 
         let record = store.get("https://example.com/alpha").unwrap().unwrap();
         assert_eq!(record.provenance.len(), 2);
@@ -948,7 +912,6 @@ mod tests {
             "https://example.com/alpha",
             "sha256:a",
             "2026-08-09T00:00:00Z",
-            "full",
             "Match One",
         );
         seed_row(
@@ -956,7 +919,6 @@ mod tests {
             "https://example.com/beta",
             "sha256:b",
             "2026-08-09T01:00:00Z",
-            "full",
             "Match Two",
         );
         seed_sync(&log_a, 1);
@@ -1037,7 +999,6 @@ mod tests {
             "https://example.com/alpha",
             "sha256:a",
             "2026-08-09T00:00:00Z",
-            "full",
             "Alpha Title",
         );
         seed_sync(&log_dir, 1);
@@ -1080,7 +1041,6 @@ mod tests {
             "https://example.com/alpha",
             "sha256:a",
             "2026-08-09T00:00:00Z",
-            "full",
             "Alpha Title",
         );
         seed_sync(&log_a, 4);
@@ -1140,7 +1100,6 @@ mod tests {
             "https://example.com/alpha",
             "sha256:stale",
             "2026-08-09T12:00:00Z",
-            "full",
             "Alpha Title",
         );
         seed_tier1_row(
@@ -1157,7 +1116,6 @@ mod tests {
             "https://example.com/alpha",
             "sha256:fresh",
             "2026-08-09T13:00:00Z",
-            "full",
             "Alpha Title",
         );
         seed_tier1_row(
@@ -1216,7 +1174,6 @@ mod tests {
             "https://example.com/a",
             "sha256:a",
             "2026-08-09T00:00:00Z",
-            "full",
             "A",
         );
         seed_row(
@@ -1224,7 +1181,6 @@ mod tests {
             "https://example.com/b",
             "sha256:b",
             "2026-08-09T00:00:00Z",
-            "full",
             "B",
         );
         seed_row(
@@ -1232,7 +1188,6 @@ mod tests {
             "https://example.com/c",
             "sha256:c",
             "2026-08-09T00:00:00Z",
-            "full",
             "C",
         );
         seed_row(
@@ -1240,7 +1195,6 @@ mod tests {
             "https://example.com/d",
             "sha256:d",
             "2026-08-09T00:00:00Z",
-            "full",
             "D",
         );
         seed_embeddings(
@@ -1281,7 +1235,6 @@ mod tests {
         assert!((hits[2].score - (-1.0)).abs() < 1e-9);
         assert_eq!(hits[0].hit.provenance.len(), 1);
         assert_eq!(hits[0].hit.provenance[0].log_id, "log-a");
-        assert_eq!(hits[0].hit.provenance[0].weight, "full");
     }
 
     #[test]
@@ -1321,7 +1274,6 @@ mod tests {
             "https://example.com/origin",
             "sha256:origin",
             "2026-08-09T00:00:00Z",
-            "full",
             "Origin",
         );
         seed_row(
@@ -1329,7 +1281,6 @@ mod tests {
             "https://example.com/near",
             "sha256:near",
             "2026-08-09T00:00:00Z",
-            "full",
             "Near",
         );
         seed_row(
@@ -1337,7 +1288,6 @@ mod tests {
             "https://example.com/mid",
             "sha256:mid",
             "2026-08-09T00:00:00Z",
-            "full",
             "Mid",
         );
         seed_row(
@@ -1345,7 +1295,6 @@ mod tests {
             "https://example.com/far",
             "sha256:far",
             "2026-08-09T00:00:00Z",
-            "full",
             "Far",
         );
         seed_embeddings(
@@ -1383,7 +1332,6 @@ mod tests {
             "https://example.com/other",
             "sha256:other",
             "2026-08-09T00:00:00Z",
-            "full",
             "Other",
         );
         seed_sync(&log_a, 1);
@@ -1393,7 +1341,6 @@ mod tests {
             "https://example.com/a",
             "sha256:a",
             "2026-08-09T00:00:00Z",
-            "full",
             "A",
         );
         seed_row(
@@ -1401,7 +1348,6 @@ mod tests {
             "https://example.com/b",
             "sha256:b",
             "2026-08-09T00:00:00Z",
-            "full",
             "B",
         );
         seed_embeddings(
@@ -1431,7 +1377,6 @@ mod tests {
             "https://example.com/a",
             "sha256:a",
             "2026-08-09T00:00:00Z",
-            "full",
             "A",
         );
         seed_sync(&log_a, 1);
@@ -1453,7 +1398,6 @@ mod tests {
             "https://example.com/alpha",
             "sha256:a",
             "2026-08-09T00:00:00Z",
-            "full",
             "Alpha Title",
         );
         seed_sync(&log_a, 1);

@@ -286,18 +286,17 @@ mod tests {
         std::fs::create_dir_all(log_dir).unwrap();
         let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
         conn.execute_batch(
-            "CREATE TABLE records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, weight TEXT, title TEXT, abstract TEXT, lang TEXT);
+            "CREATE TABLE records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, title TEXT, abstract TEXT, lang TEXT);
              CREATE VIRTUAL TABLE records_fts USING fts5(title, abstract, content=records, content_rowid=rowid);",
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
                 "https://example.com/alpha",
                 "example.com",
                 "sha256:a",
                 "2026-08-09T00:00:00Z",
-                "full",
                 "Alpha Title",
                 Some("Alpha abstract text"),
                 "en",
@@ -305,13 +304,12 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO records(url, publisher, delta_id, observed_at, weight, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
                 "https://example.com/beta",
                 "example.com",
                 "sha256:b",
                 "2026-08-09T01:00:00Z",
-                "full",
                 "Beta Title",
                 Some("Beta abstract text"),
                 "en",
