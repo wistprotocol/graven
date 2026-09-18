@@ -3,15 +3,17 @@ mod common;
 use common::Signer;
 use graven::store::MultiStore;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use wist_core::crypto::hex_decode;
 
-fn load_vector() -> Option<Value> {
-    let dir = std::env::var("WIST_SPEC_DIR").ok()?;
-    let path = Path::new(&dir).join("vectors/multilog/dedup.json");
+fn load_vector() -> Value {
+    let dir = std::env::var_os("WIST_SPEC_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec"));
+    let path = dir.join("vectors/multilog/dedup.json");
     let bytes = std::fs::read(&path)
         .unwrap_or_else(|e| panic!("reading spec vector at {}: {e}", path.display()));
-    Some(serde_json::from_slice(&bytes).unwrap())
+    serde_json::from_slice(&bytes).unwrap()
 }
 
 struct LogFixture {
@@ -60,13 +62,25 @@ fn build_log_fixture(vector: &Value, log: &Value) -> LogFixture {
     let sqlite_bytes = common::write_tier0(&snapdir.join("tier0/index.sqlite"), &[]);
     let content_digest_value = wist_core::snapshot::content_digest(&[]).unwrap();
 
-    let (state_bytes, state_digest_value) = common::write_state(
+    // WIST-3 §7: the state carries an `aggregator_key` tuple for the
+    // Anchor's genesis key, which this Log's Anchor names itself.
+    let genesis = &log["anchor"]["anchor"]["genesis_key"];
+    let (state_bytes, state_digest_value) = common::write_state_with(
         &snapdir.join("state.json"),
         &signer,
         3600,
         &[(domain, vector["publisher_declaration"].clone())],
         &[],
         anchor_size,
+        vec![wist_core::objects::StateEntry::AggregatorKey(
+            wist_core::objects::AggregatorKeyEntry {
+                key_id: genesis["key_id"].as_str().unwrap().to_string(),
+                public_key: genesis["public_key"].as_str().unwrap().to_string(),
+                added_height: 0,
+                removed_height: None,
+            },
+        )],
+        0,
     );
 
     common::write_manifest(
@@ -101,10 +115,7 @@ fn build_log_fixture(vector: &Value, log: &Value) -> LogFixture {
 
 #[test]
 fn multilog_dedup_vector() {
-    let Some(vector) = load_vector() else {
-        println!("skip: WIST_SPEC_DIR not set, skipping spec multi-log dedup vector test");
-        return;
-    };
+    let vector = load_vector();
 
     let logs = vector["logs"].as_array().unwrap();
     let fixtures: Vec<LogFixture> = logs
