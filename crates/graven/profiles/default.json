@@ -20,19 +20,19 @@
   "filters": {
     "distrust_above": 0.5,
     "spam": true,
-    "min_age_blocks": 0,
+    "min_age_epochs": 0,
     "trusted_graph_only": false
   },
   "propagation": {
     "alpha": 0.15,
     "iterations": 20,
-    "decay_per_block": 0.999,
-    "growth_window_blocks": 720,
+    "decay_per_epoch": 0.999,
+    "growth_window_epochs": 720,
     "growth_damping": 1.0
   },
   "readings": {
-    "persistence_blocks": 2,
-    "labeler_inactive_blocks": 720
+    "persistence_epochs": 2,
+    "labeler_inactive_epochs": 720
   },
   "personalization": false
 }

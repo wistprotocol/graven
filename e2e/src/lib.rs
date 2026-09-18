@@ -554,9 +554,9 @@ pub fn wait_until_pulled_since(
 
 /// WIST-3 §3.2 seals on the accepted cadence grid, hourly by default and
 /// amendable only with a seven-day grace, so the harness advances Log time
-/// by whole hours: the first Block seals at the next hour boundary and each
+/// by whole hours: the first Epoch seals at the next hour boundary and each
 /// later one an hour after it, while Deltas keep wall-clock `observed_at`
-/// values that stay inside every Block's clock allowance.
+/// values that stay inside every Epoch's clock allowance.
 pub fn grid_instant(hours_ahead: i64) -> String {
     let now = jiff::Timestamp::now().as_second();
     let next_hour = now.div_euclid(3600) * 3600 + 3600;

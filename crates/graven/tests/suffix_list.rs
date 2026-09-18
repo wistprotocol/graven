@@ -15,7 +15,7 @@ fn serve_list(fx: &common::Fixture, octets: &[u8]) -> String {
     identifier
 }
 
-fn append_block(fx: &common::Fixture, entries: &[Value]) -> u64 {
+fn append_epoch(fx: &common::Fixture, entries: &[Value]) -> u64 {
     let sealed_at = common::next_instant(fx);
     common::seal_next(fx, &sealed_at, entries)
 }
@@ -81,7 +81,7 @@ fn a_pinned_snapshot_is_obtained_verified_and_held() {
     assert_eq!(held(target.path()), (Vec::new(), Vec::new()));
 
     let identifier = serve_list(&fx, LIST);
-    let height = append_block(&fx, &[suffix_act(&fx, &identifier, LIST.len())]);
+    let height = append_epoch(&fx, &[suffix_act(&fx, &identifier, LIST.len())]);
     sync(&fx, target.path()).unwrap();
     assert_eq!(
         held(target.path()),
@@ -91,12 +91,12 @@ fn a_pinned_snapshot_is_obtained_verified_and_held() {
         )
     );
 
-    append_block(&fx, &[suffix_act(&fx, &identifier, LIST.len() + 1)]);
+    append_epoch(&fx, &[suffix_act(&fx, &identifier, LIST.len() + 1)]);
     sync(&fx, target.path()).unwrap();
     assert_eq!(held(target.path()).1.len(), 1);
 
     let unserved = wist_core::suffix_list::identifier(b"net\n");
-    append_block(&fx, &[suffix_act(&fx, &unserved, 4)]);
+    append_epoch(&fx, &[suffix_act(&fx, &unserved, 4)]);
     let err = sync(&fx, target.path()).unwrap_err().to_string();
     assert!(err.contains("WIST3-E01"), "{err}");
 }
@@ -113,7 +113,7 @@ fn a_served_file_that_does_not_hash_to_its_name_fails_the_sync() {
         b"net\n",
     )
     .unwrap();
-    append_block(&fx, &[suffix_act(&fx, &identifier, LIST.len())]);
+    append_epoch(&fx, &[suffix_act(&fx, &identifier, LIST.len())]);
     let err = sync(&fx, target.path()).unwrap_err().to_string();
     assert!(err.contains("WIST3-E03"), "{err}");
 }
@@ -122,7 +122,7 @@ fn a_served_file_that_does_not_hash_to_its_name_fails_the_sync() {
 fn capacity_is_counted_per_registrable_domain_under_the_adopted_tuple() {
     let identifier = wist_core::suffix_list::identifier(LIST);
     let caps = |extra: &mut Vec<StateEntry>| {
-        for name in ["domain_block_entries_max", "labeler_block_entries_max"] {
+        for name in ["domain_epoch_entries_max", "labeler_epoch_entries_max"] {
             extra.push(StateEntry::Parameter(ParameterEntry {
                 name: name.into(),
                 effective_at: "2026-08-09T13:00:00Z".into(),
@@ -140,7 +140,7 @@ fn capacity_is_counted_per_registrable_domain_under_the_adopted_tuple() {
     let target = tempfile::tempdir().unwrap();
     sync(&fx, target.path()).unwrap();
     assert_eq!(held(target.path()).1, vec![(0, identifier.clone())]);
-    append_block(
+    append_epoch(
         &fx,
         &[
             delta_entry("https://a.example.com/x"),
@@ -158,7 +158,7 @@ fn capacity_is_counted_per_registrable_domain_under_the_adopted_tuple() {
     let fx = common::build_fixture_with_state(without_tuple, 0);
     let target = tempfile::tempdir().unwrap();
     sync(&fx, target.path()).unwrap();
-    append_block(
+    append_epoch(
         &fx,
         &[
             delta_entry("https://a.example.com/x"),
@@ -166,7 +166,7 @@ fn capacity_is_counted_per_registrable_domain_under_the_adopted_tuple() {
         ],
     );
     sync(&fx, target.path()).unwrap();
-    append_block(
+    append_epoch(
         &fx,
         &[
             delta_entry("https://a.example.com/x"),

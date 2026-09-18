@@ -101,7 +101,7 @@ fn a_fresh_identity_supplies_no_authority_while_pending_and_a_reversal_discards_
 fn a_fresh_identity_activates_at_the_delay_the_parameter_map_fixes() {
     let fx = common::build_fixture_with_state(
         vec![StateEntry::Parameter(ParameterEntry {
-            name: "declaration_activation_blocks".into(),
+            name: "declaration_activation_epochs".into(),
             effective_at: "2026-08-09T13:00:00Z".into(),
             value: 1,
         })],
@@ -117,7 +117,7 @@ fn a_fresh_identity_activates_at_the_delay_the_parameter_map_fixes() {
     assert_eq!(
         activation,
         sealed + 1,
-        "the parameter map fixes a one-Block delay"
+        "the parameter map fixes a one-Epoch delay"
     );
     sync(&fx, target.path());
     assert!(present(target.path(), &activated_url));
@@ -170,7 +170,7 @@ fn a_pending_declaration_tuple_resumes_into_its_activation() {
     assert!(present(target.path(), "https://records.example/alpha"));
     assert!(
         !present(target.path(), "https://records.example/beta"),
-        "the replaced key signs nothing from the activation Block on"
+        "the replaced key signs nothing from the activation Epoch on"
     );
     assert!(present(target.path(), &activated_url));
 }

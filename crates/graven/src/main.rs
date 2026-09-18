@@ -117,7 +117,7 @@ enum PackCommand {
 
 fn print_report(report: &SyncReport) {
     let from = report
-        .block_number_before
+        .epoch_number_before
         .map_or_else(|| "cold start".to_string(), |n| n.to_string());
     let witnessing = if report.unwitnessed {
         "unwitnessed"
@@ -126,7 +126,7 @@ fn print_report(report: &SyncReport) {
     };
     let staleness = if report.stale { ", stale" } else { "" };
     println!(
-        "[{}] synced from {from} to head block {} (tree size {}, root {}, {witnessing}{staleness}), withdrawn {}",
+        "[{}] synced from {from} to head epoch {} (tree size {}, root {}, {witnessing}{staleness}), withdrawn {}",
         report.log_id, report.head, report.tree_size, report.root, report.withdrawn
     );
 }

@@ -5,7 +5,7 @@ use graven::store::{save_subscriptions, MultiStore};
 use serde_json::{json, Value};
 use wist_core::envelope::sign_envelope;
 
-fn append_block(fx: &common::Fixture, entries: &[Value]) -> u64 {
+fn append_epoch(fx: &common::Fixture, entries: &[Value]) -> u64 {
     let sealed_at = common::next_instant(fx);
     common::seal_next(fx, &sealed_at, entries)
 }
@@ -111,7 +111,7 @@ fn a_profile_and_a_height_reproduce_a_ranking() {
     }
     let label = json!({"wist_version": "1.0.0", "labeler": "labels.example", "subject": "seed.example", "name": "wist:trust-seed", "asserted_at": "2026-08-09T12:30:00Z"});
     entries.push(json!({"type": "label", "body": sign_envelope(&label, "label", &labeler.signer.kid(), &labeler.signer.sk).unwrap()}));
-    let height = append_block(&fx, &entries);
+    let height = append_epoch(&fx, &entries);
     sync(&fx, target.path());
     let mut subscriptions = std::collections::BTreeSet::new();
     subscriptions.insert("labels.example".to_string());
@@ -134,7 +134,7 @@ fn a_profile_and_a_height_reproduce_a_ranking() {
     assert!(cited_hit.signals.relevance < ranked[1].signals.relevance);
     assert_eq!(ranked[1].signals.trust, 0.0);
     assert!(ranked[1].signals.inlinks > 0.0 && ranked[1].signals.inlink_growth > 0.0);
-    assert_eq!(cited_hit.signals.age_blocks, Some(0));
+    assert_eq!(cited_hit.signals.age_epochs, Some(0));
     assert!(cited_hit
         .explanation
         .iter()
@@ -246,7 +246,7 @@ fn ranking_costs_are_measured() {
             &refs,
         ));
     }
-    append_block(&fx, &entries);
+    append_epoch(&fx, &entries);
     sync(&fx, target.path());
     let store = MultiStore::open_read_only(target.path()).unwrap();
     let mut personal = load_profile(target.path(), "personal-seeds").unwrap();

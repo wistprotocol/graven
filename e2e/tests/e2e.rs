@@ -936,7 +936,7 @@ fn end_to_end() {
     let thief = wist_core::crypto::SigningKey::from_seed(&[42u8; 32]);
     let thief_entry = wist_core::objects::PublisherKey::new(
         &thief.public().to_b64u(),
-        u64::try_from(jiff::Timestamp::now().as_second() - 3600).expect("epoch second"),
+        u64::try_from(jiff::Timestamp::now().as_second() - 3600).expect("unix second"),
         None,
     );
     let hijacked = wist_core::envelope::sign_envelope(
@@ -1086,7 +1086,7 @@ fn end_to_end() {
     );
     drop(mcp4);
 
-    // --- a one-Block mismatch Label is not counted yet ---
+    // --- a one-Epoch mismatch Label is not counted yet ---
     run(
         &spake,
         &[
@@ -1144,30 +1144,30 @@ fn end_to_end() {
             .map(|h| h["ranking"]["signals"]["mismatch"] == true)
             .unwrap_or_else(|| panic!("no hit for {cited_url}: {hits:?}"))
     };
-    let one_block = mcp5.tool_call(
+    let one_epoch = mcp5.tool_call(
         "search",
         serde_json::json!({"query": "orchard", "profile": "default"}),
     );
     assert!(
-        !cited_mismatch(one_block.as_array().expect("search returns an array")),
-        "a Label sealed one Block ago must not count yet: {one_block}"
+        !cited_mismatch(one_epoch.as_array().expect("search returns an array")),
+        "a Label sealed one Epoch ago must not count yet: {one_epoch}"
     );
     drop(mcp5);
 
-    // The same Label, still live a Block later, counts.
+    // The same Label, still live an Epoch later, counts.
     let ninth_seal = grid_instant(8);
     for data in [&clave_data, &clave2_data] {
         run(&clave, &["seal", "--data", s(data), "--at", &ninth_seal]);
     }
     run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
     let mut mcp6 = McpClient::start(&graven, &gdir);
-    let two_blocks = mcp6.tool_call(
+    let two_epochs = mcp6.tool_call(
         "search",
         serde_json::json!({"query": "orchard", "profile": "default"}),
     );
     assert!(
-        cited_mismatch(two_blocks.as_array().expect("search returns an array")),
-        "a Label live through two consecutive Blocks must count: {two_blocks}"
+        cited_mismatch(two_epochs.as_array().expect("search returns an array")),
+        "a Label live through two consecutive Epochs must count: {two_epochs}"
     );
     drop(mcp6);
 

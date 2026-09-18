@@ -99,12 +99,12 @@ fn mismatch_at(
 #[test]
 fn the_default_profile_counts_a_mismatch_label_only_once_it_has_persisted() {
     let profile = load_profile(std::path::Path::new("/nonexistent"), "default").unwrap();
-    assert_eq!(profile.readings.persistence_blocks, 2);
+    assert_eq!(profile.readings.persistence_epochs, 2);
     let vector = vector("wist3/label-tables");
     let mut cases = 0;
     for case in vector["persistence_cases"].as_array().unwrap() {
         let events = case["events"].as_array().unwrap();
-        // The vector's expiry height is the first height at which the Block
+        // The vector's expiry height is the first height at which the Epoch
         // instant reaches the expiry; the index reads it from the head's
         // instant, so an expiring case is probed against that boundary.
         let expiry = case["expires_at_height"].as_u64();
@@ -141,7 +141,7 @@ fn a_profile_ignores_a_labeler_that_has_sealed_nothing_within_its_window() {
     let mut cases = 0;
     for case in vector["inactivity_cases"].as_array().unwrap() {
         let mut profile = load_profile(std::path::Path::new("/nonexistent"), "default").unwrap();
-        profile.readings.labeler_inactive_blocks = case["inactivity_blocks"].as_u64().unwrap();
+        profile.readings.labeler_inactive_epochs = case["inactivity_epochs"].as_u64().unwrap();
         let conn = index(events, None, case["last_sealed_height"].as_u64().unwrap());
         assert_eq!(
             mismatch_at(&conn, &profile, case["height"].as_u64().unwrap(), None),
@@ -168,11 +168,11 @@ fn a_label_an_index_holds_only_as_a_snapshot_tuple_still_counts() {
     conn.execute("DELETE FROM labels", []).unwrap();
     assert!(
         mismatch_at(&conn, &profile, 5000, None),
-        "a Label sealed below the Snapshot was live at the head and the Block before it"
+        "a Label sealed below the Snapshot was live at the head and the Epoch before it"
     );
     assert!(
         !mismatch_at(&conn, &profile, 4000, None),
-        "the Block that sealed it is still its first"
+        "the Epoch that sealed it is still its first"
     );
 }
 

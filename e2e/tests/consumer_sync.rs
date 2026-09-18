@@ -25,7 +25,7 @@ fn seal_reaching_witnesses(clave: &Path, log: &Aggregator, at: &str) {
     );
 }
 
-/// The head Block, tree size and whether the acceptance was unwitnessed,
+/// The head Epoch, tree size and whether the acceptance was unwitnessed,
 /// as `graven sync` reports them.
 fn sync(graven: &Path, dir: &Path, log: &Aggregator, witnesses: &[&str]) -> (u64, u64, bool) {
     let anchor = log.data.join("anchor.json");
@@ -47,7 +47,7 @@ fn sync(graven: &Path, dir: &Path, log: &Aggregator, witnesses: &[&str]) -> (u64
     let output = run(graven, &borrowed);
     let line = String::from_utf8_lossy(&output.stdout)
         .lines()
-        .find(|line| line.contains("head block"))
+        .find(|line| line.contains("head epoch"))
         .unwrap_or_else(|| {
             panic!(
                 "no sync report in {}",
@@ -56,11 +56,11 @@ fn sync(graven: &Path, dir: &Path, log: &Aggregator, witnesses: &[&str]) -> (u64
         })
         .to_string();
     let head = line
-        .split("head block ")
+        .split("head epoch ")
         .nth(1)
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("no head block in {line:?}"));
+        .unwrap_or_else(|| panic!("no head epoch in {line:?}"));
     let tree_size = line
         .split("tree size ")
         .nth(1)
@@ -70,7 +70,7 @@ fn sync(graven: &Path, dir: &Path, log: &Aggregator, witnesses: &[&str]) -> (u64
     (head, tree_size, line.contains("unwitnessed"))
 }
 
-/// WIST-3 §8: a Consumer cold-starts at the Snapshot's Block, keeps the
+/// WIST-3 §8: a Consumer cold-starts at the Snapshot's Epoch, keeps the
 /// verified head in its store, and each later run continues from it.
 #[test]
 fn a_consumer_cold_starts_at_a_snapshot_and_continues_from_its_persisted_head() {
@@ -82,7 +82,7 @@ fn a_consumer_cold_starts_at_a_snapshot_and_continues_from_its_persisted_head() 
 
     seal(&clave, &log, &grid_instant(0));
     let (head, tree_size, unwitnessed) = sync(&graven, &dir, &log, &[]);
-    assert_eq!(head, 0, "the cold start adopts the Snapshot's Block");
+    assert_eq!(head, 0, "the cold start adopts the Snapshot's Epoch");
     assert!(
         unwitnessed,
         "with an empty roster and a quorum of 0 the head is adopted unwitnessed"
@@ -97,8 +97,8 @@ fn a_consumer_cold_starts_at_a_snapshot_and_continues_from_its_persisted_head() 
         .expect("the Consumer persisted its sync state"),
     )
     .expect("sync.json is JSON");
-    assert_eq!(state["block_number"], head);
-    assert_eq!(state["log_position"], tree_size);
+    assert_eq!(state["epoch_number"], head);
+    assert_eq!(state["tree_size"], tree_size);
     assert_eq!(state["unwitnessed"], true);
 
     seal(&clave, &log, &grid_instant(1));
@@ -125,7 +125,7 @@ fn a_source_serving_an_old_head_does_not_regress_the_consumer() {
     assert_eq!(head, 1);
 
     let current = std::fs::read(log.data.join("checkpoint")).expect("read the head Checkpoint");
-    let stale = std::fs::read(log.data.join("log/checkpoints/000000000")).expect("read Block 0");
+    let stale = std::fs::read(log.data.join("log/checkpoints/000000000")).expect("read Epoch 0");
     std::fs::write(log.data.join("checkpoint"), &stale).expect("serve the old head");
     let (head, _, _) = sync(&graven, &dir, &log, &[]);
     assert_eq!(head, 1, "the stale head adopts nothing and is no error");

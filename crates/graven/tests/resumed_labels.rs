@@ -17,7 +17,7 @@ fn label_entry(signer: &Signer, inner: Value) -> (String, Value) {
 
 /// Builds a Log whose only Snapshot is at `snapshot_height`, so a
 /// Consumer syncing this fixture resumes from it and never walks the
-/// Blocks the Snapshot's tuples stand in for.
+/// Epochs the Snapshot's tuples stand in for.
 struct Resumed {
     dir: tempfile::TempDir,
     target: tempfile::TempDir,
@@ -88,7 +88,7 @@ fn setup_resumed(
     }
 }
 
-fn seal_after_snapshot(r: &Resumed, _block_number: u64, sealed_at: &str, entries: &[Value]) {
+fn seal_after_snapshot(r: &Resumed, _epoch_number: u64, sealed_at: &str, entries: &[Value]) {
     r.state.borrow_mut().seal(sealed_at, entries);
 }
 
@@ -267,9 +267,9 @@ fn default_profile_naming(labeler: &str) -> Profile {
             "seeds": [],
             "distrust_seeds": [],
             "weights": {{"trust_floor": 0.05, "trust": 1.0, "inlinks": 0.25, "freshness": 0.2, "distrust": 1.0, "mismatch": 0.5}},
-            "filters": {{"distrust_above": 0.5, "spam": true, "min_age_blocks": 0, "trusted_graph_only": false}},
-            "propagation": {{"alpha": 0.15, "iterations": 20, "decay_per_block": 0.999, "growth_window_blocks": 720, "growth_damping": 1.0}},
-            "readings": {{"persistence_blocks": 2, "labeler_inactive_blocks": 720}},
+            "filters": {{"distrust_above": 0.5, "spam": true, "min_age_epochs": 0, "trusted_graph_only": false}},
+            "propagation": {{"alpha": 0.15, "iterations": 20, "decay_per_epoch": 0.999, "growth_window_epochs": 720, "growth_damping": 1.0}},
+            "readings": {{"persistence_epochs": 2, "labeler_inactive_epochs": 720}},
             "personalization": false
         }}"#
     );
@@ -297,9 +297,9 @@ fn resumed_labeler_activity_matches_a_full_replay() {
     );
     let labeler = Signer::new([51u8; 32]);
     let declaration = common::build_declaration(&labeler, domain);
-    let block0 = genesis_state.seal("2026-08-09T00:00:00Z", &[]);
-    let block0_root = block0.root_token();
-    let block0_size = block0.tree_size();
+    let epoch0 = genesis_state.seal("2026-08-09T00:00:00Z", &[]);
+    let epoch0_root = epoch0.root_token();
+    let epoch0_size = epoch0.tree_size();
     let snapshot_date = "2026-08-09";
     let snapdir = genesis_dir.path().join("snapshots").join(snapshot_date);
     let sqlite_bytes = common::write_tier0(&snapdir.join("tier0/index.sqlite"), &[]);
@@ -310,7 +310,7 @@ fn resumed_labeler_activity_matches_a_full_replay() {
         3600,
         &[(domain.to_string(), declaration.clone())],
         &[],
-        block0_size,
+        epoch0_size,
         Vec::new(),
         0,
     );
@@ -319,8 +319,8 @@ fn resumed_labeler_activity_matches_a_full_replay() {
         &genesis_log,
         snapshot_date,
         0,
-        block0_size,
-        &block0_root,
+        epoch0_size,
+        &epoch0_root,
         &content_digest_value,
         &state_bytes,
         &state_digest_value,
@@ -330,7 +330,7 @@ fn resumed_labeler_activity_matches_a_full_replay() {
         &genesis_dir.path().join("snapshots/index.json"),
         &genesis_log,
         snapshot_date,
-        block0_size,
+        epoch0_size,
         &format!("/snapshots/{snapshot_date}/manifest.json"),
         &content_digest_value,
     );
@@ -420,7 +420,7 @@ fn resumed_labeler_activity_matches_a_full_replay() {
     assert!(near_genesis.spam_urls.contains(subject));
     assert!(near_resumed.spam_urls.contains(subject));
 
-    // Past the window from height 1 (720 blocks): both must read the
+    // Past the window from height 1 (720 Epochs): both must read the
     // Labeler as inactive and stop counting its Label, in agreement.
     let far_height = 1 + 720 + 5;
     let far_genesis =

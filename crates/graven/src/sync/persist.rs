@@ -69,11 +69,11 @@ pub(super) fn save_parameters(conn: &Connection, chain: &ChainState) -> Result<(
     conn.execute("DELETE FROM parameters", [])?;
     for a in chain.accepted() {
         conn.execute(
-            "INSERT INTO parameters(parameter, value, block_number, entry_index, sealed_at_s, effective_at_s) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO parameters(parameter, value, epoch_number, entry_index, sealed_at_s, effective_at_s) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             (
                 &a.parameter,
                 a.value,
-                a.block_number as i64,
+                a.epoch_number as i64,
                 a.entry_index as i64,
                 a.sealed_at_s,
                 a.effective_at_s,
@@ -86,13 +86,13 @@ pub(super) fn save_parameters(conn: &Connection, chain: &ChainState) -> Result<(
 pub(super) fn load_parameters(conn: &Connection) -> Result<Vec<Amendment>> {
     conn.execute_batch(crate::store::CREATE_PARAMETERS)?;
     let mut stmt = conn.prepare(
-        "SELECT parameter, value, block_number, entry_index, sealed_at_s, effective_at_s FROM parameters ORDER BY block_number, entry_index",
+        "SELECT parameter, value, epoch_number, entry_index, sealed_at_s, effective_at_s FROM parameters ORDER BY epoch_number, entry_index",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(Amendment {
             parameter: r.get(0)?,
             value: r.get(1)?,
-            block_number: r.get::<_, i64>(2)? as u64,
+            epoch_number: r.get::<_, i64>(2)? as u64,
             entry_index: r.get::<_, i64>(3)? as u64,
             sealed_at_s: r.get(4)?,
             effective_at_s: r.get(5)?,
@@ -197,15 +197,16 @@ pub(super) fn save_chain_tips(conn: &Connection, tips: &ChainTips) -> Result<()>
 pub const CREATE_SYNC_STATE: &str = "CREATE TABLE IF NOT EXISTS sync_state(id INTEGER PRIMARY KEY CHECK(id = 1), state TEXT NOT NULL)";
 
 /// Reads a stored sync state, refusing one written before the Log became
-/// one growing tree: such a record names a Block hash where a tree size
-/// and root now stand, and reinterpreting it would silently place the
-/// verified head at a tree the Consumer never verified.
+/// one growing tree — such a record names a Block hash where a tree size
+/// and root now stand — or one written before `block_number`/`log_position`
+/// became `epoch_number`/`tree_size`; reinterpreting either would silently
+/// place the verified head at a tree the Consumer never verified.
 pub fn read_sync_state(bytes: &[u8]) -> Result<SyncState> {
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
     let format = value.get("format").and_then(serde_json::Value::as_u64);
     if format != Some(u64::from(super::SYNC_STATE_FORMAT)) {
         return Err(Error::Verify(
-            "the stored sync state is in a superseded format that names a Block hash rather than the tree size and root a Checkpoint states; remove the log's directory and sync again".into(),
+            "the stored sync state is in a superseded format, from before the Log became one growing tree or from before its fields were renamed to epoch_number/tree_size; remove the log's directory and sync again".into(),
         ));
     }
     Ok(serde_json::from_value(value)?)
@@ -594,13 +595,13 @@ pub(super) fn replace_inlinks(
 }
 
 /// Seeds the ranking index from an adopted Snapshot: every record and
-/// every tier-1 link is read as sealed at `log_position`, the height the
+/// every tier-1 link is read as sealed at `height`, the Epoch the
 /// Snapshot stands at.
-pub(super) fn seed_ranking_index(conn: &Connection, log_position: u64) -> Result<()> {
+pub(super) fn seed_ranking_index(conn: &Connection, height: u64) -> Result<()> {
     conn.execute_batch(crate::store::CREATE_RANKING)?;
     conn.execute(
         "INSERT OR IGNORE INTO record_heights(url, publisher, height) SELECT url, publisher, ?1 FROM records",
-        [log_position as i64],
+        [height as i64],
     )?;
     if crate::store::table_exists(conn, "links")? {
         let mut stmt = conn.prepare("SELECT source_url, target_url FROM links")?;
@@ -618,7 +619,7 @@ pub(super) fn seed_ranking_index(conn: &Connection, log_position: u64) -> Result
                 .unwrap_or_else(|| host_of(&source_url));
             conn.execute(
                 "INSERT OR IGNORE INTO inlinks(source_url, source_host, target_url, target_host, height) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (&source_url, source_host, &target_url, host_of(&target_url), log_position as i64),
+                (&source_url, source_host, &target_url, host_of(&target_url), height as i64),
             )?;
         }
     }

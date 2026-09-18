@@ -1,9 +1,9 @@
 # graven
 
-The signed Delta format targets [WIST specification revision `5eccdedc156c8e13e6784b690a08d27da414faec`](https://github.com/wistprotocol/spec/tree/5eccdedc156c8e13e6784b690a08d27da414faec). Object version `1.0.0` alone does not identify a compatible draft.
+The signed Delta format targets [WIST specification revision `0127b0f2e5420e167a15d3f7afae6ed81030e158`](https://github.com/wistprotocol/spec/tree/0127b0f2e5420e167a15d3f7afae6ed81030e158). Object version `1.0.0` alone does not identify a compatible draft.
 
 WIST Protocol consumer and MCP server. Graven cold-syncs a verified Snapshot,
-then applies incremental Blocks to a separate SQLite index per Log (WIST-3 §8).
+then applies incremental Epochs to a separate SQLite index per Log (WIST-3 §8).
 `serve` exposes the merged index with per-record provenance to an LLM agent
 over MCP. Verification checks and limits are listed
 [below](#what-sync-verifies).
@@ -31,8 +31,8 @@ is resolved under its base's own path, so a Mirror serving the Log at
 `https://cdn.example/wist/` is read at `https://cdn.example/wist/tile/…`. Each log gets
 its own `<dir>/logs/<sanitized-log-id>/` holding `index.sqlite` (records,
 and, where `--tier1` is on, `extracts`/`links`/FTS tables) whose
-`sync_state` row is the sync cursor: the verified head's `block_number`,
-the tree size it states as `log_position`, its `root` in the
+`sync_state` row is the sync cursor: the verified head's `epoch_number`,
+the tree size it states as `tree_size`, its `root` in the
 `sha256:`+hex form, whether the acceptance was `unwitnessed`, the
 `content_digest` and the schedule position. `sync.json` beside it mirrors
 that row for readers of the file and is rewritten after each commit.
@@ -48,11 +48,12 @@ keys valid there — parameters and withdrawals are persisted in
 `index.sqlite` too, so an incremental sync
 reloads them without re-walking the Log from genesis. A `sync_state` row
 written before the Log became one growing tree — one naming a Block hash
-where a tree size and root now stand — is refused with an instruction to
+where a tree size and root now stand — or before its fields were renamed
+to `epoch_number`/`tree_size` — is refused with an instruction to
 remove the log's directory and sync again, never reinterpreted.
 A divergence leaves an evidence bundle under
-`<dir>/logs/<sanitized-log-id>/evidence/`: `equivocation-block-<N>/` with
-the retained and offered Checkpoint notes, or `divergence-block-<N>/`
+`<dir>/logs/<sanitized-log-id>/evidence/`: `equivocation-epoch-<N>/` with
+the retained and offered Checkpoint notes, or `divergence-epoch-<N>/`
 with the Checkpoints and, where the form needs them, the tiles that
 reproduce the larger root. It also writes `halt.json` beside them: from
 that point the Consumer applies nothing more from that Aggregator and
@@ -84,33 +85,33 @@ rejected Log file fails the sync.
 
 Tree-level (WIST-3 §§3–6): the head Checkpoint is the five-line signed
 note of §5, and every archived Checkpoint between the verified head and
-it is fetched and verified in `block_number` order — sequential numbering,
+it is fetched and verified in `epoch_number` order — sequential numbering,
 a tree that never shrinks, a strictly increasing `sealed_at` on the
-cadence grid in force at the previous Block, the Consistency Proof from
+cadence grid in force at the previous Epoch, the Consistency Proof from
 the previous tree size with the size-0 root compared rather than skipped,
-the Block's Entries against the leaf range `size(N-1)`..`size(N)` of the
+the Epoch's Entries against the leaf range `size(N-1)`..`size(N)` of the
 tree the Checkpoint states, then the Log's signature under the Aggregator
-keys valid at N. Block N's key acts apply first, in canonical Entry
+keys valid at N. Epoch N's key acts apply first, in canonical Entry
 index order, each authenticated under the keys valid at N−1; every other
-Registry Update of the Block, and Checkpoint N itself, is authenticated
+Registry Update of the Epoch, and Checkpoint N itself, is authenticated
 under the keys valid at N. A key act that fails — a `key_id` or note key
 ID the Log already admitted, a removal of a key not valid at N−1 — is
 ignored as `WIST4-E04`, one no key valid at N−1 signed as `WIST4-E11`,
-and the Block stays valid. Tiles and entry bundles are kept only where
+and the Epoch stays valid. Tiles and entry bundles are kept only where
 they recompute the Checkpoint's root; a partial tile or bundle is fetched
 only at the width a Checkpoint's size requires, with the full one as the
 fallback. A tile over 8 192 octets, an entry bundle over 16 777 472, an
-Entry over 65 535 or a Block over the transport bound its verified prefix
+Entry over 65 535 or an Epoch over the transport bound its verified prefix
 derives is refused while the response streams, before the octets past the
 bound are buffered (`WIST3-E03`). A Checkpoint at or below the verified head
 adopts nothing and is no error, and the head is fetched from the next
 source; one whose note text differs from the one retained at its
-`block_number` is equivocation only where a key valid at *that
+`epoch_number` is equivocation only where a key valid at *that
 Checkpoint's own height* signs it — `WIST3-E02`, which halts the Log and
 leaves an evidence bundle — and is otherwise `WIST3-E03` against the
 source that served it, preserved as nothing. The same rule governs every
 divergence above the head: two Checkpoints stating one tree size and
-different roots, a tree below the Block before it, a tree that does not
+different roots, a tree below the Epoch before it, a tree that does not
 extend the verified head's, a failed Consistency Proof and a size-0
 Checkpoint stating another root than `SHA-256("")` are `WIST3-E02` with
 their evidence when the offered Checkpoint authenticates under the keys
@@ -120,8 +121,8 @@ fork's tiles are fetched into a scratch tree and never written over the
 tiles the Consumer has verified. On cold start, the snapshot
 index/manifest/state signatures and the recomputed
 `content_digest`/`state_digest` are checked against the manifest's
-claims, and the Checkpoint at the manifest's `block_number` must state
-its `log_position` and `anchor_block_hash` (`WIST3-E02` otherwise).
+claims, and the Checkpoint at the manifest's `epoch_number` must state
+its `tree_size` and `root_hash` (`WIST3-E02` otherwise).
 The Checkpoint a Consumer adopts as its head must carry Cosignatures
 from at least `checkpoint_witness_quorum` distinct Witnesses of its
 roster, read as in force at that Checkpoint's `sealed_at` (WIST-3 §5,
@@ -132,7 +133,7 @@ never read from the Log; it is empty by default, which at the quorum of
 unwitnessed. A Checkpoint short of the quorum is neither evidence nor an
 error: the head stands, nothing above its tree size is applied, and the
 next run tries again. The acceptance is recorded as `unwitnessed` with
-the Checkpoint it belongs to, in the `checkpoints` row of the Block
+the Checkpoint it belongs to, in the `checkpoints` row of the Epoch
 adopted — a Checkpoint verified on the way to the head but never adopted
 carries no such record — and in the sync cursor for the head; the sync
 report and every MCP provenance row carry it. Staleness is judged on the
@@ -142,9 +143,9 @@ or no source served a head at all.
 
 Log-signed `parameter_change` acts replay through core's accepted-schedule
 rules (WIST-4 §9, ADR-0020): rejected amendments are ignored, an amendment
-cannot cut the cap below a Block already sealed, and a Block above the cap
+cannot cut the cap below an Epoch already sealed, and an Epoch above the cap
 in force at its instant fails the sync. The accepted schedule, the largest
-Block seen and the previous instant persist in the sync cursor and the
+Epoch seen and the previous instant persist in the sync cursor and the
 `parameters` table; a cold start seeds the schedule from the Snapshot's
 `parameter` tuples, so pending amendments survive. Any mismatch fails the
 sync closed and, on an already-migrated directory, rolls the migration back.
@@ -155,19 +156,19 @@ rules (WIST-4 §3.1): an accepted act's file is fetched from
 (`WIST3-E03`) and held in the `suffix_lists` table, a file no source
 serves fails the sync (`WIST3-E01`), and an act the Log key does not
 authenticate or whose `bytes` disagrees with the file is ignored with
-its code. Every walked Block's `publisher_delta`, `label` and `dispute`
+its code. Every walked Epoch's `publisher_delta`, `label` and `dispute`
 Entries are counted per Registrable Domain under the snapshot in force
-at it against `domain_block_entries_max`, and its `label` and `dispute`
-Entries against `labeler_block_entries_max` (WIST-3 §3.2); a Block over
+at it against `domain_epoch_entries_max`, and its `label` and `dispute`
+Entries against `labeler_epoch_entries_max` (WIST-3 §3.2); an Epoch over
 either fails the sync (`WIST3-E03`). Before the first accepted act every
 Canonical Host is its own unit. A cold start adopts the Snapshot's
-`suffix_list` tuple and obtains its file before the first walked Block.
+`suffix_list` tuple and obtains its file before the first walked Epoch.
 
 Per-delta, independently of the above, in WIST-1 §7's order: complete
 field validation under `delta.schema.json` (`WIST1-E14`), wire major `1`
 support with same-major minor and patch values accepted (`WIST1-E15`,
 ADR-0030), the presence rules and the URL and commitment caps the accepted
-schedule holds at the Block's `sealed_at` (`WIST1-E09`/`E07`/`E11`/`E04`),
+schedule holds at the Epoch's `sealed_at` (`WIST1-E09`/`E07`/`E11`/`E04`),
 then the WIST-1 §5.2 binding: `sig.key_id` must resolve to a key in its
 publisher's key set as of the sealing height, and that key's `valid_from`
 must not be after the delta's `observed_at` under the Publisher timestamp
@@ -175,7 +176,7 @@ profile's exact fraction and offset arithmetic (ADR-0026). Verification
 selects history by the canonical signed `publisher` and checks its literal
 URL scope; shared keys and reused identifiers in other domains cannot
 change authorship. Last, WIST-1 §3.4's clock check uses the committing
-Block's `sealed_at` and the `clock_skew_seconds` accepted at that instant
+Epoch's `sealed_at` and the `clock_skew_seconds` accepted at that instant
 (`WIST1-E06`); no wall clock takes part. Deltas failing any of these are
 ignored without advancing their chains.
 
@@ -199,24 +200,24 @@ accepted sequence floor every later Declaration must exceed, and a
 `recovery_window` tuple restores the recovery-chain head at its own height
 with the window end on it (WIST-3 §§7/8); a `withdrawal` tuple is recorded
 in the `withdrawals` table and removes the content it names from the
-adopted index, so a Consumer resuming above the withdrawal's Block excludes
+adopted index, so a Consumer resuming above the withdrawal's Epoch excludes
 it exactly as a replaying one does (WIST-3 §6.2); a `label` tuple is parsed
 and carried no further.
 
 Registry Updates carry four acts (WIST-4 §3). Only `aggregator_key_add`
 and `aggregator_key_remove` must verify under an Aggregator key for the
-Block to stand; a `parameter_change` replays through the accepted schedule
+Epoch to stand; a `parameter_change` replays through the accepted schedule
 above and a `payload_withdrawal` replays through core's withdrawal
-engine under the Aggregator key valid at its Block — field, version and
+engine under the Aggregator key valid at its Epoch — field, version and
 authenticity failures and a Delta of another Publisher or sealed above
 the act are ignored with their WIST-4 §5.1 code — then records the
-withdrawn Delta at the earliest Block that withdrew it and removes its
+withdrawn Delta at the earliest Epoch that withdrew it and removes its
 record, extracts, links and embeddings; a withdrawal sealed in the same
-Block as the Delta it names keeps that Delta from materializing at all.
-A Delta sealed below the Blocks the sync walked cannot be checked
+Epoch as the Delta it names keeps that Delta from materializing at all.
+A Delta sealed below the Epochs the sync walked cannot be checked
 against the act, since no Snapshot tuple names sealed Deltas, and such
 an act is read as consistent. A `label` or `dispute` Entry is validated under its signer's Declaration
-at the Block as the Aggregator validated it — fields, the registry name,
+at the Epoch as the Aggregator validated it — fields, the registry name,
 self-labeling, the disputed Label's sealing and authority, the signature
 — and one that fails is ignored like a forked Delta (WIST-2 §3.3). The
 index keeps every walked Label and dispute, the current Label per
@@ -258,18 +259,18 @@ domains and the profile's `distrust_seeds`, so a domain that links to a
 bad seed inherits it; a trust seed that links to distrusted or
 spam-labeled domains vouches for less. In-links are counted per domain
 with age decay and damped by their growth rate over
-`growth_window_blocks`, death rates are reported beside them, domain
+`growth_window_epochs`, death rates are reported beside them, domain
 age is read from the first sealed Declaration or, where a fresh identity
 has taken effect, from its activation height (WIST-4 §8), and freshness
 from the record's seal height. Two readings WIST-4 §6 recommends are
 profile fields: a `wist:mismatch` or `wist:unavailable` Label counts
 against a subject only once it has been live through
-`persistence_blocks` consecutive Blocks, two by default, and a Labeler
-with no sealed Entry within `labeler_inactive_blocks`, 720 by default,
+`persistence_epochs` consecutive Epochs, two by default, and a Labeler
+with no sealed Entry within `labeler_inactive_epochs`, 720 by default,
 is ignored. The score is relevance × (`trust_floor` + `trust`
 × trust) × (1 + `inlinks` × in-links) × freshness × (1 − `distrust` ×
 distrust) × (1 − `mismatch` where one counts), after the filters: distrust above a threshold, spam labels,
-domains younger than `min_age_blocks`, and, for a strict profile, any
+domains younger than `min_age_epochs`, and, for a strict profile, any
 domain no trust reaches. Every hit carries its score, its signals and
 an explanation, so a profile and the synced heights in the hit's
 provenance reproduce the rank.
@@ -293,7 +294,7 @@ A pack is a signed envelope, `{"pack": {...}, "sig": {...}}` (verified the
 same way as every other WIST envelope, against a key the caller supplies
 explicitly with `--key`: trust in a pack is trust in its publisher, the
 protocol makes no claim about vector correctness). `pack` fields:
-`wist_version`; `content_digest` and `log_position`, binding the pack to
+`wist_version`; `content_digest` and `tree_size`, binding the pack to
 one exact synced snapshot of one log (WIST-3 §7) — `pack import` rejects a
 mismatch with the local sync cursor; `model` (`name`, `version`,
 `weights_hash`, `dim`, `quantization`, `metric` — one of
@@ -362,7 +363,7 @@ the head Checkpoint's signature under the Log's verifier key, the root
 recomputed from the tiles, an Inclusion Proof for every leaf and a
 Consistency Proof from every smaller size; it needs a Go toolchain and is
 skipped without one, or fails under `CI=1`. A second suite in the same crate drives the Consumer against
-an Aggregator with no Publisher: a cold start at a Snapshot's Block
+an Aggregator with no Publisher: a cold start at a Snapshot's Epoch
 followed by continuous sync, a source serving an old head leaving the
 verified head where it is, and a Checkpoint adopted only once a Witness
 in the roster has cosigned it — with a minimal in-process Witness
@@ -373,7 +374,7 @@ for capacity measurements: `cargo run -p e2e --bin baseline -- --domains N
 [--no-tier1] [--out report.json]` publishes N loopback sites of M pages
 through the publisher, ingests them through one aggregator behind a
 request-counting proxy, seals, cold-starts a consumer, changes P percent of
-the pages, seals again, seals K further empty Blocks, verifies the history
+the pages, seals again, seals K further empty Epochs, verifies the history
 and catches the consumer up, reporting wall seconds, bytes and request
 counts per stage together with every repository revision it ran. Set
 `WIST_BUILD_PROFILE=release` to build and time release executables.

@@ -490,14 +490,14 @@ mod tests {
             log_dir.join("sync.json"),
             serde_json::to_vec(&SyncState {
                 format: crate::sync::SYNC_STATE_FORMAT,
-                log_position: 0,
-                block_number: 7,
+                tree_size: 0,
+                epoch_number: 7,
                 root: "sha256:deadbeef".into(),
                 unwitnessed: false,
                 content_digest: None,
                 schedule_first_s: None,
                 prior_sealed_at_s: None,
-                largest_block_bytes: 0,
+                largest_epoch_bytes: 0,
             })
             .unwrap(),
         )

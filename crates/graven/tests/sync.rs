@@ -17,15 +17,15 @@ fn cold_sync_verifies_chain_and_populates_store() {
     )
     .unwrap();
 
-    assert_eq!(report.block_number_before, None);
+    assert_eq!(report.epoch_number_before, None);
     assert_eq!(report.head, 1);
 
     let sync_json: serde_json::Value = serde_json::from_slice(
         &std::fs::read(common::synced_log_dir(target.path()).join("sync.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(sync_json["block_number"], 1);
-    assert_eq!(sync_json["log_position"], fx.head_tree_size());
+    assert_eq!(sync_json["epoch_number"], 1);
+    assert_eq!(sync_json["tree_size"], fx.head_tree_size());
     assert!(sync_json["root"].as_str().unwrap().starts_with("sha256:"));
     assert_eq!(sync_json["unwitnessed"], true);
 
@@ -251,13 +251,13 @@ fn continuous_sync_advances_head_and_applies_new_delta() {
     )
     .unwrap();
     assert_eq!(report2.head, 2);
-    assert_eq!(report2.block_number_before, Some(1));
+    assert_eq!(report2.epoch_number_before, Some(1));
 
     let sync_json: serde_json::Value = serde_json::from_slice(
         &std::fs::read(common::synced_log_dir(target.path()).join("sync.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(sync_json["block_number"], 2);
+    assert_eq!(sync_json["epoch_number"], 2);
 
     let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
     let extra = store.get(&new_url).unwrap().unwrap();
@@ -292,7 +292,7 @@ fn continuous_sync_is_noop_when_checkpoint_unchanged() {
     .unwrap();
 
     assert_eq!(report.head, 1);
-    assert_eq!(report.block_number_before, Some(1));
+    assert_eq!(report.epoch_number_before, Some(1));
 }
 
 #[test]
@@ -340,13 +340,13 @@ fn a_checkpoint_below_the_verified_head_does_not_regress_it_and_is_no_error() {
     assert_eq!(
         graven::store::synced_state(&common::synced_log_dir(target.path()))
             .unwrap()
-            .block_number,
+            .epoch_number,
         2
     );
 }
 
 #[test]
-fn a_differing_checkpoint_at_a_retained_block_number_is_equivocation_with_an_evidence_bundle() {
+fn a_differing_checkpoint_at_a_retained_epoch_number_is_equivocation_with_an_evidence_bundle() {
     let fx = common::build_fixture(true, false);
     let target = tempfile::tempdir().unwrap();
 
@@ -383,7 +383,7 @@ fn a_differing_checkpoint_at_a_retained_block_number_is_equivocation_with_an_evi
 
     assert!(error.contains("WIST3-E02"), "error was: {error}");
     let bundle =
-        common::synced_log_dir(target.path()).join("evidence/equivocation-block-000000002");
+        common::synced_log_dir(target.path()).join("evidence/equivocation-epoch-000000002");
     assert!(
         bundle.join("retained.checkpoint").exists() && bundle.join("offered.checkpoint").exists(),
         "both Checkpoints must be preserved in {}",
@@ -441,7 +441,7 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
     common::write_payload(dir.path(), hex1, &payload1);
     let wrapped_delta1 = serde_json::json!({"type": "publisher_delta", "body": delta1_env});
 
-    let block0 = state.seal(
+    let epoch0 = state.seal(
         "2026-08-09T12:00:00Z",
         &[wrapped_declaration, wrapped_delta1],
     );
@@ -475,7 +475,7 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
         3600,
         &[(domain.clone(), declaration_env.clone())],
         std::slice::from_ref(&record1),
-        block0.tree_size(),
+        epoch0.tree_size(),
     );
 
     common::write_manifest(
@@ -483,8 +483,8 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
         &log,
         &snapshot_date,
         0,
-        block0.tree_size(),
-        &block0.root_token(),
+        epoch0.tree_size(),
+        &epoch0.root_token(),
         &content_digest_value,
         &state_bytes,
         &state_digest_value,
@@ -495,7 +495,7 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
         &dir.path().join("snapshots/index.json"),
         &log,
         &snapshot_date,
-        block0.tree_size(),
+        epoch0.tree_size(),
         &format!("/snapshots/{snapshot_date}/manifest.json"),
         &content_digest_value,
     );
@@ -947,7 +947,7 @@ fn an_ignored_delta_leaves_the_index_unchanged() {
     let sync_after = std::fs::read(common::synced_log_dir(dir.path()).join("sync.json")).unwrap();
     assert_ne!(
         sync_before, sync_after,
-        "the sync advances past a Block whose only Delta is ignored"
+        "the sync advances past an Epoch whose only Delta is ignored"
     );
 
     let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
@@ -1293,7 +1293,7 @@ fn failed_migration_restores_legacy_layout_and_registers_nothing() {
 
     // The second Log's Checkpoints carry its own origin line and its own
     // key, so its Checkpoint 1 differs from the one the migrated store
-    // retains at that Block and no key valid there signs it: WIST3-E03,
+    // retains at that Epoch and no key valid there signs it: WIST3-E03,
     // and the migration is rolled back.
 
     let result = graven::sync::run(
@@ -1731,13 +1731,13 @@ fn a_log_that_rotates_its_aggregator_key_stays_syncable() {
     let sealed_at = common::next_instant(&fx);
     common::seal_next(&fx, &sealed_at, &[add]);
 
-    // The next Block's Checkpoint is signed by the key the previous one
+    // The next Epoch's Checkpoint is signed by the key the previous one
     // admitted.
     let sealed_after = common::next_instant(&fx);
     let after = fx
         .log_state()
         .seal_signed_by(&next, &sealed_after, &[])
-        .block_number();
+        .epoch_number();
 
     let dir = tempfile::tempdir().unwrap();
     let report = graven::sync::run(
@@ -1973,7 +1973,7 @@ fn parameter_change(
     serde_json::json!({"type": "registry_update", "body": body})
 }
 
-/// A `block_decompressed_cap_bytes` above WIST-4 §5's floor of 65 537 —
+/// An `epoch_cap_bytes` above WIST-4 §5's floor of 65 537 —
 /// the octets one Entry of the largest admissible size occupies — and low
 /// enough that a few hundred Deltas cross it.
 const CAP: i64 = 70_000;
@@ -1996,12 +1996,12 @@ fn bulk_deltas(fx: &common::Fixture, count: usize) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Seals the next Block, reporting its number and WIST-3 §6's Block
+/// Seals the next Epoch, reporting its number and WIST-3 §6's Epoch
 /// size: the octets its Entries occupy in entry bundles.
 fn seal_next(fx: &common::Fixture, sealed_at: &str, entries: &[serde_json::Value]) -> (u64, u64) {
     let mut ordered = entries.to_vec();
-    wist_core::block::sort_entries(&mut ordered).unwrap();
-    let octets = wist_core::block::block_octets(&ordered).unwrap();
+    wist_core::epoch::sort_entries(&mut ordered).unwrap();
+    let octets = wist_core::epoch::epoch_octets(&ordered).unwrap();
     (common::seal_next(fx, sealed_at, entries), octets)
 }
 
@@ -2019,7 +2019,7 @@ fn cold_sync(fx: &common::Fixture) -> Result<(graven::sync::SyncReport, i64), St
             Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
         let accepted = conn
             .query_row(
-                "SELECT COUNT(*) FROM parameters WHERE parameter = 'block_decompressed_cap_bytes'",
+                "SELECT COUNT(*) FROM parameters WHERE parameter = 'epoch_cap_bytes'",
                 [],
                 |r| r.get(0),
             )
@@ -2030,14 +2030,14 @@ fn cold_sync(fx: &common::Fixture) -> Result<(graven::sync::SyncReport, i64), St
 }
 
 #[test]
-fn an_accepted_cap_reduction_rejects_a_later_block_above_it() {
+fn an_accepted_cap_reduction_rejects_a_later_epoch_above_it() {
     let fx = common::build_fixture(true, false);
     let (_, size) = seal_next(
         &fx,
         "2026-08-09T14:00:00Z",
         &[parameter_change(
             &fx,
-            "block_decompressed_cap_bytes",
+            "epoch_cap_bytes",
             CAP,
             "2026-08-16T14:00:00Z",
         )],
@@ -2053,14 +2053,14 @@ fn an_accepted_cap_reduction_rejects_a_later_block_above_it() {
 }
 
 #[test]
-fn a_cap_reduction_accepts_blocks_within_it() {
+fn a_cap_reduction_accepts_epochs_within_it() {
     let fx = common::build_fixture(true, false);
     let (_, _) = seal_next(
         &fx,
         "2026-08-09T14:00:00Z",
         &[parameter_change(
             &fx,
-            "block_decompressed_cap_bytes",
+            "epoch_cap_bytes",
             CAP,
             "2026-08-16T14:00:00Z",
         )],
@@ -2073,12 +2073,12 @@ fn a_cap_reduction_accepts_blocks_within_it() {
 }
 
 #[test]
-fn a_cap_below_a_sealed_block_is_not_accepted() {
+fn a_cap_below_a_sealed_epoch_is_not_accepted() {
     let fx = common::build_fixture(true, false);
     let mut entries = bulk_deltas(&fx, 200);
     entries.push(parameter_change(
         &fx,
-        "block_decompressed_cap_bytes",
+        "epoch_cap_bytes",
         CAP,
         "2026-08-16T14:00:00Z",
     ));
@@ -2088,12 +2088,12 @@ fn a_cap_below_a_sealed_block_is_not_accepted() {
     assert_eq!(report.head, head);
     assert_eq!(
         accepted, 0,
-        "a cap below a sealed Block's size is WIST4-E03 and stays ignored"
+        "a cap below a sealed Epoch's size is WIST4-E03 and stays ignored"
     );
 }
 
 #[test]
-fn a_fractional_block_timestamp_fails_the_sync() {
+fn a_fractional_epoch_timestamp_fails_the_sync() {
     let fx = common::build_fixture(true, false);
     fx.log_state()
         .seal_off_profile("2026-08-09T14:00:00.5Z", &[]);
@@ -2105,7 +2105,7 @@ fn a_fractional_block_timestamp_fails_the_sync() {
 }
 
 #[test]
-fn an_off_grid_block_timestamp_fails_the_sync() {
+fn an_off_grid_epoch_timestamp_fails_the_sync() {
     let fx = common::build_fixture(true, false);
     fx.log_state().seal_off_profile("2026-08-09T14:00:01Z", &[]);
     let error = cold_sync(&fx).unwrap_err();
@@ -2149,7 +2149,7 @@ fn delta_observed(
 }
 
 #[test]
-fn sealed_deltas_are_checked_against_their_block_clock_and_accepted_allowance() {
+fn sealed_deltas_are_checked_against_their_epoch_clock_and_accepted_allowance() {
     let fx = common::build_fixture(true, false);
     let publisher = common::Signer::new([1u8; 32]);
     let mut entries = vec![parameter_change(
@@ -2271,7 +2271,7 @@ fn a_sync_that_cannot_commit_leaves_cursor_keys_and_index_unchanged() {
     .unwrap();
     let index = common::synced_log_dir(dir.path()).join("index.sqlite");
     let before = synced_state(dir.path());
-    assert_eq!(before.block_number, 1);
+    assert_eq!(before.epoch_number, 1);
     let snapshot = |conn: &Connection| {
         (
             count(conn, "records"),
@@ -2300,7 +2300,7 @@ fn a_sync_that_cannot_commit_leaves_cursor_keys_and_index_unchanged() {
     drop(holder);
 
     let after = synced_state(dir.path());
-    assert_eq!(after.block_number, 1);
+    assert_eq!(after.epoch_number, 1);
     assert_eq!(after.root, before.root);
     let conn = Connection::open(&index).unwrap();
     assert_eq!(snapshot(&conn), counts_before);
@@ -2318,7 +2318,7 @@ fn a_sync_that_cannot_commit_leaves_cursor_keys_and_index_unchanged() {
     )
     .unwrap();
     assert_eq!(report.head, 2);
-    assert_eq!(synced_state(dir.path()).block_number, 2);
+    assert_eq!(synced_state(dir.path()).epoch_number, 2);
     let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
     assert!(store.get(&new_url).unwrap().is_some());
 }
@@ -2347,12 +2347,12 @@ fn the_sync_cursor_lives_in_the_index_not_the_mirror_file() {
         false,
     )
     .unwrap();
-    assert_eq!(report.block_number_before, Some(1));
+    assert_eq!(report.epoch_number_before, Some(1));
     assert_eq!(report.head, 2);
     let mirrored: serde_json::Value =
         serde_json::from_slice(&std::fs::read(log_dir.join("sync.json")).unwrap()).unwrap();
-    assert_eq!(mirrored["block_number"], 2);
-    assert_eq!(synced_state(dir.path()).block_number, 2);
+    assert_eq!(mirrored["epoch_number"], 2);
+    assert_eq!(synced_state(dir.path()).epoch_number, 2);
 }
 
 #[test]
@@ -2371,7 +2371,7 @@ fn a_store_carrying_only_the_sync_file_is_read_and_imported() {
     let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
     conn.execute_batch("DROP TABLE sync_state").unwrap();
     drop(conn);
-    assert_eq!(synced_state(dir.path()).block_number, 1);
+    assert_eq!(synced_state(dir.path()).epoch_number, 1);
     common::extend_fixture(&fx);
 
     let report = graven::sync::run(
@@ -2382,7 +2382,7 @@ fn a_store_carrying_only_the_sync_file_is_read_and_imported() {
         false,
     )
     .unwrap();
-    assert_eq!(report.block_number_before, Some(1));
+    assert_eq!(report.epoch_number_before, Some(1));
     assert_eq!(report.head, 2);
 }
 
@@ -2404,5 +2404,5 @@ fn a_cold_start_replaces_the_verifying_index_a_crash_left_behind() {
     .unwrap();
     assert_eq!(report.head, 1);
     assert!(!log_dir.join("index.sqlite.verifying").exists());
-    assert_eq!(synced_state(target.path()).block_number, 1);
+    assert_eq!(synced_state(target.path()).epoch_number, 1);
 }

@@ -126,7 +126,7 @@ fn a_pack_with_a_repeated_member_imports_nothing() {
         pack_dir.path(),
         &fx.log,
         sync_json["content_digest"].as_str().unwrap(),
-        sync_json["log_position"].as_u64().unwrap(),
+        sync_json["tree_size"].as_u64().unwrap(),
         &[(
             alpha_id.as_str(),
             "https://records.example/alpha",

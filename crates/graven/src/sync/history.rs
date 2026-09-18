@@ -13,22 +13,22 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use wist_core::aggregator_keys::Registry;
-use wist_core::block::verify_block;
 use wist_core::checkpoint::{
     self, check_consistency, check_sequence, Adoption, Checkpoint, WitnessKey,
 };
 use wist_core::delta::{content_bytes, verify_commitment};
+use wist_core::epoch::verify_epoch;
 use wist_core::merkle::consistency_proof_from;
 use wist_core::objects::{
     ChangeType, DeltaEnvelope, DeltaPayloadCommitment, Payload, PublisherEnvelope,
 };
 use wist_core::parameters::{Amendment, Schedule};
-use wist_core::suffix_list::BlockCaps;
+use wist_core::suffix_list::EpochCaps;
 use wist_core::timestamp::log_seconds;
 use wist_core::withdrawal::{Disposition, SealedDelta, WithdrawalReplay};
 
 /// WIST-4 §9 and ADR-0020: the accepted parameter schedule, the largest
-/// Block seen and the previous Block's instant, carried across the walk
+/// Epoch seen and the previous Epoch's instant, carried across the walk
 /// and across restarts so amendments, size bounds and the cadence grid are
 /// checked as a replaying Consumer checks them.
 pub struct ChainState {
@@ -50,7 +50,7 @@ impl ChainState {
 
     /// The schedule a Snapshot's `parameter` tuples restore (WIST-3 §7):
     /// accepted amendments whose sealing position the Snapshot does not
-    /// carry, adopted before the first walked Block.
+    /// carry, adopted before the first walked Epoch.
     pub fn from_tuples(tuples: &[(String, String, i64)]) -> Result<Self> {
         let adopted = tuples
             .iter()
@@ -61,7 +61,7 @@ impl ChainState {
                 Ok(Amendment {
                     parameter: name.clone(),
                     value: *value,
-                    block_number: 0,
+                    epoch_number: 0,
                     entry_index: index as u64,
                     sealed_at_s: effective_at_s,
                     effective_at_s,
@@ -87,7 +87,7 @@ impl ChainState {
         Self {
             schedule,
             adopted: Vec::new(),
-            largest: state.largest_block_bytes,
+            largest: state.largest_epoch_bytes,
             prior_at: state.prior_sealed_at_s,
         }
     }
@@ -103,24 +103,24 @@ impl ChainState {
         self.schedule.as_mut().unwrap()
     }
 
-    /// WIST-3 §6: the greatest `block_decompressed_cap_bytes` in the map
+    /// WIST-3 §6: the greatest `epoch_cap_bytes` in the map
     /// at the verified prefix's last `sealed_at` and at every accepted
-    /// future effective instant; with no verified Block, the default.
+    /// future effective instant; with no verified Epoch, the default.
     pub fn transport_bound(&self) -> u64 {
         match (&self.schedule, self.prior_at) {
-            (Some(schedule), Some(at)) => schedule.block_size_bounds(at).1,
-            _ => default_of("block_decompressed_cap_bytes"),
+            (Some(schedule), Some(at)) => schedule.epoch_size_bounds(at).1,
+            _ => default_of("epoch_cap_bytes"),
         }
     }
 
-    /// The sealing cadence in force at the previous Block's `sealed_at`,
-    /// which WIST-3 §3.1 puts the next Block's instant on the grid of.
+    /// The sealing cadence in force at the previous Epoch's `sealed_at`,
+    /// which WIST-3 §3.1 puts the next Epoch's instant on the grid of.
     pub fn cadence(&self) -> i64 {
         match (&self.schedule, self.prior_at) {
-            (Some(schedule), Some(at)) => schedule.value_at("block_cadence_seconds", at),
+            (Some(schedule), Some(at)) => schedule.value_at("epoch_cadence_seconds", at),
             _ => None,
         }
-        .unwrap_or_else(|| default_of("block_cadence_seconds") as i64)
+        .unwrap_or_else(|| default_of("epoch_cadence_seconds") as i64)
     }
 
     /// WIST-3 §5 and WIST-4 §5: `checkpoint_witness_quorum` as in force at
@@ -141,7 +141,7 @@ impl ChainState {
     }
 
     pub fn schedule_first_s(&self) -> Option<i64> {
-        self.schedule.as_ref().map(|s| s.first_block_s())
+        self.schedule.as_ref().map(|s| s.first_epoch_s())
     }
 
     pub fn prior_at(&self) -> Option<i64> {
@@ -168,28 +168,28 @@ fn default_of(parameter: &str) -> u64 {
         .max(0) as u64
 }
 
-pub struct BlockEvent {
+pub struct EpochEvent {
     pub height: u64,
     /// The root of the tree Checkpoint N states, in the `sha256:` form of
-    /// WIST-3 §3.1; a Block has no hash apart from it.
-    pub block_root: String,
+    /// WIST-3 §3.1; an Epoch has no hash apart from it.
+    pub epoch_root: String,
     pub sealed_at: String,
     pub sealed_at_s: i64,
     /// The caps and clock allowance accepted at `sealed_at`, under which
-    /// every Delta this Block seals is validated (WIST-1 §3.4).
+    /// every Delta this Epoch seals is validated (WIST-1 §3.4).
     pub profile: DeltaProfile,
     /// `recovery_window_days` in force at `sealed_at`, which freezes the
-    /// end of a recovery window opened in this Block (WIST-1 §5.2).
+    /// end of a recovery window opened in this Epoch (WIST-1 §5.2).
     pub recovery_window_days: i64,
-    /// `declaration_activation_blocks` in force at `sealed_at`, which
-    /// fixes the activation height of a fresh identity this Block seals
+    /// `declaration_activation_epochs` in force at `sealed_at`, which
+    /// fixes the activation height of a fresh identity this Epoch seals
     /// (WIST-1 §5.2).
-    pub declaration_activation_blocks: i64,
-    /// The `publisher_declaration` Entries in canonical Block order.
+    pub declaration_activation_epochs: i64,
+    /// The `publisher_declaration` Entries in canonical Epoch order.
     pub declarations: Vec<Value>,
-    /// Each `payload_withdrawal` this Block seals that core's replay
+    /// Each `payload_withdrawal` this Epoch seals that core's replay
     /// accepted (WIST-4 §5.1): the withdrawn Delta ID, its Publisher and
-    /// the earliest Block that withdrew it (WIST-3 §6.2).
+    /// the earliest Epoch that withdrew it (WIST-3 §6.2).
     pub withdrawals: Vec<(String, String, u64)>,
     pub delta_bodies: Vec<Value>,
     /// The `label` Entries with their canonical Entry index (WIST-2 §3.3).
@@ -240,7 +240,7 @@ pub struct Verified {
 }
 
 pub struct Walk {
-    pub events: Vec<BlockEvent>,
+    pub events: Vec<EpochEvent>,
     pub verified: Vec<Verified>,
 }
 
@@ -271,9 +271,9 @@ pub struct WalkState<'a> {
 }
 
 /// WIST-3 §5 and §8 steps 6–8: verifies every Checkpoint above the
-/// verified head in `block_number` order — the sequence rules, the
-/// Block's Entries against the tree the Checkpoint states, the
-/// Consistency Proof from the previous size, the Block's Registry
+/// verified head in `epoch_number` order — the sequence rules, the
+/// Epoch's Entries against the tree the Checkpoint states, the
+/// Consistency Proof from the previous size, the Epoch's Registry
 /// Updates, then the Log's signature under the key set valid at its
 /// height — and reports what the Witness quorum says about each.
 pub fn walk_checkpoints(
@@ -289,13 +289,13 @@ pub fn walk_checkpoints(
         suffix_lists,
         tree,
     } = state;
-    let mut events: Vec<BlockEvent> = Vec::new();
+    let mut events: Vec<EpochEvent> = Vec::new();
     let mut verified: Vec<Verified> = Vec::new();
     let mut walked_deltas: BTreeMap<String, (String, u64)> = BTreeMap::new();
     let mut previous = head.clone();
-    let reached = head.block_number();
+    let reached = head.epoch_number();
     for checkpoint in offered {
-        let n = checkpoint.block_number();
+        let n = checkpoint.epoch_number();
         let diverged = |detail: &str, tiles: Option<&Tree>| {
             super::checkpoints::divergence(
                 inputs.log_dir,
@@ -321,15 +321,15 @@ pub fn walk_checkpoints(
             ));
         }
         if let Err(error) = check_sequence(Some(&previous), checkpoint, chain.cadence()) {
-            // A tree below the Block before it is §5's third form, and the
+            // A tree below the Epoch before it is §5's third form, and the
             // tiles the Consumer holds reproduce the larger root.
             if error.code() == Some("WIST3-E02") {
                 return Err(diverged(
-                    "a Checkpoint states a tree below the Block before it",
+                    "a Checkpoint states a tree below the Epoch before it",
                     Some(tree),
                 ));
             }
-            return Err(Error::Verify(format!("block {n}: {error}")));
+            return Err(Error::Verify(format!("epoch {n}: {error}")));
         }
         let previous_size = previous.tree_size();
         let tree_size = checkpoint.tree_size();
@@ -354,7 +354,7 @@ pub fn walk_checkpoints(
             tree_size,
             checkpoint.root(),
         ) {
-            // The verified tiles plus the ones this Block's leaves add do
+            // The verified tiles plus the ones this Epoch's leaves add do
             // not reproduce the offered root. A source may be serving
             // another tree entirely, so ask each for the whole tree that
             // size requires — into a scratch tree, never over the tiles
@@ -372,22 +372,22 @@ pub fn walk_checkpoints(
                     }
                     **tree = offered_tree;
                 }
-                None => return Err(Error::Verify(format!("block {n}: {range_error}"))),
+                None => return Err(Error::Verify(format!("epoch {n}: {range_error}"))),
             }
         }
         let proof = consistency_proof_from(tree.reader(), previous_size, tree_size)?;
         if let Err(error) = check_consistency(&previous, checkpoint, &proof) {
             return Err(diverged(&error.to_string(), Some(tree)));
         }
-        let entries = super::tree::block_entries(
+        let entries = super::tree::epoch_entries(
             inputs.sources,
             tree,
             previous_size,
             tree_size,
             chain.transport_bound(),
         )
-        .map_err(|e| Error::Verify(format!("block {n}: {e}")))?;
-        let summary = match verify_block(
+        .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
+        let summary = match verify_epoch(
             previous_size,
             checkpoint,
             &entries,
@@ -398,12 +398,12 @@ pub fn walk_checkpoints(
             Err(error) if error.code() == Some("WIST3-E02") => {
                 return Err(diverged(&error.to_string(), Some(tree)))
             }
-            Err(error) => return Err(Error::Verify(format!("block {n}: {error}"))),
+            Err(error) => return Err(Error::Verify(format!("epoch {n}: {error}"))),
         };
 
-        // WIST-3 §3.3 and §3.4: Block N's key acts apply first, in
+        // WIST-3 §3.3 and §3.4: Epoch N's key acts apply first, in
         // canonical Entry index order, each authenticated under the keys
-        // valid at N−1; a key act that fails is ignored and the Block
+        // valid at N−1; a key act that fails is ignored and the Epoch
         // stays valid.
         let key_acts: Vec<&Value> = entries
             .iter()
@@ -416,12 +416,12 @@ pub fn walk_checkpoints(
                 )
             })
             .collect();
-        for outcome in keys.apply_block(n, key_acts) {
+        for outcome in keys.apply_epoch(n, key_acts) {
             if let Some(code) = outcome.code() {
                 eprintln!("ignoring an Aggregator key act at height {n}: {code}");
             }
         }
-        // Every other Registry Update of Block N is authenticated under
+        // Every other Registry Update of Epoch N is authenticated under
         // the keys valid at N, the set its own key acts leave in force.
         let authenticators = keys.valid_at(n);
         let authentic =
@@ -430,7 +430,7 @@ pub fn walk_checkpoints(
         let sealed_at = checkpoint.sealed_at().to_string();
         let at = checkpoint
             .sealed_at_s()
-            .map_err(|e| Error::Verify(format!("block {n}: WIST3-E03 {e}")))?;
+            .map_err(|e| Error::Verify(format!("epoch {n}: WIST3-E03 {e}")))?;
         let largest = chain.largest.max(summary.octets);
         let schedule = chain.schedule_at(at);
         for (index, entry) in entries.iter().enumerate() {
@@ -448,17 +448,17 @@ pub fn walk_checkpoints(
             let Ok(effective_at_s) = log_seconds(effective_at) else {
                 continue;
             };
-            // WIST-4 §5.1: an act no key valid at this Block signed is
+            // WIST-4 §5.1: an act no key valid at this Epoch signed is
             // WIST4-E11 and changes nothing.
             if !authentic(&entry["body"]) {
                 eprintln!("ignoring a parameter_change at height {n}: WIST4-E11");
                 continue;
             }
-            let _ = schedule.try_accept_with_block_size(
+            let _ = schedule.try_accept_with_epoch_size(
                 Amendment {
                     parameter: parameter.to_owned(),
                     value,
-                    block_number: n,
+                    epoch_number: n,
                     entry_index: index as u64,
                     sealed_at_s: at,
                     effective_at_s,
@@ -466,23 +466,23 @@ pub fn walk_checkpoints(
                 largest,
             );
         }
-        if largest > schedule.block_size_bounds(at).0 {
+        if largest > schedule.epoch_size_bounds(at).0 {
             return Err(Error::Verify(format!(
-                "block {n}: WIST3-E03 Block exceeds the accepted size schedule"
+                "epoch {n}: WIST3-E03 Epoch exceeds the accepted size schedule"
             )));
         }
         let profile = DeltaProfile::from_schedule(schedule, at);
         let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
-        let declaration_activation_blocks = schedule
-            .value_at("declaration_activation_blocks", at)
+        let declaration_activation_epochs = schedule
+            .value_at("declaration_activation_epochs", at)
             .unwrap();
-        let caps = BlockCaps {
-            domain_block_entries_max: schedule
-                .value_at("domain_block_entries_max", at)
+        let caps = EpochCaps {
+            domain_epoch_entries_max: schedule
+                .value_at("domain_epoch_entries_max", at)
                 .unwrap()
                 .max(0) as u64,
-            labeler_block_entries_max: schedule
-                .value_at("labeler_block_entries_max", at)
+            labeler_epoch_entries_max: schedule
+                .value_at("labeler_epoch_entries_max", at)
                 .unwrap()
                 .max(0) as u64,
         };
@@ -520,14 +520,14 @@ pub fn walk_checkpoints(
                 Some("publisher_declaration") => {
                     if entry.get("body").is_none() {
                         return Err(Error::Verify(format!(
-                            "block {n}: publisher_declaration entry missing body"
+                            "epoch {n}: publisher_declaration entry missing body"
                         )));
                     }
                     declarations.push(entry.clone());
                 }
                 Some("registry_update") => {
                     let body = entry.get("body").ok_or_else(|| {
-                        Error::Verify(format!("block {n}: registry_update entry missing body"))
+                        Error::Verify(format!("epoch {n}: registry_update entry missing body"))
                     })?;
                     if body["update"]["action"] == "payload_withdrawal" {
                         withdrawal_acts.push(body.clone());
@@ -535,7 +535,7 @@ pub fn walk_checkpoints(
                 }
                 Some("publisher_delta") => {
                     let body = entry.get("body").ok_or_else(|| {
-                        Error::Verify(format!("block {n}: publisher_delta entry missing body"))
+                        Error::Verify(format!("epoch {n}: publisher_delta entry missing body"))
                     })?;
                     delta_bodies.push(body.clone());
                 }
@@ -585,9 +585,9 @@ pub fn walk_checkpoints(
             }
         }
 
-        // WIST-3 §5: the key set that can speak for Block N is the one the
+        // WIST-3 §5: the key set that can speak for Epoch N is the one the
         // Log establishes at N, so the signature closes the loop only after
-        // this Block's Registry Updates have been applied.
+        // this Epoch's Registry Updates have been applied.
         let adoption = super::checkpoints::decide(
             checkpoint,
             inputs.log_id,
@@ -595,20 +595,20 @@ pub fn walk_checkpoints(
             inputs.witnesses,
             chain.quorum_at(at),
         )
-        .map_err(|e| Error::Verify(format!("block {n}: {e}")))?;
+        .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
         verified.push(Verified {
             checkpoint: checkpoint.clone(),
             adoption,
         });
 
-        events.push(BlockEvent {
+        events.push(EpochEvent {
             height: n,
-            block_root: checkpoint.root_token(),
+            epoch_root: checkpoint.root_token(),
             sealed_at,
             sealed_at_s: at,
             profile,
             recovery_window_days,
-            declaration_activation_blocks,
+            declaration_activation_epochs,
             declarations,
             withdrawals,
             delta_bodies,
@@ -964,7 +964,7 @@ fn recompute_and_restore(
 /// domain's URLs is excluded exactly as a `delete` excludes it — a parent
 /// scope no longer reaches URLs the subdomain now declares for itself.
 /// Idempotent, so running it once per Declaration Entry of the domain in
-/// a Block is safe.
+/// an Epoch is safe.
 fn sweep_declared_domain(
     conn: &Connection,
     history: &KeyHistory,
@@ -1017,7 +1017,7 @@ pub fn apply_events(
     client: &Client,
     base: &Url,
     history: &mut KeyHistory,
-    events: &[BlockEvent],
+    events: &[EpochEvent],
     tier1: bool,
     walk_floor: u64,
 ) -> Result<ApplyStats> {
@@ -1036,12 +1036,12 @@ pub fn apply_events(
     let mut withdrawn = load_withdrawn(conn)?;
     for event in events {
         let sealed_at_s = event.sealed_at_s;
-        history.apply_block(
+        history.apply_epoch(
             event.height,
-            &event.block_root,
+            &event.epoch_root,
             &event.sealed_at,
             event.recovery_window_days,
-            event.declaration_activation_blocks,
+            event.declaration_activation_epochs,
             &event.declarations,
         )?;
         for entry in &event.declarations {
@@ -1078,7 +1078,7 @@ pub fn apply_events(
 
         for body in &event.delta_bodies {
             // WIST-3 §3.3: a sealed Delta that fails the Key Set its own
-            // Block resolves is ignored exactly as a fork is — applied to
+            // Epoch resolves is ignored exactly as a fork is — applied to
             // nothing, moving no chain tip — never a reason to abandon
             // the sync; field, version, cap and clock failures share
             // that disposition.
@@ -1105,7 +1105,7 @@ pub fn apply_events(
                 continue;
             }
             // WIST-3 §6.2: a withdrawn Delta's content never materializes,
-            // even when the withdrawal sealed in the same Block.
+            // even when the withdrawal sealed in the same Epoch.
             if withdrawn.is_withdrawn(&id) {
                 continue;
             }
@@ -1281,13 +1281,13 @@ fn record_identity_starts(conn: &Connection, history: &KeyHistory) -> Result<()>
         conn.execute(
             "INSERT INTO identity_starts(domain, height) VALUES (?1, ?2)
              ON CONFLICT(domain) DO UPDATE SET height = excluded.height",
-            (domain, reset.block_number as i64),
+            (domain, reset.epoch_number as i64),
         )?;
     }
     Ok(())
 }
 
-/// WIST-2 §3.3 and WIST-3 §3.3: applies a Block's `label` and `dispute`
+/// WIST-2 §3.3 and WIST-3 §3.3: applies an Epoch's `label` and `dispute`
 /// Entries after its Deltas, each validated under its signer's Declaration
 /// as the Aggregator validated it; one that fails is ignored like a
 /// forked Delta. Every sealed Entry of a Labeler moves its last sealed
@@ -1295,7 +1295,7 @@ fn record_identity_starts(conn: &Connection, history: &KeyHistory) -> Result<()>
 pub(super) fn apply_labels(
     conn: &Connection,
     history: &KeyHistory,
-    event: &BlockEvent,
+    event: &EpochEvent,
     walk_floor: u64,
     stats: &mut ApplyStats,
 ) -> Result<()> {

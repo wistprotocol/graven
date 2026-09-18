@@ -1,5 +1,5 @@
 //! The Consumer's view of every Publisher's Declaration chain: core's
-//! WIST-1 §5.2 replay engine applied Block by Block, seeded from Snapshot
+//! WIST-1 §5.2 replay engine applied Epoch by Epoch, seeded from Snapshot
 //! state at a cold start and persisted between syncs, plus the WIST-3 §7
 //! reading of which Deltas materialize.
 use crate::error::{Error, Result};
@@ -54,10 +54,10 @@ impl KeyHistory {
         &self.declarations
     }
 
-    /// Starts the accepted prefix at a Snapshot's `log_position`.
-    pub fn seed_head(&mut self, block_number: u64, block_root: &str, sealed_at_s: Option<i64>) {
+    /// Starts the accepted prefix at a Snapshot's `tree_size`.
+    pub fn seed_head(&mut self, epoch_number: u64, epoch_root: &str, sealed_at_s: Option<i64>) {
         self.declarations
-            .seed_head(block_number, block_root, sealed_at_s);
+            .seed_head(epoch_number, epoch_root, sealed_at_s);
     }
 
     /// WIST-3 §§7/8: adopts a Snapshot's `declaration` tuple — the
@@ -76,7 +76,7 @@ impl KeyHistory {
                 domain,
                 declaration.clone(),
                 Position {
-                    block_number: sealing_height,
+                    epoch_number: sealing_height,
                     entry_index: 0,
                 },
                 0,
@@ -102,7 +102,7 @@ impl KeyHistory {
         let window = Some((
             head.clone(),
             Position {
-                block_number: head_height,
+                epoch_number: head_height,
                 entry_index: 0,
             },
             0,
@@ -124,7 +124,7 @@ impl KeyHistory {
         let pending = Some((
             head.clone(),
             Position {
-                block_number: head_height,
+                epoch_number: head_height,
                 entry_index: 0,
             },
             0,
@@ -184,26 +184,26 @@ impl KeyHistory {
             .map_err(history_error)
     }
 
-    /// Applies one sealed Block's `publisher_declaration` Entries under
+    /// Applies one sealed Epoch's `publisher_declaration` Entries under
     /// WIST-1 §5.2 with the `recovery_window_days` and
-    /// `declaration_activation_blocks` in force at its `sealed_at`; a
-    /// Block whose Declarations the shared rules reject fails the sync.
-    pub fn apply_block(
+    /// `declaration_activation_epochs` in force at its `sealed_at`; an
+    /// Epoch whose Declarations the shared rules reject fails the sync.
+    pub fn apply_epoch(
         &mut self,
-        block_number: u64,
-        block_root: &str,
+        epoch_number: u64,
+        epoch_root: &str,
         sealed_at: &str,
         recovery_window_days: i64,
-        declaration_activation_blocks: i64,
+        declaration_activation_epochs: i64,
         entries: &[Value],
     ) -> Result<Effects> {
         self.declarations
-            .apply_block(
-                block_number,
-                block_root,
+            .apply_epoch(
+                epoch_number,
+                epoch_root,
                 sealed_at,
                 recovery_window_days,
-                declaration_activation_blocks,
+                declaration_activation_epochs,
                 entries,
             )
             .map_err(history_error)
@@ -238,7 +238,7 @@ impl KeyHistory {
     /// and §3.1 major support, the presence and parameter-profile caps, the
     /// §5.2 author binding and scope under the Declaration in force for
     /// sealing at the current projection, then the §3.4 clock check against
-    /// the committing Block's `sealed_at` and the allowance accepted there.
+    /// the committing Epoch's `sealed_at` and the allowance accepted there.
     /// A Delta sealed inside an open recovery window, which WIST-1 §5.2
     /// queues instead, verifies under nothing.
     pub fn verify_delta(
@@ -311,7 +311,7 @@ impl KeyHistory {
 }
 
 /// The parameter profile a sealed Delta is validated under: the caps and
-/// clock allowance the accepted schedule holds at its Block's `sealed_at`
+/// clock allowance the accepted schedule holds at its Epoch's `sealed_at`
 /// (WIST-1 §§3.2/3.4/3.6, WIST-4 §9).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeltaProfile {
@@ -442,11 +442,11 @@ mod tests {
         sign_envelope(&delta, "delta", key_id, &signer.sk).unwrap()
     }
 
-    /// Seals one Block carrying the given Declarations at the next height.
+    /// Seals one Epoch carrying the given Declarations at the next height.
     struct Chain {
         history: KeyHistory,
         height: Option<u64>,
-        activation_blocks: i64,
+        activation_epochs: i64,
     }
 
     impl Chain {
@@ -454,11 +454,11 @@ mod tests {
             Chain::with_activation(0)
         }
 
-        fn with_activation(activation_blocks: i64) -> Self {
+        fn with_activation(activation_epochs: i64) -> Self {
             Chain {
                 history: KeyHistory::new(),
                 height: None,
-                activation_blocks,
+                activation_epochs,
             }
         }
 
@@ -468,12 +468,12 @@ mod tests {
                 .iter()
                 .map(|d| serde_json::json!({"type": "publisher_declaration", "body": d}))
                 .collect();
-            let effects = self.history.apply_block(
+            let effects = self.history.apply_epoch(
                 height,
                 &format!("sha256:{height:064}"),
                 sealed_at,
                 7,
-                self.activation_blocks,
+                self.activation_epochs,
                 &entries,
             )?;
             self.height = Some(height);
@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn an_ordinary_rotation_retires_the_old_key_from_its_block() {
+    fn an_ordinary_rotation_retires_the_old_key_from_its_epoch() {
         let pk1 = Signer::new([1u8; 32]);
         let pk2 = Signer::new([2u8; 32]);
         let mut chain = Chain::new();
@@ -791,7 +791,7 @@ mod tests {
         );
         let entry = serde_json::json!({"type": "publisher_declaration", "body": decl1});
         assert!(history
-            .apply_block(
+            .apply_epoch(
                 6,
                 "sha256:h6",
                 "2026-08-10T00:00:00Z",
@@ -801,7 +801,7 @@ mod tests {
             )
             .is_err());
         history
-            .apply_block(5, "sha256:h5", "2026-08-10T00:00:00Z", 7, 24, &[entry])
+            .apply_epoch(5, "sha256:h5", "2026-08-10T00:00:00Z", 7, 24, &[entry])
             .unwrap();
         let url = "https://records.example/a";
         assert!(history

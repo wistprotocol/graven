@@ -102,7 +102,7 @@ fn the_rollback_vector_keeps_the_head_and_preserves_an_equivocating_pair() {
                 .unwrap();
         }
         let offered = Checkpoint::parse(case["offered_checkpoint"].as_str().unwrap()).unwrap();
-        let head = case["verified_head_block_number"].as_u64().unwrap();
+        let head = case["verified_head_epoch_number"].as_u64().unwrap();
         let outcome =
             checkpoints::progression(log_dir.path(), &conn, &offered, head, &log_id, &registry);
         match case["expected"].as_str().unwrap() {
@@ -123,7 +123,7 @@ fn the_rollback_vector_keeps_the_head_and_preserves_an_equivocating_pair() {
                 let bundle = log_dir
                     .path()
                     .join("evidence")
-                    .join(format!("equivocation-block-{:09}", offered.block_number()));
+                    .join(format!("equivocation-epoch-{:09}", offered.epoch_number()));
                 let retained = std::fs::read_to_string(bundle.join("retained.checkpoint")).unwrap();
                 let kept = std::fs::read_to_string(bundle.join("offered.checkpoint")).unwrap();
                 assert_eq!(
@@ -201,7 +201,7 @@ fn the_note_form_vector_rejects_every_octet_level_departure() {
 }
 
 #[test]
-fn the_archive_vector_rejects_a_checkpoint_filed_under_another_blocks_path() {
+fn the_archive_vector_rejects_a_checkpoint_filed_under_another_epochs_path() {
     let vector = vectors();
     let client = Client::new(true);
     for case in vector["archive_cases"].as_array().unwrap() {
@@ -216,14 +216,14 @@ fn the_archive_vector_rejects_a_checkpoint_filed_under_another_blocks_path() {
             &client,
             vec![graven::fetch::parse_base(&format!("http://{addr}")).unwrap()],
         );
-        let block_number = Checkpoint::parse(case["checkpoint"].as_str().unwrap())
+        let epoch_number = Checkpoint::parse(case["checkpoint"].as_str().unwrap())
             .unwrap()
-            .block_number();
+            .epoch_number();
         let requested = path.rsplit('/').next().unwrap().parse::<u64>().unwrap();
         let outcome = checkpoints::archived(&sources, requested);
         match case["expected"].as_str().unwrap() {
             "valid" => {
-                assert_eq!(outcome.unwrap().block_number(), block_number, "{name}");
+                assert_eq!(outcome.unwrap().epoch_number(), epoch_number, "{name}");
             }
             "WIST3-E03" => {
                 let error = outcome.err().map(|e| e.to_string()).unwrap_or_default();
@@ -235,7 +235,7 @@ fn the_archive_vector_rejects_a_checkpoint_filed_under_another_blocks_path() {
 }
 
 #[test]
-fn the_cold_start_vector_matches_a_manifest_to_the_checkpoint_at_its_block() {
+fn the_cold_start_vector_matches_a_manifest_to_the_checkpoint_at_its_epoch() {
     let vector = vectors();
     for case in vector["cold_start_cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
@@ -243,9 +243,9 @@ fn the_cold_start_vector_matches_a_manifest_to_the_checkpoint_at_its_block() {
             serde_json::from_value(serde_json::json!({
                 "wist_version": "1.0.0",
                 "snapshot_date": "2026-08-02",
-                "block_number": case["manifest"]["block_number"],
-                "log_position": case["manifest"]["log_position"],
-                "anchor_block_hash": case["manifest"]["anchor_block_hash"],
+                "epoch_number": case["manifest"]["epoch_number"],
+                "tree_size": case["manifest"]["tree_size"],
+                "root_hash": case["manifest"]["root_hash"],
                 "content_digest": format!("sha256:{}", "0".repeat(64)),
                 "state": {
                     "path": "state.json",
@@ -338,7 +338,7 @@ fn tree_dir(leaves: &[Vec<u8>], tree_size: u64) -> tempfile::TempDir {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(file, bytes).unwrap();
     }
-    for bundle in wist_core::tiles::required_bundles(tree_size) {
+    for bundle in wist_core::tiles::required_entry_bundles(tree_size) {
         let (start, end) = bundle.leaf_range();
         let bytes =
             wist_core::tiles::encode_entry_bundle(&leaves[start as usize..end as usize]).unwrap();
@@ -489,7 +489,7 @@ fn a_tampered_entry_bundle_at_one_source_is_fetched_from_another() {
     let only_broken = Sources::new(&client, vec![base(&broken_addr)]);
     let mut held = graven::sync::Tree::new();
     tree::seed(&only_broken, &mut held, 4, &root).unwrap();
-    let error = tree::block_entries(&only_broken, &held, 0, 4, 1 << 20)
+    let error = tree::epoch_entries(&only_broken, &held, 0, 4, 1 << 20)
         .unwrap_err()
         .to_string();
     assert!(error.contains("WIST3-E03"), "{error}");
@@ -497,11 +497,11 @@ fn a_tampered_entry_bundle_at_one_source_is_fetched_from_another() {
     let both = Sources::new(&client, vec![base(&broken_addr), base(&good_addr)]);
     let mut held = graven::sync::Tree::new();
     tree::seed(&both, &mut held, 4, &root).unwrap();
-    let read = tree::block_entries(&both, &held, 0, 4, 1 << 20).unwrap();
+    let read = tree::epoch_entries(&both, &held, 0, 4, 1 << 20).unwrap();
     assert_eq!(
         read.len(),
         4,
-        "the second source serves the Block's Entries"
+        "the second source serves the Epoch's Entries"
     );
 }
 
@@ -533,7 +533,7 @@ fn sync_from(
 }
 
 /// WIST-3 §5: Equivocation is two Checkpoints *each validly signed* under
-/// a key valid at the height its `block_number` line states, so a note
+/// a key valid at the height its `epoch_number` line states, so a note
 /// no such key authenticates is `WIST3-E03` against the source that
 /// served it — never evidence, and never a reason to stop applying the
 /// Log while another source serves it honestly.
@@ -562,7 +562,7 @@ fn a_forged_note_at_the_verified_head_is_e03_against_its_source_and_leaves_no_ev
         "an unverifiable note is preserved as nothing"
     );
 
-    // The same Block, this time under the key valid at its height: the
+    // The same Epoch, this time under the key valid at its height: the
     // two Checkpoints equivocate and the bundle is kept.
     common::forge_head_note(&fx, [0xcd; 32], &fx.log);
     let error = sync_from(&fx, target.path(), std::slice::from_ref(&mirror), &[])
@@ -570,27 +570,27 @@ fn a_forged_note_at_the_verified_head_is_e03_against_its_source_and_leaves_no_ev
         .to_string();
     assert!(error.contains("WIST3-E02"), "{error}");
     assert!(common::synced_log_dir(target.path())
-        .join("evidence/equivocation-block-000000001")
+        .join("evidence/equivocation-epoch-000000001")
         .join("offered.checkpoint")
         .exists());
 }
 
 /// WIST-3 §5: a Checkpoint at or below the verified head is judged under
 /// the key set valid at its own height, never at the head's, so a key
-/// valid then and retired since still speaks for the Block it signed —
+/// valid then and retired since still speaks for the Epoch it signed —
 /// and a key not yet admitted at that height does not.
 #[test]
 fn a_checkpoint_below_the_head_is_judged_under_the_keys_valid_at_its_own_height() {
-    for (offered_block, expected, evidence) in
+    for (offered_epoch, expected, evidence) in
         [(5u64, "WIST3-E02", true), (2u64, "WIST3-E03", false)]
     {
         let fx = common::build_fixture(true, false);
         let second = common::Signer::new([41u8; 32]);
-        // k2 is admitted at Block 3 and retired at Block 8; the head is
-        // Block 10.
-        for block in 2..=10u64 {
+        // k2 is admitted at Epoch 3 and retired at Epoch 8; the head is
+        // Epoch 10.
+        for epoch in 2..=10u64 {
             let at = common::next_instant(&fx);
-            let entries = match block {
+            let entries = match epoch {
                 3 => vec![common::key_act(
                     &fx,
                     "aggregator_key_add",
@@ -616,14 +616,14 @@ fn a_checkpoint_below_the_head_is_judged_under_the_keys_valid_at_its_own_height(
         let target = tempfile::tempdir().unwrap();
         assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 10);
 
-        // A source offers a differing Checkpoint of a Block the Consumer
+        // A source offers a differing Checkpoint of an Epoch the Consumer
         // retains, signed by k2.
-        let retained = fx.log_state().checkpoints[offered_block as usize].clone();
+        let retained = fx.log_state().checkpoints[offered_epoch as usize].clone();
         let mut forged = Checkpoint::new(
             retained.origin(),
             retained.tree_size(),
             [0x5a; 32],
-            retained.block_number(),
+            retained.epoch_number(),
             retained.sealed_at(),
         )
         .unwrap();
@@ -631,13 +631,13 @@ fn a_checkpoint_below_the_head_is_judged_under_the_keys_valid_at_its_own_height(
         fx.log_state().write_head_note(&forged.encode());
 
         let error = sync_with(&fx, target.path(), &[]).unwrap_err().to_string();
-        assert!(error.contains(expected), "block {offered_block}: {error}");
+        assert!(error.contains(expected), "epoch {offered_epoch}: {error}");
         assert_eq!(
             common::synced_log_dir(target.path())
-                .join(format!("evidence/equivocation-block-{offered_block:09}"))
+                .join(format!("evidence/equivocation-epoch-{offered_epoch:09}"))
                 .exists(),
             evidence,
-            "block {offered_block}: evidence is kept only for an authenticated Checkpoint"
+            "epoch {offered_epoch}: evidence is kept only for an authenticated Checkpoint"
         );
     }
 }
@@ -656,7 +656,7 @@ fn two_checkpoints_stating_one_tree_size_and_different_roots_are_divergence() {
         head.origin(),
         head.tree_size(),
         [0x77; 32],
-        head.block_number() + 1,
+        head.epoch_number() + 1,
         "2026-08-09T14:00:00Z",
     )
     .unwrap();
@@ -665,7 +665,7 @@ fn two_checkpoints_stating_one_tree_size_and_different_roots_are_divergence() {
 
     let error = sync_with(&fx, target.path(), &[]).unwrap_err().to_string();
     assert!(error.contains("WIST3-E02"), "{error}");
-    let bundle = common::synced_log_dir(target.path()).join("evidence/divergence-block-000000002");
+    let bundle = common::synced_log_dir(target.path()).join("evidence/divergence-epoch-000000002");
     assert!(bundle.join("previous.checkpoint").exists());
     assert!(bundle.join("offered.checkpoint").exists());
     assert!(
@@ -684,9 +684,9 @@ fn a_fork_below_the_verified_head_is_divergence_with_the_forks_tiles_preserved()
     assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 1);
     let honest_size = fx.head_tree_size();
 
-    // A second history under the same key and origin: its Block 1 seals
+    // A second history under the same key and origin: its Epoch 1 seals
     // other Entries, so the tree the Consumer holds at the head's size is
-    // not the prefix of the tree Block 2 states.
+    // not the prefix of the tree Epoch 2 states.
     let publisher = common::Signer::new([1u8; 32]);
     let fork_entries: Vec<Value> = (0..honest_size + 2)
         .map(|i| {
@@ -712,7 +712,7 @@ fn a_fork_below_the_verified_head_is_divergence_with_the_forks_tiles_preserved()
 
     let error = sync_with(&fx, target.path(), &[]).unwrap_err().to_string();
     assert!(error.contains("WIST3-E02"), "{error}");
-    let bundle = common::synced_log_dir(target.path()).join("evidence/divergence-block-000000002");
+    let bundle = common::synced_log_dir(target.path()).join("evidence/divergence-epoch-000000002");
     assert!(bundle.join("offered.checkpoint").exists());
     assert!(
         std::fs::read_dir(bundle.join("tiles"))
@@ -755,7 +755,7 @@ fn a_size_zero_checkpoint_stating_another_root_is_divergence() {
     )
     .to_string();
     assert!(error.contains("WIST3-E02"), "{error}");
-    let bundle = dir.path().join("evidence/divergence-block-000000000");
+    let bundle = dir.path().join("evidence/divergence-epoch-000000000");
     assert!(bundle.join("offered.checkpoint").exists());
     assert!(!bundle.join("previous.checkpoint").exists());
 
@@ -796,7 +796,7 @@ fn a_verified_divergence_halts_every_later_sync_of_that_log() {
     assert_eq!(
         graven::store::synced_state(&common::synced_log_dir(target.path()))
             .unwrap()
-            .block_number,
+            .epoch_number,
         1,
         "nothing more is applied from this Aggregator"
     );
@@ -830,7 +830,7 @@ fn a_head_kept_short_of_the_quorum_is_reported_stale() {
     assert_eq!(report.head, 2);
     assert!(
         report.stale,
-        "the fixture's Blocks are sealed far in the past"
+        "the fixture's Epochs are sealed far in the past"
     );
 
     // A fresh Checkpoint arrives, but no Witness of the roster cosigned
@@ -871,7 +871,7 @@ fn a_head_no_source_serves_reports_the_verified_heads_staleness() {
     assert_eq!(
         graven::store::synced_state(&common::synced_log_dir(target.path()))
             .unwrap()
-            .block_number,
+            .epoch_number,
         1
     );
 }
@@ -895,23 +895,23 @@ fn the_unwitnessed_record_stays_with_the_checkpoint_it_belongs_to() {
 
     let conn =
         Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
-    let recorded = |block: u64| -> Option<bool> {
+    let recorded = |epoch: u64| -> Option<bool> {
         conn.query_row(
-            "SELECT unwitnessed FROM checkpoints WHERE block_number = ?1",
-            [block as i64],
+            "SELECT unwitnessed FROM checkpoints WHERE epoch_number = ?1",
+            [epoch as i64],
             |row| row.get::<_, Option<bool>>(0),
         )
         .unwrap()
     };
-    assert_eq!(recorded(1), Some(true), "Block 1 was adopted unwitnessed");
-    assert_eq!(recorded(2), Some(false), "Block 2 carries a Cosignature");
+    assert_eq!(recorded(1), Some(true), "Epoch 1 was adopted unwitnessed");
+    assert_eq!(recorded(2), Some(false), "Epoch 2 carries a Cosignature");
 }
 
-/// WIST-3 §6: a Block whose leaves cross a tile boundary is read from
+/// WIST-3 §6: an Epoch whose leaves cross a tile boundary is read from
 /// every entry bundle and tile its leaf range meets, the right-edge ones
 /// at the partial widths the Checkpoint's size requires.
 #[test]
-fn a_block_whose_leaves_cross_a_tile_boundary_is_verified_and_applied() {
+fn an_epoch_whose_leaves_cross_a_tile_boundary_is_verified_and_applied() {
     let fx = common::build_fixture(true, false);
     let publisher = common::Signer::new([1u8; 32]);
     let entries: Vec<Value> = (0..300)
@@ -932,7 +932,7 @@ fn a_block_whose_leaves_cross_a_tile_boundary_is_verified_and_applied() {
     common::seal_next(&fx, "2026-08-09T14:00:00Z", &entries);
     assert!(
         fx.head_tree_size() > 256,
-        "the Block's leaves must cross the first tile"
+        "the Epoch's leaves must cross the first tile"
     );
 
     let target = tempfile::tempdir().unwrap();
@@ -955,7 +955,7 @@ fn an_empty_roster_at_quorum_zero_adopts_the_head_and_records_it_unwitnessed() {
     assert!(report.unwitnessed);
     let state = graven::store::synced_state(&common::synced_log_dir(target.path())).unwrap();
     assert!(state.unwitnessed);
-    assert_eq!(state.block_number, report.head);
+    assert_eq!(state.epoch_number, report.head);
 }
 
 /// A store written before the Log became one growing tree names a Block

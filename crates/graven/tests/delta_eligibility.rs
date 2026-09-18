@@ -104,7 +104,7 @@ fn version_cases_keep_same_major_values_and_reject_other_majors() {
     entries
         .sort_by_key(|e| wist_core::merkle::leaf_hash(&wist_core::jcs::canonicalize(e).unwrap()));
     history
-        .apply_block(0, "sha256:h0", "2026-08-01T00:00:00Z", 7, 24, &entries)
+        .apply_epoch(0, "sha256:h0", "2026-08-01T00:00:00Z", 7, 24, &entries)
         .unwrap();
     for case in vector["version_cases"].as_array().unwrap() {
         let doc = &case["envelope"];
@@ -131,7 +131,7 @@ fn version_cases_keep_same_major_values_and_reject_other_majors() {
 }
 
 #[test]
-fn historical_clock_probes_use_the_committing_block_and_its_allowance() {
+fn historical_clock_probes_use_the_committing_epoch_and_its_allowance() {
     let vector = vector("delta-clock-time.json");
     let mut history = baseline("example.com", &vector["public_key"], 0);
     for probe in vector["probes"]
@@ -148,8 +148,8 @@ fn historical_clock_probes_use_the_committing_block_and_its_allowance() {
         };
         let outcome = history.verify_delta(1, sealed_at_s, &profile, &probe["envelope"]);
         let observed_at = probe["envelope"]["delta"]["observed_at"].as_str().unwrap();
-        let before_epoch = !wist_core::publisher_time::at_or_after(observed_at, 0).unwrap();
-        let expected = if before_epoch {
+        let before_unix_zero = !wist_core::publisher_time::at_or_after(observed_at, 0).unwrap();
+        let expected = if before_unix_zero {
             json!("WIST1-E02")
         } else {
             probe["expected"].clone()

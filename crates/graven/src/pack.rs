@@ -35,7 +35,7 @@ pub struct PackVectors {
 pub struct Pack {
     pub wist_version: String,
     pub content_digest: String,
-    pub log_position: u64,
+    pub tree_size: u64,
     pub model: PackModel,
     pub vectors: PackVectors,
 }
@@ -127,11 +127,11 @@ pub fn import(dir: &Path, log_id: &str, pack_path: &Path, key_b64u: &str) -> Res
     let log_dir = resolve_log_dir(dir, log_id)?;
     let sync_state = crate::store::synced_state(&log_dir)?;
 
-    if pack.log_position != sync_state.log_position
+    if pack.tree_size != sync_state.tree_size
         || Some(pack.content_digest.clone()) != sync_state.content_digest
     {
         return Err(Error::Verify(
-            "pack log_position/content_digest does not match local sync state".into(),
+            "pack tree_size/content_digest does not match local sync state".into(),
         ));
     }
 

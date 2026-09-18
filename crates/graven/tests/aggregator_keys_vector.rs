@@ -9,9 +9,9 @@
 //! state Envelopes under the Anchor's genesis key, and an Anchor naming
 //! a key the test controls is refused by the store's own rule that the
 //! `aggregator_key` tuples must carry the Anchor's genesis key. Each
-//! history is therefore installed at its Block 0 — the earliest Block a
-//! Snapshot can describe — with the vector's Block 0 tuples as the state
-//! a resume adopts, and every Block above it is fetched, verified and
+//! history is therefore installed at its Epoch 0 — the earliest Epoch a
+//! Snapshot can describe — with the vector's Epoch 0 tuples as the state
+//! a resume adopts, and every Epoch above it is fetched, verified and
 //! applied by the ordinary sync.
 mod common;
 
@@ -101,7 +101,7 @@ fn stored_rows(target: &Path, log_id: &str) -> Vec<(String, String, u64, Option<
     rows
 }
 
-/// A history's Blocks published as WIST-3 §6's static surface, with the
+/// A history's Epochs published as WIST-3 §6's static surface, with the
 /// Anchor the vector carries served at `/log/anchor.json`.
 struct ServedHistory {
     dir: tempfile::TempDir,
@@ -111,9 +111,9 @@ struct ServedHistory {
     anchor_path: PathBuf,
 }
 
-/// Publishes the first `through` Blocks of a history, replacing the last
+/// Publishes the first `through` Epochs of a history, replacing the last
 /// one's Checkpoint with `note` where the caller supplies one — which is
-/// how a candidate Checkpoint, or the note a Block no Checkpoint verifies
+/// how a candidate Checkpoint, or the note an Epoch no Checkpoint verifies
 /// would need, is offered as the head.
 fn serve(history: &Value, through: usize, note: Option<&str>) -> ServedHistory {
     let dir = tempfile::tempdir().unwrap();
@@ -127,15 +127,15 @@ fn serve(history: &Value, through: usize, note: Option<&str>) -> ServedHistory {
     .unwrap();
 
     let mut log = common::Log::empty(dir.path(), common::Signer::new([0u8; 32]), &log_id);
-    let blocks = history["blocks"].as_array().unwrap();
-    for (index, block) in blocks[..through].iter().enumerate() {
+    let epochs = history["epochs"].as_array().unwrap();
+    for (index, epoch) in epochs[..through].iter().enumerate() {
         let published = match (index + 1 == through, note) {
             (true, Some(note)) => note,
-            _ => block["checkpoint"]
+            _ => epoch["checkpoint"]
                 .as_str()
-                .expect("the Block carries a Checkpoint"),
+                .expect("the Epoch carries a Checkpoint"),
         };
-        log.adopt(published, block["entries"].as_array().unwrap());
+        log.adopt(published, epoch["entries"].as_array().unwrap());
     }
     let base_url = format!("http://{}", common::serve_static(dir.path().to_path_buf()));
     ServedHistory {
@@ -148,9 +148,9 @@ fn serve(history: &Value, through: usize, note: Option<&str>) -> ServedHistory {
 }
 
 /// The store a Consumer holds after WIST-3 §8's cold start at the
-/// history's Block 0: the Checkpoint it verified, the tree it holds and
+/// history's Epoch 0: the Checkpoint it verified, the tree it holds and
 /// the `aggregator_key` tuples the state artifact carried.
-fn install_at_block_0(served: &ServedHistory, target: &Path, history: &Value) {
+fn install_at_epoch_0(served: &ServedHistory, target: &Path, history: &Value) {
     let checkpoint = served.log.checkpoints[0].clone();
     let log_dir = graven::registry::log_dir(target, &served.log_id);
     std::fs::create_dir_all(&log_dir).unwrap();
@@ -163,7 +163,7 @@ fn install_at_block_0(served: &ServedHistory, target: &Path, history: &Value) {
     conn.execute_batch(graven::store::CREATE_AGGREGATOR_KEYS)
         .unwrap();
     conn.execute_batch(CREATE_DECLARATION_STATE).unwrap();
-    for entry in key_entries(&history["blocks"][0]["expected_state"]) {
+    for entry in key_entries(&history["epochs"][0]["expected_state"]) {
         conn.execute(
             "INSERT INTO aggregator_keys(key_id, public_key, added_height, removed_height) VALUES (?1, ?2, ?3, ?4)",
             (
@@ -177,7 +177,7 @@ fn install_at_block_0(served: &ServedHistory, target: &Path, history: &Value) {
     }
     let mut keys = graven::keyset::KeyHistory::new();
     keys.seed_head(
-        checkpoint.block_number(),
+        checkpoint.epoch_number(),
         &checkpoint.root_token(),
         Some(checkpoint.sealed_at_s().unwrap()),
     );
@@ -191,14 +191,14 @@ fn install_at_block_0(served: &ServedHistory, target: &Path, history: &Value) {
         &conn,
         &SyncState {
             format: graven::sync::SYNC_STATE_FORMAT,
-            log_position: checkpoint.tree_size(),
-            block_number: checkpoint.block_number(),
+            tree_size: checkpoint.tree_size(),
+            epoch_number: checkpoint.epoch_number(),
             root: checkpoint.root_token(),
             unwitnessed: true,
             content_digest: None,
             schedule_first_s: None,
             prior_sealed_at_s: Some(checkpoint.sealed_at_s().unwrap()),
-            largest_block_bytes: 0,
+            largest_epoch_bytes: 0,
         },
     )
     .unwrap();
@@ -220,12 +220,12 @@ fn install_at_block_0(served: &ServedHistory, target: &Path, history: &Value) {
 }
 
 /// Every parameter amendment the store accepted, as the `subject` and
-/// value of the act that carried it and the Block that sealed it.
+/// value of the act that carried it and the Epoch that sealed it.
 fn stored_amendments(target: &Path, log_id: &str) -> Vec<(String, i64, u64)> {
     let index = graven::registry::log_dir(target, log_id).join("index.sqlite");
     let conn = Connection::open(index).unwrap();
     let mut stmt = conn
-        .prepare("SELECT parameter, value, block_number FROM parameters")
+        .prepare("SELECT parameter, value, epoch_number FROM parameters")
         .unwrap();
     let mut rows = stmt
         .query_map([], |row| {
@@ -243,19 +243,19 @@ fn stored_amendments(target: &Path, log_id: &str) -> Vec<(String, i64, u64)> {
 }
 
 /// The amendments the vector's dispositions leave accepted above the
-/// Block the store was installed at: a `parameter_change` no key valid at
-/// its own Block signed is `WIST4-E11` and changes nothing.
+/// Epoch the store was installed at: a `parameter_change` no key valid at
+/// its own Epoch signed is `WIST4-E11` and changes nothing.
 fn accepted_amendments(history: &Value, through: usize) -> Vec<(String, i64, u64)> {
     let mut accepted = Vec::new();
-    for block in history["blocks"].as_array().unwrap()[1..through].iter() {
-        for act in block["acts"].as_array().unwrap() {
+    for epoch in history["epochs"].as_array().unwrap()[1..through].iter() {
+        for act in epoch["acts"].as_array().unwrap() {
             let index = act["entry_index"].as_u64().unwrap() as usize;
-            let update = &block["entries"][index]["body"]["update"];
+            let update = &epoch["entries"][index]["body"]["update"];
             if act["action"] == "parameter_change" && act["code"].is_null() {
                 accepted.push((
                     act["subject"].as_str().unwrap().to_string(),
                     update["details"]["value"].as_i64().unwrap(),
-                    block["block_number"].as_u64().unwrap(),
+                    epoch["epoch_number"].as_u64().unwrap(),
                 ));
             }
         }
@@ -274,26 +274,26 @@ fn sync(served: &ServedHistory, target: &Path) -> Result<graven::sync::SyncRepor
     )
 }
 
-fn applied_blocks(history: &Value) -> usize {
-    history["blocks"]
+fn applied_epochs(history: &Value) -> usize {
+    history["epochs"]
         .as_array()
         .unwrap()
         .iter()
-        .take_while(|block| block["applied"].as_bool().unwrap())
+        .take_while(|epoch| epoch["applied"].as_bool().unwrap())
         .count()
 }
 
 fn head_state(history: &Value) -> Value {
-    history["blocks"].as_array().unwrap()[applied_blocks(history) - 1]["expected_state"].clone()
+    history["epochs"].as_array().unwrap()[applied_epochs(history) - 1]["expected_state"].clone()
 }
 
 #[test]
 fn each_history_walks_to_its_verified_head_and_persists_the_tuples_the_vector_records() {
     for history in histories() {
         let name = history["name"].as_str().unwrap();
-        let served = serve(&history, applied_blocks(&history), None);
+        let served = serve(&history, applied_epochs(&history), None);
         let target = tempfile::tempdir().unwrap();
-        install_at_block_0(&served, target.path(), &history);
+        install_at_epoch_0(&served, target.path(), &history);
         let report = sync(&served, target.path()).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(
             Some(report.head),
@@ -307,40 +307,40 @@ fn each_history_walks_to_its_verified_head_and_persists_the_tuples_the_vector_re
         );
         assert_eq!(
             stored_amendments(target.path(), &served.log_id),
-            accepted_amendments(&history, applied_blocks(&history)),
-            "{name}: the amendments the walked Blocks leave accepted"
+            accepted_amendments(&history, applied_epochs(&history)),
+            "{name}: the amendments the walked Epochs leave accepted"
         );
         drop(served.dir);
     }
 }
 
 #[test]
-fn a_checkpoint_no_key_valid_at_its_block_signs_leaves_the_head_where_it_was() {
+fn a_checkpoint_no_key_valid_at_its_epoch_signs_leaves_the_head_where_it_was() {
     let mut refused = 0;
     let mut adopted = 0;
     for history in histories() {
         let name = history["name"].as_str().unwrap();
-        for (index, block) in history["blocks"].as_array().unwrap().iter().enumerate() {
-            // A candidate for Block 0 is judged against the Checkpoint the
+        for (index, epoch) in history["epochs"].as_array().unwrap().iter().enumerate() {
+            // A candidate for Epoch 0 is judged against the Checkpoint the
             // store was installed with, which states the same note text,
             // so it decides nothing about the keys; core's conformance
             // tests judge those candidates directly.
             if index == 0 {
                 continue;
             }
-            for case in block["checkpoint_cases"].as_array().unwrap() {
+            for case in epoch["checkpoint_cases"].as_array().unwrap() {
                 let case_name = case["name"].as_str().unwrap();
                 let note = case["checkpoint"].as_str().unwrap();
                 let mut served = serve(&history, index, None);
                 let target = tempfile::tempdir().unwrap();
-                install_at_block_0(&served, target.path(), &history);
-                let kept = history["blocks"].as_array().unwrap()[index - 1].clone();
+                install_at_epoch_0(&served, target.path(), &history);
+                let kept = history["epochs"].as_array().unwrap()[index - 1].clone();
                 assert_eq!(
                     sync(&served, target.path()).unwrap().head,
-                    kept["block_number"].as_u64().unwrap(),
-                    "{name}: {case_name}: the Blocks below the candidate"
+                    kept["epoch_number"].as_u64().unwrap(),
+                    "{name}: {case_name}: the Epochs below the candidate"
                 );
-                served.log.adopt(note, block["entries"].as_array().unwrap());
+                served.log.adopt(note, epoch["entries"].as_array().unwrap());
                 let outcome = sync(&served, target.path());
                 match case["expected"].as_str().unwrap() {
                     "valid" => {
@@ -348,7 +348,7 @@ fn a_checkpoint_no_key_valid_at_its_block_signs_leaves_the_head_where_it_was() {
                         assert_eq!(report.head, index as u64, "{name}: {case_name}");
                         assert_eq!(
                             stored_rows(target.path(), &served.log_id),
-                            rows(&key_entries(&block["expected_state"])),
+                            rows(&key_entries(&epoch["expected_state"])),
                             "{name}: {case_name}"
                         );
                         adopted += 1;
@@ -362,14 +362,14 @@ fn a_checkpoint_no_key_valid_at_its_block_signs_leaves_the_head_where_it_was() {
                                 &served.log_id
                             ))
                             .unwrap()
-                            .block_number,
-                            kept["block_number"].as_u64().unwrap(),
+                            .epoch_number,
+                            kept["epoch_number"].as_u64().unwrap(),
                             "{name}: {case_name}: the verified head stands"
                         );
                         assert_eq!(
                             stored_rows(target.path(), &served.log_id),
                             rows(&key_entries(&kept["expected_state"])),
-                            "{name}: {case_name}: the Block changes no key registry state"
+                            "{name}: {case_name}: the Epoch changes no key registry state"
                         );
                         refused += 1;
                     }
@@ -386,46 +386,46 @@ fn a_checkpoint_no_key_valid_at_its_block_signs_leaves_the_head_where_it_was() {
 }
 
 #[test]
-fn a_block_no_checkpoint_verifies_is_never_applied() {
+fn an_epoch_no_checkpoint_verifies_is_never_applied() {
     let history = histories()
         .into_iter()
         .find(|history| {
-            history["blocks"]
+            history["epochs"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|block| !block["applied"].as_bool().unwrap())
+                .any(|epoch| !epoch["applied"].as_bool().unwrap())
         })
-        .expect("the vector carries a Block no Checkpoint verifies");
-    let blocks = history["blocks"].as_array().unwrap();
-    let index = blocks
+        .expect("the vector carries an Epoch no Checkpoint verifies");
+    let epochs = history["epochs"].as_array().unwrap();
+    let index = epochs
         .iter()
-        .position(|block| !block["applied"].as_bool().unwrap())
+        .position(|epoch| !epoch["applied"].as_bool().unwrap())
         .unwrap();
-    assert!(blocks[index]["checkpoint"].is_null());
-    for case in blocks[index]["checkpoint_cases"].as_array().unwrap() {
+    assert!(epochs[index]["checkpoint"].is_null());
+    for case in epochs[index]["checkpoint_cases"].as_array().unwrap() {
         assert_eq!(case["expected"], "WIST3-E03");
     }
 
-    // Served without any Checkpoint for its Block, the Block is not even
-    // offered: the head stays at the Block below it.
+    // Served without any Checkpoint for its Epoch, the Epoch is not even
+    // offered: the head stays at the Epoch below it.
     let served = serve(&history, index, None);
     let target = tempfile::tempdir().unwrap();
-    install_at_block_0(&served, target.path(), &history);
+    install_at_epoch_0(&served, target.path(), &history);
     let report = sync(&served, target.path()).unwrap();
     assert_eq!(
         report.head,
-        blocks[index - 1]["block_number"].as_u64().unwrap()
+        epochs[index - 1]["epoch_number"].as_u64().unwrap()
     );
     assert_eq!(
         stored_rows(target.path(), &served.log_id),
-        rows(&key_entries(&blocks[index]["expected_state"])),
-        "the refused Block leaves the tuples the Block below it left"
+        rows(&key_entries(&epochs[index]["expected_state"])),
+        "the refused Epoch leaves the tuples the Epoch below it left"
     );
 }
 
 #[test]
-fn a_checkpoint_below_the_head_is_evidence_only_under_the_keys_valid_at_its_own_block() {
+fn a_checkpoint_below_the_head_is_evidence_only_under_the_keys_valid_at_its_own_epoch() {
     let mut seen = std::collections::BTreeSet::new();
     for history in histories() {
         let name = history["name"].as_str().unwrap();
@@ -434,9 +434,9 @@ fn a_checkpoint_below_the_head_is_evidence_only_under_the_keys_valid_at_its_own_
         };
         for case in cases {
             let case_name = case["name"].as_str().unwrap();
-            let served = serve(&history, applied_blocks(&history), None);
+            let served = serve(&history, applied_epochs(&history), None);
             let target = tempfile::tempdir().unwrap();
-            install_at_block_0(&served, target.path(), &history);
+            install_at_epoch_0(&served, target.path(), &history);
             assert_eq!(
                 Some(sync(&served, target.path()).unwrap().head),
                 history["verified_head"].as_u64()
@@ -453,13 +453,13 @@ fn a_checkpoint_below_the_head_is_evidence_only_under_the_keys_valid_at_its_own_
             assert!(error.contains(expected), "{name}: {case_name}: {error}");
             let log_dir = graven::registry::log_dir(target.path(), &served.log_id);
             assert_eq!(
-                graven::store::synced_state(&log_dir).unwrap().block_number,
+                graven::store::synced_state(&log_dir).unwrap().epoch_number,
                 history["verified_head"].as_u64().unwrap(),
                 "{name}: {case_name}: the verified head stands"
             );
             let bundle = log_dir.join(format!(
-                "evidence/equivocation-block-{:09}",
-                case["block_number"].as_u64().unwrap()
+                "evidence/equivocation-epoch-{:09}",
+                case["epoch_number"].as_u64().unwrap()
             ));
             assert_eq!(
                 bundle.exists(),

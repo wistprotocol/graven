@@ -111,8 +111,8 @@ pub(super) fn load_anchor(
 }
 
 /// A verified Snapshot installed into a temporary index with the state
-/// its tuples carry adopted (WIST-3 §8 steps 1–10), before any Block
-/// above `log_position` has been walked.
+/// its tuples carry adopted (WIST-3 §8 steps 1–10), before any Epoch
+/// above `tree_size` has been walked.
 pub(super) struct Installation {
     guard: TempFileGuard,
     tmp_sqlite_path: PathBuf,
@@ -193,10 +193,10 @@ pub(super) fn snapshot(
             )));
         }
     }
-    if newest.log_position != manifest.log_position {
+    if newest.tree_size != manifest.tree_size {
         return Err(Error::Verify(format!(
-            "WIST3-E04: snapshot index names log_position {}, its manifest {}",
-            newest.log_position, manifest.log_position
+            "WIST3-E04: snapshot index names tree_size {}, its manifest {}",
+            newest.tree_size, manifest.tree_size
         )));
     }
     let snapshot_base = format!("/snapshots/{}/", manifest.snapshot_date);
@@ -313,7 +313,7 @@ pub(super) fn snapshot(
                 ));
             }
             // WIST-3 §6.2 and §7: a Consumer resuming above a withdrawal's
-            // Block never sees its Entry, so the tuple is what excludes
+            // Epoch never sees its Entry, so the tuple is what excludes
             // the content from every later materialization.
             StateEntry::Withdrawal(w) => {
                 record_withdrawal(&conn, &w.delta_id, &w.publisher, w.sealing_height)?;
@@ -355,10 +355,10 @@ pub(super) fn snapshot(
         )?;
     }
     save_chain_tips(&conn, &tips)?;
-    super::persist::seed_ranking_index(&conn, manifest.block_number)?;
+    super::persist::seed_ranking_index(&conn, manifest.epoch_number)?;
 
     // WIST-3 §7: the `aggregator_key` tuples carry every key admitted at
-    // or below `log_position`, removed ones included, so the resumed
+    // or below `tree_size`, removed ones included, so the resumed
     // registry judges key acts and lower Checkpoints as a replaying
     // Consumer does. A state that carries none leaves the Anchor's
     // genesis key alone; one that carries tuples and omits the Anchor's

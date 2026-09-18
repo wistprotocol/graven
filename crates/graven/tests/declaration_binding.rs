@@ -27,7 +27,7 @@ fn outcome(stored: &Value, fetched: &Value) -> String {
     let mut history = KeyHistory::new();
     if !stored.is_null() {
         let effects = history
-            .apply_block(
+            .apply_epoch(
                 0,
                 "sha256:h0",
                 "2026-08-02T12:00:00Z",
@@ -39,7 +39,7 @@ fn outcome(stored: &Value, fetched: &Value) -> String {
         assert_eq!(effects.installations[0].decision, None);
     }
     let height = if stored.is_null() { 0 } else { 1 };
-    match history.apply_block(
+    match history.apply_epoch(
         height,
         "sha256:h1",
         "2026-08-03T12:00:00Z",
@@ -97,7 +97,7 @@ fn an_ordinary_rotation_keeps_the_identity_and_a_fresh_one_waits_for_activation(
             .unwrap();
         let mut history = KeyHistory::new();
         history
-            .apply_block(
+            .apply_epoch(
                 0,
                 "sha256:h0",
                 "2026-08-02T12:00:00Z",
@@ -107,7 +107,7 @@ fn an_ordinary_rotation_keeps_the_identity_and_a_fresh_one_waits_for_activation(
             )
             .unwrap();
         let effects = history
-            .apply_block(
+            .apply_epoch(
                 1,
                 "sha256:h1",
                 "2026-08-03T12:00:00Z",

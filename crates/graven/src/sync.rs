@@ -7,7 +7,7 @@ mod suffix;
 pub mod tree;
 
 use history::*;
-pub use history::{ApplyStats, BlockEvent, ChainState};
+pub use history::{ApplyStats, ChainState, EpochEvent};
 use install::*;
 use persist::*;
 pub use persist::{load_sync_state, save_sync_state, CREATE_SYNC_STATE};
@@ -42,10 +42,10 @@ use wist_core::objects::GenesisKey;
 #[derive(Debug, Clone)]
 pub struct SyncReport {
     pub log_id: String,
-    pub block_number_before: Option<u64>,
+    pub epoch_number_before: Option<u64>,
     pub head: u64,
     /// The tree size the adopted Checkpoint states (WIST-3 §7's
-    /// `log_position`).
+    /// `tree_size`).
     pub tree_size: u64,
     pub root: String,
     /// WIST-3 §5's interim: the adopted Checkpoint carried no Cosignature
@@ -61,18 +61,19 @@ pub struct SyncReport {
 
 /// The format the sync state is written in. A store written before the
 /// Log became one growing tree carries no `format` member and names a
-/// Block hash rather than a tree size, and is refused rather than
-/// reinterpreted.
-pub const SYNC_STATE_FORMAT: u32 = 3;
+/// Block hash rather than a tree size; one written before `block_number`
+/// and `log_position` became `epoch_number` and `tree_size` carries an
+/// older `format` member. Either is refused rather than reinterpreted.
+pub const SYNC_STATE_FORMAT: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncState {
     pub format: u32,
     /// The tree size the verified head states (WIST-3 §7).
-    pub log_position: u64,
-    /// The Block the verified head ends.
-    pub block_number: u64,
-    /// The root of the tree at `log_position`, in the `sha256:` form of
+    pub tree_size: u64,
+    /// The Epoch the verified head ends.
+    pub epoch_number: u64,
+    /// The root of the tree at `tree_size`, in the `sha256:` form of
     /// WIST-3 §3.1.
     pub root: String,
     #[serde(default)]
@@ -84,7 +85,7 @@ pub struct SyncState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_sealed_at_s: Option<i64>,
     #[serde(default)]
-    pub largest_block_bytes: u64,
+    pub largest_epoch_bytes: u64,
 }
 
 /// How a Log is configured: where its Anchor and its files come from, and
@@ -286,7 +287,7 @@ struct SyncContext<'a> {
 }
 
 /// The state a walk mutates, restored from the committed index before
-/// every attempt so that nothing a Block above the adopted Checkpoint
+/// every attempt so that nothing an Epoch above the adopted Checkpoint
 /// establishes survives into the store.
 struct Restored {
     keys: Registry,
@@ -312,7 +313,7 @@ fn restore(conn: &Connection, context: &SyncContext, local: &SyncState) -> Resul
 fn offered_above(
     context: &SyncContext,
     conn: &Connection,
-    head_block_number: u64,
+    head_epoch_number: u64,
     keys: &Registry,
 ) -> Result<Vec<Checkpoint>> {
     let Some(head) = checkpoints::offered_head(
@@ -320,21 +321,21 @@ fn offered_above(
         context.log_dir,
         conn,
         context.log_id,
-        head_block_number,
+        head_epoch_number,
         keys,
     )?
     else {
         return Ok(Vec::new());
     };
     let mut offered = Vec::new();
-    for number in head_block_number + 1..head.block_number() {
+    for number in head_epoch_number + 1..head.epoch_number() {
         offered.push(checkpoints::archived(context.sources, number)?);
     }
     offered.push(head);
     Ok(offered)
 }
 
-/// The Checkpoint the Consumer adopts and the Blocks up to it, walked
+/// The Checkpoint the Consumer adopts and the Epochs up to it, walked
 /// from the committed state. A Checkpoint short of the quorum leaves the
 /// head where it is, so the walk is repeated at the newest Checkpoint the
 /// quorum admits; the Entries above it are never handed to the index.
@@ -365,16 +366,16 @@ fn walk_to_adoption(
         match walk.adopted() {
             None => return Ok(None),
             Some(adopted) => {
-                let number = adopted.checkpoint.block_number();
+                let number = adopted.checkpoint.epoch_number();
                 let unwitnessed =
                     matches!(adopted.adoption, Adoption::Adopted { unwitnessed: true });
-                if number == offered[end - 1].block_number() {
+                if number == offered[end - 1].epoch_number() {
                     let checkpoint = adopted.checkpoint.clone();
                     return Ok(Some((restored, walk, checkpoint, unwitnessed)));
                 }
                 end = offered
                     .iter()
-                    .position(|c| c.block_number() == number)
+                    .position(|c| c.epoch_number() == number)
                     .map(|index| index + 1)
                     .unwrap_or(0);
             }
@@ -388,7 +389,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
     let conn = Connection::open(&index_sqlite_path)?;
     let local = load_sync_state(&conn)?
         .ok_or_else(|| Error::Verify("the index carries no sync state".into()))?;
-    let head = checkpoints::retained(&conn, local.block_number)?.ok_or_else(|| {
+    let head = checkpoints::retained(&conn, local.epoch_number)?.ok_or_else(|| {
         Error::Verify(
             "the index carries no Checkpoint at its verified head; remove the store and sync again"
                 .into(),
@@ -397,9 +398,9 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
     let cadence = ChainState::restore(&local, load_parameters(&conn)?).cadence();
     let unchanged = |stale: bool| SyncReport {
         log_id: context.log_id.to_string(),
-        block_number_before: Some(local.block_number),
-        head: local.block_number,
-        tree_size: local.log_position,
+        epoch_number_before: Some(local.epoch_number),
+        head: local.epoch_number,
+        tree_size: local.tree_size,
         root: local.root.clone(),
         unwitnessed: local.unwitnessed,
         stale,
@@ -407,7 +408,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
     };
 
     let keys = load_aggregator_keys(&conn, context.log_id, context.genesis)?;
-    let offered = match offered_above(context, &conn, local.block_number, &keys) {
+    let offered = match offered_above(context, &conn, local.epoch_number, &keys) {
         Ok(offered) => offered,
         // No source served a head: the verified head is the newest
         // Checkpoint this Consumer can accept, and its staleness is
@@ -416,8 +417,8 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
             return Err(
                 match checkpoints::warn_if_stale(context.log_id, &head, cadence) {
                     true => Error::Verify(format!(
-                        "{error}; the verified head at block {} is stale, sealed at {}",
-                        local.block_number,
+                        "{error}; the verified head at epoch {} is stale, sealed at {}",
+                        local.epoch_number,
                         head.sealed_at()
                     )),
                     false => error,
@@ -437,8 +438,8 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
         walk_to_adoption(context, &conn, &local, &head, &offered)?
     else {
         eprintln!(
-            "log {}: no Checkpoint above block {} carries the Witness quorum in force; keeping the verified head",
-            context.log_id, local.block_number
+            "log {}: no Checkpoint above epoch {} carries the Witness quorum in force; keeping the verified head",
+            context.log_id, local.epoch_number
         );
         return Ok(unchanged(checkpoints::warn_if_stale(
             context.log_id,
@@ -461,7 +462,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
     save_aggregator_keys(&tx, &keys)?;
     tree.save(&tx)?;
     for verified in &walk.verified {
-        let adopted_here = verified.checkpoint.block_number() == adopted.block_number();
+        let adopted_here = verified.checkpoint.epoch_number() == adopted.epoch_number();
         checkpoints::save_checkpoint(
             &tx,
             &verified.checkpoint,
@@ -477,7 +478,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
         &mut history,
         &walk.events,
         context.tier1,
-        local.block_number,
+        local.epoch_number,
     )?;
     fetch_definitions(
         &tx,
@@ -494,14 +495,14 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
     }
     let sync_state = SyncState {
         format: SYNC_STATE_FORMAT,
-        log_position: adopted.tree_size(),
-        block_number: adopted.block_number(),
+        tree_size: adopted.tree_size(),
+        epoch_number: adopted.epoch_number(),
         root: adopted.root_token(),
         unwitnessed,
         content_digest: local.content_digest.clone(),
         schedule_first_s: chain.schedule_first_s(),
         prior_sealed_at_s: chain.prior_at(),
-        largest_block_bytes: chain.largest(),
+        largest_epoch_bytes: chain.largest(),
     };
     save_sync_state(&tx, &sync_state)?;
     tx.commit()?;
@@ -510,9 +511,9 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
 
     Ok(SyncReport {
         log_id: context.log_id.to_string(),
-        block_number_before: Some(local.block_number),
-        head: sync_state.block_number,
-        tree_size: sync_state.log_position,
+        epoch_number_before: Some(local.epoch_number),
+        head: sync_state.epoch_number,
+        tree_size: sync_state.tree_size,
         root: sync_state.root.clone(),
         unwitnessed,
         stale,
@@ -529,16 +530,16 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
         context.log_dir,
         context.tier1,
     )?;
-    // WIST-3 §8 step 5: the Checkpoint at the Snapshot's Block, verified
+    // WIST-3 §8 step 5: the Checkpoint at the Snapshot's Epoch, verified
     // under the `aggregator_key` tuples just loaded, states the tree the
     // manifest names or the Snapshot describes another tree entirely.
-    let anchor = checkpoints::archived(context.sources, installed.manifest.block_number)?;
+    let anchor = checkpoints::archived(context.sources, installed.manifest.epoch_number)?;
     let verification = wist_core::checkpoint::verify(
         &anchor,
         context.log_id,
         &installed
             .aggregator_keys
-            .valid_at(installed.manifest.block_number),
+            .valid_at(installed.manifest.epoch_number),
         context.witnesses,
     )?;
     wist_core::snapshot::check_manifest_anchor(&installed.manifest, &anchor)?;
@@ -547,7 +548,7 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
     let anchor_adoption =
         wist_core::checkpoint::adoption(&verification, installed.chain.quorum_at(sealed_at_s));
     installed.history.seed_head(
-        anchor.block_number(),
+        anchor.epoch_number(),
         &anchor.root_token(),
         Some(sealed_at_s),
     );
@@ -572,21 +573,21 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
     )?;
     let anchor_state = SyncState {
         format: SYNC_STATE_FORMAT,
-        log_position: anchor.tree_size(),
-        block_number: anchor.block_number(),
+        tree_size: anchor.tree_size(),
+        epoch_number: anchor.epoch_number(),
         root: anchor.root_token(),
         unwitnessed: matches!(anchor_adoption, Adoption::Adopted { unwitnessed: true }),
         content_digest: Some(installed.content_digest.clone()),
         schedule_first_s: installed.chain.schedule_first_s(),
         prior_sealed_at_s: installed.chain.prior_at(),
-        largest_block_bytes: installed.chain.largest(),
+        largest_epoch_bytes: installed.chain.largest(),
     };
     save_sync_state(&installed.conn, &anchor_state)?;
     let cadence = installed.chain.cadence();
     let offered = offered_above(
         context,
         &installed.conn,
-        anchor.block_number(),
+        anchor.epoch_number(),
         &installed.aggregator_keys,
     )?;
 
@@ -607,7 +608,7 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
         None => {
             if matches!(anchor_adoption, Adoption::NotAdopted) {
                 return Err(Error::Verify(format!(
-                    "log {}: no Checkpoint from the Snapshot's Block upward carries the Witness quorum in force, so there is no state to act on; this is a wait, not a fault, and the sync can be retried",
+                    "log {}: no Checkpoint from the Snapshot's Epoch upward carries the Witness quorum in force, so there is no state to act on; this is a wait, not a fault, and the sync can be retried",
                     context.log_id
                 )));
             }
@@ -629,7 +630,7 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
         installed.chain = state.chain;
     }
     for entry in &verified {
-        let adopted_here = entry.checkpoint.block_number() == adopted.block_number();
+        let adopted_here = entry.checkpoint.epoch_number() == adopted.epoch_number();
         checkpoints::save_checkpoint(
             &installed.conn,
             &entry.checkpoint,
@@ -644,7 +645,7 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
         &mut installed.history,
         &events,
         context.tier1,
-        anchor.block_number(),
+        anchor.epoch_number(),
     )?;
     fetch_definitions(
         &installed.conn,
@@ -663,14 +664,14 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
     }
     let sync_state = SyncState {
         format: SYNC_STATE_FORMAT,
-        log_position: adopted.tree_size(),
-        block_number: adopted.block_number(),
+        tree_size: adopted.tree_size(),
+        epoch_number: adopted.epoch_number(),
         root: adopted.root_token(),
         unwitnessed,
         content_digest: Some(installed.content_digest.clone()),
         schedule_first_s: installed.chain.schedule_first_s(),
         prior_sealed_at_s: installed.chain.prior_at(),
-        largest_block_bytes: installed.chain.largest(),
+        largest_epoch_bytes: installed.chain.largest(),
     };
     save_sync_state(&installed.conn, &sync_state)?;
     installed.commit(context.log_dir)?;
@@ -679,9 +680,9 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
 
     Ok(SyncReport {
         log_id: context.log_id.to_string(),
-        block_number_before: None,
-        head: sync_state.block_number,
-        tree_size: sync_state.log_position,
+        epoch_number_before: None,
+        head: sync_state.epoch_number,
+        tree_size: sync_state.tree_size,
         root: sync_state.root.clone(),
         unwitnessed,
         stale,

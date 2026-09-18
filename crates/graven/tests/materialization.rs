@@ -98,8 +98,8 @@ fn wrap_delta(d: &Value) -> Value {
     json!({"type": "publisher_delta", "body": d})
 }
 
-/// A from-scratch Log with an empty Snapshot at `log_position` 0, so every
-/// Declaration and Delta this suite cares about is a walked Block rather
+/// A from-scratch Log with an empty Snapshot at `tree_size` 0, so every
+/// Declaration and Delta this suite cares about is a walked Epoch rather
 /// than adopted Snapshot state.
 struct Harness {
     dir: tempfile::TempDir,
@@ -126,15 +126,15 @@ impl Harness {
         let (state_bytes, state_digest_value) =
             write_state(&snapdir.join("state.json"), &log, 60, &[], &[], 0);
 
-        let block0 = state.seal("2026-08-09T00:00:00Z", &[]);
+        let epoch0 = state.seal("2026-08-09T00:00:00Z", &[]);
 
         write_manifest(
             &snapdir.join("manifest.json"),
             &log,
             snapshot_date,
             0,
-            block0.tree_size(),
-            &block0.root_token(),
+            epoch0.tree_size(),
+            &epoch0.root_token(),
             &content_digest_value,
             &state_bytes,
             &state_digest_value,
@@ -144,7 +144,7 @@ impl Harness {
             &dir.path().join("snapshots/index.json"),
             &log,
             snapshot_date,
-            block0.tree_size(),
+            epoch0.tree_size(),
             &format!("/snapshots/{snapshot_date}/manifest.json"),
             &content_digest_value,
         );

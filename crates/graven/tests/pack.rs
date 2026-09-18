@@ -9,7 +9,7 @@ fn read_sync_state(target: &std::path::Path) -> (String, u64) {
     .unwrap();
     (
         value["content_digest"].as_str().unwrap().to_string(),
-        value["log_position"].as_u64().unwrap(),
+        value["tree_size"].as_u64().unwrap(),
     )
 }
 
@@ -58,14 +58,14 @@ fn sync_fixture() -> (common::Fixture, tempfile::TempDir) {
 fn happy_import_over_synced_fixture() {
     let (fx, target) = sync_fixture();
     let (alpha_id, beta_id) = alpha_beta_ids();
-    let (content_digest, log_position) = read_sync_state(target.path());
+    let (content_digest, tree_size) = read_sync_state(target.path());
 
     let pack_dir = tempfile::tempdir().unwrap();
     let pack_path = common::build_pack(
         pack_dir.path(),
         &fx.log,
         &content_digest,
-        log_position,
+        tree_size,
         &[
             (
                 alpha_id.as_str(),
@@ -101,14 +101,14 @@ fn happy_import_over_synced_fixture() {
 fn wrong_key_rejects_and_writes_nothing() {
     let (fx, target) = sync_fixture();
     let (alpha_id, _) = alpha_beta_ids();
-    let (content_digest, log_position) = read_sync_state(target.path());
+    let (content_digest, tree_size) = read_sync_state(target.path());
 
     let pack_dir = tempfile::tempdir().unwrap();
     let pack_path = common::build_pack(
         pack_dir.path(),
         &fx.log,
         &content_digest,
-        log_position,
+        tree_size,
         &[(
             alpha_id.as_str(),
             "https://records.example/alpha",
@@ -139,14 +139,14 @@ fn wrong_key_rejects_and_writes_nothing() {
 fn digest_mismatch_rejects() {
     let (fx, target) = sync_fixture();
     let (alpha_id, _) = alpha_beta_ids();
-    let (_, log_position) = read_sync_state(target.path());
+    let (_, tree_size) = read_sync_state(target.path());
 
     let pack_dir = tempfile::tempdir().unwrap();
     let pack_path = common::build_pack(
         pack_dir.path(),
         &fx.log,
         &format!("sha256:{}", "0".repeat(64)),
-        log_position,
+        tree_size,
         &[(
             alpha_id.as_str(),
             "https://records.example/alpha",
@@ -170,14 +170,14 @@ fn digest_mismatch_rejects() {
 fn tampered_vectors_file_rejects() {
     let (fx, target) = sync_fixture();
     let (alpha_id, _) = alpha_beta_ids();
-    let (content_digest, log_position) = read_sync_state(target.path());
+    let (content_digest, tree_size) = read_sync_state(target.path());
 
     let pack_dir = tempfile::tempdir().unwrap();
     let pack_path = common::build_pack(
         pack_dir.path(),
         &fx.log,
         &content_digest,
-        log_position,
+        tree_size,
         &[(
             alpha_id.as_str(),
             "https://records.example/alpha",
@@ -207,14 +207,14 @@ fn tampered_vectors_file_rejects() {
 fn dim_mismatch_row_rejects() {
     let (fx, target) = sync_fixture();
     let (alpha_id, _) = alpha_beta_ids();
-    let (content_digest, log_position) = read_sync_state(target.path());
+    let (content_digest, tree_size) = read_sync_state(target.path());
 
     let pack_dir = tempfile::tempdir().unwrap();
     let pack_path = common::build_pack(
         pack_dir.path(),
         &fx.log,
         &content_digest,
-        log_position,
+        tree_size,
         &[(
             alpha_id.as_str(),
             "https://records.example/alpha",
@@ -238,7 +238,7 @@ fn dim_mismatch_row_rejects() {
 fn unknown_delta_id_is_skipped_others_import() {
     let (fx, target) = sync_fixture();
     let (alpha_id, _) = alpha_beta_ids();
-    let (content_digest, log_position) = read_sync_state(target.path());
+    let (content_digest, tree_size) = read_sync_state(target.path());
     let unknown_id = format!("sha256:{}", "f".repeat(64));
 
     let pack_dir = tempfile::tempdir().unwrap();
@@ -246,7 +246,7 @@ fn unknown_delta_id_is_skipped_others_import() {
         pack_dir.path(),
         &fx.log,
         &content_digest,
-        log_position,
+        tree_size,
         &[
             (
                 alpha_id.as_str(),
@@ -280,7 +280,7 @@ fn unknown_delta_id_is_skipped_others_import() {
 #[test]
 fn all_unknown_delta_ids_rejects() {
     let (fx, target) = sync_fixture();
-    let (content_digest, log_position) = read_sync_state(target.path());
+    let (content_digest, tree_size) = read_sync_state(target.path());
     let unknown1 = format!("sha256:{}", "e".repeat(64));
     let unknown2 = format!("sha256:{}", "f".repeat(64));
 
@@ -289,7 +289,7 @@ fn all_unknown_delta_ids_rejects() {
         pack_dir.path(),
         &fx.log,
         &content_digest,
-        log_position,
+        tree_size,
         &[
             (
                 unknown1.as_str(),
@@ -325,14 +325,14 @@ fn all_unknown_delta_ids_rejects() {
 fn re_import_replaces_prior_embeddings() {
     let (fx, target) = sync_fixture();
     let (alpha_id, beta_id) = alpha_beta_ids();
-    let (content_digest, log_position) = read_sync_state(target.path());
+    let (content_digest, tree_size) = read_sync_state(target.path());
 
     let pack_dir1 = tempfile::tempdir().unwrap();
     let pack_path1 = common::build_pack(
         pack_dir1.path(),
         &fx.log,
         &content_digest,
-        log_position,
+        tree_size,
         &[
             (
                 alpha_id.as_str(),
@@ -365,7 +365,7 @@ fn re_import_replaces_prior_embeddings() {
         pack_dir2.path(),
         &fx.log,
         &content_digest,
-        log_position,
+        tree_size,
         &[(
             alpha_id.as_str(),
             "https://records.example/alpha",
@@ -390,14 +390,14 @@ fn re_import_replaces_prior_embeddings() {
 fn withdrawal_purges_embedding_row() {
     let (fx, target) = sync_fixture();
     let (alpha_id, beta_id) = alpha_beta_ids();
-    let (content_digest, log_position) = read_sync_state(target.path());
+    let (content_digest, tree_size) = read_sync_state(target.path());
 
     let pack_dir = tempfile::tempdir().unwrap();
     let pack_path = common::build_pack(
         pack_dir.path(),
         &fx.log,
         &content_digest,
-        log_position,
+        tree_size,
         &[
             (
                 alpha_id.as_str(),

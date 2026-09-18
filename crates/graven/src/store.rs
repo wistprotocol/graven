@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS identity_starts(domain TEXT PRIMARY KEY, height INTEG
 
 /// WIST-4 §9: the accepted parameter amendments, so a restarted sync
 /// continues the schedule a replaying Consumer holds.
-pub const CREATE_PARAMETERS: &str = "CREATE TABLE IF NOT EXISTS parameters(parameter TEXT NOT NULL, value INTEGER NOT NULL, block_number INTEGER NOT NULL, entry_index INTEGER NOT NULL, sealed_at_s INTEGER NOT NULL, effective_at_s INTEGER NOT NULL, PRIMARY KEY(parameter, block_number, entry_index))";
+pub const CREATE_PARAMETERS: &str = "CREATE TABLE IF NOT EXISTS parameters(parameter TEXT NOT NULL, value INTEGER NOT NULL, epoch_number INTEGER NOT NULL, entry_index INTEGER NOT NULL, sealed_at_s INTEGER NOT NULL, effective_at_s INTEGER NOT NULL, PRIMARY KEY(parameter, epoch_number, entry_index))";
 
 pub const CREATE_TIER1: &str = "CREATE TABLE IF NOT EXISTS extracts(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, extract TEXT NOT NULL, PRIMARY KEY(url, publisher)); CREATE VIRTUAL TABLE IF NOT EXISTS extracts_fts USING fts5(extract, content=extracts, content_rowid=rowid); CREATE TABLE IF NOT EXISTS links(source_url TEXT NOT NULL, target_url TEXT NOT NULL, position INTEGER NOT NULL)";
 
@@ -353,7 +353,7 @@ pub struct LogHandle {
     /// WIST-3 §5: whether the Consumer has stopped applying new data
     /// from this log's Aggregator after verifying a divergence.
     pub halted: bool,
-    /// The head Block's `sealed_at`, against which a Label's expiry is read.
+    /// The head Epoch's `sealed_at`, against which a Label's expiry is read.
     pub head_sealed_at: Option<String>,
     pub store: Store,
 }
@@ -481,7 +481,7 @@ impl MultiStore {
                 .and_then(|s| wist_core::timestamp::instant(s).ok());
             logs.push(LogHandle {
                 log_id: entry.log_id,
-                synced_height: state.block_number,
+                synced_height: state.epoch_number,
                 unwitnessed: state.unwitnessed,
                 halted: crate::sync::checkpoints::halt(&log_dir).is_some(),
                 head_sealed_at,
@@ -1360,14 +1360,14 @@ mod tests {
             log_dir.join("sync.json"),
             serde_json::to_vec(&SyncState {
                 format: crate::sync::SYNC_STATE_FORMAT,
-                log_position: 0,
-                block_number: height,
+                tree_size: 0,
+                epoch_number: height,
                 root: "sha256:deadbeef".into(),
                 unwitnessed: false,
                 content_digest: None,
                 schedule_first_s: None,
                 prior_sealed_at_s: None,
-                largest_block_bytes: 0,
+                largest_epoch_bytes: 0,
             })
             .unwrap(),
         )
@@ -1478,14 +1478,14 @@ mod tests {
             tmp.path().join("sync.json"),
             serde_json::to_vec(&SyncState {
                 format: crate::sync::SYNC_STATE_FORMAT,
-                log_position: 0,
-                block_number: 1,
+                tree_size: 0,
+                epoch_number: 1,
                 root: "sha256:deadbeef".into(),
                 unwitnessed: false,
                 content_digest: None,
                 schedule_first_s: None,
                 prior_sealed_at_s: None,
-                largest_block_bytes: 0,
+                largest_epoch_bytes: 0,
             })
             .unwrap(),
         )

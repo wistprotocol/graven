@@ -39,9 +39,9 @@ fn build_log_fixture(vector: &Value, log: &Value) -> LogFixture {
     );
     let mut anchor_root = String::new();
     let mut anchor_size = 0u64;
-    for (index, block) in log["blocks"].as_array().unwrap().iter().enumerate() {
-        let entries: Vec<Value> = block["entries"].as_array().cloned().unwrap_or_default();
-        published.adopt(block["checkpoint"].as_str().unwrap(), &entries);
+    for (index, epoch) in log["epochs"].as_array().unwrap().iter().enumerate() {
+        let entries: Vec<Value> = epoch["entries"].as_array().cloned().unwrap_or_default();
+        published.adopt(epoch["checkpoint"].as_str().unwrap(), &entries);
         if index == 0 {
             anchor_root = published.head().root_token();
             anchor_size = published.head().tree_size();

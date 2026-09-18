@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate every artifact the e2e run produced against $WIST_SPEC_DIR/schemas/.
 
-Crypto is never reimplemented here: delta_id/block_hash/state_digest use the
+Crypto is never reimplemented here: delta_id/root_hash/state_digest use the
 same rfc8785+hashlib primitives $WIST_SPEC_DIR/tools/validate_examples.py uses
 inline for the same computations, and every signature/commitment/merkle-root
 recompute calls that module's own functions directly (imported below). That
@@ -184,10 +184,10 @@ def main() -> int:
             parsed = ve.verify_checkpoint(
                 note_path.read_text(), log_id, {log_id: pub_log}
             )
-            assert parsed["block_number"] == int(note_path.name), (
-                "the archived Checkpoint's block_number is not the path's number"
+            assert parsed["epoch_number"] == int(note_path.name), (
+                "the archived Checkpoint's epoch_number is not the path's number"
             )
-            archived[parsed["block_number"]] = parsed
+            archived[parsed["epoch_number"]] = parsed
 
         check(f"log/checkpoints/{note_path.name}", _archived)
 
@@ -238,7 +238,7 @@ def main() -> int:
             assert rfc8785.dumps(entry) == octets, (
                 "an Entry's leaf data is not its JCS serialization"
             )
-            assert set(entry) == {"type", "body"}, "malformed Block Entry envelope"
+            assert set(entry) == {"type", "body"}, "malformed Epoch Entry envelope"
             schema_validate(ENTRY_SCHEMAS[entry["type"]], entry["body"])
             update = entry.get("body", {}).get("update", {})
             if entry["type"] != "registry_update" or update.get("action") != "suffix_list_update":
@@ -278,10 +278,10 @@ def main() -> int:
     check("checkpoint:states-the-served-tree", _head_states_the_served_tree)
 
     def _archive_holds_the_head():
-        assert head["block_number"] in archived, (
-            "the head Checkpoint's Block is not in the archive"
+        assert head["epoch_number"] in archived, (
+            "the head Checkpoint's Epoch is not in the archive"
         )
-        held = archived[head["block_number"]]
+        held = archived[head["epoch_number"]]
         assert held["root"] == head["root"] and held["tree_size"] == head["tree_size"], (
             "the archived Checkpoint states another tree than the head"
         )

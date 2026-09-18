@@ -44,20 +44,20 @@ pub struct Weights {
 /// to the Labels it follows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Readings {
-    /// Consecutive Blocks through which a `wist:mismatch` or
+    /// Consecutive Epochs through which a `wist:mismatch` or
     /// `wist:unavailable` Label must have been live before it counts: one
-    /// Block's disagreement is the ordinary course of publication.
-    pub persistence_blocks: u64,
-    /// Blocks without a sealed Entry of any type after which a Labeler is
+    /// Epoch's disagreement is the ordinary course of publication.
+    pub persistence_epochs: u64,
+    /// Epochs without a sealed Entry of any type after which a Labeler is
     /// ignored.
-    pub labeler_inactive_blocks: u64,
+    pub labeler_inactive_epochs: u64,
 }
 
 impl Default for Readings {
     fn default() -> Self {
         Readings {
-            persistence_blocks: 2,
-            labeler_inactive_blocks: 720,
+            persistence_epochs: 2,
+            labeler_inactive_epochs: 720,
         }
     }
 }
@@ -69,7 +69,7 @@ pub struct Filters {
     /// Drop a record its Labelers mark as spam, by URL or by domain.
     pub spam: bool,
     /// Drop a record whose domain's first sealed Entry is younger than this.
-    pub min_age_blocks: u64,
+    pub min_age_epochs: u64,
     /// Drop a record whose domain no trust reaches.
     pub trusted_graph_only: bool,
 }
@@ -78,8 +78,8 @@ pub struct Filters {
 pub struct Propagation {
     pub alpha: f64,
     pub iterations: u32,
-    pub decay_per_block: f64,
-    pub growth_window_blocks: u64,
+    pub decay_per_epoch: f64,
+    pub growth_window_epochs: u64,
     pub growth_damping: f64,
 }
 
@@ -215,10 +215,10 @@ pub struct Signals {
     /// A `wist:mismatch` or `wist:unavailable` Label that the profile's
     /// Labelers agree on and that has persisted long enough to count.
     pub mismatch: bool,
-    /// Blocks since the domain's identity began — its first sealed
+    /// Epochs since the domain's identity began — its first sealed
     /// Declaration, or the activation height of a fresh identity — none
     /// when the index holds no Declaration for it.
-    pub age_blocks: Option<u64>,
+    pub age_epochs: Option<u64>,
     pub freshness: f64,
     /// Age-decayed in-links to the record's domain, normalized.
     pub inlinks: f64,
@@ -350,7 +350,7 @@ fn active_labelers(
         .filter(|labeler| match last.get(*labeler) {
             Some(height) => wist_core::label::labeler_active(
                 *height,
-                readings.labeler_inactive_blocks,
+                readings.labeler_inactive_epochs,
                 head_height,
             ),
             None => true,
@@ -403,8 +403,8 @@ fn counted_subjects(
             ));
         }
     }
-    // A Label's expiry is read against the head's Block instant; an expiry
-    // later than that is later than every earlier Block's too. The current
+    // A Label's expiry is read against the head's Epoch instant; an expiry
+    // later than that is later than every earlier Epoch's too. The current
     // Label is also an event in its own right: an index resumed from a
     // Snapshot holds the tuple and none of the history behind it.
     let mut expired: BTreeSet<Triple> = BTreeSet::new();
@@ -476,7 +476,7 @@ fn counted_subjects(
 }
 
 /// WIST-4 §6's persistence reading, widened to the profile's window: the
-/// Label must be live at the head and through the `persistence_blocks - 1`
+/// Label must be live at the head and through the `persistence_epochs - 1`
 /// heights before it.
 fn counted(
     events: &[wist_core::label::LabelEvent<'_>],
@@ -484,12 +484,12 @@ fn counted(
     head_height: u64,
     readings: &Readings,
 ) -> bool {
-    match readings.persistence_blocks {
+    match readings.persistence_epochs {
         0 | 1 => wist_core::label::live_at(events, expires_at_height, head_height),
         2 => wist_core::label::counted_at(events, expires_at_height, head_height),
-        blocks => {
-            head_height + 1 >= blocks
-                && (0..blocks).all(|back| {
+        epochs => {
+            head_height + 1 >= epochs
+                && (0..epochs).all(|back| {
                     wist_core::label::live_at(events, expires_at_height, head_height - back)
                 })
         }
@@ -579,7 +579,7 @@ impl DomainState {
                 let age = head_height.saturating_sub(height.max(0) as u64);
                 let weight = profile
                     .propagation
-                    .decay_per_block
+                    .decay_per_epoch
                     .powi(age.min(i32::MAX as u64) as i32);
                 *out.entry(source)
                     .or_default()
@@ -590,7 +590,7 @@ impl DomainState {
         }
         let mut growth: HashMap<String, (f64, f64)> = HashMap::new();
         if table_exists(conn, "link_changes")? {
-            let window_start = head_height.saturating_sub(profile.propagation.growth_window_blocks);
+            let window_start = head_height.saturating_sub(profile.propagation.growth_window_epochs);
             let mut stmt = conn.prepare(
                 "SELECT target_host, SUM(added), SUM(removed) FROM link_changes WHERE height >= ?1 GROUP BY target_host",
             )?;
@@ -749,7 +749,7 @@ pub fn rank(
         let mismatch = state.mismatch_urls.contains(&hit.url)
             || state.mismatch_hosts.contains(&unit)
             || state.mismatch_hosts.contains(&target_unit);
-        let age_blocks = state
+        let age_epochs = state
             .first_height
             .get(&hit.publisher)
             .map(|first| state.head_height.saturating_sub(*first));
@@ -767,7 +767,7 @@ pub fn rank(
         let freshness = height.map_or(1.0, |h| {
             profile
                 .propagation
-                .decay_per_block
+                .decay_per_epoch
                 .powi(state.head_height.saturating_sub(h).min(i32::MAX as u64) as i32)
         });
         let raw_inlinks = state.inlinks.get(&target_unit).copied().unwrap_or(0.0);
@@ -791,7 +791,7 @@ pub fn rank(
             distrust,
             spam,
             mismatch,
-            age_blocks,
+            age_epochs,
             freshness,
             inlinks,
             inlink_growth,
@@ -806,7 +806,7 @@ pub fn rank(
         if profile.filters.spam && spam {
             continue;
         }
-        if age_blocks.is_some_and(|age| age < profile.filters.min_age_blocks) {
+        if age_epochs.is_some_and(|age| age < profile.filters.min_age_epochs) {
             continue;
         }
         if profile.filters.trusted_graph_only && trust <= 0.0 {
@@ -848,12 +848,12 @@ pub fn rank(
         }
         if w.mismatch > 0.0 && mismatch {
             explanation.push(format!(
-                "a mismatch or unavailable Label counted after {} consecutive Blocks, factor {mismatch_factor:.3}",
-                profile.readings.persistence_blocks.max(1)
+                "a mismatch or unavailable Label counted after {} consecutive Epochs, factor {mismatch_factor:.3}",
+                profile.readings.persistence_epochs.max(1)
             ));
         }
-        if let Some(age) = age_blocks {
-            explanation.push(format!("identity began {age} blocks before the head"));
+        if let Some(age) = age_epochs {
+            explanation.push(format!("identity began {age} epochs before the head"));
         }
         ranked.push(Ranked {
             hit,

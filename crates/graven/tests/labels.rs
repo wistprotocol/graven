@@ -7,7 +7,7 @@ use wist_core::objects::{DisputeEntry, LabelEntry, StateEntry};
 
 const SUBJECT: &str = "https://other.example/x";
 
-fn append_block(fx: &common::Fixture, entries: &[Value]) -> u64 {
+fn append_epoch(fx: &common::Fixture, entries: &[Value]) -> u64 {
     let sealed_at = common::next_instant(fx);
     common::seal_next(fx, &sealed_at, entries)
 }
@@ -43,7 +43,7 @@ fn walked_labels_and_disputes_reach_the_index() {
         &labeler,
         json!({"wist_version": "1.0.0", "labeler": "records.example", "subject": "https://records.example/alpha", "name": "wist:spam", "asserted_at": "2026-08-09T12:30:00Z"}),
     );
-    let height = append_block(&fx, &[entry, self_label]);
+    let height = append_epoch(&fx, &[entry, self_label]);
     sync(&fx, target.path());
     let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
     let labels = store.labels_for(SUBJECT, None).unwrap();
@@ -81,7 +81,7 @@ fn walked_labels_and_disputes_reach_the_index() {
     let dispute = json!({"type": "dispute", "body": sign_envelope(&dispute_inner, "dispute", &disputant.kid(), &disputant.sk).unwrap()});
     let unknown = json!({"wist_version": "1.0.0", "disputant": "other.example", "label": format!("sha256:{}", "f".repeat(64)), "log": "log.example", "height": height, "asserted_at": "2026-08-09T13:00:00Z"});
     let unknown_dispute = json!({"type": "dispute", "body": sign_envelope(&unknown, "dispute", &disputant.kid(), &disputant.sk).unwrap()});
-    append_block(
+    append_epoch(
         &fx,
         &[
             json!({"type": "publisher_declaration", "body": declaration}),
@@ -124,7 +124,7 @@ fn walked_labels_and_disputes_reach_the_index() {
         &labeler,
         json!({"wist_version": "1.0.0", "labeler": "records.example", "subject": SUBJECT, "name": "wist:spam", "asserted_at": "2026-08-09T11:00:00Z"}),
     );
-    append_block(&fx, &[retraction, stale]);
+    append_epoch(&fx, &[retraction, stale]);
     sync(&fx, target.path());
     let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
     assert!(store.labels_for(SUBJECT, None).unwrap().is_empty());

@@ -3,10 +3,11 @@ use crate::error::{Error, Result};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use wist_core::block::parse_entries;
+use wist_core::epoch::parse_entries;
 use wist_core::tiles::{
-    bundles_for_range, check_bundle, decode_entry_bundle, decode_tile, required_tiles,
-    tiles_for_range, Bundle, Tile, TileSet, ENTRY_BUNDLE_MAX_BYTES, TILE_MAX_BYTES, TILE_WIDTH,
+    check_entry_bundle, decode_entry_bundle, decode_tile, entry_bundles_for_range, required_tiles,
+    tiles_for_range, EntryBundle, Tile, TileSet, ENTRY_BUNDLE_MAX_BYTES, TILE_MAX_BYTES,
+    TILE_WIDTH,
 };
 
 pub const CREATE_TREE_TILES: &str = "CREATE TABLE IF NOT EXISTS tree_tiles(level INTEGER NOT NULL, idx INTEGER NOT NULL, hashes BLOB NOT NULL, PRIMARY KEY(level, idx))";
@@ -16,7 +17,7 @@ fn invalid(message: &str) -> Error {
 }
 
 /// WIST-3 §6: the tree hashes the Consumer holds, as the tiles it
-/// fetched them in. Keeping them is what lets a later Block be verified
+/// fetched them in. Keeping them is what lets a later Epoch be verified
 /// against the prefix without refetching the Log's history.
 #[derive(Clone, Default)]
 pub struct Tree {
@@ -176,7 +177,7 @@ pub fn seed(sources: &Sources, tree: &mut Tree, tree_size: u64, root: &[u8; 32])
     adopt_tiles(sources, tree, &required_tiles(tree_size), tree_size, root)
 }
 
-/// The tiles Block N's leaves add to the tree, kept only where the whole
+/// The tiles Epoch N's leaves add to the tree, kept only where the whole
 /// tree reproduces Checkpoint N's root.
 pub fn extend(
     sources: &Sources,
@@ -212,7 +213,7 @@ pub fn offered_tree(sources: &Sources, tree_size: u64, root: &[u8; 32]) -> Resul
     Ok(None)
 }
 
-fn bundle_bytes(sources: &Sources, tree: &Tree, bundle: &Bundle) -> Result<Vec<u8>> {
+fn bundle_bytes(sources: &Sources, tree: &Tree, bundle: &EntryBundle) -> Result<Vec<u8>> {
     let (start, _) = bundle.leaf_range();
     let width = bundle.width as usize;
     let check = |bytes: &[u8]| -> Result<()> {
@@ -220,13 +221,13 @@ fn bundle_bytes(sources: &Sources, tree: &Tree, bundle: &Bundle) -> Result<Vec<u
         if entries.len() != width {
             return Err(invalid("an entry bundle is not the width its path states"));
         }
-        check_bundle(&entries, start, tree.reader())?;
+        check_entry_bundle(&entries, start, tree.reader())?;
         Ok(())
     };
     match sources.cached(&bundle.path(), ENTRY_BUNDLE_MAX_BYTES, check) {
         Ok(bytes) => Ok(bytes),
         Err(error) if bundle.width < TILE_WIDTH => {
-            let full = Bundle {
+            let full = EntryBundle {
                 index: bundle.index,
                 width: TILE_WIDTH,
             };
@@ -236,7 +237,7 @@ fn bundle_bytes(sources: &Sources, tree: &Tree, bundle: &Bundle) -> Result<Vec<u
                     return Err(invalid("an entry bundle is shorter than the tree requires"));
                 }
                 let held = entries[..width].to_vec();
-                check_bundle(&held, start, tree.reader())?;
+                check_entry_bundle(&held, start, tree.reader())?;
                 wist_core::tiles::encode_entry_bundle(&held).map_err(Into::into)
             };
             for at in 0..sources.count() {
@@ -253,11 +254,11 @@ fn bundle_bytes(sources: &Sources, tree: &Tree, bundle: &Bundle) -> Result<Vec<u
     }
 }
 
-/// WIST-3 §3.1 and §6: the Entries whose leaf indexes lie in Block N's
+/// WIST-3 §3.1 and §6: the Entries whose leaf indexes lie in Epoch N's
 /// range, read from the entry bundles that cover it, each verified
 /// against the tree's level-0 hashes, and stopped at the transport bound
 /// the verified prefix derives.
-pub fn block_entries(
+pub fn epoch_entries(
     sources: &Sources,
     tree: &Tree,
     from: u64,
@@ -267,10 +268,10 @@ pub fn block_entries(
     if from >= to {
         return Ok(Vec::new());
     }
-    let over = || invalid("the Block's Entries exceed the transport bound of its prefix");
+    let over = || invalid("the Epoch's Entries exceed the transport bound of its prefix");
     let mut leaf_data: Vec<Vec<u8>> = Vec::new();
     let mut octets: u64 = 0;
-    for bundle in bundles_for_range(from, to, to) {
+    for bundle in entry_bundles_for_range(from, to, to) {
         if octets > transport_bound {
             return Err(over());
         }

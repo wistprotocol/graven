@@ -264,7 +264,7 @@ impl Log {
         }
     }
 
-    /// Publishes a Block whose Checkpoint another party signed, keeping
+    /// Publishes an Epoch whose Checkpoint another party signed, keeping
     /// the note verbatim.
     pub fn adopt(&mut self, note: &str, entries: &[Value]) {
         for entry in entries {
@@ -277,11 +277,11 @@ impl Log {
         self.publish();
     }
 
-    /// Seals a Block under a `sealed_at` this suite's profile or cadence
+    /// Seals an Epoch under a `sealed_at` this suite's profile or cadence
     /// grid rejects, which only a misbehaving Aggregator publishes.
     pub fn seal_off_profile(&mut self, sealed_at: &str, entries: &[Value]) {
         let mut ordered = entries.to_vec();
-        wist_core::block::sort_entries(&mut ordered).expect("entries are well formed");
+        wist_core::epoch::sort_entries(&mut ordered).expect("entries are well formed");
         for entry in &ordered {
             let bytes = jcs::canonicalize(entry).expect("entry canonicalizes");
             self.hashes.push(merkle::leaf_hash(&bytes));
@@ -289,7 +289,7 @@ impl Log {
         }
         let number = self.checkpoints.len() as u64;
         let note_text = format!(
-            "{}\n{}\n{}\nblock_number {number}\nsealed_at {sealed_at}\n",
+            "{}\n{}\n{}\nepoch_number {number}\nsealed_at {sealed_at}\n",
             self.log_id,
             self.hashes.len(),
             base64::engine::general_purpose::STANDARD.encode(merkle::merkle_root(&self.hashes)),
@@ -307,7 +307,7 @@ impl Log {
         self.publish_tree();
     }
 
-    /// Seals a Block from leaf data supplied verbatim, so that a test can
+    /// Seals an Epoch from leaf data supplied verbatim, so that a test can
     /// publish an Entry whose octets are not the JCS of anything.
     pub fn seal_leaf_bytes(&mut self, sealed_at: &str, leaves: &[Vec<u8>]) -> WistCheckpoint {
         for bytes in leaves {
@@ -330,11 +330,13 @@ impl Log {
     }
 
     pub fn head(&self) -> &WistCheckpoint {
-        self.checkpoints.last().expect("the Log has sealed a Block")
+        self.checkpoints
+            .last()
+            .expect("the Log has sealed an Epoch")
     }
 
     pub fn head_number(&self) -> u64 {
-        self.head().block_number()
+        self.head().epoch_number()
     }
 
     pub fn tree_size(&self) -> u64 {
@@ -350,7 +352,7 @@ impl Log {
         self.seal_signed_by(&signer, sealed_at, entries)
     }
 
-    /// Seals the next Block under a named Aggregator key, which is how a
+    /// Seals the next Epoch under a named Aggregator key, which is how a
     /// Log that rotated its key signs the Checkpoints after the rotation.
     pub fn seal_signed_by(
         &mut self,
@@ -359,7 +361,7 @@ impl Log {
         entries: &[Value],
     ) -> WistCheckpoint {
         let mut ordered = entries.to_vec();
-        wist_core::block::sort_entries(&mut ordered).expect("entries are well formed");
+        wist_core::epoch::sort_entries(&mut ordered).expect("entries are well formed");
         for entry in &ordered {
             let bytes = jcs::canonicalize(entry).expect("entry canonicalizes");
             self.hashes.push(merkle::leaf_hash(&bytes));
@@ -383,7 +385,7 @@ impl Log {
     /// Appends each Witness's Cosignature to the head Checkpoint, as the
     /// Aggregator republishes it after `add-checkpoint` (WIST-3 §5).
     pub fn cosign_head(&mut self, witnesses: &[&Witness], timestamp_s: u64) {
-        let head = self.checkpoints.last_mut().expect("a sealed Block");
+        let head = self.checkpoints.last_mut().expect("a sealed Epoch");
         let note_text = head.note_text();
         for witness in witnesses {
             head.add_signature(wist_core::checkpoint::cosignature_line(
@@ -408,7 +410,7 @@ impl Log {
         for checkpoint in &self.checkpoints {
             let path = self
                 .dir
-                .join(format!("log/checkpoints/{:09}", checkpoint.block_number()));
+                .join(format!("log/checkpoints/{:09}", checkpoint.epoch_number()));
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, checkpoint.encode()).expect("write an archived Checkpoint");
         }
@@ -423,7 +425,7 @@ impl Log {
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(file, bytes).expect("write a tile");
         }
-        for bundle in wist_core::tiles::required_bundles(tree_size) {
+        for bundle in wist_core::tiles::required_entry_bundles(tree_size) {
             let (start, end) = bundle.leaf_range();
             let bytes =
                 wist_core::tiles::encode_entry_bundle(&self.leaves[start as usize..end as usize])
@@ -521,7 +523,7 @@ pub fn write_state(
     cadence: i64,
     declarations: &[(String, Value)],
     records: &[RecordFixture],
-    log_position: u64,
+    tree_size: u64,
 ) -> (Vec<u8>, String) {
     write_state_with(
         path,
@@ -529,7 +531,7 @@ pub fn write_state(
         cadence,
         declarations,
         records,
-        log_position,
+        tree_size,
         Vec::new(),
         0,
     )
@@ -542,13 +544,13 @@ pub fn write_state_with(
     cadence: i64,
     declarations: &[(String, Value)],
     records: &[RecordFixture],
-    log_position: u64,
+    tree_size: u64,
     extra: Vec<StateEntry>,
     floor: u64,
 ) -> (Vec<u8>, String) {
     let mut entries = extra;
     // WIST-3 §7: the state carries an `aggregator_key` tuple for every
-    // key admitted at or below `log_position`, removed ones included; a
+    // key admitted at or below `tree_size`, removed ones included; a
     // caller supplying its own set replaces the genesis-only default.
     if !entries
         .iter()
@@ -562,7 +564,7 @@ pub fn write_state_with(
         }));
     }
     entries.push(StateEntry::Parameter(ParameterEntry {
-        name: "block_cadence_seconds".into(),
+        name: "epoch_cadence_seconds".into(),
         effective_at: "2026-08-09T13:00:00Z".into(),
         value: cadence,
     }));
@@ -586,7 +588,7 @@ pub fn write_state_with(
     }
     let state = SnapshotState {
         wist_version: "1.0.0".into(),
-        log_position,
+        tree_size,
         entries,
     };
     let entry_values: Vec<Value> = state
@@ -609,9 +611,9 @@ fn write_manifest_with_files(
     path: &Path,
     log: &Signer,
     snapshot_date: &str,
-    block_number: u64,
-    log_position: u64,
-    anchor_block_hash: &str,
+    epoch_number: u64,
+    tree_size: u64,
+    root_hash: &str,
     content_digest_value: &str,
     state_bytes: &[u8],
     state_digest_value: &str,
@@ -637,9 +639,9 @@ fn write_manifest_with_files(
     let manifest = SnapshotManifest {
         wist_version: "1.0.0".into(),
         snapshot_date: snapshot_date.into(),
-        block_number,
-        log_position,
-        anchor_block_hash: anchor_block_hash.into(),
+        epoch_number,
+        tree_size,
+        root_hash: root_hash.into(),
         content_digest: content_digest_value.into(),
         state: SnapshotStateFile {
             path: "state.json".into(),
@@ -661,9 +663,9 @@ pub fn write_manifest(
     path: &Path,
     log: &Signer,
     snapshot_date: &str,
-    block_number: u64,
-    log_position: u64,
-    anchor_block_hash: &str,
+    epoch_number: u64,
+    tree_size: u64,
+    root_hash: &str,
     content_digest_value: &str,
     state_bytes: &[u8],
     state_digest_value: &str,
@@ -673,9 +675,9 @@ pub fn write_manifest(
         path,
         log,
         snapshot_date,
-        block_number,
-        log_position,
-        anchor_block_hash,
+        epoch_number,
+        tree_size,
+        root_hash,
         content_digest_value,
         state_bytes,
         state_digest_value,
@@ -689,9 +691,9 @@ pub fn write_manifest_with_tier1(
     path: &Path,
     log: &Signer,
     snapshot_date: &str,
-    block_number: u64,
-    log_position: u64,
-    anchor_block_hash: &str,
+    epoch_number: u64,
+    tree_size: u64,
+    root_hash: &str,
     content_digest_value: &str,
     state_bytes: &[u8],
     state_digest_value: &str,
@@ -702,9 +704,9 @@ pub fn write_manifest_with_tier1(
         path,
         log,
         snapshot_date,
-        block_number,
-        log_position,
-        anchor_block_hash,
+        epoch_number,
+        tree_size,
+        root_hash,
         content_digest_value,
         state_bytes,
         state_digest_value,
@@ -717,7 +719,7 @@ pub fn write_index(
     path: &Path,
     log: &Signer,
     snapshot_date: &str,
-    log_position: u64,
+    tree_size: u64,
     manifest_url: &str,
     content_digest_value: &str,
 ) {
@@ -726,7 +728,7 @@ pub fn write_index(
         updated_at: "2026-08-09T12:05:00Z".into(),
         snapshots: vec![SnapshotIndexEntry {
             snapshot_date: snapshot_date.into(),
-            log_position,
+            tree_size,
             manifest_url: manifest_url.into(),
             content_digest: content_digest_value.into(),
         }],
@@ -786,7 +788,7 @@ pub fn resign_checkpoint_with_wrong_key(fx: &Fixture, other: &Signer) {
         head.origin(),
         head.tree_size(),
         *head.root(),
-        head.block_number(),
+        head.epoch_number(),
         head.sealed_at(),
     )
     .expect("checkpoint fields are well formed");
@@ -794,9 +796,9 @@ pub fn resign_checkpoint_with_wrong_key(fx: &Fixture, other: &Signer) {
     fx.log_state().write_head_note(&forged.encode());
 }
 
-/// Seals one more Block, publishing the tree and its Checkpoint.
+/// Seals one more Epoch, publishing the tree and its Checkpoint.
 pub fn seal_next(fx: &Fixture, sealed_at: &str, entries: &[Value]) -> u64 {
-    fx.log_state().seal(sealed_at, entries).block_number()
+    fx.log_state().seal(sealed_at, entries).epoch_number()
 }
 
 /// The `sealed_at` one cadence above the Log's head, on the hourly grid
@@ -856,10 +858,10 @@ pub fn parameter_act(
     serde_json::json!({"type": "registry_update", "body": body})
 }
 
-/// The canonical Entry order WIST-3 §3.3 fixes for a Block's Entries.
+/// The canonical Entry order WIST-3 §3.3 fixes for an Epoch's Entries.
 pub fn canonical_order(entries: &[Value]) -> Vec<Value> {
     let mut ordered = entries.to_vec();
-    wist_core::block::sort_entries(&mut ordered).unwrap();
+    wist_core::epoch::sort_entries(&mut ordered).unwrap();
     ordered
 }
 
@@ -993,7 +995,7 @@ pub fn build_pack(
     dir: &Path,
     signer: &Signer,
     content_digest: &str,
-    log_position: u64,
+    tree_size: u64,
     rows: &[(&str, &str, &str, Vec<f32>)],
     dim: u32,
     metric: &str,
@@ -1018,7 +1020,7 @@ pub fn build_pack(
     let pack = serde_json::json!({
         "wist_version": "1.0.0",
         "content_digest": content_digest,
-        "log_position": log_position,
+        "tree_size": tree_size,
         "model": {
             "name": "test-model",
             "version": "1.0.0",
@@ -1138,8 +1140,8 @@ impl Fixture {
     }
 }
 
-/// Serves, at `/checkpoint`, a Checkpoint of the head's Block stating
-/// another root: what a Log equivocating about a Block it already
+/// Serves, at `/checkpoint`, a Checkpoint of the head's Epoch stating
+/// another root: what a Log equivocating about an Epoch it already
 /// published would serve. `signer` is the key that signs it, so a test
 /// can offer a note no key valid at that height authenticates.
 pub fn forge_head_note(fx: &Fixture, root: [u8; 32], signer: &Signer) {
@@ -1148,7 +1150,7 @@ pub fn forge_head_note(fx: &Fixture, root: [u8; 32], signer: &Signer) {
         head.origin(),
         head.tree_size(),
         root,
-        head.block_number(),
+        head.epoch_number(),
         head.sealed_at(),
     )
     .expect("checkpoint fields are well formed");
@@ -1249,12 +1251,12 @@ fn build_fixture_state(
     write_payload(dir.path(), hex1, &payload1);
     let wrapped_delta1 = serde_json::json!({"type": "publisher_delta", "body": delta1_env});
 
-    let block0 = state.seal(
+    let epoch0 = state.seal(
         "2026-08-09T12:00:00Z",
         &[wrapped_declaration, wrapped_delta1],
     );
-    let block0_root = block0.root_token();
-    let block0_size = block0.tree_size();
+    let epoch0_root = epoch0.root_token();
+    let epoch0_size = epoch0.tree_size();
 
     let record1 = RecordFixture {
         url: "https://records.example/alpha".into(),
@@ -1284,7 +1286,7 @@ fn build_fixture_state(
         3600,
         &[(domain.clone(), declaration_env.clone())],
         std::slice::from_ref(&record1),
-        block0_size,
+        epoch0_size,
         extra_state,
         floor,
     );
@@ -1306,8 +1308,8 @@ fn build_fixture_state(
             &log,
             &snapshot_date,
             0,
-            block0_size,
-            &block0_root,
+            epoch0_size,
+            &epoch0_root,
             &content_digest_value,
             &state_bytes,
             &state_digest_value,
@@ -1323,8 +1325,8 @@ fn build_fixture_state(
             &log,
             &snapshot_date,
             0,
-            block0_size,
-            &block0_root,
+            epoch0_size,
+            &epoch0_root,
             &content_digest_value,
             &state_bytes,
             &state_digest_value,
@@ -1336,7 +1338,7 @@ fn build_fixture_state(
         &dir.path().join("snapshots/index.json"),
         &log,
         &snapshot_date,
-        block0_size,
+        epoch0_size,
         &format!("/snapshots/{snapshot_date}/manifest.json"),
         &content_digest_value,
     );

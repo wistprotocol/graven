@@ -25,7 +25,7 @@ pub const CHECKPOINT_MAX_BYTES: u64 = 65_536;
 /// Checkpoint the Consumer verified on the way to its head but never
 /// adopted, which is no acceptance to record.
 pub const CREATE_CHECKPOINTS: &str =
-    "CREATE TABLE IF NOT EXISTS checkpoints(block_number INTEGER PRIMARY KEY, note TEXT NOT NULL, unwitnessed INTEGER)";
+    "CREATE TABLE IF NOT EXISTS checkpoints(epoch_number INTEGER PRIMARY KEY, note TEXT NOT NULL, unwitnessed INTEGER)";
 
 fn invalid(message: &str) -> Error {
     Error::Verify(format!("WIST3-E03 {message}"))
@@ -80,10 +80,10 @@ pub fn head(sources: &Sources) -> Result<Checkpoint> {
     parse_note(&bytes, "/checkpoint")
 }
 
-/// WIST-3 §6: the archived Checkpoint of one Block, rejected where the
-/// file's `block_number` line is not the path's number.
-pub fn archived(sources: &Sources, block_number: u64) -> Result<Checkpoint> {
-    let path = archive_path(block_number);
+/// WIST-3 §6: the archived Checkpoint of one Epoch, rejected where the
+/// file's `epoch_number` line is not the path's number.
+pub fn archived(sources: &Sources, epoch_number: u64) -> Result<Checkpoint> {
+    let path = archive_path(epoch_number);
     let bytes = sources.cached(&path, CHECKPOINT_MAX_BYTES, |bytes| {
         let checkpoint = parse_note(bytes, &path)?;
         check_archive_path(&checkpoint, &path)?;
@@ -99,10 +99,10 @@ pub fn save_checkpoint(
 ) -> Result<()> {
     conn.execute_batch(CREATE_CHECKPOINTS)?;
     conn.execute(
-        "INSERT INTO checkpoints(block_number, note, unwitnessed) VALUES (?1, ?2, ?3)
-         ON CONFLICT(block_number) DO UPDATE SET note = excluded.note, unwitnessed = COALESCE(excluded.unwitnessed, checkpoints.unwitnessed)",
+        "INSERT INTO checkpoints(epoch_number, note, unwitnessed) VALUES (?1, ?2, ?3)
+         ON CONFLICT(epoch_number) DO UPDATE SET note = excluded.note, unwitnessed = COALESCE(excluded.unwitnessed, checkpoints.unwitnessed)",
         (
-            checkpoint.block_number() as i64,
+            checkpoint.epoch_number() as i64,
             checkpoint.encode(),
             unwitnessed,
         ),
@@ -110,32 +110,32 @@ pub fn save_checkpoint(
     Ok(())
 }
 
-/// Whether the acceptance of the Checkpoint at one Block was recorded as
+/// Whether the acceptance of the Checkpoint at one Epoch was recorded as
 /// unwitnessed; absent where the Consumer retained it without adopting it.
-pub fn retained_unwitnessed(conn: &Connection, block_number: u64) -> Result<Option<bool>> {
+pub fn retained_unwitnessed(conn: &Connection, epoch_number: u64) -> Result<Option<bool>> {
     if !crate::store::table_exists(conn, "checkpoints")? {
         return Ok(None);
     }
     Ok(conn
         .query_row(
-            "SELECT unwitnessed FROM checkpoints WHERE block_number = ?1",
-            [block_number as i64],
+            "SELECT unwitnessed FROM checkpoints WHERE epoch_number = ?1",
+            [epoch_number as i64],
             |row| row.get::<_, Option<bool>>(0),
         )
         .optional()?
         .flatten())
 }
 
-/// The Checkpoint the Consumer retains at one Block, against whose note
-/// text a later offer of that Block is compared (WIST-3 §5).
-pub fn retained(conn: &Connection, block_number: u64) -> Result<Option<Checkpoint>> {
+/// The Checkpoint the Consumer retains at one Epoch, against whose note
+/// text a later offer of that Epoch is compared (WIST-3 §5).
+pub fn retained(conn: &Connection, epoch_number: u64) -> Result<Option<Checkpoint>> {
     if !crate::store::table_exists(conn, "checkpoints")? {
         return Ok(None);
     }
     let note: Option<String> = conn
         .query_row(
-            "SELECT note FROM checkpoints WHERE block_number = ?1",
-            [block_number as i64],
+            "SELECT note FROM checkpoints WHERE epoch_number = ?1",
+            [epoch_number as i64],
             |row| row.get(0),
         )
         .optional()?;
@@ -143,10 +143,10 @@ pub fn retained(conn: &Connection, block_number: u64) -> Result<Option<Checkpoin
         .transpose()
 }
 
-fn evidence_dir(log_dir: &Path, kind: &str, block_number: u64) -> PathBuf {
+fn evidence_dir(log_dir: &Path, kind: &str, epoch_number: u64) -> PathBuf {
     log_dir
         .join("evidence")
-        .join(format!("{kind}-block-{block_number:09}"))
+        .join(format!("{kind}-epoch-{epoch_number:09}"))
 }
 
 /// WIST-3 §5 and §9: two Checkpoints that equivocate are kept as the
@@ -156,7 +156,7 @@ pub fn record_equivocation(
     retained: &Checkpoint,
     offered: &Checkpoint,
 ) -> Result<PathBuf> {
-    let dir = evidence_dir(log_dir, "equivocation", offered.block_number());
+    let dir = evidence_dir(log_dir, "equivocation", offered.epoch_number());
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("retained.checkpoint"), retained.encode())?;
     std::fs::write(dir.join("offered.checkpoint"), offered.encode())?;
@@ -175,7 +175,7 @@ pub fn record_divergence(
     offered: &Checkpoint,
     tree: Option<&Tree>,
 ) -> Result<PathBuf> {
-    let dir = evidence_dir(log_dir, "divergence", offered.block_number());
+    let dir = evidence_dir(log_dir, "divergence", offered.epoch_number());
     std::fs::create_dir_all(&dir)?;
     if let Some(previous) = previous {
         std::fs::write(dir.join("previous.checkpoint"), previous.encode())?;
@@ -198,7 +198,7 @@ pub const HALT_FILE: &str = "halt.json";
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Halt {
     pub code: String,
-    pub block_number: u64,
+    pub epoch_number: u64,
     pub reason: String,
     pub evidence: String,
 }
@@ -208,10 +208,10 @@ pub fn halt(log_dir: &Path) -> Option<Halt> {
     serde_json::from_slice(&bytes).ok()
 }
 
-pub fn record_halt(log_dir: &Path, block_number: u64, reason: &str, evidence: &Path) -> Result<()> {
+pub fn record_halt(log_dir: &Path, epoch_number: u64, reason: &str, evidence: &Path) -> Result<()> {
     let halt = Halt {
         code: "WIST3-E02".into(),
-        block_number,
+        epoch_number,
         reason: reason.to_owned(),
         evidence: evidence.display().to_string(),
     };
@@ -224,8 +224,8 @@ pub fn halted(log_dir: &Path) -> Result<()> {
     match halt(log_dir) {
         None => Ok(()),
         Some(halt) => Err(Error::Verify(format!(
-            "WIST3-E02 this Log diverged at block {}: {}; the evidence is in {}, and nothing more is applied from this Aggregator until {} is removed",
-            halt.block_number,
+            "WIST3-E02 this Log diverged at epoch {}: {}; the evidence is in {}, and nothing more is applied from this Aggregator until {} is removed",
+            halt.epoch_number,
             halt.reason,
             halt.evidence,
             log_dir.display()
@@ -235,7 +235,7 @@ pub fn halted(log_dir: &Path) -> Result<()> {
 
 /// WIST-3 §5: Equivocation and chain divergence are established between
 /// Checkpoints "each validly signed under an Aggregator key valid at the
-/// height its `block_number` line states", so an offered Checkpoint is
+/// height its `epoch_number` line states", so an offered Checkpoint is
 /// authenticated before it is treated as evidence — under the keys valid
 /// at its own height where the Consumer's verified history has reached
 /// it, and otherwise under those valid at the verified head, since a
@@ -252,17 +252,17 @@ pub fn divergence(
     tiles: Option<&Tree>,
     detail: &str,
 ) -> Error {
-    let height = offered.block_number().min(reached);
+    let height = offered.epoch_number().min(reached);
     if let Err(error) = checkpoint::verify(offered, log_id, &registry.valid_at(height), &[]) {
         return Error::Verify(format!(
-            "{error}; {detail} is no evidence while no key valid at block {height} signs the Checkpoint offered"
+            "{error}; {detail} is no evidence while no key valid at epoch {height} signs the Checkpoint offered"
         ));
     }
     let dir = match record_divergence(log_dir, previous, offered, tiles) {
         Ok(dir) => dir,
         Err(error) => return error,
     };
-    if let Err(error) = record_halt(log_dir, offered.block_number(), detail, &dir) {
+    if let Err(error) = record_halt(log_dir, offered.epoch_number(), detail, &dir) {
         return error;
     }
     Error::Verify(format!(
@@ -274,9 +274,9 @@ pub fn divergence(
 /// WIST-3 §5's rollback rule, with the evidence an equivocating offer
 /// leaves behind: a Checkpoint at or below the verified head adopts
 /// nothing and carries no error code, unless its note text differs from
-/// the one retained at its `block_number`. Equivocation is two
+/// the one retained at its `epoch_number`. Equivocation is two
 /// Checkpoints each validly signed under a key valid at the height its
-/// `block_number` line states, so a differing note is verified under the
+/// `epoch_number` line states, so a differing note is verified under the
 /// keys valid at that height before it is treated as evidence: one that
 /// does not verify is `WIST3-E03` against the source that served it and
 /// is preserved as nothing.
@@ -284,28 +284,28 @@ pub fn progression(
     log_dir: &Path,
     conn: &Connection,
     offered: &Checkpoint,
-    head_block_number: u64,
+    head_epoch_number: u64,
     log_id: &str,
     registry: &Registry,
 ) -> Result<Progression> {
-    let held = retained(conn, offered.block_number())?;
-    match checkpoint::progression(offered, head_block_number, held.as_ref()) {
+    let held = retained(conn, offered.epoch_number())?;
+    match checkpoint::progression(offered, head_epoch_number, held.as_ref()) {
         Ok(progression) => Ok(progression),
         Err(error) => {
             if let (Some("WIST3-E02"), Some(held)) = (error.code(), held.as_ref()) {
-                // The Consumer has verified this Block, so the keys valid
+                // The Consumer has verified this Epoch, so the keys valid
                 // at its own height are the ones that can speak for it.
                 checkpoint::verify(
                     offered,
                     log_id,
-                    &registry.valid_at(offered.block_number()),
+                    &registry.valid_at(offered.epoch_number()),
                     &[],
                 )?;
                 let dir = record_equivocation(log_dir, held, offered)?;
                 record_halt(
                     log_dir,
-                    offered.block_number(),
-                    "two Checkpoints of one Block state different note text",
+                    offered.epoch_number(),
+                    "two Checkpoints of one Epoch state different note text",
                     &dir,
                 )?;
                 return Err(Error::Verify(format!(
@@ -329,7 +329,7 @@ pub fn offered_head(
     log_dir: &Path,
     conn: &Connection,
     log_id: &str,
-    head_block_number: u64,
+    head_epoch_number: u64,
     registry: &Registry,
 ) -> Result<Option<Checkpoint>> {
     let mut last: Option<Error> = None;
@@ -347,7 +347,7 @@ pub fn offered_head(
                 continue;
             }
         };
-        match progression(log_dir, conn, &offered, head_block_number, log_id, registry) {
+        match progression(log_dir, conn, &offered, head_epoch_number, log_id, registry) {
             Ok(Progression::Above) => return Ok(Some(offered)),
             Ok(Progression::NotAdopted) => answered = true,
             Err(error) if error.code().as_deref() == Some("WIST3-E02") => return Err(error),

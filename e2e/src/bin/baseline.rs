@@ -425,7 +425,7 @@ fn main() {
         });
         empty_seal_seconds.push(seal_s);
     }
-    let blocks = 3 + args.extra_empty_seals;
+    let epochs = 3 + args.extra_empty_seals;
     report["stages"]["extra_empty_seals"] = json!({
         "count": args.extra_empty_seals,
         "seconds_each": empty_seal_seconds,
@@ -435,7 +435,7 @@ fn main() {
     let ((), verify_s) = timed(|| {
         run(&clave, &["verify-history", "--data", s(&clave_data)]);
     });
-    report["stages"]["verify_history"] = json!({ "seconds": verify_s, "blocks": blocks });
+    report["stages"]["verify_history"] = json!({ "seconds": verify_s, "epochs": epochs });
 
     let ((), catchup_s) = timed(|| {
         run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
@@ -462,7 +462,7 @@ fn main() {
         run(&graven, &cold_args);
     });
     report["stages"]["consumer_cold_start_after_all_seals"] = json!({
-        "blocks": blocks,
+        "epochs": epochs,
         "seconds": cold2_s,
         "store_bytes": dir_bytes(&gdir2),
     });

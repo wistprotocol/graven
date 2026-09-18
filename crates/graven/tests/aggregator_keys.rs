@@ -1,4 +1,4 @@
-//! WIST-3 §3.4 at the Consumer: which key speaks for a Block, what a
+//! WIST-3 §3.4 at the Consumer: which key speaks for an Epoch, what a
 //! key act is authenticated under, which key acts fail, and that a
 //! removed key — the genesis key included — stays removed across the
 //! reload every later sync begins with.
@@ -52,7 +52,7 @@ fn accepted_parameter(dir: &Path, parameter: &str) -> i64 {
     .unwrap_or(0)
 }
 
-/// Seals the Blocks that admit a second Aggregator key and retire the
+/// Seals the Epochs that admit a second Aggregator key and retire the
 /// genesis key, leaving `second` the only key valid at the head.
 fn retire_the_genesis_key(fx: &common::Fixture, second: &common::Signer) {
     let at = common::next_instant(fx);
@@ -69,7 +69,7 @@ fn retire_the_genesis_key(fx: &common::Fixture, second: &common::Signer) {
             EFFECTIVE_AT,
         )],
     );
-    // The removal is authenticated at the height below its Block, where
+    // The removal is authenticated at the height below its Epoch, where
     // the genesis key is still valid; Checkpoint N is signed by the key
     // valid at N, which the removal leaves as `log2` alone.
     let at = common::next_instant(fx);
@@ -103,8 +103,8 @@ fn a_removed_genesis_key_stays_removed_across_a_reload() {
         "the store keeps the genesis key's own removal height"
     );
 
-    // The next Block's Checkpoint is signed by the retired genesis key
-    // alone. A reload that restored it would adopt this Block.
+    // The next Epoch's Checkpoint is signed by the retired genesis key
+    // alone. A reload that restored it would adopt this Epoch.
     let at = common::next_instant(&fx);
     fx.log_state().seal(&at, &[]);
     let error = sync(&fx, target.path()).unwrap_err().to_string();
@@ -112,7 +112,7 @@ fn a_removed_genesis_key_stays_removed_across_a_reload() {
     assert_eq!(
         graven::store::synced_state(&common::synced_log_dir(target.path()))
             .unwrap()
-            .block_number,
+            .epoch_number,
         3,
         "the verified head stands"
     );
@@ -126,9 +126,9 @@ fn a_retired_genesis_key_authenticates_no_act_after_a_reload() {
     retire_the_genesis_key(&fx, &second);
     assert_eq!(sync(&fx, target.path()).unwrap().head, 3);
 
-    // Block 4 carries two amendments: one under the retired genesis key,
+    // Epoch 4 carries two amendments: one under the retired genesis key,
     // which WIST-4 §5.1 ignores as `WIST4-E11`, and one under the key
-    // valid at the Block, which is accepted.
+    // valid at the Epoch, which is accepted.
     let at = common::next_instant(&fx);
     let acts = [
         common::parameter_act(
@@ -141,7 +141,7 @@ fn a_retired_genesis_key_authenticates_no_act_after_a_reload() {
         common::parameter_act(
             "log2",
             &second,
-            "record_seal_blocks",
+            "record_seal_epochs",
             48,
             "2026-08-20T00:00:00Z",
         ),
@@ -155,18 +155,18 @@ fn a_retired_genesis_key_authenticates_no_act_after_a_reload() {
         "an act the retired genesis key signed changes nothing"
     );
     assert_eq!(
-        accepted_parameter(target.path(), "record_seal_blocks"),
+        accepted_parameter(target.path(), "record_seal_epochs"),
         1,
-        "an act a key valid at the Block signed is accepted"
+        "an act a key valid at the Epoch signed is accepted"
     );
 }
 
 /// WIST-3 §3.4: "The key set valid at N does not depend on the order in
-/// which Block N's key acts are evaluated", so one Block adding a key and
+/// which Epoch N's key acts are evaluated", so one Epoch adding a key and
 /// retiring another leaves the same registry whichever Entry order the
 /// leaf hashes put them in.
 #[test]
-fn an_addition_and_a_removal_in_one_block_leave_the_same_registry_in_either_order() {
+fn an_addition_and_a_removal_in_one_epoch_leave_the_same_registry_in_either_order() {
     let mut seen_orders = std::collections::BTreeSet::new();
     for instant in [
         "2026-08-09T15:00:00Z",
@@ -244,9 +244,9 @@ fn an_addition_and_a_removal_in_one_block_leave_the_same_registry_in_either_orde
 
 /// WIST-3 §3.4 and WIST-4 §5.1: a key act that fails is ignored as
 /// `WIST4-E04` — it changes no key registry state and the containing
-/// Block stays valid.
+/// Epoch stays valid.
 #[test]
-fn a_failed_key_act_is_ignored_and_leaves_its_block_valid() {
+fn a_failed_key_act_is_ignored_and_leaves_its_epoch_valid() {
     let second = common::Signer::new([28u8; 32]);
     let third = common::Signer::new([29u8; 32]);
     for (name, act) in [
@@ -296,7 +296,7 @@ fn a_failed_key_act_is_ignored_and_leaves_its_block_valid() {
 
         let target = tempfile::tempdir().unwrap();
         let report = sync(&fx, target.path())
-            .unwrap_or_else(|e| panic!("{name}: the Block stays valid: {e}"));
+            .unwrap_or_else(|e| panic!("{name}: the Epoch stays valid: {e}"));
         assert_eq!(report.head, 3, "{name}");
         assert_eq!(
             registry_rows(target.path()),
@@ -306,11 +306,11 @@ fn a_failed_key_act_is_ignored_and_leaves_its_block_valid() {
     }
 }
 
-/// WIST-3 §3.4: a key act sealed in Block N is authenticated under the
-/// keys valid at N−1, so a key added in Block N signs no key act of that
-/// Block.
+/// WIST-3 §3.4: a key act sealed in Epoch N is authenticated under the
+/// keys valid at N−1, so a key added in Epoch N signs no key act of that
+/// Epoch.
 #[test]
-fn a_key_added_in_one_block_authenticates_no_key_act_of_that_block() {
+fn a_key_added_in_one_epoch_authenticates_no_key_act_of_that_epoch() {
     let fx = common::build_fixture(true, false);
     let second = common::Signer::new([30u8; 32]);
     let third = common::Signer::new([31u8; 32]);
@@ -349,16 +349,16 @@ fn a_key_added_in_one_block_authenticates_no_key_act_of_that_block() {
     );
 }
 
-/// WIST-3 §3.4: a key added in Block N signs no key act of that Block,
-/// but may sign its other acts and Checkpoint N; a key removed in Block N
-/// may sign that Block's key acts and signs neither its other acts nor
+/// WIST-3 §3.4: a key added in Epoch N signs no key act of that Epoch,
+/// but may sign its other acts and Checkpoint N; a key removed in Epoch N
+/// may sign that Epoch's key acts and signs neither its other acts nor
 /// Checkpoint N.
 #[test]
-fn a_blocks_other_acts_and_checkpoint_read_the_key_set_its_own_key_acts_leave() {
+fn an_epochs_other_acts_and_checkpoint_read_the_key_set_its_own_key_acts_leave() {
     let fx = common::build_fixture(true, false);
     let second = common::Signer::new([33u8; 32]);
     let at = common::next_instant(&fx);
-    // Block 2 admits log2 and, under that same key, amends a parameter;
+    // Epoch 2 admits log2 and, under that same key, amends a parameter;
     // its Checkpoint is signed by log2 too.
     let entries = [
         common::key_act(
@@ -373,15 +373,15 @@ fn a_blocks_other_acts_and_checkpoint_read_the_key_set_its_own_key_acts_leave() 
         common::parameter_act(
             "log2",
             &second,
-            "record_seal_blocks",
+            "record_seal_epochs",
             48,
             "2026-08-20T00:00:00Z",
         ),
     ];
     fx.log_state().seal_signed_by(&second, &at, &entries);
 
-    // Block 3 retires the genesis key under its own signature and carries
-    // an amendment under it, which the key set valid at Block 3 no longer
+    // Epoch 3 retires the genesis key under its own signature and carries
+    // an amendment under it, which the key set valid at Epoch 3 no longer
     // admits.
     let at = common::next_instant(&fx);
     let entries = [
@@ -414,14 +414,14 @@ fn a_blocks_other_acts_and_checkpoint_read_the_key_set_its_own_key_acts_leave() 
         ]
     );
     assert_eq!(
-        accepted_parameter(target.path(), "record_seal_blocks"),
+        accepted_parameter(target.path(), "record_seal_epochs"),
         1,
-        "a key added in the Block signs that Block's other acts"
+        "a key added in the Epoch signs that Epoch's other acts"
     );
     assert_eq!(
         accepted_parameter(target.path(), "payload_window_days"),
         0,
-        "a key removed in the Block signs none of its other acts"
+        "a key removed in the Epoch signs none of its other acts"
     );
 }
 
@@ -481,7 +481,7 @@ fn a_snapshot_resume_keeps_a_retired_keys_tuple() {
         &[common::parameter_act(
             "retired",
             &retired,
-            "record_seal_blocks",
+            "record_seal_epochs",
             48,
             "2026-08-20T00:00:00Z",
         )],
@@ -498,7 +498,7 @@ fn a_snapshot_resume_keeps_a_retired_keys_tuple() {
         "the resumed registry keeps the retired key's tuple"
     );
     assert_eq!(
-        accepted_parameter(target.path(), "record_seal_blocks"),
+        accepted_parameter(target.path(), "record_seal_epochs"),
         0,
         "an act the retired key signed changes nothing"
     );
