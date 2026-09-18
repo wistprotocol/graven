@@ -25,26 +25,6 @@ import sqlite3
 import sys
 
 
-def zstd_decompress(data: bytes) -> bytes:
-    try:
-        from compression import zstd
-
-        return zstd.decompress(data)
-    except ImportError:
-        pass
-    try:
-        import zstandard
-
-        return zstandard.ZstdDecompressor().decompress(data)
-    except ImportError:
-        pass
-    import subprocess
-
-    return subprocess.run(
-        ["zstd", "-d", "-c"], input=data, capture_output=True, check=True
-    ).stdout
-
-
 def load_validate_examples(spec_dir: pathlib.Path):
     sys.path.insert(0, str(spec_dir / "tools"))
     path = spec_dir / "tools" / "validate_examples.py"
@@ -104,9 +84,6 @@ def main() -> int:
 
     def sha256_hex(data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
-
-    def block_hash_of(header) -> str:
-        return "sha256:" + sha256_hex(rfc8785.dumps(header))
 
     def delta_id_of(delta) -> str:
         return "sha256:" + sha256_hex(rfc8785.dumps(delta))
@@ -185,72 +162,131 @@ def main() -> int:
     check("anchor.json", _anchor)
     pub_log = ve.b64u_decode(anchor_doc["anchor"]["genesis_key"]["public_key"])
 
-    checkpoint_doc = read_json(clave_dir / "log" / "checkpoint.json")
+    log_id = anchor_doc["anchor"]["log_id"]
 
-    def _checkpoint():
-        schema_validate("checkpoint", checkpoint_doc)
-        ve.verify_envelope(checkpoint_doc, "checkpoint", pub_log)
+    head_text = (clave_dir / "checkpoint").read_text()
+    head = {}
 
-    check("checkpoint.json", _checkpoint)
+    def _head():
+        head.update(ve.verify_checkpoint(head_text, log_id, {log_id: pub_log}))
 
-    status_path = clave_dir / "status.json"
-    if status_path.exists():
+    check("checkpoint", _head)
 
-        def _status():
-            schema_validate("status", read_json(status_path))
+    archive = sorted((clave_dir / "log" / "checkpoints").glob("[0-9]" * 9))
+    if not archive:
+        failures.append("log/checkpoints:none-found")
+        print("FAIL log/checkpoints:none-found")
 
-        check("status.json", _status)
+    archived = {}
+    for note_path in archive:
 
-    block_files = sorted((clave_dir / "log" / "blocks").glob("*.json.zst"))
-    if not block_files:
-        failures.append("blocks:none-found")
-        print("FAIL blocks:none-found")
+        def _archived(note_path=note_path):
+            parsed = ve.verify_checkpoint(
+                note_path.read_text(), log_id, {log_id: pub_log}
+            )
+            assert parsed["block_number"] == int(note_path.name), (
+                "the archived Checkpoint's block_number is not the path's number"
+            )
+            archived[parsed["block_number"]] = parsed
 
-    last_header = {}
+        check(f"log/checkpoints/{note_path.name}", _archived)
+
+    def decode_entry_bundle(data: bytes):
+        entries = []
+        position = 0
+        while position < len(data):
+            length = int.from_bytes(data[position : position + 2], "big")
+            body = data[position + 2 : position + 2 + length]
+            assert len(body) == length, "an entry bundle ends inside an Entry"
+            entries.append(body)
+            position += 2 + length
+        return entries
+
+    leaf_data = []
     pinned = set()
 
-    for block_path in block_files:
-
-        def _block(block_path=block_path):
-            block = json.loads(zstd_decompress(block_path.read_bytes()))
-            schema_validate("block", block)
-            header = block["header"]
-            entries = block["entries"]
-            assert header["entry_count"] == len(entries), "entry_count mismatch"
-            if entries:
-                leaves = [ve.leaf_hash(rfc8785.dumps(e)) for e in entries]
-                root = "sha256:" + ve.merkle_root(leaves).hex()
+    def _entry_bundles():
+        index = 0
+        while True:
+            full = clave_dir / "tile" / "entries" / f"{index:03d}"
+            partial = sorted((clave_dir / "tile" / "entries").glob(f"{index:03d}.p/*"))
+            if full.exists():
+                data = full.read_bytes()
+            elif partial:
+                data = max(partial, key=lambda p: int(p.name)).read_bytes()
             else:
-                root = "sha256:" + ve.leaf_hash(b"").hex()
-            assert root == header["merkle_root"], "merkle root mismatch"
-            signed_bytes = rfc8785.dumps(header)
-            Ed25519PublicKey.from_public_bytes(pub_log).verify(
-                ve.b64u_decode(block["sig"]["value"]), signed_bytes
+                break
+            assert len(data) <= 16_777_472, "an entry bundle over its format size"
+            leaf_data.extend(decode_entry_bundle(data))
+            index += 1
+        assert leaf_data, "the Log serves no Entry"
+
+    check("tile/entries", _entry_bundles)
+
+    ENTRY_SCHEMAS = {
+        "publisher_delta": "delta",
+        "publisher_declaration": "publisher",
+        "registry_update": "registry-update",
+        "label": "label",
+        "dispute": "dispute",
+    }
+
+    def _entries():
+        for octets in leaf_data:
+            assert len(octets) <= 65_535, "an Entry over 65 535 octets"
+            entry = json.loads(octets)
+            assert rfc8785.dumps(entry) == octets, (
+                "an Entry's leaf data is not its JCS serialization"
             )
-            last_header[header["block_number"]] = header
-            for e in entries:
-                update = e.get("body", {}).get("update", {})
-                if e["type"] != "registry_update" or update.get("action") != "suffix_list_update":
-                    continue
-                identifier = update["details"]["sha256"]
-                served = clave_dir / "log" / "suffix-lists" / (identifier.split(":", 1)[1] + ".dat")
-                data = served.read_bytes()
-                assert "sha256:" + sha256_hex(data) == identifier, "suffix-list file does not hash to its name"
-                assert len(data) == update["details"]["bytes"], "suffix-list act bytes disagree with the file"
-                pinned.add(identifier)
+            assert set(entry) == {"type", "body"}, "malformed Block Entry envelope"
+            schema_validate(ENTRY_SCHEMAS[entry["type"]], entry["body"])
+            update = entry.get("body", {}).get("update", {})
+            if entry["type"] != "registry_update" or update.get("action") != "suffix_list_update":
+                continue
+            identifier = update["details"]["sha256"]
+            served = clave_dir / "log" / "suffix-lists" / (identifier.split(":", 1)[1] + ".dat")
+            data = served.read_bytes()
+            assert "sha256:" + sha256_hex(data) == identifier, "suffix-list file does not hash to its name"
+            assert len(data) == update["details"]["bytes"], "suffix-list act bytes disagree with the file"
+            pinned.add(identifier)
 
-        check(f"block:{block_path.name}", _block)
+    check("tile/entries:entries", _entries)
 
-    def _checkpoint_binds_newest_block():
-        assert last_header, "no block to bind"
-        newest = last_header[max(last_header)]
-        assert checkpoint_doc["checkpoint"]["block_hash"] == block_hash_of(newest), (
-            "checkpoint.block_hash does not match the recomputed hash of its "
-            "named block header"
+    def _head_states_the_served_tree():
+        assert head, "the head Checkpoint did not verify"
+        assert len(leaf_data) == head["tree_size"], (
+            "the Entries served are not the tree size the head Checkpoint states"
         )
-        assert checkpoint_doc["checkpoint"]["block_number"] == newest["block_number"]
+        leaves = [ve.leaf_hash(octets) for octets in leaf_data]
+        expected = ve.merkle_root(leaves) if leaves else hashlib.sha256(b"").digest()
+        assert expected == head["root"], (
+            "the served Entries do not reproduce the root the head Checkpoint states"
+        )
+        for index in range(0, len(leaves), 256):
+            group = leaves[index : index + 256]
+            tile = clave_dir / "tile" / "0" / f"{index // 256:03d}"
+            if not tile.exists():
+                partials = sorted((clave_dir / "tile" / "0").glob(f"{index // 256:03d}.p/*"))
+                assert partials, "the tree's level-0 tile is not served"
+                tile = max(partials, key=lambda p: int(p.name))
+            served = tile.read_bytes()
+            assert len(served) <= 8192, "a tile over its format size"
+            assert served == b"".join(group), (
+                "a level-0 tile does not carry the leaf hashes of its Entries"
+            )
 
-    check("checkpoint:binds-newest-block", _checkpoint_binds_newest_block)
+    check("checkpoint:states-the-served-tree", _head_states_the_served_tree)
+
+    def _archive_holds_the_head():
+        assert head["block_number"] in archived, (
+            "the head Checkpoint's Block is not in the archive"
+        )
+        held = archived[head["block_number"]]
+        assert held["root"] == head["root"] and held["tree_size"] == head["tree_size"], (
+            "the archived Checkpoint states another tree than the head"
+        )
+
+    check("log/checkpoints:holds-the-head", _archive_holds_the_head)
 
     index_doc = read_json(clave_dir / "snapshots" / "index.json")
 

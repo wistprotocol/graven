@@ -1,7 +1,6 @@
 use e2e::{
-    free_loopback_addr, graven_bin, grid_instant, now_rfc3339, resolve_sibling_bin, run,
-    run_with_env, s, serve_sites, spawn_clave_serve, wait_until_pulled_since,
-    wait_until_status_active, workspace_root, McpClient,
+    graven_bin, grid_instant, now_rfc3339, resolve_sibling_bin, run, run_with_env, s, serve_sites,
+    start_aggregator, wait_until_pulled_since, wait_until_status_active, workspace_root, McpClient,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -159,6 +158,33 @@ fn validate_artifacts(site: &Path, clave_data: &Path) {
     assert!(status.success(), "validate_artifacts.py reported failures");
 }
 
+fn verify_with_external_tlog_client(base_url: &str, verifier_key: &str) {
+    let go_available = Command::new("go").arg("version").output();
+    if !matches!(go_available, Ok(output) if output.status.success()) {
+        assert!(
+            std::env::var("CI").is_err(),
+            "the external tlog client was skipped under CI: no Go toolchain"
+        );
+        eprintln!("SKIP external tlog client: no Go toolchain on PATH");
+        return;
+    }
+    let client = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tlog-client");
+    let output = Command::new("go")
+        .current_dir(&client)
+        .args(["run", ".", "-log", base_url, "-key", verifier_key])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run the external tlog client: {e}"));
+    assert!(
+        output.status.success(),
+        "the external tlog client rejected the served Log: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprint!("{stdout}");
+    assert!(stdout.contains("checkpoint verified"), "{stdout}");
+    assert!(stdout.contains("inclusion verified"), "{stdout}");
+}
+
 #[test]
 fn end_to_end() {
     let harness_start = Instant::now();
@@ -238,48 +264,33 @@ fn end_to_end() {
 
     let suffix_list =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/public-suffix-list.dat");
-    let clave_host = free_loopback_addr();
-    run(
+    let aggregator = start_aggregator(
         &clave,
-        &[
-            "init",
-            "--log-id",
-            &clave_host,
-            "--data",
-            s(&clave_data),
-            "--suffix-list",
-            s(&suffix_list),
-        ],
+        clave_data.clone(),
+        Some(&suffix_list),
+        Some(&site_proxy),
     );
-    let (_clave_child, clave_bound_addr, clave_stderr) =
-        spawn_clave_serve(&clave, &clave_data, &clave_host, &site_proxy);
-    assert_eq!(
-        clave_bound_addr, clave_host,
-        "clave serve bound a different address than the pre-picked --log-id"
+    let clave_host = aggregator.log_id.clone();
+    let clave_base = aggregator.base_url.clone();
+    let clave_stderr = aggregator.stderr.clone();
+    assert!(
+        aggregator
+            .verifier_key
+            .starts_with(&format!("{clave_host}+")),
+        "the verifier key names the Log's origin: {}",
+        aggregator.verifier_key
     );
-    let clave_base = format!("http://{clave_host}");
 
     let clave2_data = tmp.path().join("clave-data-2");
-    let clave2_host = free_loopback_addr();
-    run(
+    let aggregator2 = start_aggregator(
         &clave,
-        &[
-            "init",
-            "--log-id",
-            &clave2_host,
-            "--data",
-            s(&clave2_data),
-            "--suffix-list",
-            s(&suffix_list),
-        ],
+        clave2_data.clone(),
+        Some(&suffix_list),
+        Some(&site_proxy),
     );
-    let (_clave2_child, clave2_bound_addr, clave2_stderr) =
-        spawn_clave_serve(&clave, &clave2_data, &clave2_host, &site_proxy);
-    assert_eq!(
-        clave2_bound_addr, clave2_host,
-        "clave serve bound a different address than the pre-picked --log-id"
-    );
-    let clave2_base = format!("http://{clave2_host}");
+    let clave2_host = aggregator2.log_id.clone();
+    let clave2_base = aggregator2.base_url.clone();
+    let clave2_stderr = aggregator2.stderr.clone();
 
     run(
         &spake,
@@ -1161,6 +1172,7 @@ fn end_to_end() {
     drop(mcp6);
 
     validate_artifacts(&site, &clave_data);
+    verify_with_external_tlog_client(&aggregator.base_url, &aggregator.verifier_key);
 
     eprintln!("end_to_end completed in {:?}", harness_start.elapsed());
 }

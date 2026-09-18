@@ -305,11 +305,11 @@ fn main() {
             &["seal", "--data", s(&clave_data), "--at", &first_seal],
         );
     });
-    let block0 = clave_data.join("log/blocks/000000000.json.zst");
     report["stages"]["seal_1"] = json!({
         "seconds": seal_s,
-        "block_compressed_bytes": dir_bytes(&block0),
-        "block_decompressed_bytes": zstd::decode_all(std::fs::read(&block0).expect("block 0").as_slice()).map(|b| b.len()).unwrap_or(0),
+        "entry_bundle_bytes": dir_bytes(&clave_data.join("tile/entries")),
+        "tile_bytes": dir_bytes(&clave_data.join("tile")),
+        "checkpoint_bytes": dir_bytes(&clave_data.join("log/checkpoints")),
         "payloads_bytes": dir_bytes(&clave_data.join("payloads")),
         "snapshots_bytes": dir_bytes(&clave_data.join("snapshots")),
         "sqlite_bytes": dir_bytes(&clave_data.join("clave.sqlite")),
@@ -399,10 +399,11 @@ fn main() {
             &["seal", "--data", s(&clave_data), "--at", &second_seal],
         );
     });
-    let block1 = clave_data.join("log/blocks/000000001.json.zst");
     report["stages"]["seal_2"] = json!({
         "seconds": seal2_s,
-        "block_compressed_bytes": dir_bytes(&block1),
+        "entry_bundle_bytes": dir_bytes(&clave_data.join("tile/entries")),
+        "tile_bytes": dir_bytes(&clave_data.join("tile")),
+        "checkpoint_bytes": dir_bytes(&clave_data.join("log/checkpoints")),
         "snapshots_bytes": dir_bytes(&clave_data.join("snapshots")),
         "data_dir_bytes": dir_bytes(&clave_data),
     });

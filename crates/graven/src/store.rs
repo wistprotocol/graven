@@ -20,7 +20,7 @@ pub const CREATE_CHAIN_TIPS: &str =
 /// WIST-3 §3.4: the Aggregator keys valid for this Log, with the
 /// permanently retired ones kept so a later add naming one is rejected.
 pub const CREATE_AGGREGATOR_KEYS: &str =
-    "CREATE TABLE IF NOT EXISTS aggregator_keys(key_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, removed INTEGER NOT NULL)";
+    "CREATE TABLE IF NOT EXISTS aggregator_keys(key_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, added_height INTEGER NOT NULL, removed_height INTEGER)";
 
 /// WIST-3 §6.2: every withdrawn Delta, adopted from the Snapshot's
 /// `withdrawal` tuples and extended by each walked `payload_withdrawal`,
@@ -134,6 +134,13 @@ fn row_to_hit(row: &rusqlite::Row) -> rusqlite::Result<RecordHit> {
 pub struct ProvEntry {
     pub log_id: String,
     pub synced_height: u64,
+    /// WIST-3 §5's interim: this log's verified head was adopted with no
+    /// Cosignature from a Witness this Consumer trusts.
+    pub unwitnessed: bool,
+    /// WIST-3 §5: this log equivocated or diverged and the Consumer has
+    /// stopped applying new data from its Aggregator; what it already
+    /// applied stays queryable.
+    pub halted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -160,16 +167,13 @@ struct ExtractRow {
     observed_at: String,
 }
 
-fn merge_extract(rows: Vec<(String, u64, ExtractRow)>) -> Option<(String, Vec<ProvEntry>)> {
+fn merge_extract(rows: Vec<(ProvEntry, ExtractRow)>) -> Option<(String, Vec<ProvEntry>)> {
     let mut by_delta: BTreeMap<String, (ExtractRow, Vec<ProvEntry>)> = BTreeMap::new();
-    for (log_id, synced_height, row) in rows {
+    for (provenance, row) in rows {
         let entry = by_delta
             .entry(row.delta_id.clone())
             .or_insert_with(|| (row, Vec::new()));
-        entry.1.push(ProvEntry {
-            log_id,
-            synced_height,
-        });
+        entry.1.push(provenance);
     }
 
     let mut winner: Option<(String, String, String, Vec<ProvEntry>)> = None;
@@ -282,16 +286,13 @@ fn row_to_similar_candidate(row: &rusqlite::Row) -> rusqlite::Result<SimilarCand
     })
 }
 
-fn merge(rows: Vec<(String, u64, RecordHit)>) -> Vec<MergedHit> {
+fn merge(rows: Vec<(ProvEntry, RecordHit)>) -> Vec<MergedHit> {
     let mut by_delta: BTreeMap<String, (RecordHit, Vec<ProvEntry>)> = BTreeMap::new();
-    for (log_id, synced_height, hit) in rows {
+    for (provenance, hit) in rows {
         let entry = by_delta
             .entry(hit.delta_id.clone())
             .or_insert_with(|| (hit, Vec::new()));
-        entry.1.push(ProvEntry {
-            log_id,
-            synced_height,
-        });
+        entry.1.push(provenance);
     }
 
     let mut by_url_publisher: BTreeMap<(String, String), MergedHit> = BTreeMap::new();
@@ -346,9 +347,26 @@ pub struct DomainCoverage {
 pub struct LogHandle {
     pub log_id: String,
     pub synced_height: u64,
+    /// WIST-3 §5: whether this log's verified head was adopted
+    /// unwitnessed.
+    pub unwitnessed: bool,
+    /// WIST-3 §5: whether the Consumer has stopped applying new data
+    /// from this log's Aggregator after verifying a divergence.
+    pub halted: bool,
     /// The head Block's `sealed_at`, against which a Label's expiry is read.
     pub head_sealed_at: Option<String>,
     pub store: Store,
+}
+
+impl LogHandle {
+    pub fn provenance(&self) -> ProvEntry {
+        ProvEntry {
+            log_id: self.log_id.clone(),
+            synced_height: self.synced_height,
+            unwitnessed: self.unwitnessed,
+            halted: self.halted,
+        }
+    }
 }
 
 pub struct MultiStore {
@@ -463,7 +481,9 @@ impl MultiStore {
                 .and_then(|s| wist_core::timestamp::instant(s).ok());
             logs.push(LogHandle {
                 log_id: entry.log_id,
-                synced_height: state.head_number,
+                synced_height: state.block_number,
+                unwitnessed: state.unwitnessed,
+                halted: crate::sync::checkpoints::halt(&log_dir).is_some(),
                 head_sealed_at,
                 store,
             });
@@ -503,10 +523,7 @@ impl MultiStore {
                 handle.head_sealed_at.as_deref(),
             )?;
             for ranked in crate::ranking::rank(&handle.store.conn, profile, &state, scored)? {
-                let provenance = ProvEntry {
-                    log_id: handle.log_id.clone(),
-                    synced_height: handle.synced_height,
-                };
+                let provenance = handle.provenance();
                 let key = (ranked.hit.url.clone(), ranked.hit.publisher.clone());
                 match merged.get_mut(&key) {
                     Some(existing) if existing.score >= ranked.score => {
@@ -576,10 +593,7 @@ impl MultiStore {
                     .store
                     .treatment(&row.labeler, &row.name)?
                     .unwrap_or_else(|| "inform".to_string());
-                let provenance = ProvEntry {
-                    log_id: handle.log_id.clone(),
-                    synced_height: handle.synced_height,
-                };
+                let provenance = handle.provenance();
                 let key = (row.labeler.clone(), row.name.clone());
                 match views.get_mut(&key) {
                     Some(existing)
@@ -622,10 +636,7 @@ impl MultiStore {
         let mut views: BTreeMap<String, LabelerView> = BTreeMap::new();
         for handle in &self.logs {
             for stats in handle.store.labelers()? {
-                let provenance = ProvEntry {
-                    log_id: handle.log_id.clone(),
-                    synced_height: handle.synced_height,
-                };
+                let provenance = handle.provenance();
                 views
                     .entry(stats.labeler.clone())
                     .and_modify(|existing| {
@@ -666,7 +677,7 @@ impl MultiStore {
         let mut rows = Vec::new();
         for handle in &self.logs {
             for hit in handle.store.search(q, limit)? {
-                rows.push((handle.log_id.clone(), handle.synced_height, hit));
+                rows.push((handle.provenance(), hit));
             }
         }
         let mut merged = merge(rows);
@@ -678,7 +689,7 @@ impl MultiStore {
         let mut rows = Vec::new();
         for handle in &self.logs {
             if let Some(hit) = handle.store.get(url)? {
-                rows.push((handle.log_id.clone(), handle.synced_height, hit));
+                rows.push((handle.provenance(), hit));
             }
         }
         Ok(merge(rows).into_iter().next())
@@ -688,7 +699,7 @@ impl MultiStore {
         let mut rows = Vec::new();
         for handle in &self.logs {
             if let Some(row) = handle.store.extract_row(url)? {
-                rows.push((handle.log_id.clone(), handle.synced_height, row));
+                rows.push((handle.provenance(), row));
             }
         }
         Ok(merge_extract(rows))
@@ -731,11 +742,7 @@ impl MultiStore {
 
     pub fn similar(&self, url: &str, k: usize) -> Result<Vec<SimilarHit>> {
         for handle in &self.logs {
-            if let Some(hits) =
-                handle
-                    .store
-                    .similar_within(url, k, &handle.log_id, handle.synced_height)?
-            {
+            if let Some(hits) = handle.store.similar_within(url, k, &handle.provenance())? {
                 return Ok(hits);
             }
         }
@@ -1036,8 +1043,7 @@ impl Store {
         &self,
         url: &str,
         k: usize,
-        log_id: &str,
-        synced_height: u64,
+        provenance: &ProvEntry,
     ) -> Result<Option<Vec<SimilarHit>>> {
         if !table_exists(&self.conn, "embeddings")? {
             return Ok(None);
@@ -1101,10 +1107,7 @@ impl Store {
                         observed_at: candidate.observed_at,
                         title: candidate.title,
                         r#abstract: candidate.r#abstract,
-                        provenance: vec![ProvEntry {
-                            log_id: log_id.to_string(),
-                            synced_height,
-                        }],
+                        provenance: vec![provenance.clone()],
                     },
                     score,
                 })
@@ -1214,12 +1217,20 @@ mod tests {
         }
     }
 
+    fn prov(log_id: &str, synced_height: u64) -> ProvEntry {
+        ProvEntry {
+            log_id: log_id.to_string(),
+            synced_height,
+            unwitnessed: false,
+            halted: false,
+        }
+    }
+
     #[test]
     fn same_delta_in_two_logs_merges_to_one_hit() {
         let rows = vec![
             (
-                "log-b".to_string(),
-                5u64,
+                prov("log-b", 5),
                 hit(
                     "https://example.com/a",
                     "sha256:same",
@@ -1227,8 +1238,7 @@ mod tests {
                 ),
             ),
             (
-                "log-a".to_string(),
-                3u64,
+                prov("log-a", 3),
                 hit(
                     "https://example.com/a",
                     "sha256:same",
@@ -1250,8 +1260,7 @@ mod tests {
     fn same_url_different_delta_ids_prefers_latest_observed_at() {
         let rows = vec![
             (
-                "log-a".to_string(),
-                3u64,
+                prov("log-a", 3),
                 hit(
                     "https://example.com/a",
                     "sha256:stale",
@@ -1259,8 +1268,7 @@ mod tests {
                 ),
             ),
             (
-                "log-b".to_string(),
-                5u64,
+                prov("log-b", 5),
                 hit(
                     "https://example.com/a",
                     "sha256:fresh",
@@ -1280,8 +1288,7 @@ mod tests {
     fn tie_on_observed_at_breaks_by_delta_id() {
         let rows = vec![
             (
-                "log-a".to_string(),
-                3u64,
+                prov("log-a", 3),
                 hit(
                     "https://example.com/a",
                     "sha256:aaa",
@@ -1289,8 +1296,7 @@ mod tests {
                 ),
             ),
             (
-                "log-b".to_string(),
-                5u64,
+                prov("log-b", 5),
                 hit(
                     "https://example.com/a",
                     "sha256:bbb",
@@ -1353,9 +1359,11 @@ mod tests {
         std::fs::write(
             log_dir.join("sync.json"),
             serde_json::to_vec(&SyncState {
+                format: crate::sync::SYNC_STATE_FORMAT,
                 log_position: 0,
-                head_number: height,
-                head_hash: "sha256:deadbeef".into(),
+                block_number: height,
+                root: "sha256:deadbeef".into(),
+                unwitnessed: false,
                 content_digest: None,
                 schedule_first_s: None,
                 prior_sealed_at_s: None,
@@ -1374,6 +1382,8 @@ mod tests {
                 anchor: format!("anchor-{id}"),
                 base: format!("https://{id}.example"),
                 tier1: false,
+                mirrors: Vec::new(),
+                witnesses: Vec::new(),
             })
             .collect();
         crate::registry::save(dir, &crate::registry::Registry { logs }).unwrap();
@@ -1467,9 +1477,11 @@ mod tests {
         std::fs::write(
             tmp.path().join("sync.json"),
             serde_json::to_vec(&SyncState {
+                format: crate::sync::SYNC_STATE_FORMAT,
                 log_position: 0,
-                head_number: 1,
-                head_hash: "sha256:deadbeef".into(),
+                block_number: 1,
+                root: "sha256:deadbeef".into(),
+                unwitnessed: false,
                 content_digest: None,
                 schedule_first_s: None,
                 prior_sealed_at_s: None,
@@ -1486,6 +1498,8 @@ mod tests {
                     anchor: "anchor.json".into(),
                     base: "https://log.example".into(),
                     tier1: false,
+                    mirrors: Vec::new(),
+                    witnesses: Vec::new(),
                 }],
             },
         )
@@ -1521,12 +1535,16 @@ mod tests {
                         anchor: "anchor-a.json".into(),
                         base: "https://host-9.example".into(),
                         tier1: false,
+                        mirrors: Vec::new(),
+                        witnesses: Vec::new(),
                     },
                     crate::registry::LogEntry {
                         log_id: "host:9".into(),
                         anchor: "anchor-b.json".into(),
                         base: "https://host-b.example".into(),
                         tier1: false,
+                        mirrors: Vec::new(),
+                        witnesses: Vec::new(),
                     },
                 ],
             },

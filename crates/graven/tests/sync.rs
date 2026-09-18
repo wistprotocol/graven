@@ -17,19 +17,17 @@ fn cold_sync_verifies_chain_and_populates_store() {
     )
     .unwrap();
 
-    assert_eq!(report.log_position_before, None);
+    assert_eq!(report.block_number_before, None);
     assert_eq!(report.head, 1);
 
     let sync_json: serde_json::Value = serde_json::from_slice(
         &std::fs::read(common::synced_log_dir(target.path()).join("sync.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(sync_json["log_position"], 0);
-    assert_eq!(sync_json["head_number"], 1);
-    assert!(sync_json["head_hash"]
-        .as_str()
-        .unwrap()
-        .starts_with("sha256:"));
+    assert_eq!(sync_json["block_number"], 1);
+    assert_eq!(sync_json["log_position"], fx.head_tree_size());
+    assert!(sync_json["root"].as_str().unwrap().starts_with("sha256:"));
+    assert_eq!(sync_json["unwitnessed"], true);
 
     assert!(common::synced_log_dir(target.path())
         .join("index.sqlite")
@@ -57,7 +55,7 @@ fn cold_sync_verifies_chain_and_populates_store() {
 fn cold_sync_accepts_anchor_fetched_over_http() {
     let fx = common::build_fixture(true, false);
     let target = tempfile::tempdir().unwrap();
-    let anchor_url = format!("{}/anchor.json", fx.base_url);
+    let anchor_url = format!("{}/log/anchor.json", fx.base_url);
 
     let report = graven::sync::run(&anchor_url, &fx.base_url, target.path(), true, false).unwrap();
 
@@ -85,14 +83,20 @@ fn cold_sync_records_post_snapshot_delta_with_unfetchable_payload_as_empty() {
     assert!(beta.r#abstract.is_none());
 }
 
+/// WIST-3 §6: an entry bundle is verified only by recomputation against
+/// the root a verified Checkpoint states, so altered octets are
+/// `WIST3-E03` and nothing above the head is applied.
 #[test]
-fn cold_sync_rejects_tampered_block_file() {
+fn cold_sync_rejects_a_tampered_entry_bundle() {
     let fx = common::build_fixture(true, false);
-    let block1_path = fx.dir.path().join("log/blocks/000000001.json.zst");
-    let mut bytes = std::fs::read(&block1_path).unwrap();
+    let bundle = fx
+        .dir
+        .path()
+        .join(format!("tile/entries/000.p/{}", fx.head_tree_size()));
+    let mut bytes = std::fs::read(&bundle).unwrap();
     let last = bytes.len() - 1;
     bytes[last] ^= 0xFF;
-    std::fs::write(&block1_path, bytes).unwrap();
+    std::fs::write(&bundle, bytes).unwrap();
 
     let target = tempfile::tempdir().unwrap();
     let result = graven::sync::run(
@@ -179,7 +183,7 @@ fn cold_sync_rejects_state_signed_by_wrong_key() {
 #[test]
 fn cold_sync_rejects_checkpoint_signed_by_wrong_key() {
     let fx = common::build_fixture(true, false);
-    common::resign_checkpoint_with_wrong_key(fx.dir.path(), &fx.other);
+    common::resign_checkpoint_with_wrong_key(&fx, &fx.other);
 
     let target = tempfile::tempdir().unwrap();
     let result = graven::sync::run(
@@ -247,14 +251,13 @@ fn continuous_sync_advances_head_and_applies_new_delta() {
     )
     .unwrap();
     assert_eq!(report2.head, 2);
-    assert_eq!(report2.log_position_before, Some(1));
+    assert_eq!(report2.block_number_before, Some(1));
 
     let sync_json: serde_json::Value = serde_json::from_slice(
         &std::fs::read(common::synced_log_dir(target.path()).join("sync.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(sync_json["log_position"], 0);
-    assert_eq!(sync_json["head_number"], 2);
+    assert_eq!(sync_json["block_number"], 2);
 
     let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
     let extra = store.get(&new_url).unwrap().unwrap();
@@ -289,11 +292,11 @@ fn continuous_sync_is_noop_when_checkpoint_unchanged() {
     .unwrap();
 
     assert_eq!(report.head, 1);
-    assert_eq!(report.log_position_before, Some(1));
+    assert_eq!(report.block_number_before, Some(1));
 }
 
 #[test]
-fn continuous_sync_rejects_rollback_checkpoint() {
+fn a_checkpoint_below_the_verified_head_does_not_regress_it_and_is_no_error() {
     let fx = common::build_fixture(true, false);
     let target = tempfile::tempdir().unwrap();
 
@@ -306,7 +309,7 @@ fn continuous_sync_rejects_rollback_checkpoint() {
     )
     .unwrap();
 
-    let old_checkpoint_bytes = std::fs::read(fx.dir.path().join("log/checkpoint.json")).unwrap();
+    let old_checkpoint_bytes = std::fs::read(fx.dir.path().join("checkpoint")).unwrap();
     common::extend_fixture(&fx);
 
     let report2 = graven::sync::run(
@@ -319,26 +322,31 @@ fn continuous_sync_rejects_rollback_checkpoint() {
     .unwrap();
     assert_eq!(report2.head, 2);
 
-    std::fs::write(
-        fx.dir.path().join("log/checkpoint.json"),
-        &old_checkpoint_bytes,
-    )
-    .unwrap();
+    std::fs::write(fx.dir.path().join("checkpoint"), &old_checkpoint_bytes).unwrap();
 
-    let result = graven::sync::run(
+    let report = graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
         &fx.base_url,
         target.path(),
         true,
         false,
-    );
+    )
+    .unwrap();
 
-    let err = result.unwrap_err().to_string();
-    assert!(err.to_lowercase().contains("rollback"), "error was: {err}");
+    assert_eq!(
+        report.head, 2,
+        "WIST-3 §5: a source serving an old Checkpoint has shown only that it is behind; the verified head stands and there is no error code"
+    );
+    assert_eq!(
+        graven::store::synced_state(&common::synced_log_dir(target.path()))
+            .unwrap()
+            .block_number,
+        2
+    );
 }
 
 #[test]
-fn continuous_sync_rejects_same_height_different_hash_checkpoint() {
+fn a_differing_checkpoint_at_a_retained_block_number_is_equivocation_with_an_evidence_bundle() {
     let fx = common::build_fixture(true, false);
     let target = tempfile::tempdir().unwrap();
 
@@ -361,24 +369,26 @@ fn continuous_sync_rejects_same_height_different_hash_checkpoint() {
     )
     .unwrap();
 
-    let forged_hash = format!("sha256:{}", "ab".repeat(32));
-    common::write_checkpoint(
-        fx.dir.path(),
-        &fx.log,
-        2,
-        &forged_hash,
-        "2026-08-09T20:00:00Z",
-    );
+    common::forge_head_note(&fx, [0xab; 32], &fx.log);
 
-    let result = graven::sync::run(
+    let error = graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
         &fx.base_url,
         target.path(),
         true,
         false,
-    );
+    )
+    .unwrap_err()
+    .to_string();
 
-    assert!(result.is_err());
+    assert!(error.contains("WIST3-E02"), "error was: {error}");
+    let bundle =
+        common::synced_log_dir(target.path()).join("evidence/equivocation-block-000000002");
+    assert!(
+        bundle.join("retained.checkpoint").exists() && bundle.join("offered.checkpoint").exists(),
+        "both Checkpoints must be preserved in {}",
+        bundle.display()
+    );
 }
 
 #[test]
@@ -409,7 +419,11 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
     let snapshot_date = "2026-08-09".to_string();
     let url = "https://records.example/alpha".to_string();
 
-    common::write_anchor(&dir.path().join("anchor.json"), &log, "graven-test-log");
+    let mut state = common::Log::new(
+        dir.path(),
+        common::Signer::new([9u8; 32]),
+        "graven-test-log",
+    );
 
     let declaration_env = common::build_declaration(&publisher, &domain);
     let wrapped_declaration =
@@ -427,14 +441,10 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
     common::write_payload(dir.path(), hex1, &payload1);
     let wrapped_delta1 = serde_json::json!({"type": "publisher_delta", "body": delta1_env});
 
-    let (block0, block0_hash) = common::build_block(
-        &log,
-        0,
-        "sha256:genesis",
+    let block0 = state.seal(
         "2026-08-09T12:00:00Z",
         &[wrapped_declaration, wrapped_delta1],
     );
-    common::write_block(dir.path(), 0, &block0);
 
     let record1 = common::RecordFixture {
         url: url.clone(),
@@ -465,7 +475,7 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
         3600,
         &[(domain.clone(), declaration_env.clone())],
         std::slice::from_ref(&record1),
-        0,
+        block0.tree_size(),
     );
 
     common::write_manifest(
@@ -473,7 +483,8 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
         &log,
         &snapshot_date,
         0,
-        &block0_hash,
+        block0.tree_size(),
+        &block0.root_token(),
         &content_digest_value,
         &state_bytes,
         &state_digest_value,
@@ -484,7 +495,7 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
         &dir.path().join("snapshots/index.json"),
         &log,
         &snapshot_date,
-        0,
+        block0.tree_size(),
         &format!("/snapshots/{snapshot_date}/manifest.json"),
         &content_digest_value,
     );
@@ -501,21 +512,13 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
     common::write_payload(dir.path(), hex2, &payload2);
     let wrapped_delta2 = serde_json::json!({"type": "publisher_delta", "body": delta2_env});
 
-    let (block1, block1_hash) = common::build_block(
-        &log,
-        1,
-        &block0_hash,
-        "2026-08-09T13:00:00Z",
-        &[wrapped_delta2],
-    );
-    common::write_block(dir.path(), 1, &block1);
-    common::write_checkpoint(dir.path(), &log, 1, &block1_hash, "2026-08-09T13:00:00Z");
+    state.seal("2026-08-09T13:00:00Z", &[wrapped_delta2]);
 
     let base_url = format!("http://{}", common::serve_static(dir.path().to_path_buf()));
 
     let target = tempfile::tempdir().unwrap();
     let report = graven::sync::run(
-        dir.path().join("anchor.json").to_str().unwrap(),
+        dir.path().join("log/anchor.json").to_str().unwrap(),
         &base_url,
         target.path(),
         true,
@@ -584,19 +587,9 @@ fn delta_after_rotation_signed_by_old_key_is_ignored_like_a_fork() {
     let old = common::Signer::new([1u8; 32]);
     let new_key = common::Signer::new([2u8; 32]);
 
-    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
-    let doc: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
-    let prev_hash = doc["checkpoint"]["block_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
     let decl0 = common::build_declaration(&old, &fx.domain);
     let hash0 = common::declaration_hash(&decl0);
 
-    let rotation_number = prev_number + 1;
     let rotation_decl = common::build_declaration_full(
         &old,
         &fx.domain,
@@ -604,28 +597,23 @@ fn delta_after_rotation_signed_by_old_key_is_ignored_like_a_fork() {
         Some(&hash0),
         &[(&new_key, "2026-08-09T00:00:00Z")],
     );
-    let wrapped_decl = serde_json::json!({"type": "publisher_declaration", "body": rotation_decl});
-    let sealed_at1 = format!("2026-08-09T{:02}:00:00Z", 14 + rotation_number);
-    let (block1, hash1) = common::build_block(
-        &fx.log,
-        rotation_number,
-        &prev_hash,
-        &sealed_at1,
-        &[wrapped_decl],
+    let at = common::next_instant(&fx);
+    common::seal_next(
+        &fx,
+        &at,
+        &[serde_json::json!({"type": "publisher_declaration", "body": rotation_decl})],
     );
-    common::write_block(fx.dir.path(), rotation_number, &block1);
-    common::write_checkpoint(fx.dir.path(), &fx.log, rotation_number, &hash1, &sealed_at1);
 
-    let delta_number = rotation_number + 1;
+    let delta_number = fx.head_number() + 1;
     let url = format!("https://records.example/extra-{delta_number}");
     let (_id, delta_env, _payload) =
         common::build_delta(&old, &url, "Stale Title", None, "stale body", None);
-    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
-    let sealed_at2 = format!("2026-08-09T{:02}:00:00Z", 14 + delta_number);
-    let (block2, hash2) =
-        common::build_block(&fx.log, delta_number, &hash1, &sealed_at2, &[wrapped_delta]);
-    common::write_block(fx.dir.path(), delta_number, &block2);
-    common::write_checkpoint(fx.dir.path(), &fx.log, delta_number, &hash2, &sealed_at2);
+    let at = common::next_instant(&fx);
+    common::seal_next(
+        &fx,
+        &at,
+        &[serde_json::json!({"type": "publisher_delta", "body": delta_env})],
+    );
 
     let dir = tempfile::tempdir().unwrap();
     graven::sync::run(
@@ -1303,16 +1291,10 @@ fn failed_migration_restores_legacy_layout_and_registers_nothing() {
     )
     .unwrap();
 
-    // fixture content is deterministic, so two logs can coincidentally hash
-    // identically at height 1; forge fx_b's hash to force equivocation.
-    let forged_hash = format!("sha256:{}", "cd".repeat(32));
-    common::write_checkpoint(
-        fx_b.dir.path(),
-        &fx_b.log,
-        1,
-        &forged_hash,
-        "2026-08-09T13:00:00Z",
-    );
+    // The second Log's Checkpoints carry its own origin line and its own
+    // key, so its Checkpoint 1 differs from the one the migrated store
+    // retains at that Block and no key valid there signs it: WIST3-E03,
+    // and the migration is rolled back.
 
     let result = graven::sync::run(
         fx_b.anchor_path().to_str().unwrap(),
@@ -1322,9 +1304,12 @@ fn failed_migration_restores_legacy_layout_and_registers_nothing() {
         false,
     );
     let err = result.unwrap_err();
+    assert!(err.to_string().contains("WIST3-E03"), "error was: {err}");
     assert!(
-        err.to_string().to_lowercase().contains("equivocation"),
-        "error was: {err}"
+        !graven::registry::log_dir(legacy.path(), "other-log")
+            .join("evidence")
+            .exists(),
+        "a Checkpoint no valid key signs is preserved as nothing"
     );
 
     assert!(legacy.path().join("index.sqlite").exists());
@@ -1512,16 +1497,6 @@ fn incremental_sync_with_tier1_replaces_links_and_extract_on_update() {
         None,
     );
 
-    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
-    let doc: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
-    let prev_hash = doc["checkpoint"]["block_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let next_number = prev_number + 1;
-
     let (id2, delta2_env, payload2) = common::build_delta_with_links(
         &publisher,
         "https://records.example/alpha",
@@ -1535,16 +1510,8 @@ fn incremental_sync_with_tier1_replaces_links_and_extract_on_update() {
     common::write_payload(fx.dir.path(), hex2, &payload2);
     let wrapped_delta2 = serde_json::json!({"type": "publisher_delta", "body": delta2_env});
 
-    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
-    let (block, new_hash) = common::build_block(
-        &fx.log,
-        next_number,
-        &prev_hash,
-        &sealed_at,
-        &[wrapped_delta2],
-    );
-    common::write_block(fx.dir.path(), next_number, &block);
-    common::write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+    let sealed_at = common::next_instant(&fx);
+    common::seal_next(&fx, &sealed_at, &[wrapped_delta2]);
 
     graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -1596,15 +1563,6 @@ fn incremental_sync_leaves_tier1_absent_when_payload_fetch_fails() {
     .unwrap();
 
     let publisher = common::Signer::new([1u8; 32]);
-    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
-    let doc: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
-    let prev_hash = doc["checkpoint"]["block_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let next_number = prev_number + 1;
 
     let url = "https://records.example/no-payload".to_string();
     let (_id, delta_env, _payload) = common::build_delta(
@@ -1617,16 +1575,8 @@ fn incremental_sync_leaves_tier1_absent_when_payload_fetch_fails() {
     );
     let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
 
-    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
-    let (block, new_hash) = common::build_block(
-        &fx.log,
-        next_number,
-        &prev_hash,
-        &sealed_at,
-        &[wrapped_delta],
-    );
-    common::write_block(fx.dir.path(), next_number, &block);
-    common::write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+    let sealed_at = common::next_instant(&fx);
+    common::seal_next(&fx, &sealed_at, &[wrapped_delta]);
 
     graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -1679,16 +1629,6 @@ fn incremental_sync_purges_stale_tier1_rows_when_update_payload_fetch_fails() {
         None,
     );
 
-    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
-    let doc: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
-    let prev_hash = doc["checkpoint"]["block_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let next_number = prev_number + 1;
-
     let (id2, delta2_env, _payload2) = common::build_delta(
         &publisher,
         "https://records.example/alpha",
@@ -1699,16 +1639,8 @@ fn incremental_sync_purges_stale_tier1_rows_when_update_payload_fetch_fails() {
     );
     let wrapped_delta2 = serde_json::json!({"type": "publisher_delta", "body": delta2_env});
 
-    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
-    let (block, new_hash) = common::build_block(
-        &fx.log,
-        next_number,
-        &prev_hash,
-        &sealed_at,
-        &[wrapped_delta2],
-    );
-    common::write_block(fx.dir.path(), next_number, &block);
-    common::write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+    let sealed_at = common::next_instant(&fx);
+    common::seal_next(&fx, &sealed_at, &[wrapped_delta2]);
 
     graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -1787,37 +1719,25 @@ fn a_log_that_rotates_its_aggregator_key_stays_syncable() {
     let fx = common::build_fixture(true, false);
     let next = common::Signer::new([21u8; 32]);
 
-    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
-    let doc: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
-    let prev_hash = doc["checkpoint"]["block_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let add = common::key_act(
+        &fx,
+        "aggregator_key_add",
+        "log1",
+        &fx.log,
+        "log2",
+        Some(&next),
+        "2026-08-09T15:00:00Z",
+    );
+    let sealed_at = common::next_instant(&fx);
+    common::seal_next(&fx, &sealed_at, &[add]);
 
-    let add_number = prev_number + 1;
-    let add = serde_json::json!({
-        "wist_version": "1.0.0",
-        "action": "aggregator_key_add",
-        "subject": "log",
-        "details": {"key_id": "log2", "public_key": next.public_b64u()},
-        "effective_at": "2026-08-09T15:00:00Z",
-    });
-    let envelope = wist_core::envelope::sign_envelope(&add, "update", "log1", &fx.log.sk).unwrap();
-    let wrapped = serde_json::json!({"type": "registry_update", "body": envelope});
-    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + add_number);
-    let (block, hash) =
-        common::build_block(&fx.log, add_number, &prev_hash, &sealed_at, &[wrapped]);
-    common::write_block(fx.dir.path(), add_number, &block);
-    common::write_checkpoint(fx.dir.path(), &fx.log, add_number, &hash, &sealed_at);
-
-    // The next Block is signed by the key the previous one admitted.
-    let after = add_number + 1;
-    let sealed_after = format!("2026-08-09T{:02}:00:00Z", 14 + after);
-    let (block2, hash2) = common::build_block_as(&next, "log2", after, &hash, &sealed_after, &[]);
-    common::write_block(fx.dir.path(), after, &block2);
-    common::write_checkpoint_as(fx.dir.path(), &next, "log2", after, &hash2, &sealed_after);
+    // The next Block's Checkpoint is signed by the key the previous one
+    // admitted.
+    let sealed_after = common::next_instant(&fx);
+    let after = fx
+        .log_state()
+        .seal_signed_by(&next, &sealed_after, &[])
+        .block_number();
 
     let dir = tempfile::tempdir().unwrap();
     let report = graven::sync::run(
@@ -1839,12 +1759,6 @@ fn malformed_signed_publisher_does_not_abort_sync_or_advance_a_chain() {
         Some(serde_json::Value::Null),
     ] {
         let fx = common::build_fixture(true, false);
-        let checkpoint: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(fx.dir.path().join("log/checkpoint.json")).unwrap(),
-        )
-        .unwrap();
-        let height = checkpoint["checkpoint"]["block_number"].as_u64().unwrap() + 1;
-        let previous = checkpoint["checkpoint"]["block_hash"].as_str().unwrap();
         let signer = common::Signer::new([1u8; 32]);
         let (_, envelope, _) = common::build_delta(
             &signer,
@@ -1864,10 +1778,8 @@ fn malformed_signed_publisher_does_not_abort_sync_or_advance_a_chain() {
         let signed =
             wist_core::envelope::sign_envelope(&inner, "delta", &signer.kid(), &signer.sk).unwrap();
         let wrapped = serde_json::json!({"type":"publisher_delta", "body":signed});
-        let at = "2026-08-09T18:00:00Z";
-        let (block, hash) = common::build_block(&fx.log, height, previous, at, &[wrapped]);
-        common::write_block(fx.dir.path(), height, &block);
-        common::write_checkpoint(fx.dir.path(), &fx.log, height, &hash, at);
+        let at = common::next_instant(&fx);
+        common::seal_next(&fx, &at, &[wrapped]);
         let target = tempfile::tempdir().unwrap();
         graven::sync::run(
             fx.anchor_path().to_str().unwrap(),
@@ -2017,10 +1929,8 @@ fn a_withdrawal_sealed_beside_its_delta_keeps_the_delta_out_of_the_index() {
     });
     let withdrawal =
         wist_core::envelope::sign_envelope(&update, "update", "log1", &fx.log.sk).unwrap();
-    let (_, head_hash) = head_of(&fx);
     seal_next(
         &fx,
-        &head_hash,
         "2026-08-09T14:00:00Z",
         &[
             serde_json::json!({"type": "registry_update", "body": withdrawal}),
@@ -2049,27 +1959,6 @@ fn a_withdrawal_sealed_beside_its_delta_keeps_the_delta_out_of_the_index() {
     assert_eq!(tip, gamma_id, "a withdrawn Delta still moves its chain tip");
 }
 
-fn spec_dir() -> std::path::PathBuf {
-    std::env::var_os("WIST_SPEC_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec")
-        })
-}
-
-fn head_of(fx: &common::Fixture) -> (u64, String) {
-    let doc: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(fx.dir.path().join("log/checkpoint.json")).unwrap())
-            .unwrap();
-    (
-        doc["checkpoint"]["block_number"].as_u64().unwrap(),
-        doc["checkpoint"]["block_hash"]
-            .as_str()
-            .unwrap()
-            .to_string(),
-    )
-}
-
 fn parameter_change(
     fx: &common::Fixture,
     parameter: &str,
@@ -2083,6 +1972,11 @@ fn parameter_change(
     let body = wist_core::envelope::sign_envelope(&update, "update", "log1", &fx.log.sk).unwrap();
     serde_json::json!({"type": "registry_update", "body": body})
 }
+
+/// A `block_decompressed_cap_bytes` above WIST-4 §5's floor of 65 537 —
+/// the octets one Entry of the largest admissible size occupies — and low
+/// enough that a few hundred Deltas cross it.
+const CAP: i64 = 70_000;
 
 fn bulk_deltas(fx: &common::Fixture, count: usize) -> Vec<serde_json::Value> {
     let publisher = common::Signer::new([1u8; 32]);
@@ -2102,18 +1996,13 @@ fn bulk_deltas(fx: &common::Fixture, count: usize) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn seal_next(
-    fx: &common::Fixture,
-    prev_hash: &str,
-    sealed_at: &str,
-    entries: &[serde_json::Value],
-) -> (u64, String, usize) {
-    let (head, _) = head_of(fx);
-    let number = head + 1;
-    let (block, hash) = common::build_block(&fx.log, number, prev_hash, sealed_at, entries);
-    common::write_block(fx.dir.path(), number, &block);
-    common::write_checkpoint(fx.dir.path(), &fx.log, number, &hash, sealed_at);
-    (number, hash, serde_json::to_vec(&block).unwrap().len())
+/// Seals the next Block, reporting its number and WIST-3 §6's Block
+/// size: the octets its Entries occupy in entry bundles.
+fn seal_next(fx: &common::Fixture, sealed_at: &str, entries: &[serde_json::Value]) -> (u64, u64) {
+    let mut ordered = entries.to_vec();
+    wist_core::block::sort_entries(&mut ordered).unwrap();
+    let octets = wist_core::block::block_octets(&ordered).unwrap();
+    (common::seal_next(fx, sealed_at, entries), octets)
 }
 
 fn cold_sync(fx: &common::Fixture) -> Result<(graven::sync::SyncReport, i64), String> {
@@ -2143,21 +2032,19 @@ fn cold_sync(fx: &common::Fixture) -> Result<(graven::sync::SyncReport, i64), St
 #[test]
 fn an_accepted_cap_reduction_rejects_a_later_block_above_it() {
     let fx = common::build_fixture(true, false);
-    let (_, head_hash) = head_of(&fx);
-    let (_, hash, size) = seal_next(
+    let (_, size) = seal_next(
         &fx,
-        &head_hash,
         "2026-08-09T14:00:00Z",
         &[parameter_change(
             &fx,
             "block_decompressed_cap_bytes",
-            4096,
+            CAP,
             "2026-08-16T14:00:00Z",
         )],
     );
-    assert!(size <= 4096);
-    let (_, _, size) = seal_next(&fx, &hash, "2026-08-16T14:00:00Z", &bulk_deltas(&fx, 8));
-    assert!(size > 4096);
+    assert!(size <= CAP as u64);
+    let (_, size) = seal_next(&fx, "2026-08-16T14:00:00Z", &bulk_deltas(&fx, 200));
+    assert!(size > CAP as u64);
     let error = cold_sync(&fx).unwrap_err();
     assert!(
         error.contains("exceeds the accepted size schedule"),
@@ -2168,20 +2055,18 @@ fn an_accepted_cap_reduction_rejects_a_later_block_above_it() {
 #[test]
 fn a_cap_reduction_accepts_blocks_within_it() {
     let fx = common::build_fixture(true, false);
-    let (_, head_hash) = head_of(&fx);
-    let (_, hash, _) = seal_next(
+    let (_, _) = seal_next(
         &fx,
-        &head_hash,
         "2026-08-09T14:00:00Z",
         &[parameter_change(
             &fx,
             "block_decompressed_cap_bytes",
-            4096,
+            CAP,
             "2026-08-16T14:00:00Z",
         )],
     );
-    let (head, _, size) = seal_next(&fx, &hash, "2026-08-16T14:00:00Z", &bulk_deltas(&fx, 1));
-    assert!(size <= 4096);
+    let (head, size) = seal_next(&fx, "2026-08-16T14:00:00Z", &bulk_deltas(&fx, 1));
+    assert!(size <= CAP as u64);
     let (report, accepted) = cold_sync(&fx).unwrap();
     assert_eq!(report.head, head);
     assert_eq!(accepted, 1);
@@ -2190,16 +2075,15 @@ fn a_cap_reduction_accepts_blocks_within_it() {
 #[test]
 fn a_cap_below_a_sealed_block_is_not_accepted() {
     let fx = common::build_fixture(true, false);
-    let (_, head_hash) = head_of(&fx);
-    let mut entries = bulk_deltas(&fx, 3);
+    let mut entries = bulk_deltas(&fx, 200);
     entries.push(parameter_change(
         &fx,
         "block_decompressed_cap_bytes",
-        1024,
+        CAP,
         "2026-08-16T14:00:00Z",
     ));
-    let (head, _, size) = seal_next(&fx, &head_hash, "2026-08-09T14:00:00Z", &entries);
-    assert!(size > 1024);
+    let (head, size) = seal_next(&fx, "2026-08-09T14:00:00Z", &entries);
+    assert!(size > CAP as u64);
     let (report, accepted) = cold_sync(&fx).unwrap();
     assert_eq!(report.head, head);
     assert_eq!(
@@ -2211,71 +2095,21 @@ fn a_cap_below_a_sealed_block_is_not_accepted() {
 #[test]
 fn a_fractional_block_timestamp_fails_the_sync() {
     let fx = common::build_fixture(true, false);
-    let (_, head_hash) = head_of(&fx);
-    seal_next(&fx, &head_hash, "2026-08-09T14:00:00.5Z", &[]);
+    fx.log_state()
+        .seal_off_profile("2026-08-09T14:00:00.5Z", &[]);
     let error = cold_sync(&fx).unwrap_err();
     assert!(
-        error.contains("timestamp must be whole-second UTC"),
-        "ADR-0022 strict timestamps: {error}"
+        error.contains("WIST3-E03") && error.contains("sealed_at"),
+        "WIST-3 §3.1 whole-second instants: {error}"
     );
 }
 
 #[test]
 fn an_off_grid_block_timestamp_fails_the_sync() {
     let fx = common::build_fixture(true, false);
-    let (_, head_hash) = head_of(&fx);
-    seal_next(&fx, &head_hash, "2026-08-09T14:00:01Z", &[]);
+    fx.log_state().seal_off_profile("2026-08-09T14:00:01Z", &[]);
     let error = cold_sync(&fx).unwrap_err();
-    assert!(error.contains("off the accepted cadence grid"), "{error}");
-}
-
-#[test]
-fn a_block_file_with_two_frames_fails_the_sync() {
-    let fx = common::build_fixture(true, false);
-    let vector: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(spec_dir().join("vectors/wist3/block-frames.json")).unwrap(),
-    )
-    .unwrap();
-    let case = vector["cases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["label"] == "reject trailing empty")
-        .unwrap();
-    let raw: Vec<u8> = case["parts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .flat_map(|part| {
-            wist_core::crypto::hex_decode(
-                vector["fragments_hex"][part.as_str().unwrap()]
-                    .as_str()
-                    .unwrap(),
-            )
-            .unwrap()
-        })
-        .collect();
-    let (head, _) = head_of(&fx);
-    std::fs::write(
-        fx.dir
-            .path()
-            .join(format!("log/blocks/{:09}.json.zst", head + 1)),
-        raw,
-    )
-    .unwrap();
-    let block_hash = wist_core::block::block_hash(&vector["block"]["header"]).unwrap();
-    common::write_checkpoint(
-        fx.dir.path(),
-        &fx.log,
-        head + 1,
-        &block_hash,
-        "2026-08-09T14:00:00Z",
-    );
-    let error = cold_sync(&fx).unwrap_err();
-    assert!(
-        error.contains("WIST3-E03") && error.contains("frame"),
-        "ADR-0021 single-frame Blocks: {error}"
-    );
+    assert!(error.contains("off the cadence grid"), "{error}");
 }
 
 fn delta_observed(
@@ -2352,8 +2186,7 @@ fn sealed_deltas_are_checked_against_their_block_clock_and_accepted_allowance() 
         sealed.push(url);
         entries.push(serde_json::json!({"type": "publisher_delta", "body": envelope}));
     }
-    let (_, head_hash) = head_of(&fx);
-    let (_, hash, _) = seal_next(&fx, &head_hash, "2026-08-09T14:00:00Z", &entries);
+    seal_next(&fx, "2026-08-09T14:00:00Z", &entries);
     let mut entries = Vec::new();
     for (url, observed_at) in [
         (
@@ -2370,7 +2203,7 @@ fn sealed_deltas_are_checked_against_their_block_clock_and_accepted_allowance() 
         sealed.push(url);
         entries.push(serde_json::json!({"type": "publisher_delta", "body": envelope}));
     }
-    let (head, _, _) = seal_next(&fx, &hash, "2026-08-16T14:00:00Z", &entries);
+    let (head, _) = seal_next(&fx, "2026-08-16T14:00:00Z", &entries);
     let target = tempfile::tempdir().unwrap();
     let report = graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -2438,7 +2271,7 @@ fn a_sync_that_cannot_commit_leaves_cursor_keys_and_index_unchanged() {
     .unwrap();
     let index = common::synced_log_dir(dir.path()).join("index.sqlite");
     let before = synced_state(dir.path());
-    assert_eq!(before.head_number, 1);
+    assert_eq!(before.block_number, 1);
     let snapshot = |conn: &Connection| {
         (
             count(conn, "records"),
@@ -2467,8 +2300,8 @@ fn a_sync_that_cannot_commit_leaves_cursor_keys_and_index_unchanged() {
     drop(holder);
 
     let after = synced_state(dir.path());
-    assert_eq!(after.head_number, 1);
-    assert_eq!(after.head_hash, before.head_hash);
+    assert_eq!(after.block_number, 1);
+    assert_eq!(after.root, before.root);
     let conn = Connection::open(&index).unwrap();
     assert_eq!(snapshot(&conn), counts_before);
     let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
@@ -2485,7 +2318,7 @@ fn a_sync_that_cannot_commit_leaves_cursor_keys_and_index_unchanged() {
     )
     .unwrap();
     assert_eq!(report.head, 2);
-    assert_eq!(synced_state(dir.path()).head_number, 2);
+    assert_eq!(synced_state(dir.path()).block_number, 2);
     let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
     assert!(store.get(&new_url).unwrap().is_some());
 }
@@ -2514,12 +2347,12 @@ fn the_sync_cursor_lives_in_the_index_not_the_mirror_file() {
         false,
     )
     .unwrap();
-    assert_eq!(report.log_position_before, Some(1));
+    assert_eq!(report.block_number_before, Some(1));
     assert_eq!(report.head, 2);
     let mirrored: serde_json::Value =
         serde_json::from_slice(&std::fs::read(log_dir.join("sync.json")).unwrap()).unwrap();
-    assert_eq!(mirrored["head_number"], 2);
-    assert_eq!(synced_state(dir.path()).head_number, 2);
+    assert_eq!(mirrored["block_number"], 2);
+    assert_eq!(synced_state(dir.path()).block_number, 2);
 }
 
 #[test]
@@ -2538,7 +2371,7 @@ fn a_store_carrying_only_the_sync_file_is_read_and_imported() {
     let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
     conn.execute_batch("DROP TABLE sync_state").unwrap();
     drop(conn);
-    assert_eq!(synced_state(dir.path()).head_number, 1);
+    assert_eq!(synced_state(dir.path()).block_number, 1);
     common::extend_fixture(&fx);
 
     let report = graven::sync::run(
@@ -2549,7 +2382,7 @@ fn a_store_carrying_only_the_sync_file_is_read_and_imported() {
         false,
     )
     .unwrap();
-    assert_eq!(report.log_position_before, Some(1));
+    assert_eq!(report.block_number_before, Some(1));
     assert_eq!(report.head, 2);
 }
 
@@ -2571,5 +2404,5 @@ fn a_cold_start_replaces_the_verifying_index_a_crash_left_behind() {
     .unwrap();
     assert_eq!(report.head, 1);
     assert!(!log_dir.join("index.sqlite.verifying").exists());
-    assert_eq!(synced_state(target.path()).head_number, 1);
+    assert_eq!(synced_state(target.path()).block_number, 1);
 }

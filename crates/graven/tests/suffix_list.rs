@@ -15,27 +15,9 @@ fn serve_list(fx: &common::Fixture, octets: &[u8]) -> String {
     identifier
 }
 
-fn head(fx: &common::Fixture) -> (u64, String) {
-    let doc: Value =
-        serde_json::from_slice(&std::fs::read(fx.dir.path().join("log/checkpoint.json")).unwrap())
-            .unwrap();
-    (
-        doc["checkpoint"]["block_number"].as_u64().unwrap(),
-        doc["checkpoint"]["block_hash"]
-            .as_str()
-            .unwrap()
-            .to_string(),
-    )
-}
-
 fn append_block(fx: &common::Fixture, entries: &[Value]) -> u64 {
-    let (prev_number, prev_hash) = head(fx);
-    let next = prev_number + 1;
-    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next);
-    let (block, hash) = common::build_block(&fx.log, next, &prev_hash, &sealed_at, entries);
-    common::write_block(fx.dir.path(), next, &block);
-    common::write_checkpoint(fx.dir.path(), &fx.log, next, &hash, &sealed_at);
-    next
+    let sealed_at = common::next_instant(fx);
+    common::seal_next(fx, &sealed_at, entries)
 }
 
 fn suffix_act(fx: &common::Fixture, identifier: &str, bytes: usize) -> Value {

@@ -119,22 +119,18 @@ impl SuffixLists {
 
     /// WIST-3 §3.2: the Block's `publisher_delta`, `label` and `dispute`
     /// Entries per Registrable Domain under the snapshot in force at it.
-    pub fn check_capacity(&mut self, height: u64, block: &Value, caps: BlockCaps) -> Result<()> {
+    pub fn check_capacity(&mut self, height: u64, block: &[Value], caps: BlockCaps) -> Result<()> {
         let list = self.in_force_at_block(height)?;
-        let entries = block["entries"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| {
-                let kind = entry["type"].as_str()?;
-                let host = match kind {
-                    "publisher_delta" => entry["body"]["delta"]["publisher"].as_str(),
-                    "label" => entry["body"]["label"]["labeler"].as_str(),
-                    "dispute" => entry["body"]["dispute"]["disputant"].as_str(),
-                    _ => None,
-                }?;
-                Some((kind, host))
-            });
+        let entries = block.iter().filter_map(|entry| {
+            let kind = entry["type"].as_str()?;
+            let host = match kind {
+                "publisher_delta" => entry["body"]["delta"]["publisher"].as_str(),
+                "label" => entry["body"]["label"]["labeler"].as_str(),
+                "dispute" => entry["body"]["dispute"]["disputant"].as_str(),
+                _ => None,
+            }?;
+            Some((kind, host))
+        });
         suffix_list::check_block_capacity(entries, list.as_deref(), caps)
             .map_err(|e| Error::Verify(format!("block {height}: {e}")))
     }

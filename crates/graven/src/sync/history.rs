@@ -1,6 +1,8 @@
 use super::persist::{
     load_chain_tips, load_withdrawn, record_withdrawal, save_chain_tips, save_history,
 };
+use super::source::Sources;
+use super::tree::Tree;
 use super::SyncState;
 use crate::error::{Error, Result};
 use crate::fetch::{resolve, Client};
@@ -10,10 +12,13 @@ use reqwest::Url;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use wist_core::block::{block_hash, verify_block, verify_chain_link};
-use wist_core::crypto::PublicKey;
+use wist_core::aggregator_keys::Registry;
+use wist_core::block::verify_block;
+use wist_core::checkpoint::{
+    self, check_consistency, check_sequence, Adoption, Checkpoint, WitnessKey,
+};
 use wist_core::delta::{content_bytes, verify_commitment};
-use wist_core::envelope::verify_envelope;
+use wist_core::merkle::consistency_proof_from;
 use wist_core::objects::{
     ChangeType, DeltaEnvelope, DeltaPayloadCommitment, Payload, PublisherEnvelope,
 };
@@ -98,13 +103,34 @@ impl ChainState {
         self.schedule.as_mut().unwrap()
     }
 
-    fn transport_bound(&self) -> u64 {
+    /// WIST-3 §6: the greatest `block_decompressed_cap_bytes` in the map
+    /// at the verified prefix's last `sealed_at` and at every accepted
+    /// future effective instant; with no verified Block, the default.
+    pub fn transport_bound(&self) -> u64 {
         match (&self.schedule, self.prior_at) {
             (Some(schedule), Some(at)) => schedule.block_size_bounds(at).1,
-            _ => wist_core::parameters::spec("block_decompressed_cap_bytes")
-                .and_then(|p| p.default)
-                .unwrap_or(0) as u64,
+            _ => default_of("block_decompressed_cap_bytes"),
         }
+    }
+
+    /// The sealing cadence in force at the previous Block's `sealed_at`,
+    /// which WIST-3 §3.1 puts the next Block's instant on the grid of.
+    pub fn cadence(&self) -> i64 {
+        match (&self.schedule, self.prior_at) {
+            (Some(schedule), Some(at)) => schedule.value_at("block_cadence_seconds", at),
+            _ => None,
+        }
+        .unwrap_or_else(|| default_of("block_cadence_seconds") as i64)
+    }
+
+    /// WIST-3 §5 and WIST-4 §5: `checkpoint_witness_quorum` as in force at
+    /// a Checkpoint's `sealed_at`.
+    pub fn quorum_at(&self, at: i64) -> u64 {
+        self.schedule
+            .as_ref()
+            .and_then(|schedule| schedule.value_at("checkpoint_witness_quorum", at))
+            .unwrap_or_else(|| default_of("checkpoint_witness_quorum") as i64)
+            .max(0) as u64
     }
 
     pub fn accepted(&self) -> Vec<Amendment> {
@@ -122,15 +148,31 @@ impl ChainState {
         self.prior_at
     }
 
+    /// Seeds the verified prefix's last `sealed_at` from the Checkpoint a
+    /// Snapshot resumes at, so the cadence grid, the transport bound and
+    /// the Witness quorum are read from that prefix (WIST-3 §§5, 6).
+    pub fn seed_prior(&mut self, at: i64) {
+        self.prior_at = Some(at);
+        self.schedule_at(at);
+    }
+
     pub fn largest(&self) -> u64 {
         self.largest
     }
 }
 
+fn default_of(parameter: &str) -> u64 {
+    wist_core::parameters::spec(parameter)
+        .and_then(|p| p.default)
+        .unwrap_or(0)
+        .max(0) as u64
+}
+
 pub struct BlockEvent {
     pub height: u64,
-    pub block_hash: String,
-    pub prev_block_hash: String,
+    /// The root of the tree Checkpoint N states, in the `sha256:` form of
+    /// WIST-3 §3.1; a Block has no hash apart from it.
+    pub block_root: String,
     pub sealed_at: String,
     pub sealed_at_s: i64,
     /// The caps and clock allowance accepted at `sealed_at`, under which
@@ -190,200 +232,208 @@ pub(super) fn fetch_payload(
     })
 }
 
-/// WIST-3 §3.4: a Block sealed at height N MUST be signed by a key
-/// valid at N — the genesis key, or one a validly-signed
-/// `aggregator_key_add` sealed at a height ≤ N named and no
-/// `aggregator_key_remove` has retired. Removal is permanent, so an
-/// `aggregator_key_add` naming a removed `key_id` is rejected and
-/// restores nothing.
-pub struct AggregatorKeys {
-    pub(super) valid: BTreeMap<String, PublicKey>,
-    pub(super) removed: BTreeSet<String>,
+/// One Checkpoint the walk verified, with what WIST-3 §5's quorum said
+/// about adopting it as the head.
+pub struct Verified {
+    pub checkpoint: Checkpoint,
+    pub adoption: Adoption,
 }
 
-impl AggregatorKeys {
-    pub fn admit(&mut self, key_id: &str, public_key: &str, removed: bool) -> Result<()> {
-        if removed {
-            self.valid.remove(key_id);
-            self.removed.insert(key_id.to_string());
-        } else {
-            self.valid
-                .insert(key_id.to_string(), PublicKey::from_b64u(public_key)?);
-        }
-        Ok(())
-    }
+pub struct Walk {
+    pub events: Vec<BlockEvent>,
+    pub verified: Vec<Verified>,
 }
 
-impl AggregatorKeys {
-    pub fn genesis(key_id: &str, key: PublicKey) -> Self {
-        let mut valid = BTreeMap::new();
-        valid.insert(key_id.to_string(), key);
-        AggregatorKeys {
-            valid,
-            removed: BTreeSet::new(),
-        }
-    }
-
-    pub fn key(&self, key_id: &str) -> Option<&PublicKey> {
-        self.valid.get(key_id)
-    }
-
-    fn signer_of(&self, envelope: &Value) -> Result<&PublicKey> {
-        let key_id = envelope["sig"]["key_id"]
-            .as_str()
-            .ok_or_else(|| Error::Verify("entry signature names no key_id".into()))?;
-        self.key(key_id).ok_or_else(|| {
-            Error::Verify(format!(
-                "no Aggregator key {key_id} is valid at this height"
-            ))
-        })
-    }
-
-    fn apply(&mut self, update: &Value) -> Result<()> {
-        let action = update["update"]["action"].as_str().unwrap_or_default();
-        let key_id = match update["update"]["details"]["key_id"].as_str() {
-            Some(id) => id.to_string(),
-            None => return Ok(()),
-        };
-        match action {
-            "aggregator_key_add" => {
-                if self.removed.contains(&key_id) {
-                    return Err(Error::Verify(format!(
-                        "aggregator_key_add names the retired key {key_id}"
-                    )));
-                }
-                let public_key = update["update"]["details"]["public_key"]
-                    .as_str()
-                    .ok_or_else(|| {
-                        Error::Verify("aggregator_key_add names no public_key".into())
-                    })?;
-                self.valid.insert(key_id, PublicKey::from_b64u(public_key)?);
-            }
-            "aggregator_key_remove" => {
-                self.valid.remove(&key_id);
-                self.removed.insert(key_id);
-            }
-            _ => {}
-        }
-        Ok(())
+impl Walk {
+    /// WIST-3 §8 step 8: the newest verified Checkpoint carrying the
+    /// quorum in force at its own `sealed_at`.
+    pub fn adopted(&self) -> Option<&Verified> {
+        self.verified
+            .iter()
+            .rev()
+            .find(|v| matches!(v.adoption, Adoption::Adopted { .. }))
     }
 }
 
-/// A Checkpoint names a Block, so it is verified under the Aggregator
-/// key set valid at that Block rather than under the genesis key alone.
-pub(super) fn verify_checkpoint_signature(
-    checkpoint_value: &Value,
-    keys: &AggregatorKeys,
-) -> Result<()> {
-    let key_id = checkpoint_value["sig"]["key_id"]
-        .as_str()
-        .ok_or_else(|| Error::Verify("checkpoint signature names no key_id".into()))?;
-    let key = keys.key(key_id).ok_or_else(|| {
-        Error::Verify(format!(
-            "checkpoint is signed by {key_id}, valid at no height here"
-        ))
-    })?;
-    verify_envelope(checkpoint_value, "checkpoint", key)?;
-    Ok(())
+pub struct WalkInputs<'a> {
+    pub sources: &'a Sources<'a>,
+    pub log_id: &'a str,
+    pub witnesses: &'a [WitnessKey],
+    pub log_dir: &'a std::path::Path,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn walk_blocks(
-    client: &Client,
-    base: &Url,
-    keys: &mut AggregatorKeys,
-    chain: &mut ChainState,
-    withdrawals_replay: &mut WithdrawalReplay,
-    suffix_lists: &mut super::suffix::SuffixLists,
-    start_number: u64,
-    end_number: u64,
-    start_hash: &str,
-) -> Result<(Vec<BlockEvent>, Option<Value>)> {
-    let mut prev_hash = start_hash.to_string();
-    let mut last_block_value: Option<Value> = None;
+pub struct WalkState<'a> {
+    pub keys: &'a mut Registry,
+    pub chain: &'a mut ChainState,
+    pub withdrawals_replay: &'a mut WithdrawalReplay,
+    pub suffix_lists: &'a mut super::suffix::SuffixLists,
+    pub tree: &'a mut Tree,
+}
+
+/// WIST-3 §5 and §8 steps 6–8: verifies every Checkpoint above the
+/// verified head in `block_number` order — the sequence rules, the
+/// Block's Entries against the tree the Checkpoint states, the
+/// Consistency Proof from the previous size, the Block's Registry
+/// Updates, then the Log's signature under the key set valid at its
+/// height — and reports what the Witness quorum says about each.
+pub fn walk_checkpoints(
+    inputs: &WalkInputs,
+    state: &mut WalkState,
+    head: &Checkpoint,
+    offered: &[Checkpoint],
+) -> Result<Walk> {
+    let WalkState {
+        keys,
+        chain,
+        withdrawals_replay,
+        suffix_lists,
+        tree,
+    } = state;
     let mut events: Vec<BlockEvent> = Vec::new();
+    let mut verified: Vec<Verified> = Vec::new();
     let mut walked_deltas: BTreeMap<String, (String, u64)> = BTreeMap::new();
-    for n in start_number..=end_number {
-        let block_url = resolve(base, &format!("/log/blocks/{n:09}.json.zst"))?;
-        let compressed = client.get_bytes(&block_url)?;
-        let decompressed = wist_core::block_frames::decode(&compressed, chain.transport_bound())
-            .map_err(|e| Error::Verify(format!("block {n}: {e}")))?;
-        let block_value = wist_core::json::parse(&decompressed)
-            .map_err(|e| Error::Verify(format!("block {n}: WIST3-E03 {e}")))?;
-        if wist_core::jcs::canonicalize(&block_value)? != decompressed {
-            return Err(Error::Verify(format!(
-                "block {n}: WIST3-E03 Block file does not contain canonical JCS bytes"
-            )));
+    let mut previous = head.clone();
+    let reached = head.block_number();
+    for checkpoint in offered {
+        let n = checkpoint.block_number();
+        let diverged = |detail: &str, tiles: Option<&Tree>| {
+            super::checkpoints::divergence(
+                inputs.log_dir,
+                inputs.log_id,
+                keys,
+                reached,
+                Some(&previous),
+                checkpoint,
+                tiles,
+                detail,
+            )
+        };
+        // WIST-3 §5, the first Equivocation form: two Checkpoints of one
+        // Log stating the same tree size and different root hashes. The
+        // two notes are the whole evidence, so no tile is fetched for it.
+        if matches!(
+            checkpoint::equivocation(&previous, checkpoint),
+            Some(checkpoint::Equivocation::SameSizeDifferentRoot)
+        ) {
+            return Err(diverged(
+                "two Checkpoints of one Log state one tree size and different root hashes",
+                None,
+            ));
         }
-        wist_core::block::validate_entry_order(
-            block_value["entries"]
-                .as_array()
-                .map_or(&[][..], Vec::as_slice),
+        if let Err(error) = check_sequence(Some(&previous), checkpoint, chain.cadence()) {
+            // A tree below the Block before it is §5's third form, and the
+            // tiles the Consumer holds reproduce the larger root.
+            if error.code() == Some("WIST3-E02") {
+                return Err(diverged(
+                    "a Checkpoint states a tree below the Block before it",
+                    Some(tree),
+                ));
+            }
+            return Err(Error::Verify(format!("block {n}: {error}")));
+        }
+        let previous_size = previous.tree_size();
+        let tree_size = checkpoint.tree_size();
+        // WIST-3 §4: the root at size 0 is SHA-256(""), and an empty
+        // Consistency Proof exempts no root from comparison.
+        if tree_size == 0 && *checkpoint.root() != wist_core::merkle::EMPTY_ROOT {
+            return Err(super::checkpoints::divergence(
+                inputs.log_dir,
+                inputs.log_id,
+                keys,
+                reached,
+                None,
+                checkpoint,
+                None,
+                "a Checkpoint states tree size 0 with another root than the empty tree's",
+            ));
+        }
+        if let Err(range_error) = super::tree::extend(
+            inputs.sources,
+            tree,
+            previous_size,
+            tree_size,
+            checkpoint.root(),
+        ) {
+            // The verified tiles plus the ones this Block's leaves add do
+            // not reproduce the offered root. A source may be serving
+            // another tree entirely, so ask each for the whole tree that
+            // size requires — into a scratch tree, never over the tiles
+            // the Consumer has verified — and compare its prefix with the
+            // root the previous Checkpoint states.
+            match super::tree::offered_tree(inputs.sources, tree_size, checkpoint.root())? {
+                Some(offered_tree) => {
+                    let prefix =
+                        wist_core::merkle::root_from(offered_tree.reader(), previous_size)?;
+                    if prefix != *previous.root() {
+                        return Err(diverged(
+                            "the tree a Checkpoint states does not extend the verified head's",
+                            Some(&offered_tree),
+                        ));
+                    }
+                    **tree = offered_tree;
+                }
+                None => return Err(Error::Verify(format!("block {n}: {range_error}"))),
+            }
+        }
+        let proof = consistency_proof_from(tree.reader(), previous_size, tree_size)?;
+        if let Err(error) = check_consistency(&previous, checkpoint, &proof) {
+            return Err(diverged(&error.to_string(), Some(tree)));
+        }
+        let entries = super::tree::block_entries(
+            inputs.sources,
+            tree,
+            previous_size,
+            tree_size,
+            chain.transport_bound(),
         )
         .map_err(|e| Error::Verify(format!("block {n}: {e}")))?;
-        for entry in block_value
-            .get("entries")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|e| e.get("type").and_then(Value::as_str) == Some("registry_update"))
-        {
-            let body = entry
-                .get("body")
-                .ok_or_else(|| Error::Verify(format!("block {n}: registry_update missing body")))?;
-            if matches!(
-                body["update"]["action"].as_str(),
-                Some("aggregator_key_add" | "aggregator_key_remove")
-            ) {
-                let signer = keys.signer_of(body)?.clone();
-                verify_envelope(body, "update", &signer)?;
-                keys.apply(body)?;
+        let summary = match verify_block(
+            previous_size,
+            checkpoint,
+            &entries,
+            tree.reader(),
+            chain.transport_bound(),
+        ) {
+            Ok(summary) => summary,
+            Err(error) if error.code() == Some("WIST3-E02") => {
+                return Err(diverged(&error.to_string(), Some(tree)))
+            }
+            Err(error) => return Err(Error::Verify(format!("block {n}: {error}"))),
+        };
+
+        // WIST-3 §3.3 and §3.4: Block N's key acts apply first, in
+        // canonical Entry index order, each authenticated under the keys
+        // valid at N−1; a key act that fails is ignored and the Block
+        // stays valid.
+        let key_acts: Vec<&Value> = entries
+            .iter()
+            .filter(|entry| entry["type"] == "registry_update")
+            .map(|entry| &entry["body"])
+            .filter(|body| {
+                matches!(
+                    body["update"]["action"].as_str(),
+                    Some("aggregator_key_add" | "aggregator_key_remove")
+                )
+            })
+            .collect();
+        for outcome in keys.apply_block(n, key_acts) {
+            if let Some(code) = outcome.code() {
+                eprintln!("ignoring an Aggregator key act at height {n}: {code}");
             }
         }
-        let block_key_id = block_value["sig"]["key_id"]
-            .as_str()
-            .ok_or_else(|| Error::Verify(format!("block {n} signature names no key_id")))?;
-        let block_key = keys.key(block_key_id).ok_or_else(|| {
-            Error::Verify(format!(
-                "block {n} is signed by {block_key_id}, valid at no height here"
-            ))
-        })?;
-        verify_block(&block_value, block_key)?;
-        let header = block_value
-            .get("header")
-            .ok_or_else(|| Error::Verify(format!("block {n} missing header")))?;
-        verify_chain_link(header, &prev_hash)?;
-        prev_hash = block_hash(header)?;
-        let sealed_at = header
-            .get("sealed_at")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::Verify(format!("block {n} missing header.sealed_at")))?
-            .to_string();
-        let at = log_seconds(&sealed_at)
+        // Every other Registry Update of Block N is authenticated under
+        // the keys valid at N, the set its own key acts leave in force.
+        let authenticators = keys.valid_at(n);
+        let authentic =
+            |body: &Value| wist_core::aggregator_keys::authenticate(body, &authenticators).is_ok();
+
+        let sealed_at = checkpoint.sealed_at().to_string();
+        let at = checkpoint
+            .sealed_at_s()
             .map_err(|e| Error::Verify(format!("block {n}: WIST3-E03 {e}")))?;
-        if chain.prior_at.is_some_and(|prior| at <= prior) {
-            return Err(Error::Verify(format!(
-                "block {n}: WIST3-E03 Block timestamps are not strictly increasing"
-            )));
-        }
-        let cadence_at = chain.prior_at.unwrap_or(at);
-        let largest = chain.largest.max(decompressed.len() as u64);
+        let largest = chain.largest.max(summary.octets);
         let schedule = chain.schedule_at(at);
-        let cadence = schedule
-            .value_at("block_cadence_seconds", cadence_at)
-            .unwrap_or(1);
-        if at.rem_euclid(cadence) != 0 {
-            return Err(Error::Verify(format!(
-                "block {n}: WIST3-E03 Block timestamp is off the accepted cadence grid"
-            )));
-        }
-        for (index, entry) in block_value
-            .get("entries")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
+        for (index, entry) in entries.iter().enumerate() {
             let update = &entry["body"]["update"];
             if entry["type"] != "registry_update" || update["action"] != "parameter_change" {
                 continue;
@@ -398,6 +448,12 @@ pub fn walk_blocks(
             let Ok(effective_at_s) = log_seconds(effective_at) else {
                 continue;
             };
+            // WIST-4 §5.1: an act no key valid at this Block signed is
+            // WIST4-E11 and changes nothing.
+            if !authentic(&entry["body"]) {
+                eprintln!("ignoring a parameter_change at height {n}: WIST4-E11");
+                continue;
+            }
             let _ = schedule.try_accept_with_block_size(
                 Amendment {
                     parameter: parameter.to_owned(),
@@ -430,18 +486,22 @@ pub fn walk_blocks(
                 .unwrap()
                 .max(0) as u64,
         };
-        suffix_lists.check_capacity(n, &block_value, caps)?;
-        for entry in block_value
-            .get("entries")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|e| e["type"] == "registry_update")
-        {
+        suffix_lists.check_capacity(n, &entries, caps)?;
+        for entry in entries.iter().filter(|e| e["type"] == "registry_update") {
             let body = &entry["body"];
             if body["update"]["action"] == "suffix_list_update" {
-                suffix_lists
-                    .apply_act(client, base, n, body, |key_id| keys.key(key_id).cloned())?;
+                suffix_lists.apply_act(
+                    inputs.sources.client(),
+                    inputs.sources.primary(),
+                    n,
+                    body,
+                    |key_id| {
+                        authenticators
+                            .iter()
+                            .find(|key| key.key_id == key_id)
+                            .map(|key| key.public_key.clone())
+                    },
+                )?;
             }
         }
         chain.largest = largest;
@@ -453,13 +513,7 @@ pub fn walk_blocks(
         let mut labels = Vec::new();
         let mut disputes = Vec::new();
 
-        for (index, entry) in block_value
-            .get("entries")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
+        for (index, entry) in entries.iter().enumerate() {
             match entry.get("type").and_then(Value::as_str) {
                 Some("label") => labels.push((index as u64, entry["body"].clone())),
                 Some("dispute") => disputes.push((index as u64, entry["body"].clone())),
@@ -503,7 +557,12 @@ pub fn walk_blocks(
             let disposition = withdrawals_replay.apply(
                 n,
                 body,
-                |key_id| keys.key(key_id).cloned(),
+                |key_id| {
+                    authenticators
+                        .iter()
+                        .find(|key| key.key_id == key_id)
+                        .map(|key| key.public_key.clone())
+                },
                 |delta_id| match walked_deltas.get(delta_id) {
                     Some((publisher, height)) => SealedDelta::Known {
                         publisher: publisher.clone(),
@@ -526,13 +585,25 @@ pub fn walk_blocks(
             }
         }
 
+        // WIST-3 §5: the key set that can speak for Block N is the one the
+        // Log establishes at N, so the signature closes the loop only after
+        // this Block's Registry Updates have been applied.
+        let adoption = super::checkpoints::decide(
+            checkpoint,
+            inputs.log_id,
+            &authenticators,
+            inputs.witnesses,
+            chain.quorum_at(at),
+        )
+        .map_err(|e| Error::Verify(format!("block {n}: {e}")))?;
+        verified.push(Verified {
+            checkpoint: checkpoint.clone(),
+            adoption,
+        });
+
         events.push(BlockEvent {
             height: n,
-            block_hash: wist_core::block::block_hash(&block_value["header"])?,
-            prev_block_hash: block_value["header"]["prev_block_hash"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+            block_root: checkpoint.root_token(),
             sealed_at,
             sealed_at_s: at,
             profile,
@@ -544,9 +615,9 @@ pub fn walk_blocks(
             labels,
             disputes,
         });
-        last_block_value = Some(block_value);
+        previous = checkpoint.clone();
     }
-    Ok((events, last_block_value))
+    Ok(Walk { events, verified })
 }
 
 pub(super) fn default_recovery_window_days() -> i64 {
@@ -967,8 +1038,7 @@ pub fn apply_events(
         let sealed_at_s = event.sealed_at_s;
         history.apply_block(
             event.height,
-            &event.prev_block_hash,
-            &event.block_hash,
+            &event.block_root,
             &event.sealed_at,
             event.recovery_window_days,
             event.declaration_activation_blocks,

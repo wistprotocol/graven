@@ -19,20 +19,6 @@ fn duplicate(raw: &[u8], name: &str, escaped: &str) -> Vec<u8> {
     changed.into_bytes()
 }
 
-fn head(fx: &common::Fixture) -> (u64, String, String) {
-    let doc: Value =
-        serde_json::from_slice(&std::fs::read(fx.dir.path().join("log/checkpoint.json")).unwrap())
-            .unwrap();
-    (
-        doc["checkpoint"]["block_number"].as_u64().unwrap(),
-        doc["checkpoint"]["block_hash"]
-            .as_str()
-            .unwrap()
-            .to_string(),
-        doc["checkpoint"]["sealed_at"].as_str().unwrap().to_string(),
-    )
-}
-
 fn cold_sync(
     fx: &common::Fixture,
 ) -> Result<(graven::sync::SyncReport, tempfile::TempDir), String> {
@@ -48,53 +34,46 @@ fn cold_sync(
     .map_err(|e| e.to_string())
 }
 
+/// WIST-3 §4: an Entry's leaf data is its JCS serialization, so leaf
+/// octets that carry a repeated member are no Entry, whatever leaf hash
+/// the tree states for them.
 #[test]
-fn a_block_with_a_repeated_member_fails_the_sync_before_its_signature_counts() {
+fn an_entry_whose_leaf_data_repeats_a_member_fails_the_sync() {
     for (name, escaped) in [
-        ("sealed_at", "sealed_at"),
-        ("entry_count", "entry_\\u0063ount"),
         ("publisher", "publishe\\u0072"),
+        ("observed_at", "observed_a\\u0074"),
     ] {
         let fx = common::build_fixture(true, false);
-        let (number, hash, sealed_at) = head(&fx);
-        let path = fx
-            .dir
-            .path()
-            .join(format!("log/blocks/{number:09}.json.zst"));
-        let original = zstd::decode_all(std::fs::read(&path).unwrap().as_slice()).unwrap();
-        let block: Value = serde_json::from_slice(&original).unwrap();
-        std::fs::write(&path, common::block_frame(&original)).unwrap();
-        assert_eq!(
-            wist_core::block::block_hash(&block["header"]).unwrap(),
-            hash
+        let publisher = common::Signer::new([1u8; 32]);
+        let (_, delta_env, _) = common::build_delta(
+            &publisher,
+            "https://records.example/repeated",
+            "Repeated",
+            None,
+            "body",
+            None,
         );
-        cold_sync(&fx).unwrap();
-        std::fs::write(
-            &path,
-            common::block_frame(&duplicate(&original, name, escaped)),
-        )
-        .unwrap();
+        let entry = serde_json::json!({"type": "publisher_delta", "body": delta_env});
+        let original = wist_core::jcs::canonicalize(&entry).unwrap();
+        let sealed_at = common::next_instant(&fx);
+        fx.log_state()
+            .seal_leaf_bytes(&sealed_at, &[duplicate(&original, name, escaped)]);
         let error = cold_sync(&fx).unwrap_err();
         assert!(
             error.contains("duplicate JSON member name"),
-            "{name}: {error} (sealed {sealed_at})"
+            "{name}: {error}"
         );
     }
 }
 
 #[test]
-fn a_checkpoint_or_anchor_with_a_repeated_member_fails_the_sync() {
-    for relative in ["log/checkpoint.json", "anchor.json"] {
-        let fx = common::build_fixture(true, false);
-        let path = fx.dir.path().join(relative);
-        let original = std::fs::read(&path).unwrap();
-        std::fs::write(&path, duplicate(&original, "key_id", "key_i\\u0064")).unwrap();
-        let error = cold_sync(&fx).unwrap_err();
-        assert!(
-            error.contains("duplicate JSON member name"),
-            "{relative}: {error}"
-        );
-    }
+fn an_anchor_with_a_repeated_member_fails_the_sync() {
+    let fx = common::build_fixture(true, false);
+    let path = fx.dir.path().join("log/anchor.json");
+    let original = std::fs::read(&path).unwrap();
+    std::fs::write(&path, duplicate(&original, "key_id", "key_i\\u0064")).unwrap();
+    let error = cold_sync(&fx).unwrap_err();
+    assert!(error.contains("duplicate JSON member name"), "{error}");
 }
 
 #[test]

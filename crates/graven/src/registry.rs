@@ -8,6 +8,15 @@ pub struct LogEntry {
     pub anchor: String,
     pub base: String,
     pub tier1: bool,
+    /// WIST-3 §5: further sources for the Log's static files, each tried
+    /// when one does not hold a file.
+    #[serde(default)]
+    pub mirrors: Vec<String>,
+    /// WIST-3 §5: the Witnesses this Consumer trusts, as the
+    /// verifier-key strings they are configured in. Never read from the
+    /// Log.
+    #[serde(default)]
+    pub witnesses: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -105,6 +114,8 @@ mod tests {
                 anchor: "anchor.json".into(),
                 base: "https://log.example".into(),
                 tier1: true,
+                mirrors: Vec::new(),
+                witnesses: Vec::new(),
             }],
         };
         save(dir.path(), &reg).unwrap();
@@ -161,6 +172,8 @@ mod tests {
             anchor: "a".into(),
             base: "b".into(),
             tier1: false,
+            mirrors: Vec::new(),
+            witnesses: Vec::new(),
         }
     }
 

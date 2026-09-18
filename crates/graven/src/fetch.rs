@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use reqwest::Url;
+use std::io::Read;
 use std::time::Duration;
 
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -39,13 +40,24 @@ pub fn parse_base(log_base: &str) -> Result<Url> {
     }
 }
 
+/// WIST-3 §5 and §6: a Log's paths are rooted at a base URL — the
+/// Service Origin, or a Mirror's `mirror_urls` entry, "each ending in
+/// `/`" — so every path is resolved under that base's own path rather
+/// than at its origin, and a Mirror serving the Log under a prefix is
+/// read at that prefix.
 pub fn resolve(base: &Url, raw: &str) -> Result<Url> {
     if let Ok(direct) = Url::parse(raw) {
         if direct.scheme() == "http" || direct.scheme() == "https" {
             return Ok(direct);
         }
     }
-    base.join(raw)
+    let mut rooted = base.clone();
+    if !rooted.path().ends_with('/') {
+        let path = format!("{}/", rooted.path());
+        rooted.set_path(&path);
+    }
+    rooted
+        .join(raw.trim_start_matches('/'))
         .map_err(|e| Error::Fetch(format!("invalid relative URL {raw}: {e}")))
 }
 
@@ -86,6 +98,60 @@ impl Client {
         let bytes = self.get_bytes(url)?;
         let value = wist_core::json::parse(&bytes)?;
         Ok((bytes, value))
+    }
+
+    /// WIST-3 §6 and §10: reads a response while it streams and refuses it
+    /// at `limit` before buffering octets past it. Equality with the bound
+    /// is permitted; one octet more is `WIST3-E03`, and no more than that
+    /// one octet is ever held.
+    pub fn get_bounded(&self, url: &Url, limit: u64) -> Result<Vec<u8>> {
+        guard_scheme(url, self.allow_http)?;
+        let mut resp = self
+            .inner
+            .get(url.clone())
+            .send()
+            .map_err(|e| Error::Fetch(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(Error::Fetch(format!("WIST3-E01 no file at {url}")));
+        }
+        if !resp.status().is_success() {
+            return Err(Error::Fetch(format!(
+                "WIST3-E01 HTTP {} for {url}",
+                resp.status()
+            )));
+        }
+        let over = || {
+            Error::Verify(format!(
+                "WIST3-E03 {url} carries more than the {limit} octets its bound admits"
+            ))
+        };
+        if resp
+            .content_length()
+            .is_some_and(|declared| declared > limit)
+        {
+            return Err(over());
+        }
+        let ceiling = usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX);
+        let mut body = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let room = ceiling - body.len();
+            if room == 0 {
+                return Err(over());
+            }
+            let take = room.min(chunk.len());
+            let read = resp
+                .read(&mut chunk[..take])
+                .map_err(|e| Error::Fetch(e.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
+        }
+        if body.len() as u64 > limit {
+            return Err(over());
+        }
+        Ok(body)
     }
 }
 
@@ -130,12 +196,30 @@ mod tests {
     }
 
     #[test]
-    fn resolve_joins_root_relative_path_against_base_authority() {
-        let base = Url::parse("https://log.example/ignored/path").unwrap();
-        let resolved = resolve(&base, "/snapshots/2026-08-09/manifest.json").unwrap();
+    fn resolve_keeps_every_path_under_the_bases_own_prefix() {
+        for base in ["https://cdn.example/wist/", "https://cdn.example/wist"] {
+            let base = Url::parse(base).unwrap();
+            assert_eq!(
+                resolve(&base, "/checkpoint").unwrap().as_str(),
+                "https://cdn.example/wist/checkpoint"
+            );
+            assert_eq!(
+                resolve(&base, "/tile/0/000").unwrap().as_str(),
+                "https://cdn.example/wist/tile/0/000"
+            );
+            assert_eq!(
+                resolve(&base, "/snapshots/2026-08-09/manifest.json")
+                    .unwrap()
+                    .as_str(),
+                "https://cdn.example/wist/snapshots/2026-08-09/manifest.json"
+            );
+        }
+        let origin = Url::parse("https://log.example").unwrap();
         assert_eq!(
-            resolved.as_str(),
-            "https://log.example/snapshots/2026-08-09/manifest.json"
+            resolve(&origin, "/log/checkpoints/000000001")
+                .unwrap()
+                .as_str(),
+            "https://log.example/log/checkpoints/000000001"
         );
     }
 

@@ -104,15 +104,7 @@ fn version_cases_keep_same_major_values_and_reject_other_majors() {
     entries
         .sort_by_key(|e| wist_core::merkle::leaf_hash(&wist_core::jcs::canonicalize(e).unwrap()));
     history
-        .apply_block(
-            0,
-            "sha256:genesis",
-            "h0",
-            "2026-08-01T00:00:00Z",
-            7,
-            24,
-            &entries,
-        )
+        .apply_block(0, "sha256:h0", "2026-08-01T00:00:00Z", 7, 24, &entries)
         .unwrap();
     for case in vector["version_cases"].as_array().unwrap() {
         let doc = &case["envelope"];

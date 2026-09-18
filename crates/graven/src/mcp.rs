@@ -489,9 +489,11 @@ mod tests {
         std::fs::write(
             log_dir.join("sync.json"),
             serde_json::to_vec(&SyncState {
+                format: crate::sync::SYNC_STATE_FORMAT,
                 log_position: 0,
-                head_number: 7,
-                head_hash: "sha256:deadbeef".into(),
+                block_number: 7,
+                root: "sha256:deadbeef".into(),
+                unwitnessed: false,
                 content_digest: None,
                 schedule_first_s: None,
                 prior_sealed_at_s: None,
@@ -508,6 +510,8 @@ mod tests {
                     anchor: "anchor.json".into(),
                     base: "https://log.example".into(),
                     tier1: false,
+                    mirrors: Vec::new(),
+                    witnesses: Vec::new(),
                 }],
             },
         )

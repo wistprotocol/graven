@@ -22,4 +22,24 @@ pub enum Error {
     PublisherVerify(String),
 }
 
+impl Error {
+    /// The suite error code this failure carries, where it carries one:
+    /// the `WIST<n>-E<nn>` token the message names.
+    pub fn code(&self) -> Option<String> {
+        let text = self.to_string();
+        text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .find(|token| {
+                let bytes = token.as_bytes();
+                bytes.len() == 9
+                    && token.starts_with("WIST")
+                    && bytes[4].is_ascii_digit()
+                    && bytes[5] == b'-'
+                    && bytes[6] == b'E'
+                    && bytes[7].is_ascii_digit()
+                    && bytes[8].is_ascii_digit()
+            })
+            .map(str::to_owned)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

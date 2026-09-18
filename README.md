@@ -11,7 +11,10 @@ over MCP. Verification checks and limits are listed
 Subcommands: `follow --anchor <url|path> --log <base-url> --dir <dir>`
 (register the log in `<dir>/logs.json` if new, cold-sync if never synced,
 sync incrementally otherwise; `--tier1` sticky-enables Tier 1 import for
-that log, `--allow-http` allows plaintext HTTP to loopback hosts only),
+that log, `--allow-http` allows plaintext HTTP to loopback hosts only,
+`--mirror <base-url>` adds a further source for the log's static files
+and `--witness <name+key-id+key>` sets the Witness roster this Consumer
+trusts, both repeatable),
 `sync --dir <dir>` (bare form re-syncs every log already in `logs.json`;
 given `--anchor`/`--log` it does exactly what `follow` does for that one
 log), `serve --dir <dir>` (MCP server over stdio against every synced log
@@ -22,15 +25,40 @@ companion pack against one already-synced log).
 ## Store layout
 
 `<dir>/logs.json` is the log registry: one entry per followed log
-(`log_id`, `anchor`, `base`, sticky `tier1`). Each log gets its own
-`<dir>/logs/<sanitized-log-id>/` holding `index.sqlite` (records, and,
-where `--tier1` is on, `extracts`/`links`/FTS tables) whose `sync_state`
-row is the sync cursor (`log_position`, head block number/hash,
-`content_digest`, the schedule position); `sync.json` beside it mirrors
+(`log_id`, `anchor`, `base`, sticky `tier1`, the `mirrors` tried when one
+source does not hold a file, and the `witnesses` roster). Every Log path
+is resolved under its base's own path, so a Mirror serving the Log at
+`https://cdn.example/wist/` is read at `https://cdn.example/wist/tile/…`. Each log gets
+its own `<dir>/logs/<sanitized-log-id>/` holding `index.sqlite` (records,
+and, where `--tier1` is on, `extracts`/`links`/FTS tables) whose
+`sync_state` row is the sync cursor: the verified head's `block_number`,
+the tree size it states as `log_position`, its `root` in the
+`sha256:`+hex form, whether the acceptance was `unwitnessed`, the
+`content_digest` and the schedule position. `sync.json` beside it mirrors
 that row for readers of the file and is rewritten after each commit.
-Publisher declarations, chain tips, Aggregator keys, parameters and
-withdrawals are persisted in `index.sqlite` too, so an incremental sync
-reloads them without re-walking the chain from genesis.
+The `checkpoints` table holds every Checkpoint the Consumer acted on,
+note and signature lines verbatim, so the rollback comparison and an
+equivocation bundle survive a restart; `tree_tiles` holds the tree
+hashes it verified, so continuing needs no refetch of the Log's history.
+Publisher declarations, chain tips, the Aggregator key registry — every
+key the Log admitted, the genesis key and retired ones included, with
+the heights that bound each one's validity, so a reload restores no key
+a removal retired and a Checkpoint at any height is judged under the
+keys valid there — parameters and withdrawals are persisted in
+`index.sqlite` too, so an incremental sync
+reloads them without re-walking the Log from genesis. A `sync_state` row
+written before the Log became one growing tree — one naming a Block hash
+where a tree size and root now stand — is refused with an instruction to
+remove the log's directory and sync again, never reinterpreted.
+A divergence leaves an evidence bundle under
+`<dir>/logs/<sanitized-log-id>/evidence/`: `equivocation-block-<N>/` with
+the retained and offered Checkpoint notes, or `divergence-block-<N>/`
+with the Checkpoints and, where the form needs them, the tiles that
+reproduce the larger root. It also writes `halt.json` beside them: from
+that point the Consumer applies nothing more from that Aggregator and
+every later sync of the log exits with `WIST3-E02` naming the evidence,
+until the operator removes the log's directory. What was already applied
+stays queryable, and every MCP provenance row carries `halted`.
 Every incremental sync commits the cursor, keys, parameters and index
 rows in one transaction, so a sync that cannot commit leaves all of them
 at the previous head; a cold start builds the whole index, cursor
@@ -46,22 +74,72 @@ cleanly if that sync then fails.
 
 ## What sync verifies
 
-Every protocol input — the Log Anchor, checkpoint, Block files, Snapshot
-index, manifest and state, Payloads, companion packs and the store's own
-retained JSON — is rejected when any object at any depth repeats a decoded
-member name, escaped spellings included, before field, signature or replay
-checks see a parsed value (WIST-1 §4, RFC 8785 §3.1); a rejected Payload
-supplies no record fields, and a rejected Log file fails the sync.
+Every JSON protocol input — the Log Anchor, the Entries an entry bundle
+carries, the Snapshot index, manifest and state, Payloads, companion
+packs and the store's own retained JSON — is rejected when any object at
+any depth repeats a decoded member name, escaped spellings included,
+before field, signature or replay checks see a parsed value (WIST-1 §4,
+RFC 8785 §3.1); a rejected Payload supplies no record fields, and a
+rejected Log file fails the sync.
 
-Chain-level: every Block's signature, hash chain, and Merkle root; the
-checkpoint's signature and its binding to the head Block; on cold start,
-the snapshot index/manifest/state signatures and the recomputed
-`content_digest`/`state_digest` against the manifest's claims. Each Block
-file must be one standard Zstandard frame whose declared size is present
-and within the accepted transport bound, decoded through core's shared
-decoder (WIST-3 §6, ADR-0021), and must carry canonical JCS bytes; each
-`sealed_at` must be a whole-second literal-`Z` Log timestamp on the
-accepted cadence grid, strictly increasing (WIST-3 §3.1, ADR-0022).
+Tree-level (WIST-3 §§3–6): the head Checkpoint is the five-line signed
+note of §5, and every archived Checkpoint between the verified head and
+it is fetched and verified in `block_number` order — sequential numbering,
+a tree that never shrinks, a strictly increasing `sealed_at` on the
+cadence grid in force at the previous Block, the Consistency Proof from
+the previous tree size with the size-0 root compared rather than skipped,
+the Block's Entries against the leaf range `size(N-1)`..`size(N)` of the
+tree the Checkpoint states, then the Log's signature under the Aggregator
+keys valid at N. Block N's key acts apply first, in canonical Entry
+index order, each authenticated under the keys valid at N−1; every other
+Registry Update of the Block, and Checkpoint N itself, is authenticated
+under the keys valid at N. A key act that fails — a `key_id` or note key
+ID the Log already admitted, a removal of a key not valid at N−1 — is
+ignored as `WIST4-E04`, one no key valid at N−1 signed as `WIST4-E11`,
+and the Block stays valid. Tiles and entry bundles are kept only where
+they recompute the Checkpoint's root; a partial tile or bundle is fetched
+only at the width a Checkpoint's size requires, with the full one as the
+fallback. A tile over 8 192 octets, an entry bundle over 16 777 472, an
+Entry over 65 535 or a Block over the transport bound its verified prefix
+derives is refused while the response streams, before the octets past the
+bound are buffered (`WIST3-E03`). A Checkpoint at or below the verified head
+adopts nothing and is no error, and the head is fetched from the next
+source; one whose note text differs from the one retained at its
+`block_number` is equivocation only where a key valid at *that
+Checkpoint's own height* signs it — `WIST3-E02`, which halts the Log and
+leaves an evidence bundle — and is otherwise `WIST3-E03` against the
+source that served it, preserved as nothing. The same rule governs every
+divergence above the head: two Checkpoints stating one tree size and
+different roots, a tree below the Block before it, a tree that does not
+extend the verified head's, a failed Consistency Proof and a size-0
+Checkpoint stating another root than `SHA-256("")` are `WIST3-E02` with
+their evidence when the offered Checkpoint authenticates under the keys
+valid at its height (at the verified head's, where the Consumer has not
+reached that height), and `WIST3-E03` against the source otherwise. A
+fork's tiles are fetched into a scratch tree and never written over the
+tiles the Consumer has verified. On cold start, the snapshot
+index/manifest/state signatures and the recomputed
+`content_digest`/`state_digest` are checked against the manifest's
+claims, and the Checkpoint at the manifest's `block_number` must state
+its `log_position` and `anchor_block_hash` (`WIST3-E02` otherwise).
+The Checkpoint a Consumer adopts as its head must carry Cosignatures
+from at least `checkpoint_witness_quorum` distinct Witnesses of its
+roster, read as in force at that Checkpoint's `sealed_at` (WIST-3 §5,
+WIST-4 §5). The roster is this Consumer's configuration, supplied as
+`--witness <name>+<hex key id>+<base64 key>` verifier-key strings and
+never read from the Log; it is empty by default, which at the quorum of
+0 this edition starts at adopts the head and records the acceptance as
+unwitnessed. A Checkpoint short of the quorum is neither evidence nor an
+error: the head stands, nothing above its tree size is applied, and the
+next run tries again. The acceptance is recorded as `unwitnessed` with
+the Checkpoint it belongs to, in the `checkpoints` row of the Block
+adopted — a Checkpoint verified on the way to the head but never adopted
+carries no such record — and in the sync cursor for the head; the sync
+report and every MCP provenance row carry it. Staleness is judged on the
+newest Checkpoint the Consumer can accept: the one it adopted, or the
+verified head it kept where everything above it was short of the quorum
+or no source served a head at all.
+
 Log-signed `parameter_change` acts replay through core's accepted-schedule
 rules (WIST-4 §9, ADR-0020): rejected amendments are ignored, an amendment
 cannot cut the cap below a Block already sealed, and a Block above the cap
@@ -240,7 +318,8 @@ text), `get_links` (declared outbound links, Tier 1), `similar_records`
 (nearest neighbors by an imported companion pack). Merging across logs
 happens at query time, in two steps: rows sharing one `delta_id` collapse
 into one, with `provenance` listing every log that carries it (`log_id`,
-`synced_height`); rows for the same
+`synced_height`, and `unwitnessed` where that log's head was adopted with
+no Cosignature from a Witness this Consumer trusts); rows for the same
 URL and publisher but different `delta_id` (logs that diverged, or synced
 to different heights) resolve to whichever has the later `observed_at`,
 `delta_id` breaking ties (WIST-3 §8).
@@ -277,7 +356,18 @@ instants (`clave seal --at`), advancing Log time by whole hours while
 Deltas keep wall-clock `observed_at` values; it validates artifacts against the spec's schemas via
 `WIST_SPEC_DIR`, requiring `jsonschema`, `rfc8785`, and `cryptography` on
 `PATH`'s python3 — set `CI=1` to hard-fail instead of skipping when they're
-missing). The same crate's `baseline` binary drives the pipeline at scale
+missing). It then reads the served Log with an independent client,
+`e2e/tlog-client`, built on Go's `golang.org/x/mod/sumdb/note` and `tlog`:
+the head Checkpoint's signature under the Log's verifier key, the root
+recomputed from the tiles, an Inclusion Proof for every leaf and a
+Consistency Proof from every smaller size; it needs a Go toolchain and is
+skipped without one, or fails under `CI=1`. A second suite in the same crate drives the Consumer against
+an Aggregator with no Publisher: a cold start at a Snapshot's Block
+followed by continuous sync, a source serving an old head leaving the
+verified head where it is, and a Checkpoint adopted only once a Witness
+in the roster has cosigned it — with a minimal in-process Witness
+answering [tlog-witness] `add-checkpoint` with a cosignature/v1 line.
+The same crate's `baseline` binary drives the pipeline at scale
 for capacity measurements: `cargo run -p e2e --bin baseline -- --domains N
 --pages M [--changed-percent P] [--body-words W] [--extra-empty-seals K]
 [--no-tier1] [--out report.json]` publishes N loopback sites of M pages

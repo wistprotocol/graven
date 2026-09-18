@@ -1,10 +1,8 @@
-use super::history::{
-    default_recovery_window_days, persist_declaration, AggregatorKeys, ChainState,
-};
-use super::persist::{load_aggregator_keys, record_withdrawal, save_chain_tips};
+use super::history::{default_recovery_window_days, persist_declaration, ChainState};
+use super::persist::{record_withdrawal, save_aggregator_keys, save_chain_tips};
+use super::source::Sources;
 use crate::error::{Error, Result};
-use crate::fetch::resolve;
-use crate::fetch::Client;
+use crate::fetch::{resolve, Client};
 use crate::keyset::KeyHistory;
 use crate::registry::{self};
 use crate::store::{CREATE_DECLARATIONS, CREATE_TIER1, CREATE_UNIQUE_INDEX};
@@ -15,12 +13,15 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::path::PathBuf;
+use wist_core::aggregator_keys::Registry;
 use wist_core::chain::ChainTips;
 use wist_core::crypto::{hex_encode, PublicKey};
 use wist_core::envelope::verify_envelope;
+use wist_core::objects::GenesisKey;
 use wist_core::objects::LogAnchorEnvelope;
 use wist_core::objects::{
-    SnapshotIndexEnvelope, SnapshotManifestEnvelope, SnapshotStateEnvelope, StateEntry,
+    SnapshotIndexEnvelope, SnapshotManifest, SnapshotManifestEnvelope, SnapshotStateEnvelope,
+    StateEntry,
 };
 use wist_core::snapshot::content_digest;
 use wist_core::snapshot::state_digest;
@@ -90,7 +91,13 @@ pub(super) fn recompute_content_digest(sqlite_path: &Path) -> Result<String> {
     Ok(content_digest(&records)?)
 }
 
-pub(super) fn load_anchor(anchor: &str, client: &Client) -> Result<(PublicKey, String, String)> {
+/// WIST-3 §3.4: the self-signed Log Anchor, with the genesis key every
+/// later key is admitted by and the `log_id` every Checkpoint's origin
+/// line carries.
+pub(super) fn load_anchor(
+    anchor: &str,
+    client: &Client,
+) -> Result<(PublicKey, String, GenesisKey)> {
     let anchor_bytes = load_anchor_bytes(anchor, client)?;
     let anchor_value = wist_core::json::parse(&anchor_bytes)?;
     let anchor_env: LogAnchorEnvelope = serde_json::from_value(anchor_value.clone())?;
@@ -99,7 +106,7 @@ pub(super) fn load_anchor(anchor: &str, client: &Client) -> Result<(PublicKey, S
     Ok((
         trust_key,
         anchor_env.anchor.log_id,
-        anchor_env.anchor.genesis_key.key_id,
+        anchor_env.anchor.genesis_key,
     ))
 }
 
@@ -110,11 +117,10 @@ pub(super) struct Installation {
     guard: TempFileGuard,
     tmp_sqlite_path: PathBuf,
     pub(super) conn: Connection,
-    pub(super) log_position: u64,
-    pub(super) anchor_block_hash: String,
+    pub(super) manifest: SnapshotManifest,
     pub(super) content_digest: String,
     pub(super) history: KeyHistory,
-    pub(super) aggregator_keys: AggregatorKeys,
+    pub(super) aggregator_keys: Registry,
     pub(super) chain: ChainState,
     pub(super) suffix_lists: super::suffix::SuffixLists,
 }
@@ -141,13 +147,15 @@ impl Installation {
 /// files against the trust key and each other, writes the tier-0 index to
 /// a temporary file and adopts every state tuple into it.
 pub(super) fn snapshot(
-    client: &Client,
-    base: &Url,
+    sources: &Sources,
     trust_key: &PublicKey,
-    genesis_key_id: &str,
+    log_id: &str,
+    genesis: &GenesisKey,
     dir: &Path,
     tier1: bool,
 ) -> Result<Installation> {
+    let client = sources.client();
+    let base = sources.primary();
     let index_url = resolve(base, "/snapshots/index.json")?;
     let (_, index_value) = client.get_json(&index_url)?;
     verify_envelope(&index_value, "index", trust_key)?;
@@ -263,7 +271,7 @@ pub(super) fn snapshot(
     let mut suffix_lists = super::suffix::SuffixLists::load(&conn)?;
     conn.execute_batch(crate::store::CREATE_CHAIN_TIPS)?;
     let mut tips = ChainTips::new();
-    let mut adopted_keys: Vec<(String, String, Option<u64>)> = Vec::new();
+    let mut adopted_keys: Vec<wist_core::objects::AggregatorKeyEntry> = Vec::new();
     let mut adopted_windows: Vec<(String, String, Value, u64)> = Vec::new();
     let mut adopted_pending: Vec<(String, Value, u64, u64)> = Vec::new();
     let mut adopted_parameters: Vec<(String, String, i64)> = Vec::new();
@@ -318,7 +326,7 @@ pub(super) fn snapshot(
             }
             StateEntry::Record(r) => tips.adopt(&r.publisher, &r.url, &r.delta_id),
             StateEntry::AggregatorKey(k) => {
-                adopted_keys.push((k.key_id.clone(), k.public_key.clone(), k.removed_height));
+                adopted_keys.push(k.clone());
             }
         }
     }
@@ -328,7 +336,6 @@ pub(super) fn snapshot(
     for (domain, head, head_height, activation_height) in &adopted_pending {
         history.adopt_pending(domain, head, *head_height, *activation_height)?;
     }
-    history.seed_head(manifest.log_position, &manifest.anchor_block_hash);
     for (head, head_height) in adopted_windows
         .iter()
         .map(|(_, _, head, height)| (head, *height))
@@ -348,20 +355,33 @@ pub(super) fn snapshot(
         )?;
     }
     save_chain_tips(&conn, &tips)?;
-    super::persist::seed_ranking_index(&conn, manifest.log_position)?;
+    super::persist::seed_ranking_index(&conn, manifest.block_number)?;
 
-    let mut aggregator_keys = load_aggregator_keys(&conn, genesis_key_id, trust_key)?;
-    for (key_id, public_key, removed_height) in &adopted_keys {
-        aggregator_keys.admit(key_id, public_key, removed_height.is_some())?;
-    }
+    // WIST-3 §7: the `aggregator_key` tuples carry every key admitted at
+    // or below `log_position`, removed ones included, so the resumed
+    // registry judges key acts and lower Checkpoints as a replaying
+    // Consumer does. A state that carries none leaves the Anchor's
+    // genesis key alone; one that carries tuples and omits the Anchor's
+    // genesis key — removed by then like any other key — omits a tuple
+    // §7 keeps, and is refused here as a reload refuses it.
+    let aggregator_keys = if adopted_keys.is_empty() {
+        Registry::from_genesis(log_id, genesis)?
+    } else {
+        if !adopted_keys.iter().any(|key| key.key_id == genesis.key_id) {
+            return Err(Error::Verify(
+                "the Snapshot's state carries aggregator_key tuples but none for the Anchor's genesis key; a removed key's tuple outlives its key, so a state file that omits it does not verify".into(),
+            ));
+        }
+        Registry::from_entries(log_id, &adopted_keys)?
+    };
+    save_aggregator_keys(&conn, &aggregator_keys)?;
     let chain = ChainState::from_tuples(&adopted_parameters)?;
     Ok(Installation {
         guard,
         tmp_sqlite_path,
         conn,
-        log_position: manifest.log_position,
-        anchor_block_hash: manifest.anchor_block_hash.clone(),
         content_digest: manifest.content_digest.clone(),
+        manifest,
         history,
         aggregator_keys,
         chain,

@@ -29,8 +29,7 @@ fn outcome(stored: &Value, fetched: &Value) -> String {
         let effects = history
             .apply_block(
                 0,
-                "sha256:genesis",
-                "h0",
+                "sha256:h0",
                 "2026-08-02T12:00:00Z",
                 7,
                 24,
@@ -39,15 +38,10 @@ fn outcome(stored: &Value, fetched: &Value) -> String {
             .unwrap();
         assert_eq!(effects.installations[0].decision, None);
     }
-    let (height, prev) = if stored.is_null() {
-        (0, "sha256:genesis")
-    } else {
-        (1, "h0")
-    };
+    let height = if stored.is_null() { 0 } else { 1 };
     match history.apply_block(
         height,
-        prev,
-        "h1",
+        "sha256:h1",
         "2026-08-03T12:00:00Z",
         7,
         24,
@@ -105,8 +99,7 @@ fn an_ordinary_rotation_keeps_the_identity_and_a_fresh_one_waits_for_activation(
         history
             .apply_block(
                 0,
-                "sha256:genesis",
-                "h0",
+                "sha256:h0",
                 "2026-08-02T12:00:00Z",
                 7,
                 24,
@@ -116,8 +109,7 @@ fn an_ordinary_rotation_keeps_the_identity_and_a_fresh_one_waits_for_activation(
         let effects = history
             .apply_block(
                 1,
-                "h0",
-                "h1",
+                "sha256:h1",
                 "2026-08-03T12:00:00Z",
                 7,
                 24,

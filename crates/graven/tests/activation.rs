@@ -8,32 +8,14 @@ use wist_core::objects::{ParameterEntry, PendingDeclarationEntry, StateEntry};
 
 const NOT_BEFORE: &str = "2026-08-09T00:00:00Z";
 
-fn head(fx: &common::Fixture) -> (u64, String) {
-    let doc: Value =
-        serde_json::from_slice(&std::fs::read(fx.dir.path().join("log/checkpoint.json")).unwrap())
-            .unwrap();
-    (
-        doc["checkpoint"]["block_number"].as_u64().unwrap(),
-        doc["checkpoint"]["block_hash"]
-            .as_str()
-            .unwrap()
-            .to_string(),
-    )
-}
-
 fn sealed_at(height: u64) -> String {
     let start = wist_core::timestamp::log_seconds("2026-08-09T12:00:00Z").unwrap();
     wist_core::timestamp::instant(start + 3600 * height as i64).unwrap()
 }
 
 fn append(fx: &common::Fixture, entries: &[Value]) -> u64 {
-    let (prev_number, prev_hash) = head(fx);
-    let next = prev_number + 1;
-    let at = sealed_at(next);
-    let (block, hash) = common::build_block(&fx.log, next, &prev_hash, &at, entries);
-    common::write_block(fx.dir.path(), next, &block);
-    common::write_checkpoint(fx.dir.path(), &fx.log, next, &hash, &at);
-    next
+    let next = fx.head_number() + 1;
+    common::seal_next(fx, &sealed_at(next), entries)
 }
 
 fn sync(fx: &common::Fixture, target: &std::path::Path) -> graven::sync::SyncReport {

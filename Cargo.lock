@@ -503,13 +503,13 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 name = "e2e"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "jiff",
  "reqwest",
  "serde_json",
  "tempfile",
  "wist-core",
  "zerovec",
- "zstd",
 ]
 
 [[package]]
@@ -727,6 +727,7 @@ name = "graven"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "ed25519-dalek",
@@ -2585,7 +2586,6 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "zerovec",
- "zstd",
 ]
 
 [[package]]

@@ -1,0 +1,292 @@
+use super::source::Sources;
+use crate::error::{Error, Result};
+use rusqlite::Connection;
+use serde_json::Value;
+use std::collections::BTreeMap;
+use wist_core::block::parse_entries;
+use wist_core::tiles::{
+    bundles_for_range, check_bundle, decode_entry_bundle, decode_tile, required_tiles,
+    tiles_for_range, Bundle, Tile, TileSet, ENTRY_BUNDLE_MAX_BYTES, TILE_MAX_BYTES, TILE_WIDTH,
+};
+
+pub const CREATE_TREE_TILES: &str = "CREATE TABLE IF NOT EXISTS tree_tiles(level INTEGER NOT NULL, idx INTEGER NOT NULL, hashes BLOB NOT NULL, PRIMARY KEY(level, idx))";
+
+fn invalid(message: &str) -> Error {
+    Error::Verify(format!("WIST3-E03 {message}"))
+}
+
+/// WIST-3 §6: the tree hashes the Consumer holds, as the tiles it
+/// fetched them in. Keeping them is what lets a later Block be verified
+/// against the prefix without refetching the Log's history.
+#[derive(Clone, Default)]
+pub struct Tree {
+    raw: BTreeMap<(u8, u64), Vec<u8>>,
+    set: TileSet,
+}
+
+impl Tree {
+    pub fn new() -> Self {
+        Tree::default()
+    }
+
+    pub fn load(conn: &Connection) -> Result<Self> {
+        conn.execute_batch(CREATE_TREE_TILES)?;
+        let mut tree = Tree::new();
+        let mut stmt = conn.prepare("SELECT level, idx, hashes FROM tree_tiles")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u8,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (level, index, bytes) in rows {
+            tree.insert(level, index, &bytes)?;
+        }
+        Ok(tree)
+    }
+
+    pub fn save(&self, conn: &Connection) -> Result<()> {
+        conn.execute_batch(CREATE_TREE_TILES)?;
+        for ((level, index), bytes) in &self.raw {
+            conn.execute(
+                "INSERT INTO tree_tiles(level, idx, hashes) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(level, idx) DO UPDATE SET hashes = excluded.hashes",
+                (i64::from(*level), *index as i64, bytes),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn insert(&mut self, level: u8, index: u64, bytes: &[u8]) -> Result<()> {
+        self.set.insert_bytes(level, index, bytes)?;
+        self.raw.insert((level, index), bytes.to_vec());
+        Ok(())
+    }
+
+    pub fn reader(&self) -> &TileSet {
+        &self.set
+    }
+
+    pub fn tiles(&self) -> &BTreeMap<(u8, u64), Vec<u8>> {
+        &self.raw
+    }
+}
+
+fn exact_tile(bytes: &[u8], path: &str, width: u32) -> Result<()> {
+    let hashes = decode_tile(bytes)?;
+    if hashes.len() as u32 != width {
+        return Err(invalid(&format!(
+            "the tile at {path} carries {} hashes, not the {width} its path states",
+            hashes.len()
+        )));
+    }
+    Ok(())
+}
+
+/// WIST-3 §6: a partial tile is fetched only where a Checkpoint's size
+/// requires that width, and the full tile is the fallback once the
+/// Aggregator has deleted the partial one.
+fn tile_bytes(sources: &Sources, at: usize, tile: &Tile) -> Result<Vec<u8>> {
+    let want = tile.width as usize * 32;
+    let path = tile.path();
+    let exact = sources.at(&path, TILE_MAX_BYTES, at, |bytes| {
+        exact_tile(bytes, &path, tile.width)
+    });
+    match exact {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if tile.width < TILE_WIDTH => {
+            let full = Tile {
+                width: TILE_WIDTH,
+                ..*tile
+            };
+            let full_path = full.path();
+            match sources.at(&full_path, TILE_MAX_BYTES, at, |bytes| {
+                exact_tile(bytes, &full_path, TILE_WIDTH)
+            }) {
+                Ok(bytes) => Ok(bytes[..want].to_vec()),
+                Err(_) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn fetch_tiles(sources: &Sources, tree: &Tree, wanted: &[Tile], at: usize) -> Result<Tree> {
+    let mut candidate = tree.clone();
+    for tile in wanted {
+        let bytes = tile_bytes(sources, at, tile)?;
+        candidate.insert(tile.level, tile.index, &bytes)?;
+    }
+    Ok(candidate)
+}
+
+/// Fetches the tiles a tree size needs and keeps them only where they
+/// reproduce the root a Checkpoint states (WIST-3 §6); a source whose
+/// octets do not is asked no further and the next one is tried.
+fn adopt_tiles(
+    sources: &Sources,
+    tree: &mut Tree,
+    wanted: &[Tile],
+    tree_size: u64,
+    root: &[u8; 32],
+) -> Result<()> {
+    let mut last: Option<Error> = None;
+    for at in 0..sources.count() {
+        let candidate = match fetch_tiles(sources, tree, wanted, at) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                last = Some(error);
+                continue;
+            }
+        };
+        match wist_core::tiles::check_tree(candidate.reader(), tree_size, root) {
+            Ok(()) => {
+                *tree = candidate;
+                return Ok(());
+            }
+            Err(error) => last = Some(error.into()),
+        }
+    }
+    Err(last.unwrap_or_else(|| Error::Fetch("WIST3-E01 no source holds the tree's tiles".into())))
+}
+
+/// WIST-3 §4: the root of the tree at size 0 is `SHA-256("")`, and no
+/// party holds a tile for it, so the root is compared rather than the
+/// comparison skipped. A Checkpoint stating another root there states a
+/// tree that is not this Log's (`WIST3-E02`).
+fn check_empty_tree(root: &[u8; 32]) -> Result<()> {
+    if *root != wist_core::merkle::EMPTY_ROOT {
+        return Err(Error::Verify(
+            "WIST3-E02 a Checkpoint states tree size 0 with another root than the empty tree's"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// WIST-3 §8 step 5: the tree hashes at a Snapshot's tree size, verified
+/// by recomputation against the root its Checkpoint states.
+pub fn seed(sources: &Sources, tree: &mut Tree, tree_size: u64, root: &[u8; 32]) -> Result<()> {
+    if tree_size == 0 {
+        return check_empty_tree(root);
+    }
+    adopt_tiles(sources, tree, &required_tiles(tree_size), tree_size, root)
+}
+
+/// The tiles Block N's leaves add to the tree, kept only where the whole
+/// tree reproduces Checkpoint N's root.
+pub fn extend(
+    sources: &Sources,
+    tree: &mut Tree,
+    from: u64,
+    to: u64,
+    root: &[u8; 32],
+) -> Result<()> {
+    if to == 0 {
+        return check_empty_tree(root);
+    }
+    let wanted = tiles_for_range(from, to, to);
+    adopt_tiles(sources, tree, &wanted, to, root)
+}
+
+/// The whole tree a Checkpoint's size requires, from the first source
+/// whose tiles reproduce the root it states, built beside the tiles the
+/// Consumer has verified rather than over them: what a party offering a
+/// fork serves is never mixed into the tree the Consumer holds.
+pub fn offered_tree(sources: &Sources, tree_size: u64, root: &[u8; 32]) -> Result<Option<Tree>> {
+    if tree_size == 0 {
+        return Ok(None);
+    }
+    let wanted = required_tiles(tree_size);
+    for at in 0..sources.count() {
+        let Ok(candidate) = fetch_tiles(sources, &Tree::new(), &wanted, at) else {
+            continue;
+        };
+        if wist_core::tiles::check_tree(candidate.reader(), tree_size, root).is_ok() {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn bundle_bytes(sources: &Sources, tree: &Tree, bundle: &Bundle) -> Result<Vec<u8>> {
+    let (start, _) = bundle.leaf_range();
+    let width = bundle.width as usize;
+    let check = |bytes: &[u8]| -> Result<()> {
+        let entries = decode_entry_bundle(bytes)?;
+        if entries.len() != width {
+            return Err(invalid("an entry bundle is not the width its path states"));
+        }
+        check_bundle(&entries, start, tree.reader())?;
+        Ok(())
+    };
+    match sources.cached(&bundle.path(), ENTRY_BUNDLE_MAX_BYTES, check) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if bundle.width < TILE_WIDTH => {
+            let full = Bundle {
+                index: bundle.index,
+                width: TILE_WIDTH,
+            };
+            let truncate = |bytes: &[u8]| -> Result<Vec<u8>> {
+                let entries = decode_entry_bundle(bytes)?;
+                if entries.len() < width {
+                    return Err(invalid("an entry bundle is shorter than the tree requires"));
+                }
+                let held = entries[..width].to_vec();
+                check_bundle(&held, start, tree.reader())?;
+                wist_core::tiles::encode_entry_bundle(&held).map_err(Into::into)
+            };
+            for at in 0..sources.count() {
+                let fetched = sources
+                    .at(&full.path(), ENTRY_BUNDLE_MAX_BYTES, at, |_| Ok(()))
+                    .and_then(|bytes| truncate(&bytes));
+                if let Ok(bytes) = fetched {
+                    return Ok(bytes);
+                }
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// WIST-3 §3.1 and §6: the Entries whose leaf indexes lie in Block N's
+/// range, read from the entry bundles that cover it, each verified
+/// against the tree's level-0 hashes, and stopped at the transport bound
+/// the verified prefix derives.
+pub fn block_entries(
+    sources: &Sources,
+    tree: &Tree,
+    from: u64,
+    to: u64,
+    transport_bound: u64,
+) -> Result<Vec<Value>> {
+    if from >= to {
+        return Ok(Vec::new());
+    }
+    let over = || invalid("the Block's Entries exceed the transport bound of its prefix");
+    let mut leaf_data: Vec<Vec<u8>> = Vec::new();
+    let mut octets: u64 = 0;
+    for bundle in bundles_for_range(from, to, to) {
+        if octets > transport_bound {
+            return Err(over());
+        }
+        let bytes = bundle_bytes(sources, tree, &bundle)?;
+        let (start, _) = bundle.leaf_range();
+        for (offset, entry) in decode_entry_bundle(&bytes)?.into_iter().enumerate() {
+            let index = start + offset as u64;
+            if index < from || index >= to {
+                continue;
+            }
+            octets += entry.len() as u64 + 2;
+            if octets > transport_bound {
+                return Err(over());
+            }
+            leaf_data.push(entry);
+        }
+    }
+    Ok(parse_entries(&leaf_data)?)
+}

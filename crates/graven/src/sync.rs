@@ -1,24 +1,29 @@
+pub mod checkpoints;
 mod history;
 mod install;
 mod persist;
+pub mod source;
 mod suffix;
+pub mod tree;
 
 use history::*;
-pub use history::{AggregatorKeys, ApplyStats, BlockEvent, ChainState};
+pub use history::{ApplyStats, BlockEvent, ChainState};
 use install::*;
 use persist::*;
 pub use persist::{load_sync_state, save_sync_state, CREATE_SYNC_STATE};
 use suffix::SuffixLists;
 
+pub use checkpoints::{parse_roster, parse_witness_key, CREATE_CHECKPOINTS};
+pub use source::Sources;
+pub use tree::Tree;
+
 use crate::error::{Error, Result};
 
-use crate::fetch::{resolve, Client};
+use crate::fetch::Client;
 
 use crate::registry::{self, LogEntry};
 
 use crate::store::{CREATE_DECLARATIONS, CREATE_UNIQUE_INDEX};
-
-use reqwest::Url;
 
 use rusqlite::Connection;
 
@@ -26,25 +31,52 @@ use serde::{Deserialize, Serialize};
 
 use std::path::Path;
 
-use wist_core::block::verify_checkpoint_binding;
+use wist_core::checkpoint::{Adoption, Checkpoint, WitnessKey};
+
+use wist_core::aggregator_keys::Registry;
 
 use wist_core::crypto::PublicKey;
 
-use wist_core::objects::CheckpointEnvelope;
+use wist_core::objects::GenesisKey;
 
 #[derive(Debug, Clone)]
 pub struct SyncReport {
     pub log_id: String,
-    pub log_position_before: Option<u64>,
+    pub block_number_before: Option<u64>,
     pub head: u64,
+    /// The tree size the adopted Checkpoint states (WIST-3 §7's
+    /// `log_position`).
+    pub tree_size: u64,
+    pub root: String,
+    /// WIST-3 §5's interim: the adopted Checkpoint carried no Cosignature
+    /// from a Witness this Consumer trusts.
+    pub unwitnessed: bool,
+    /// WIST-3 §5: the newest Checkpoint this Consumer can accept — the
+    /// one it adopted, or the verified head it kept where nothing above
+    /// it was acceptable — lags the current time by more than three
+    /// sealing cadences.
+    pub stale: bool,
     pub withdrawn: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// The format the sync state is written in. A store written before the
+/// Log became one growing tree carries no `format` member and names a
+/// Block hash rather than a tree size, and is refused rather than
+/// reinterpreted.
+pub const SYNC_STATE_FORMAT: u32 = 3;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncState {
+    pub format: u32,
+    /// The tree size the verified head states (WIST-3 §7).
     pub log_position: u64,
-    pub head_number: u64,
-    pub head_hash: String,
+    /// The Block the verified head ends.
+    pub block_number: u64,
+    /// The root of the tree at `log_position`, in the `sha256:` form of
+    /// WIST-3 §3.1.
+    pub root: String,
+    #[serde(default)]
+    pub unwitnessed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,6 +87,18 @@ pub struct SyncState {
     pub largest_block_bytes: u64,
 }
 
+/// How a Log is configured: where its Anchor and its files come from, and
+/// which Witnesses this Consumer trusts (WIST-3 §5).
+#[derive(Debug, Clone)]
+pub struct Follow<'a> {
+    pub anchor: &'a str,
+    pub log_base: &'a str,
+    pub mirrors: &'a [String],
+    pub witnesses: &'a [String],
+    pub tier1: bool,
+    pub allow_http: bool,
+}
+
 pub fn run(
     anchor: &str,
     log_base: &str,
@@ -62,26 +106,29 @@ pub fn run(
     allow_http: bool,
     tier1: bool,
 ) -> Result<SyncReport> {
+    follow(
+        &Follow {
+            anchor,
+            log_base,
+            mirrors: &[],
+            witnesses: &[],
+            tier1,
+            allow_http,
+        },
+        dir,
+    )
+}
+
+pub fn follow(config: &Follow, dir: &Path) -> Result<SyncReport> {
     std::fs::create_dir_all(dir)?;
 
-    let client = Client::new(allow_http);
-    let base = crate::fetch::parse_base(log_base)?;
-    let (trust_key, log_id, genesis_key_id) = load_anchor(anchor, &client)?;
+    let client = Client::new(config.allow_http);
+    let (trust_key, log_id, genesis) = load_anchor(config.anchor, &client)?;
     registry::validate_log_id(&log_id)?;
 
     let migrated = migrate_legacy_layout(dir, &log_id)?;
 
-    match run_registered(
-        &client,
-        &base,
-        &trust_key,
-        &genesis_key_id,
-        anchor,
-        log_base,
-        dir,
-        &log_id,
-        tier1,
-    ) {
+    match run_registered(config, &client, &trust_key, &genesis, dir, &log_id) {
         Ok(report) => Ok(report),
         Err(err) => {
             if migrated {
@@ -101,22 +148,25 @@ pub fn run_all(dir: &Path, allow_http: bool) -> Result<Vec<SyncReport>> {
     let reg = registry::load(dir)?;
     reg.logs
         .iter()
-        .map(|entry| run(&entry.anchor, &entry.base, dir, allow_http, entry.tier1))
+        .map(|entry| {
+            follow(
+                &Follow {
+                    anchor: &entry.anchor,
+                    log_base: &entry.base,
+                    mirrors: &entry.mirrors,
+                    witnesses: &entry.witnesses,
+                    tier1: entry.tier1,
+                    allow_http,
+                },
+                dir,
+            )
+        })
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_registered(
-    client: &Client,
-    base: &Url,
-    trust_key: &PublicKey,
-    genesis_key_id: &str,
-    anchor: &str,
-    log_base: &str,
-    dir: &Path,
-    log_id: &str,
-    tier1: bool,
-) -> Result<SyncReport> {
+/// The registry entry this call registers or confirms, with the Mirror
+/// list and Witness roster it leaves in force.
+fn register(dir: &Path, config: &Follow, log_id: &str) -> Result<LogEntry> {
     let mut reg = registry::load(dir)?;
     if let Some(other) = registry::find_collision(&reg.logs, log_id) {
         return Err(Error::Verify(format!(
@@ -125,33 +175,65 @@ fn run_registered(
             registry::sanitize(log_id)
         )));
     }
-    let effective_tier1 = match reg.logs.iter_mut().find(|e| e.log_id == log_id) {
+    let entry = match reg.logs.iter_mut().find(|e| e.log_id == log_id) {
         Some(entry) => {
-            if entry.anchor != anchor || entry.base != log_base {
+            if entry.anchor != config.anchor || entry.base != config.log_base {
                 return Err(Error::Verify(format!(
-                    "log {log_id} is already registered with anchor={} base={}; requested anchor={anchor} base={log_base} conflicts with it",
-                    entry.anchor, entry.base
+                    "log {log_id} is already registered with anchor={} base={}; requested anchor={} base={} conflicts with it",
+                    entry.anchor, entry.base, config.anchor, config.log_base
                 )));
             }
-            if tier1 {
+            if config.tier1 {
                 entry.tier1 = true;
             }
-            entry.tier1
+            for mirror in config.mirrors {
+                if !entry.mirrors.contains(mirror) {
+                    entry.mirrors.push(mirror.clone());
+                }
+            }
+            if !config.witnesses.is_empty() {
+                entry.witnesses = config.witnesses.to_vec();
+            }
+            entry.clone()
         }
         None => {
-            reg.logs.push(LogEntry {
+            let entry = LogEntry {
                 log_id: log_id.to_string(),
-                anchor: anchor.to_string(),
-                base: log_base.to_string(),
-                tier1,
-            });
-            tier1
+                anchor: config.anchor.to_string(),
+                base: config.log_base.to_string(),
+                tier1: config.tier1,
+                mirrors: config.mirrors.to_vec(),
+                witnesses: config.witnesses.to_vec(),
+            };
+            reg.logs.push(entry.clone());
+            entry
         }
     };
     registry::save(dir, &reg)?;
+    Ok(entry)
+}
+
+fn run_registered(
+    config: &Follow,
+    client: &Client,
+    trust_key: &PublicKey,
+    genesis: &GenesisKey,
+    dir: &Path,
+    log_id: &str,
+) -> Result<SyncReport> {
+    let entry = register(dir, config, log_id)?;
+    let witnesses = parse_roster(&entry.witnesses)?;
+    let mut bases = vec![crate::fetch::parse_base(&entry.base)?];
+    for mirror in &entry.mirrors {
+        bases.push(crate::fetch::parse_base(mirror)?);
+    }
+    let sources = Sources::new(client, bases);
 
     let log_dir = registry::log_dir(dir, log_id);
     std::fs::create_dir_all(&log_dir)?;
+    // WIST-3 §5: a Consumer that verified an equivocation or a chain
+    // divergence stops applying new data from that Aggregator.
+    checkpoints::halted(&log_dir)?;
     let sync_path = log_dir.join("sync.json");
     let index_path = log_dir.join("index.sqlite");
 
@@ -160,7 +242,7 @@ fn run_registered(
     if !synced && sync_path.exists() {
         let sync_bytes = std::fs::read(&sync_path)?;
         wist_core::json::validate(&sync_bytes)?;
-        let legacy: SyncState = serde_json::from_slice(&sync_bytes)?;
+        let legacy = read_sync_state(&sync_bytes)?;
         if !index_path.exists() {
             return Err(Error::Verify(format!(
                 "{} records a sync but {} is missing; remove the record to start over",
@@ -173,128 +255,249 @@ fn run_registered(
     }
 
     let subscriptions = crate::store::load_subscriptions(dir)?;
+    let context = SyncContext {
+        sources: &sources,
+        log_id,
+        witnesses: &witnesses,
+        trust_key,
+        genesis,
+        log_dir: &log_dir,
+        sync_path: &sync_path,
+        tier1: entry.tier1,
+        subscriptions: &subscriptions,
+    };
     if synced {
-        run_incremental(
-            client,
-            base,
-            trust_key,
-            genesis_key_id,
-            log_id,
-            &log_dir,
-            &sync_path,
-            effective_tier1,
-            &subscriptions,
-        )
+        run_incremental(&context)
     } else {
-        run_cold_start(
-            client,
-            base,
-            trust_key,
-            genesis_key_id,
-            log_id,
-            &log_dir,
-            &sync_path,
-            effective_tier1,
-            &subscriptions,
-        )
+        run_cold_start(&context)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_incremental(
-    client: &Client,
-    base: &Url,
-    trust_key: &PublicKey,
-    genesis_key_id: &str,
-    log_id: &str,
-    dir: &Path,
-    sync_path: &Path,
+struct SyncContext<'a> {
+    sources: &'a Sources<'a>,
+    log_id: &'a str,
+    witnesses: &'a [WitnessKey],
+    trust_key: &'a PublicKey,
+    genesis: &'a GenesisKey,
+    log_dir: &'a Path,
+    sync_path: &'a Path,
     tier1: bool,
-    subscriptions: &std::collections::BTreeSet<String>,
-) -> Result<SyncReport> {
-    let index_sqlite_path = dir.join("index.sqlite");
+    subscriptions: &'a std::collections::BTreeSet<String>,
+}
+
+/// The state a walk mutates, restored from the committed index before
+/// every attempt so that nothing a Block above the adopted Checkpoint
+/// establishes survives into the store.
+struct Restored {
+    keys: Registry,
+    chain: ChainState,
+    withdrawals: wist_core::withdrawal::WithdrawalReplay,
+    suffix_lists: SuffixLists,
+    tree: Tree,
+}
+
+fn restore(conn: &Connection, context: &SyncContext, local: &SyncState) -> Result<Restored> {
+    Ok(Restored {
+        keys: load_aggregator_keys(conn, context.log_id, context.genesis)?,
+        chain: ChainState::restore(local, load_parameters(conn)?),
+        withdrawals: load_withdrawn(conn)?,
+        suffix_lists: SuffixLists::load(conn)?,
+        tree: Tree::load(conn)?,
+    })
+}
+
+/// WIST-3 §8's continuous operation, steps 1–3: the offered head, the
+/// archived Checkpoints between it and the verified head, and the newest
+/// of them the Witness quorum admits.
+fn offered_above(
+    context: &SyncContext,
+    conn: &Connection,
+    head_block_number: u64,
+    keys: &Registry,
+) -> Result<Vec<Checkpoint>> {
+    let Some(head) = checkpoints::offered_head(
+        context.sources,
+        context.log_dir,
+        conn,
+        context.log_id,
+        head_block_number,
+        keys,
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut offered = Vec::new();
+    for number in head_block_number + 1..head.block_number() {
+        offered.push(checkpoints::archived(context.sources, number)?);
+    }
+    offered.push(head);
+    Ok(offered)
+}
+
+/// The Checkpoint the Consumer adopts and the Blocks up to it, walked
+/// from the committed state. A Checkpoint short of the quorum leaves the
+/// head where it is, so the walk is repeated at the newest Checkpoint the
+/// quorum admits; the Entries above it are never handed to the index.
+fn walk_to_adoption(
+    context: &SyncContext,
+    conn: &Connection,
+    local: &SyncState,
+    head: &Checkpoint,
+    offered: &[Checkpoint],
+) -> Result<Option<(Restored, Walk, Checkpoint, bool)>> {
+    let mut end = offered.len();
+    while end > 0 {
+        let mut restored = restore(conn, context, local)?;
+        let mut state = WalkState {
+            keys: &mut restored.keys,
+            chain: &mut restored.chain,
+            withdrawals_replay: &mut restored.withdrawals,
+            suffix_lists: &mut restored.suffix_lists,
+            tree: &mut restored.tree,
+        };
+        let inputs = WalkInputs {
+            sources: context.sources,
+            log_id: context.log_id,
+            witnesses: context.witnesses,
+            log_dir: context.log_dir,
+        };
+        let walk = walk_checkpoints(&inputs, &mut state, head, &offered[..end])?;
+        match walk.adopted() {
+            None => return Ok(None),
+            Some(adopted) => {
+                let number = adopted.checkpoint.block_number();
+                let unwitnessed =
+                    matches!(adopted.adoption, Adoption::Adopted { unwitnessed: true });
+                if number == offered[end - 1].block_number() {
+                    let checkpoint = adopted.checkpoint.clone();
+                    return Ok(Some((restored, walk, checkpoint, unwitnessed)));
+                }
+                end = offered
+                    .iter()
+                    .position(|c| c.block_number() == number)
+                    .map(|index| index + 1)
+                    .unwrap_or(0);
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
+    let index_sqlite_path = context.log_dir.join("index.sqlite");
     let conn = Connection::open(&index_sqlite_path)?;
     let local = load_sync_state(&conn)?
         .ok_or_else(|| Error::Verify("the index carries no sync state".into()))?;
-
-    let checkpoint_url = resolve(base, "/log/checkpoint.json")?;
-    let (_, checkpoint_value) = client.get_json(&checkpoint_url)?;
-    let checkpoint_env: CheckpointEnvelope = serde_json::from_value(checkpoint_value.clone())?;
-    let checkpoint = checkpoint_env.checkpoint;
-
-    if checkpoint.block_number < local.head_number {
-        return Err(Error::Verify(format!(
-            "rollback rejected: remote checkpoint head {} is behind local head {}",
-            checkpoint.block_number, local.head_number
-        )));
-    }
-
-    if checkpoint.block_number == local.head_number {
-        let keys = load_aggregator_keys(&conn, genesis_key_id, trust_key)?;
-        verify_checkpoint_signature(&checkpoint_value, &keys)?;
-        if checkpoint.block_hash == local.head_hash {
-            return Ok(SyncReport {
-                log_id: log_id.to_string(),
-                log_position_before: Some(local.head_number),
-                head: local.head_number,
-                withdrawn: 0,
-            });
-        }
-        return Err(Error::Verify(format!(
-            "checkpoint equivocation: block {} has hash {} locally but remote reports {}",
-            local.head_number, local.head_hash, checkpoint.block_hash
-        )));
-    }
-
-    let mut aggregator_keys = load_aggregator_keys(&conn, genesis_key_id, trust_key)?;
-    let mut chain = ChainState::restore(&local, load_parameters(&conn)?);
-    let mut withdrawals = load_withdrawn(&conn)?;
-    let mut suffix_lists = SuffixLists::load(&conn)?;
-    let (events, last_block_value) = walk_blocks(
-        client,
-        base,
-        &mut aggregator_keys,
-        &mut chain,
-        &mut withdrawals,
-        &mut suffix_lists,
-        local.head_number + 1,
-        checkpoint.block_number,
-        &local.head_hash,
-    )?;
-    verify_checkpoint_signature(&checkpoint_value, &aggregator_keys)?;
-    let last_block_value = last_block_value.ok_or_else(|| {
-        Error::Verify("continuous sync produced no blocks despite checkpoint advancing".into())
+    let head = checkpoints::retained(&conn, local.block_number)?.ok_or_else(|| {
+        Error::Verify(
+            "the index carries no Checkpoint at its verified head; remove the store and sync again"
+                .into(),
+        )
     })?;
-    verify_checkpoint_binding(&checkpoint_value, &last_block_value)?;
+    let cadence = ChainState::restore(&local, load_parameters(&conn)?).cadence();
+    let unchanged = |stale: bool| SyncReport {
+        log_id: context.log_id.to_string(),
+        block_number_before: Some(local.block_number),
+        head: local.block_number,
+        tree_size: local.log_position,
+        root: local.root.clone(),
+        unwitnessed: local.unwitnessed,
+        stale,
+        withdrawn: 0,
+    };
 
+    let keys = load_aggregator_keys(&conn, context.log_id, context.genesis)?;
+    let offered = match offered_above(context, &conn, local.block_number, &keys) {
+        Ok(offered) => offered,
+        // No source served a head: the verified head is the newest
+        // Checkpoint this Consumer can accept, and its staleness is
+        // reported with the failure.
+        Err(error) => {
+            return Err(
+                match checkpoints::warn_if_stale(context.log_id, &head, cadence) {
+                    true => Error::Verify(format!(
+                        "{error}; the verified head at block {} is stale, sealed at {}",
+                        local.block_number,
+                        head.sealed_at()
+                    )),
+                    false => error,
+                },
+            )
+        }
+    };
+    if offered.is_empty() {
+        return Ok(unchanged(checkpoints::warn_if_stale(
+            context.log_id,
+            &head,
+            cadence,
+        )));
+    }
+
+    let Some((restored, walk, adopted, unwitnessed)) =
+        walk_to_adoption(context, &conn, &local, &head, &offered)?
+    else {
+        eprintln!(
+            "log {}: no Checkpoint above block {} carries the Witness quorum in force; keeping the verified head",
+            context.log_id, local.block_number
+        );
+        return Ok(unchanged(checkpoints::warn_if_stale(
+            context.log_id,
+            &head,
+            cadence,
+        )));
+    };
+
+    let Restored {
+        keys,
+        chain,
+        suffix_lists,
+        tree,
+        ..
+    } = restored;
     let mut history = load_history(&conn)?;
     let tx = conn.unchecked_transaction()?;
     save_parameters(&tx, &chain)?;
     suffix_lists.save(&tx)?;
-    save_aggregator_keys(&tx, &aggregator_keys)?;
+    save_aggregator_keys(&tx, &keys)?;
+    tree.save(&tx)?;
+    for verified in &walk.verified {
+        let adopted_here = verified.checkpoint.block_number() == adopted.block_number();
+        checkpoints::save_checkpoint(
+            &tx,
+            &verified.checkpoint,
+            adopted_here.then_some(unwitnessed),
+        )?;
+    }
     tx.execute(CREATE_UNIQUE_INDEX, [])?;
     tx.execute(CREATE_DECLARATIONS, [])?;
     let stats = apply_events(
         &tx,
-        client,
-        base,
+        context.sources.client(),
+        context.sources.primary(),
         &mut history,
-        &events,
-        tier1,
-        local.log_position,
+        &walk.events,
+        context.tier1,
+        local.block_number,
     )?;
-    fetch_definitions(&tx, client, &history, subscriptions)?;
+    fetch_definitions(
+        &tx,
+        context.sources.client(),
+        &history,
+        context.subscriptions,
+    )?;
     tx.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
-    if tier1 {
+    if context.tier1 {
         tx.execute(
             "INSERT INTO extracts_fts(extracts_fts) VALUES('rebuild')",
             [],
         )?;
     }
     let sync_state = SyncState {
-        log_position: local.log_position,
-        head_number: checkpoint.block_number,
-        head_hash: checkpoint.block_hash.clone(),
+        format: SYNC_STATE_FORMAT,
+        log_position: adopted.tree_size(),
+        block_number: adopted.block_number(),
+        root: adopted.root_token(),
+        unwitnessed,
         content_digest: local.content_digest.clone(),
         schedule_first_s: chain.schedule_first_s(),
         prior_sealed_at_s: chain.prior_at(),
@@ -302,106 +505,186 @@ fn run_incremental(
     };
     save_sync_state(&tx, &sync_state)?;
     tx.commit()?;
-    mirror_sync_state(sync_path, &sync_state);
+    mirror_sync_state(context.sync_path, &sync_state);
+    let stale = checkpoints::warn_if_stale(context.log_id, &adopted, chain.cadence());
 
     Ok(SyncReport {
-        log_id: log_id.to_string(),
-        log_position_before: Some(local.head_number),
-        head: checkpoint.block_number,
+        log_id: context.log_id.to_string(),
+        block_number_before: Some(local.block_number),
+        head: sync_state.block_number,
+        tree_size: sync_state.log_position,
+        root: sync_state.root.clone(),
+        unwitnessed,
+        stale,
         withdrawn: stats.withdrawn,
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_cold_start(
-    client: &Client,
-    base: &Url,
-    trust_key: &PublicKey,
-    genesis_key_id: &str,
-    log_id: &str,
-    dir: &Path,
-    sync_path: &Path,
-    tier1: bool,
-    subscriptions: &std::collections::BTreeSet<String>,
-) -> Result<SyncReport> {
-    let mut installed = install::snapshot(client, base, trust_key, genesis_key_id, dir, tier1)?;
-    let checkpoint_url = resolve(base, "/log/checkpoint.json")?;
-    let (_, checkpoint_value) = client.get_json(&checkpoint_url)?;
-    let checkpoint_env: CheckpointEnvelope = serde_json::from_value(checkpoint_value.clone())?;
-    let checkpoint = checkpoint_env.checkpoint;
-
-    if installed.log_position > checkpoint.block_number {
-        return Err(Error::Verify(
-            "snapshot log_position is ahead of the checkpoint head".into(),
-        ));
-    }
-
-    let mut withdrawals = load_withdrawn(&installed.conn)?;
-    let (events, last_block_value) = walk_blocks(
-        client,
-        base,
-        &mut installed.aggregator_keys,
-        &mut installed.chain,
-        &mut withdrawals,
-        &mut installed.suffix_lists,
-        installed.log_position + 1,
-        checkpoint.block_number,
-        &installed.anchor_block_hash,
+fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
+    let mut installed = install::snapshot(
+        context.sources,
+        context.trust_key,
+        context.log_id,
+        context.genesis,
+        context.log_dir,
+        context.tier1,
     )?;
-    save_parameters(&installed.conn, &installed.chain)?;
+    // WIST-3 §8 step 5: the Checkpoint at the Snapshot's Block, verified
+    // under the `aggregator_key` tuples just loaded, states the tree the
+    // manifest names or the Snapshot describes another tree entirely.
+    let anchor = checkpoints::archived(context.sources, installed.manifest.block_number)?;
+    let verification = wist_core::checkpoint::verify(
+        &anchor,
+        context.log_id,
+        &installed
+            .aggregator_keys
+            .valid_at(installed.manifest.block_number),
+        context.witnesses,
+    )?;
+    wist_core::snapshot::check_manifest_anchor(&installed.manifest, &anchor)?;
+    let sealed_at_s = anchor.sealed_at_s()?;
+    installed.chain.seed_prior(sealed_at_s);
+    let anchor_adoption =
+        wist_core::checkpoint::adoption(&verification, installed.chain.quorum_at(sealed_at_s));
+    installed.history.seed_head(
+        anchor.block_number(),
+        &anchor.root_token(),
+        Some(sealed_at_s),
+    );
+    let mut tree = Tree::new();
+    tree::seed(
+        context.sources,
+        &mut tree,
+        anchor.tree_size(),
+        anchor.root(),
+    )?;
+    tree.save(&installed.conn)?;
     installed.suffix_lists.save(&installed.conn)?;
-    verify_checkpoint_signature(&checkpoint_value, &installed.aggregator_keys)?;
+    save_parameters(&installed.conn, &installed.chain)?;
     save_aggregator_keys(&installed.conn, &installed.aggregator_keys)?;
+    checkpoints::save_checkpoint(
+        &installed.conn,
+        &anchor,
+        Some(matches!(
+            anchor_adoption,
+            Adoption::Adopted { unwitnessed: true }
+        )),
+    )?;
+    let anchor_state = SyncState {
+        format: SYNC_STATE_FORMAT,
+        log_position: anchor.tree_size(),
+        block_number: anchor.block_number(),
+        root: anchor.root_token(),
+        unwitnessed: matches!(anchor_adoption, Adoption::Adopted { unwitnessed: true }),
+        content_digest: Some(installed.content_digest.clone()),
+        schedule_first_s: installed.chain.schedule_first_s(),
+        prior_sealed_at_s: installed.chain.prior_at(),
+        largest_block_bytes: installed.chain.largest(),
+    };
+    save_sync_state(&installed.conn, &anchor_state)?;
+    let cadence = installed.chain.cadence();
+    let offered = offered_above(
+        context,
+        &installed.conn,
+        anchor.block_number(),
+        &installed.aggregator_keys,
+    )?;
 
-    match &last_block_value {
-        Some(block_value) => verify_checkpoint_binding(&checkpoint_value, block_value)?,
+    let walked = if offered.is_empty() {
+        None
+    } else {
+        walk_to_adoption(context, &installed.conn, &anchor_state, &anchor, &offered)?
+    };
+
+    let (adopted, unwitnessed, events, verified, state) = match walked {
+        Some((restored, walk, adopted, unwitnessed)) => (
+            adopted,
+            unwitnessed,
+            walk.events,
+            walk.verified,
+            Some(restored),
+        ),
         None => {
-            if checkpoint.block_number != installed.log_position
-                || checkpoint.block_hash != installed.anchor_block_hash
-            {
-                return Err(Error::Verify(
-                    "checkpoint does not match the snapshot anchor at equal heights".into(),
-                ));
+            if matches!(anchor_adoption, Adoption::NotAdopted) {
+                return Err(Error::Verify(format!(
+                    "log {}: no Checkpoint from the Snapshot's Block upward carries the Witness quorum in force, so there is no state to act on; this is a wait, not a fault, and the sync can be retried",
+                    context.log_id
+                )));
             }
+            (
+                anchor.clone(),
+                anchor_state.unwitnessed,
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
         }
+    };
+
+    if let Some(state) = state {
+        save_parameters(&installed.conn, &state.chain)?;
+        state.suffix_lists.save(&installed.conn)?;
+        save_aggregator_keys(&installed.conn, &state.keys)?;
+        state.tree.save(&installed.conn)?;
+        installed.chain = state.chain;
+    }
+    for entry in &verified {
+        let adopted_here = entry.checkpoint.block_number() == adopted.block_number();
+        checkpoints::save_checkpoint(
+            &installed.conn,
+            &entry.checkpoint,
+            adopted_here.then_some(unwitnessed),
+        )?;
     }
 
     let stats = apply_events(
         &installed.conn,
-        client,
-        base,
+        context.sources.client(),
+        context.sources.primary(),
         &mut installed.history,
         &events,
-        tier1,
-        installed.log_position,
+        context.tier1,
+        anchor.block_number(),
     )?;
-    fetch_definitions(&installed.conn, client, &installed.history, subscriptions)?;
+    fetch_definitions(
+        &installed.conn,
+        context.sources.client(),
+        &installed.history,
+        context.subscriptions,
+    )?;
     installed
         .conn
         .execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
-    if tier1 {
+    if context.tier1 {
         installed.conn.execute(
             "INSERT INTO extracts_fts(extracts_fts) VALUES('rebuild')",
             [],
         )?;
     }
     let sync_state = SyncState {
-        log_position: installed.log_position,
-        head_number: checkpoint.block_number,
-        head_hash: checkpoint.block_hash.clone(),
+        format: SYNC_STATE_FORMAT,
+        log_position: adopted.tree_size(),
+        block_number: adopted.block_number(),
+        root: adopted.root_token(),
+        unwitnessed,
         content_digest: Some(installed.content_digest.clone()),
         schedule_first_s: installed.chain.schedule_first_s(),
         prior_sealed_at_s: installed.chain.prior_at(),
         largest_block_bytes: installed.chain.largest(),
     };
     save_sync_state(&installed.conn, &sync_state)?;
-    installed.commit(dir)?;
-    mirror_sync_state(sync_path, &sync_state);
+    installed.commit(context.log_dir)?;
+    mirror_sync_state(context.sync_path, &sync_state);
+    let stale = checkpoints::warn_if_stale(context.log_id, &adopted, cadence);
 
     Ok(SyncReport {
-        log_id: log_id.to_string(),
-        log_position_before: None,
-        head: checkpoint.block_number,
+        log_id: context.log_id.to_string(),
+        block_number_before: None,
+        head: sync_state.block_number,
+        tree_size: sync_state.log_position,
+        root: sync_state.root.clone(),
+        unwitnessed,
+        stale,
         withdrawn: stats.withdrawn,
     })
 }

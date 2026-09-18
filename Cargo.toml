@@ -17,6 +17,7 @@ zerovec = { version = "0.11", features = ["alloc"] }
 sha2 = "0.10"
 parquet = { version = "56", default-features = false }
 bytes = "1"
+base64 = "0.22"
 
 # The profile that 'dist' will build with
 [profile.dist]

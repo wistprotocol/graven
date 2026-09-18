@@ -23,32 +23,32 @@ struct LogFixture {
 fn build_log_fixture(vector: &Value, log: &Value) -> LogFixture {
     let dir = tempfile::tempdir().unwrap();
 
-    let anchor_path = dir.path().join("anchor.json");
+    let anchor_path = dir.path().join("log/anchor.json");
+    std::fs::create_dir_all(anchor_path.parent().unwrap()).unwrap();
     std::fs::write(&anchor_path, serde_json::to_vec(&log["anchor"]).unwrap()).unwrap();
-
-    for block in log["blocks"].as_array().unwrap() {
-        let number = block["header"]["block_number"].as_u64().unwrap();
-        common::write_block(dir.path(), number, block);
-    }
-
-    let checkpoint_path = dir.path().join("log/checkpoint.json");
-    std::fs::create_dir_all(checkpoint_path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &checkpoint_path,
-        serde_json::to_vec(&log["checkpoint"]).unwrap(),
-    )
-    .unwrap();
-
-    let delta_id = vector["delta_id"].as_str().unwrap();
-    let hex = delta_id.trim_start_matches("sha256:");
-    common::write_payload(dir.path(), hex, &vector["payload"]);
 
     let seed_hex = log["genesis_seed_hex"].as_str().unwrap();
     let seed: [u8; 32] = hex_decode(seed_hex).unwrap().try_into().unwrap();
     let signer = Signer::new(seed);
+    let mut published = common::Log::empty(
+        dir.path(),
+        Signer::new(seed),
+        log["log_id"].as_str().unwrap(),
+    );
+    let mut anchor_root = String::new();
+    let mut anchor_size = 0u64;
+    for (index, block) in log["blocks"].as_array().unwrap().iter().enumerate() {
+        let entries: Vec<Value> = block["entries"].as_array().cloned().unwrap_or_default();
+        published.adopt(block["checkpoint"].as_str().unwrap(), &entries);
+        if index == 0 {
+            anchor_root = published.head().root_token();
+            anchor_size = published.head().tree_size();
+        }
+    }
 
-    let block0_header = &log["blocks"][0]["header"];
-    let anchor_block_hash = wist_core::block::block_hash(block0_header).unwrap();
+    let delta_id = vector["delta_id"].as_str().unwrap();
+    let hex = delta_id.trim_start_matches("sha256:");
+    common::write_payload(dir.path(), hex, &vector["payload"]);
 
     let domain = vector["publisher_declaration"]["publisher"]["domain"]
         .as_str()
@@ -66,7 +66,7 @@ fn build_log_fixture(vector: &Value, log: &Value) -> LogFixture {
         3600,
         &[(domain, vector["publisher_declaration"].clone())],
         &[],
-        0,
+        anchor_size,
     );
 
     common::write_manifest(
@@ -74,7 +74,8 @@ fn build_log_fixture(vector: &Value, log: &Value) -> LogFixture {
         &signer,
         &snapshot_date,
         0,
-        &anchor_block_hash,
+        anchor_size,
+        &anchor_root,
         &content_digest_value,
         &state_bytes,
         &state_digest_value,
@@ -85,7 +86,7 @@ fn build_log_fixture(vector: &Value, log: &Value) -> LogFixture {
         &dir.path().join("snapshots/index.json"),
         &signer,
         &snapshot_date,
-        0,
+        anchor_size,
         &format!("/snapshots/{snapshot_date}/manifest.json"),
         &content_digest_value,
     );

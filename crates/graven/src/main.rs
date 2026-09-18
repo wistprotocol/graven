@@ -24,6 +24,15 @@ enum Command {
         tier1: bool,
         #[arg(long = "allow-http")]
         allow_http: bool,
+        /// A further base URL serving the Log's static files, tried when
+        /// one source does not hold a file. Repeatable.
+        #[arg(long = "mirror")]
+        mirrors: Vec<String>,
+        /// A Witness this Consumer trusts, as its
+        /// `<name>+<key ID>+<key>` verifier-key string. Repeatable;
+        /// supplying any replaces the roster held for the log.
+        #[arg(long = "witness")]
+        witnesses: Vec<String>,
     },
     Sync {
         #[arg(long)]
@@ -36,6 +45,10 @@ enum Command {
         tier1: bool,
         #[arg(long = "allow-http")]
         allow_http: bool,
+        #[arg(long = "mirror")]
+        mirrors: Vec<String>,
+        #[arg(long = "witness")]
+        witnesses: Vec<String>,
     },
     Serve {
         #[arg(long)]
@@ -104,11 +117,17 @@ enum PackCommand {
 
 fn print_report(report: &SyncReport) {
     let from = report
-        .log_position_before
+        .block_number_before
         .map_or_else(|| "cold start".to_string(), |n| n.to_string());
+    let witnessing = if report.unwitnessed {
+        "unwitnessed"
+    } else {
+        "witnessed"
+    };
+    let staleness = if report.stale { ", stale" } else { "" };
     println!(
-        "[{}] synced from {from} to head block {}, withdrawn {}",
-        report.log_id, report.head, report.withdrawn
+        "[{}] synced from {from} to head block {} (tree size {}, root {}, {witnessing}{staleness}), withdrawn {}",
+        report.log_id, report.head, report.tree_size, report.root, report.withdrawn
     );
 }
 
@@ -121,8 +140,20 @@ fn main() -> Result<(), graven::Error> {
             dir,
             tier1,
             allow_http,
+            mirrors,
+            witnesses,
         } => {
-            let report = graven::sync::run(&anchor, &log_base, &dir, allow_http, tier1)?;
+            let report = graven::sync::follow(
+                &graven::sync::Follow {
+                    anchor: &anchor,
+                    log_base: &log_base,
+                    mirrors: &mirrors,
+                    witnesses: &witnesses,
+                    tier1,
+                    allow_http,
+                },
+                &dir,
+            )?;
             print_report(&report);
         }
         Command::Sync {
@@ -131,9 +162,21 @@ fn main() -> Result<(), graven::Error> {
             log_base,
             tier1,
             allow_http,
+            mirrors,
+            witnesses,
         } => match (anchor, log_base) {
             (Some(anchor), Some(log_base)) => {
-                let report = graven::sync::run(&anchor, &log_base, &dir, allow_http, tier1)?;
+                let report = graven::sync::follow(
+                    &graven::sync::Follow {
+                        anchor: &anchor,
+                        log_base: &log_base,
+                        mirrors: &mirrors,
+                        witnesses: &witnesses,
+                        tier1,
+                        allow_http,
+                    },
+                    &dir,
+                )?;
                 print_report(&report);
             }
             _ => {

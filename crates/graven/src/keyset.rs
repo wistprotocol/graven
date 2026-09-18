@@ -55,8 +55,9 @@ impl KeyHistory {
     }
 
     /// Starts the accepted prefix at a Snapshot's `log_position`.
-    pub fn seed_head(&mut self, block_number: u64, block_hash: &str) {
-        self.declarations.seed_head(block_number, block_hash, None);
+    pub fn seed_head(&mut self, block_number: u64, block_root: &str, sealed_at_s: Option<i64>) {
+        self.declarations
+            .seed_head(block_number, block_root, sealed_at_s);
     }
 
     /// WIST-3 §§7/8: adopts a Snapshot's `declaration` tuple — the
@@ -187,12 +188,10 @@ impl KeyHistory {
     /// WIST-1 §5.2 with the `recovery_window_days` and
     /// `declaration_activation_blocks` in force at its `sealed_at`; a
     /// Block whose Declarations the shared rules reject fails the sync.
-    #[allow(clippy::too_many_arguments)]
     pub fn apply_block(
         &mut self,
         block_number: u64,
-        prev_block_hash: &str,
-        block_hash: &str,
+        block_root: &str,
         sealed_at: &str,
         recovery_window_days: i64,
         declaration_activation_blocks: i64,
@@ -201,8 +200,7 @@ impl KeyHistory {
         self.declarations
             .apply_block(
                 block_number,
-                prev_block_hash,
-                block_hash,
+                block_root,
                 sealed_at,
                 recovery_window_days,
                 declaration_activation_blocks,
@@ -470,13 +468,9 @@ mod tests {
                 .iter()
                 .map(|d| serde_json::json!({"type": "publisher_declaration", "body": d}))
                 .collect();
-            let prev = self
-                .height
-                .map_or("sha256:genesis".to_string(), |h| format!("h{h}"));
             let effects = self.history.apply_block(
                 height,
-                &prev,
-                &format!("h{height}"),
+                &format!("sha256:{height:064}"),
                 sealed_at,
                 7,
                 self.activation_blocks,
@@ -784,7 +778,7 @@ mod tests {
         history
             .adopt_domain("records.example", &decl0, 4, 0)
             .unwrap();
-        history.seed_head(4, "sha256:anchor");
+        history.seed_head(4, "sha256:anchor", None);
         let mut history = KeyHistory::from_state(&history.state().unwrap()).unwrap();
         let decl1 = decl(
             "records.example",
@@ -799,8 +793,7 @@ mod tests {
         assert!(history
             .apply_block(
                 6,
-                "sha256:anchor",
-                "h6",
+                "sha256:h6",
                 "2026-08-10T00:00:00Z",
                 7,
                 24,
@@ -808,15 +801,7 @@ mod tests {
             )
             .is_err());
         history
-            .apply_block(
-                5,
-                "sha256:anchor",
-                "h5",
-                "2026-08-10T00:00:00Z",
-                7,
-                24,
-                &[entry],
-            )
+            .apply_block(5, "sha256:h5", "2026-08-10T00:00:00Z", 7, 24, &[entry])
             .unwrap();
         let url = "https://records.example/a";
         assert!(history

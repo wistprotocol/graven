@@ -1,57 +1,64 @@
-use super::history::{AggregatorKeys, ChainState};
+use super::history::ChainState;
 use super::SyncState;
 use crate::error::{Error, Result};
 use crate::keyset::KeyHistory;
 use rusqlite::{Connection, OptionalExtension};
+use wist_core::aggregator_keys::Registry;
 use wist_core::chain::ChainTips;
-use wist_core::crypto::PublicKey;
+use wist_core::objects::{AggregatorKeyEntry, GenesisKey};
 use wist_core::parameters::Amendment;
 use wist_core::withdrawal::WithdrawalReplay;
 
+/// WIST-3 §3.4: every key the Log has admitted, the genesis key and
+/// retired ones included, with the heights that bound its validity — the
+/// set a Checkpoint at any height is verified under, and the set a later
+/// `aggregator_key_add` must not collide with. A store that has walked
+/// nothing carries no row and starts from the Anchor's genesis key; one
+/// that has walked a removal carries the genesis key's own removal
+/// height, so a reload never restores it.
 pub(super) fn load_aggregator_keys(
     conn: &Connection,
-    genesis_key_id: &str,
-    genesis_key: &PublicKey,
-) -> Result<AggregatorKeys> {
+    log_id: &str,
+    genesis: &GenesisKey,
+) -> Result<Registry> {
     conn.execute_batch(crate::store::CREATE_AGGREGATOR_KEYS)?;
-    let mut keys = AggregatorKeys::genesis(genesis_key_id, genesis_key.clone());
-    let mut stmt =
-        conn.prepare("SELECT key_id, public_key, removed FROM aggregator_keys WHERE key_id != ?1")?;
-    let rows = stmt
-        .query_map([genesis_key_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? != 0,
-            ))
+    let mut stmt = conn
+        .prepare("SELECT key_id, public_key, added_height, removed_height FROM aggregator_keys")?;
+    let entries = stmt
+        .query_map([], |row| {
+            Ok(AggregatorKeyEntry {
+                key_id: row.get(0)?,
+                public_key: row.get(1)?,
+                added_height: row.get::<_, i64>(2)?.max(0) as u64,
+                removed_height: row
+                    .get::<_, Option<i64>>(3)?
+                    .map(|height| height.max(0) as u64),
+            })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (key_id, public_key, removed) in rows {
-        if removed {
-            keys.valid.remove(&key_id);
-            keys.removed.insert(key_id);
-        } else {
-            keys.valid
-                .insert(key_id, PublicKey::from_b64u(&public_key)?);
-        }
+    if entries.is_empty() {
+        return Ok(Registry::from_genesis(log_id, genesis)?);
     }
-    Ok(keys)
+    if !entries.iter().any(|entry| entry.key_id == genesis.key_id) {
+        return Err(Error::Verify(
+            "the store's Aggregator key registry carries no record for the Anchor's genesis key; remove the log's directory and sync again".into(),
+        ));
+    }
+    Ok(Registry::from_entries(log_id, &entries)?)
 }
 
-pub(super) fn save_aggregator_keys(conn: &Connection, keys: &AggregatorKeys) -> Result<()> {
+pub(super) fn save_aggregator_keys(conn: &Connection, keys: &Registry) -> Result<()> {
     conn.execute_batch(crate::store::CREATE_AGGREGATOR_KEYS)?;
-    for (key_id, key) in &keys.valid {
+    for entry in keys.entries() {
         conn.execute(
-            "INSERT INTO aggregator_keys(key_id, public_key, removed) VALUES (?1, ?2, 0)
-             ON CONFLICT(key_id) DO UPDATE SET public_key = excluded.public_key, removed = 0",
-            (key_id, key.to_b64u()),
-        )?;
-    }
-    for key_id in &keys.removed {
-        conn.execute(
-            "INSERT INTO aggregator_keys(key_id, public_key, removed) VALUES (?1, '', 1)
-             ON CONFLICT(key_id) DO UPDATE SET removed = 1",
-            [key_id],
+            "INSERT INTO aggregator_keys(key_id, public_key, added_height, removed_height) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(key_id) DO UPDATE SET public_key = excluded.public_key, added_height = excluded.added_height, removed_height = excluded.removed_height",
+            (
+                &entry.key_id,
+                &entry.public_key,
+                entry.added_height as i64,
+                entry.removed_height.map(|height| height as i64),
+            ),
         )?;
     }
     Ok(())
@@ -189,6 +196,21 @@ pub(super) fn save_chain_tips(conn: &Connection, tips: &ChainTips) -> Result<()>
 /// transaction as the index rows it describes.
 pub const CREATE_SYNC_STATE: &str = "CREATE TABLE IF NOT EXISTS sync_state(id INTEGER PRIMARY KEY CHECK(id = 1), state TEXT NOT NULL)";
 
+/// Reads a stored sync state, refusing one written before the Log became
+/// one growing tree: such a record names a Block hash where a tree size
+/// and root now stand, and reinterpreting it would silently place the
+/// verified head at a tree the Consumer never verified.
+pub fn read_sync_state(bytes: &[u8]) -> Result<SyncState> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let format = value.get("format").and_then(serde_json::Value::as_u64);
+    if format != Some(u64::from(super::SYNC_STATE_FORMAT)) {
+        return Err(Error::Verify(
+            "the stored sync state is in a superseded format that names a Block hash rather than the tree size and root a Checkpoint states; remove the log's directory and sync again".into(),
+        ));
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
 pub fn load_sync_state(conn: &Connection) -> Result<Option<SyncState>> {
     if !crate::store::table_exists(conn, "sync_state")? {
         return Ok(None);
@@ -201,7 +223,7 @@ pub fn load_sync_state(conn: &Connection) -> Result<Option<SyncState>> {
     state
         .map(|state| {
             wist_core::json::validate(state.as_bytes())?;
-            Ok(serde_json::from_str(&state)?)
+            read_sync_state(state.as_bytes())
         })
         .transpose()
 }

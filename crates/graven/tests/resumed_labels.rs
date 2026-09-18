@@ -1,9 +1,10 @@
 mod common;
 
-use common::{write_anchor, write_block, write_checkpoint, write_index, write_manifest, Signer};
+use common::{write_index, write_manifest, Log, Signer};
 use graven::ranking::{DomainState, Profile};
 use graven::store::Store;
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use wist_core::envelope::sign_envelope;
 use wist_core::objects::{LabelEntry, StateEntry};
@@ -20,9 +21,8 @@ fn label_entry(signer: &Signer, inner: Value) -> (String, Value) {
 struct Resumed {
     dir: tempfile::TempDir,
     target: tempfile::TempDir,
-    log: Signer,
     log_id: String,
-    anchor_hash: String,
+    state: RefCell<Log>,
     base_url: String,
 }
 
@@ -36,15 +36,12 @@ fn setup_resumed(
     let dir = tempfile::tempdir().unwrap();
     let target = tempfile::tempdir().unwrap();
     let log = Signer::new([seed; 32]);
-    write_anchor(&dir.path().join("anchor.json"), &log, log_id);
-
-    let mut prev_hash = "sha256:genesis".to_string();
+    let mut state = Log::new(dir.path(), Signer::new([seed; 32]), log_id);
     for h in 0..=snapshot_height {
-        let sealed_at = format!("2026-08-09T{h:02}:00:00Z");
-        let (_, hash) = common::build_block(&log, h, &prev_hash, &sealed_at, &[]);
-        prev_hash = hash;
+        state.seal(&format!("2026-08-09T{h:02}:00:00Z"), &[]);
     }
-    let anchor_hash = prev_hash;
+    let anchor_root = state.root_token();
+    let anchor_size = state.tree_size();
 
     let snapshot_date = "2026-08-09";
     let snapdir = dir.path().join("snapshots").join(snapshot_date);
@@ -56,7 +53,7 @@ fn setup_resumed(
         3600,
         declarations,
         &[],
-        snapshot_height,
+        anchor_size,
         state_entries,
         0,
     );
@@ -65,7 +62,8 @@ fn setup_resumed(
         &log,
         snapshot_date,
         snapshot_height,
-        &anchor_hash,
+        anchor_size,
+        &anchor_root,
         &content_digest_value,
         &state_bytes,
         &state_digest_value,
@@ -75,39 +73,28 @@ fn setup_resumed(
         &dir.path().join("snapshots/index.json"),
         &log,
         snapshot_date,
-        snapshot_height,
+        anchor_size,
         &format!("/snapshots/{snapshot_date}/manifest.json"),
         &content_digest_value,
-    );
-    write_checkpoint(
-        dir.path(),
-        &log,
-        snapshot_height,
-        &anchor_hash,
-        &format!("2026-08-09T{snapshot_height:02}:00:00Z"),
     );
 
     let base_url = format!("http://{}", common::serve_static(dir.path().to_path_buf()));
     Resumed {
         dir,
         target,
-        log,
         log_id: log_id.to_string(),
-        anchor_hash,
+        state: RefCell::new(state),
         base_url,
     }
 }
 
-fn seal_after_snapshot(r: &Resumed, block_number: u64, sealed_at: &str, entries: &[Value]) {
-    let (block, hash) =
-        common::build_block(&r.log, block_number, &r.anchor_hash, sealed_at, entries);
-    write_block(r.dir.path(), block_number, &block);
-    write_checkpoint(r.dir.path(), &r.log, block_number, &hash, sealed_at);
+fn seal_after_snapshot(r: &Resumed, _block_number: u64, sealed_at: &str, entries: &[Value]) {
+    r.state.borrow_mut().seal(sealed_at, entries);
 }
 
 fn sync(r: &Resumed) -> graven::sync::SyncReport {
     graven::sync::run(
-        r.dir.path().join("anchor.json").to_str().unwrap(),
+        r.dir.path().join("log/anchor.json").to_str().unwrap(),
         &r.base_url,
         r.target.path(),
         true,
@@ -303,21 +290,16 @@ fn resumed_labeler_activity_matches_a_full_replay() {
     let genesis_dir = tempfile::tempdir().unwrap();
     let genesis_target = tempfile::tempdir().unwrap();
     let genesis_log = Signer::new([50u8; 32]);
-    write_anchor(
-        &genesis_dir.path().join("anchor.json"),
-        &genesis_log,
+    let mut genesis_state = Log::new(
+        genesis_dir.path(),
+        Signer::new([50u8; 32]),
         "resumed-labeler-genesis",
     );
     let labeler = Signer::new([51u8; 32]);
     let declaration = common::build_declaration(&labeler, domain);
-    let (block0, block0_hash) = common::build_block(
-        &genesis_log,
-        0,
-        "sha256:genesis",
-        "2026-08-09T00:00:00Z",
-        &[],
-    );
-    write_block(genesis_dir.path(), 0, &block0);
+    let block0 = genesis_state.seal("2026-08-09T00:00:00Z", &[]);
+    let block0_root = block0.root_token();
+    let block0_size = block0.tree_size();
     let snapshot_date = "2026-08-09";
     let snapdir = genesis_dir.path().join("snapshots").join(snapshot_date);
     let sqlite_bytes = common::write_tier0(&snapdir.join("tier0/index.sqlite"), &[]);
@@ -328,7 +310,7 @@ fn resumed_labeler_activity_matches_a_full_replay() {
         3600,
         &[(domain.to_string(), declaration.clone())],
         &[],
-        0,
+        block0_size,
         Vec::new(),
         0,
     );
@@ -337,7 +319,8 @@ fn resumed_labeler_activity_matches_a_full_replay() {
         &genesis_log,
         snapshot_date,
         0,
-        &block0_hash,
+        block0_size,
+        &block0_root,
         &content_digest_value,
         &state_bytes,
         &state_digest_value,
@@ -347,7 +330,7 @@ fn resumed_labeler_activity_matches_a_full_replay() {
         &genesis_dir.path().join("snapshots/index.json"),
         &genesis_log,
         snapshot_date,
-        0,
+        block0_size,
         &format!("/snapshots/{snapshot_date}/manifest.json"),
         &content_digest_value,
     );
@@ -355,27 +338,13 @@ fn resumed_labeler_activity_matches_a_full_replay() {
         &labeler,
         json!({"wist_version": "1.0.0", "labeler": domain, "subject": subject, "name": "wist:spam", "asserted_at": "2026-08-09T01:00:00Z"}),
     );
-    let (block1, block1_hash) = common::build_block(
-        &genesis_log,
-        1,
-        &block0_hash,
-        "2026-08-09T01:00:00Z",
-        &[label_wrapped],
-    );
-    write_block(genesis_dir.path(), 1, &block1);
-    write_checkpoint(
-        genesis_dir.path(),
-        &genesis_log,
-        1,
-        &block1_hash,
-        "2026-08-09T01:00:00Z",
-    );
+    genesis_state.seal("2026-08-09T01:00:00Z", &[label_wrapped]);
     let genesis_base = format!(
         "http://{}",
         common::serve_static(genesis_dir.path().to_path_buf())
     );
     graven::sync::run(
-        genesis_dir.path().join("anchor.json").to_str().unwrap(),
+        genesis_dir.path().join("log/anchor.json").to_str().unwrap(),
         &genesis_base,
         genesis_target.path(),
         true,

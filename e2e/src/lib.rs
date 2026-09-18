@@ -205,6 +205,68 @@ pub fn spawn_clave_serve_with(
     (ChildGuard(child), addr, stderr_buf)
 }
 
+/// The `checkpoint verifier key: …` line `clave init` prints: the
+/// signed-note verifier key a Witness or any external client is
+/// configured with (WIST-3 §3.4).
+pub fn checkpoint_verifier_key(stdout: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("checkpoint verifier key: "))
+        .unwrap_or_else(|| panic!("clave init printed no verifier key:\n{stdout}"))
+        .to_string()
+}
+
+/// A running Aggregator: the data directory, the base URL it serves the
+/// Log at, and the verifier key its `init` printed.
+pub struct Aggregator {
+    pub data: PathBuf,
+    pub log_id: String,
+    pub base_url: String,
+    pub verifier_key: String,
+    pub stderr: Arc<Mutex<String>>,
+    _child: ChildGuard,
+}
+
+/// Initializes an Aggregator at a pre-picked loopback address and serves
+/// it, optionally pinning a Public Suffix List and routing its own
+/// fetches through a proxy.
+pub fn start_aggregator(
+    bin: &Path,
+    data: PathBuf,
+    suffix_list: Option<&Path>,
+    proxy: Option<&str>,
+) -> Aggregator {
+    let log_id = free_loopback_addr();
+    let data_str = data.to_str().expect("non-utf8 path").to_string();
+    let mut args = vec![
+        "init".to_string(),
+        "--log-id".to_string(),
+        log_id.clone(),
+        "--data".to_string(),
+        data_str,
+    ];
+    if let Some(suffix_list) = suffix_list {
+        args.push("--suffix-list".to_string());
+        args.push(s(suffix_list).to_string());
+    }
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run(bin, &borrowed);
+    let verifier_key = checkpoint_verifier_key(&String::from_utf8_lossy(&output.stdout));
+    let (child, bound, stderr) = spawn_clave_serve_with(bin, &data, &log_id, proxy);
+    assert_eq!(
+        bound, log_id,
+        "clave serve bound a different address than the pre-picked --log-id"
+    );
+    Aggregator {
+        data,
+        base_url: format!("http://{log_id}"),
+        log_id,
+        verifier_key,
+        stderr,
+        _child: child,
+    }
+}
+
 pub fn free_loopback_addr() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("local_addr").to_string()
@@ -347,6 +409,89 @@ pub fn serve_one_request(mut stream: TcpStream, dir: &Path) {
                 b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             );
         }
+    }
+}
+
+/// A minimal [tlog-witness] Witness: it answers `add-checkpoint` with a
+/// [tlog-cosignature] v1 Cosignature over the note text it was sent, which
+/// is what the Aggregator republishes its Checkpoint with (WIST-3 §5).
+pub struct TestWitness {
+    pub name: String,
+    pub verifier_key: String,
+    pub base_url: String,
+}
+
+pub fn spawn_witness(name: &str, seed: [u8; 32]) -> TestWitness {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let key = wist_core::crypto::SigningKey::from_seed(&seed);
+    let mut encoded = vec![wist_core::checkpoint::WITNESS_KEY_TYPE];
+    encoded.extend_from_slice(&key.public().to_bytes());
+    let verifier_key = format!(
+        "{name}+{}+{}",
+        wist_core::crypto::hex_encode(&wist_core::checkpoint::witness_key_id(name, &key.public())),
+        STANDARD.encode(&encoded)
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind witness");
+    let addr = listener.local_addr().expect("local_addr").to_string();
+    let owned = name.to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let Ok(clone) = stream.try_clone() else {
+                continue;
+            };
+            let mut reader = BufReader::new(clone);
+            let mut request = String::new();
+            if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut length = 0usize;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 || header.trim().is_empty() {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; length];
+            if reader.read_exact(&mut body).is_err() {
+                continue;
+            }
+            let body = String::from_utf8_lossy(&body).to_string();
+            let Some((_, note)) = body.split_once("\n\n") else {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            };
+            let Ok(checkpoint) = wist_core::checkpoint::Checkpoint::parse(note) else {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            };
+            let line = wist_core::checkpoint::cosignature_line(
+                &owned,
+                &key,
+                &checkpoint.note_text(),
+                jiff::Timestamp::now().as_second().max(0) as u64,
+            );
+            let answer = format!("{}\n", line.encode());
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                answer.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(answer.as_bytes());
+        }
+    });
+    TestWitness {
+        name: name.to_string(),
+        verifier_key,
+        base_url: format!("http://{addr}"),
     }
 }
 

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use base64::Engine;
 use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
@@ -7,15 +8,18 @@ use parquet::schema::parser::parse_message_type;
 use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::cell::{RefCell, RefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use wist_core::checkpoint::Checkpoint as WistCheckpoint;
 use wist_core::crypto::{b64u_encode, hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::objects::{
-    AggregatorKeyEntry, Anchor, Checkpoint, DeclarationEntry, GenesisKey, ParameterEntry,
-    RecordEntry, SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest, SnapshotState,
+    AggregatorKeyEntry, Anchor, DeclarationEntry, GenesisKey, ParameterEntry, RecordEntry,
+    SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest, SnapshotState,
     SnapshotStateFile, StateEntry,
 };
+use wist_core::tiles::TileSet;
 use wist_core::{jcs, merkle};
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -77,7 +81,11 @@ fn record_projection(r: &RecordFixture) -> Value {
     })
 }
 
+/// WIST-3 §6 serves the Log's Anchor at `/log/anchor.json`, for
+/// convenience only: it is a trust root because of how it was obtained,
+/// never because of where it sits.
 pub fn write_anchor(path: &Path, log: &Signer, log_id: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let anchor = Anchor {
         wist_version: "1.0.0".into(),
         log_id: log_id.into(),
@@ -197,111 +205,234 @@ pub fn write_payload(dir: &Path, hex: &str, payload: &Value) {
     .unwrap();
 }
 
-pub fn build_block(
-    log: &Signer,
-    block_number: u64,
-    prev_block_hash: &str,
-    sealed_at: &str,
-    wrapped_entries: &[Value],
-) -> (Value, String) {
-    build_block_as(
-        log,
-        "log1",
-        block_number,
-        prev_block_hash,
-        sealed_at,
-        wrapped_entries,
-    )
+/// A test Log: one growing RFC 6962 tree published as WIST-3 §6's static
+/// surface — the head Checkpoint at `/checkpoint`, every Checkpoint under
+/// `/log/checkpoints/`, the tree's hashes as tiles and its Entries as
+/// entry bundles.
+pub struct Log {
+    pub dir: PathBuf,
+    pub log: Signer,
+    pub log_id: String,
+    leaves: Vec<Vec<u8>>,
+    hashes: Vec<[u8; 32]>,
+    pub checkpoints: Vec<WistCheckpoint>,
 }
 
-pub fn build_block_as(
-    log: &Signer,
-    key_id: &str,
-    block_number: u64,
-    prev_block_hash: &str,
-    sealed_at: &str,
-    wrapped_entries: &[Value],
-) -> (Value, String) {
-    let mut ordered: Vec<Value> = wrapped_entries.to_vec();
-    ordered.sort_by_key(|e| {
-        (
-            match e["type"].as_str().unwrap_or_default() {
-                "publisher_declaration" => 0,
-                "registry_update" => 1,
-                "publisher_delta" => 2,
-                _ => 3,
-            },
-            merkle::leaf_hash(&jcs::canonicalize(e).unwrap()),
+pub struct Witness {
+    pub name: String,
+    pub key: SigningKey,
+}
+
+impl Witness {
+    pub fn new(name: &str, seed: [u8; 32]) -> Self {
+        Witness {
+            name: name.to_string(),
+            key: SigningKey::from_seed(&seed),
+        }
+    }
+
+    pub fn verifier_key(&self) -> String {
+        let mut encoded = vec![wist_core::checkpoint::WITNESS_KEY_TYPE];
+        encoded.extend_from_slice(&self.key.public().to_bytes());
+        format!(
+            "{}+{}+{}",
+            self.name,
+            hex_encode(&wist_core::checkpoint::witness_key_id(
+                &self.name,
+                &self.key.public()
+            )),
+            base64::engine::general_purpose::STANDARD.encode(&encoded)
         )
-    });
-    let wrapped_entries = ordered.as_slice();
-    let leaves: Vec<[u8; 32]> = wrapped_entries
-        .iter()
-        .map(|e| merkle::leaf_hash(&jcs::canonicalize(e).unwrap()))
-        .collect();
-    let root = if leaves.is_empty() {
-        merkle::leaf_hash(&[])
-    } else {
-        merkle::merkle_root(&leaves).unwrap()
-    };
-    let header = serde_json::json!({
-        "wist_version": "1.0.0",
-        "block_number": block_number,
-        "prev_block_hash": prev_block_hash,
-        "sealed_at": sealed_at,
-        "merkle_root": format!("sha256:{}", hex_encode(&root)),
-        "entry_count": wrapped_entries.len() as u64,
-    });
-    let sig_value = log.sk.sign(&jcs::canonicalize(&header).unwrap());
-    let block_hash = wist_core::block::block_hash(&header).unwrap();
-    let block = serde_json::json!({
-        "header": header,
-        "entries": wrapped_entries,
-        "sig": {"key_id": key_id, "alg": "Ed25519", "value": sig_value},
-    });
-    (block, block_hash)
+    }
 }
 
-pub fn write_block(dir: &Path, block_number: u64, block: &Value) {
-    let blocks_dir = dir.join("log/blocks");
-    std::fs::create_dir_all(&blocks_dir).unwrap();
-    let bytes = serde_json::to_vec(block).unwrap();
-    std::fs::write(
-        blocks_dir.join(format!("{block_number:09}.json.zst")),
-        block_frame(&bytes),
-    )
-    .unwrap();
-}
+impl Log {
+    pub fn new(dir: &Path, log: Signer, log_id: &str) -> Log {
+        write_anchor(&dir.join("log/anchor.json"), &log, log_id);
+        Log::empty(dir, log, log_id)
+    }
 
-pub fn write_checkpoint(
-    dir: &Path,
-    log: &Signer,
-    block_number: u64,
-    block_hash: &str,
-    sealed_at: &str,
-) {
-    write_checkpoint_as(dir, log, "log1", block_number, block_hash, sealed_at)
-}
+    /// A Log whose Anchor another party wrote, as a spec vector's does.
+    pub fn empty(dir: &Path, log: Signer, log_id: &str) -> Log {
+        Log {
+            dir: dir.to_path_buf(),
+            log,
+            log_id: log_id.to_string(),
+            leaves: Vec::new(),
+            hashes: Vec::new(),
+            checkpoints: Vec::new(),
+        }
+    }
 
-pub fn write_checkpoint_as(
-    dir: &Path,
-    log: &Signer,
-    key_id: &str,
-    block_number: u64,
-    block_hash: &str,
-    sealed_at: &str,
-) {
-    let checkpoint = Checkpoint {
-        wist_version: "1.0.0".into(),
-        block_number,
-        block_hash: block_hash.into(),
-        sealed_at: sealed_at.into(),
-    };
-    let value = serde_json::to_value(&checkpoint).unwrap();
-    let env = sign_envelope(&value, "checkpoint", key_id, &log.sk).unwrap();
-    let path = dir.join("log/checkpoint.json");
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, serde_json::to_vec(&env).unwrap()).unwrap();
+    /// Publishes a Block whose Checkpoint another party signed, keeping
+    /// the note verbatim.
+    pub fn adopt(&mut self, note: &str, entries: &[Value]) {
+        for entry in entries {
+            let bytes = jcs::canonicalize(entry).expect("entry canonicalizes");
+            self.hashes.push(merkle::leaf_hash(&bytes));
+            self.leaves.push(bytes);
+        }
+        self.checkpoints
+            .push(WistCheckpoint::parse(note).expect("the note parses"));
+        self.publish();
+    }
+
+    /// Seals a Block under a `sealed_at` this suite's profile or cadence
+    /// grid rejects, which only a misbehaving Aggregator publishes.
+    pub fn seal_off_profile(&mut self, sealed_at: &str, entries: &[Value]) {
+        let mut ordered = entries.to_vec();
+        wist_core::block::sort_entries(&mut ordered).expect("entries are well formed");
+        for entry in &ordered {
+            let bytes = jcs::canonicalize(entry).expect("entry canonicalizes");
+            self.hashes.push(merkle::leaf_hash(&bytes));
+            self.leaves.push(bytes);
+        }
+        let number = self.checkpoints.len() as u64;
+        let note_text = format!(
+            "{}\n{}\n{}\nblock_number {number}\nsealed_at {sealed_at}\n",
+            self.log_id,
+            self.hashes.len(),
+            base64::engine::general_purpose::STANDARD.encode(merkle::merkle_root(&self.hashes)),
+        );
+        let line = wist_core::checkpoint::aggregator_signature_line(
+            &self.log_id,
+            &self.log.sk,
+            &note_text,
+        );
+        let note = format!("{note_text}\n{}\n", line.encode());
+        std::fs::write(self.dir.join("checkpoint"), &note).expect("write /checkpoint");
+        let path = self.dir.join(format!("log/checkpoints/{number:09}"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &note).expect("write an archived Checkpoint");
+        self.publish_tree();
+    }
+
+    /// Seals a Block from leaf data supplied verbatim, so that a test can
+    /// publish an Entry whose octets are not the JCS of anything.
+    pub fn seal_leaf_bytes(&mut self, sealed_at: &str, leaves: &[Vec<u8>]) -> WistCheckpoint {
+        for bytes in leaves {
+            self.hashes.push(merkle::leaf_hash(bytes));
+            self.leaves.push(bytes.clone());
+        }
+        let number = self.checkpoints.len() as u64;
+        let mut checkpoint = WistCheckpoint::new(
+            &self.log_id,
+            self.hashes.len() as u64,
+            merkle::merkle_root(&self.hashes),
+            number,
+            sealed_at,
+        )
+        .expect("checkpoint fields are well formed");
+        checkpoint.sign(&self.log.sk);
+        self.checkpoints.push(checkpoint.clone());
+        self.publish();
+        checkpoint
+    }
+
+    pub fn head(&self) -> &WistCheckpoint {
+        self.checkpoints.last().expect("the Log has sealed a Block")
+    }
+
+    pub fn head_number(&self) -> u64 {
+        self.head().block_number()
+    }
+
+    pub fn tree_size(&self) -> u64 {
+        self.hashes.len() as u64
+    }
+
+    pub fn root_token(&self) -> String {
+        self.head().root_token()
+    }
+
+    pub fn seal(&mut self, sealed_at: &str, entries: &[Value]) -> WistCheckpoint {
+        let signer = Signer::new(self.log.seed);
+        self.seal_signed_by(&signer, sealed_at, entries)
+    }
+
+    /// Seals the next Block under a named Aggregator key, which is how a
+    /// Log that rotated its key signs the Checkpoints after the rotation.
+    pub fn seal_signed_by(
+        &mut self,
+        signer: &Signer,
+        sealed_at: &str,
+        entries: &[Value],
+    ) -> WistCheckpoint {
+        let mut ordered = entries.to_vec();
+        wist_core::block::sort_entries(&mut ordered).expect("entries are well formed");
+        for entry in &ordered {
+            let bytes = jcs::canonicalize(entry).expect("entry canonicalizes");
+            self.hashes.push(merkle::leaf_hash(&bytes));
+            self.leaves.push(bytes);
+        }
+        let number = self.checkpoints.len() as u64;
+        let mut checkpoint = WistCheckpoint::new(
+            &self.log_id,
+            self.hashes.len() as u64,
+            merkle::merkle_root(&self.hashes),
+            number,
+            sealed_at,
+        )
+        .expect("checkpoint fields are well formed");
+        checkpoint.sign(&signer.sk);
+        self.checkpoints.push(checkpoint.clone());
+        self.publish();
+        checkpoint
+    }
+
+    /// Appends each Witness's Cosignature to the head Checkpoint, as the
+    /// Aggregator republishes it after `add-checkpoint` (WIST-3 §5).
+    pub fn cosign_head(&mut self, witnesses: &[&Witness], timestamp_s: u64) {
+        let head = self.checkpoints.last_mut().expect("a sealed Block");
+        let note_text = head.note_text();
+        for witness in witnesses {
+            head.add_signature(wist_core::checkpoint::cosignature_line(
+                &witness.name,
+                &witness.key,
+                &note_text,
+                timestamp_s,
+            ));
+        }
+        self.publish();
+    }
+
+    /// Writes the head Checkpoint note verbatim, for a source offering
+    /// something other than what this Log sealed.
+    pub fn write_head_note(&self, note: &str) {
+        std::fs::write(self.dir.join("checkpoint"), note).expect("write /checkpoint");
+    }
+
+    pub fn publish(&self) {
+        let head = self.head().encode();
+        std::fs::write(self.dir.join("checkpoint"), &head).expect("write /checkpoint");
+        for checkpoint in &self.checkpoints {
+            let path = self
+                .dir
+                .join(format!("log/checkpoints/{:09}", checkpoint.block_number()));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, checkpoint.encode()).expect("write an archived Checkpoint");
+        }
+        self.publish_tree();
+    }
+
+    fn publish_tree(&self) {
+        let tree_size = self.hashes.len() as u64;
+        let tiles = TileSet::build(&self.hashes);
+        for (path, bytes) in tiles.serve(tree_size) {
+            let file = self.dir.join(path.trim_start_matches('/'));
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, bytes).expect("write a tile");
+        }
+        for bundle in wist_core::tiles::required_bundles(tree_size) {
+            let (start, end) = bundle.leaf_range();
+            let bytes =
+                wist_core::tiles::encode_entry_bundle(&self.leaves[start as usize..end as usize])
+                    .expect("encode an entry bundle");
+            let file = self.dir.join(bundle.path().trim_start_matches('/'));
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, bytes).expect("write an entry bundle");
+        }
+    }
 }
 
 pub fn write_tier0(path: &Path, records: &[RecordFixture]) -> Vec<u8> {
@@ -416,12 +547,20 @@ pub fn write_state_with(
     floor: u64,
 ) -> (Vec<u8>, String) {
     let mut entries = extra;
-    entries.push(StateEntry::AggregatorKey(AggregatorKeyEntry {
-        key_id: "log1".into(),
-        public_key: log.public_b64u(),
-        added_height: 0,
-        removed_height: None,
-    }));
+    // WIST-3 §7: the state carries an `aggregator_key` tuple for every
+    // key admitted at or below `log_position`, removed ones included; a
+    // caller supplying its own set replaces the genesis-only default.
+    if !entries
+        .iter()
+        .any(|entry| matches!(entry, StateEntry::AggregatorKey(_)))
+    {
+        entries.push(StateEntry::AggregatorKey(AggregatorKeyEntry {
+            key_id: "log1".into(),
+            public_key: log.public_b64u(),
+            added_height: 0,
+            removed_height: None,
+        }));
+    }
     entries.push(StateEntry::Parameter(ParameterEntry {
         name: "block_cadence_seconds".into(),
         effective_at: "2026-08-09T13:00:00Z".into(),
@@ -470,6 +609,7 @@ fn write_manifest_with_files(
     path: &Path,
     log: &Signer,
     snapshot_date: &str,
+    block_number: u64,
     log_position: u64,
     anchor_block_hash: &str,
     content_digest_value: &str,
@@ -497,6 +637,7 @@ fn write_manifest_with_files(
     let manifest = SnapshotManifest {
         wist_version: "1.0.0".into(),
         snapshot_date: snapshot_date.into(),
+        block_number,
         log_position,
         anchor_block_hash: anchor_block_hash.into(),
         content_digest: content_digest_value.into(),
@@ -520,6 +661,7 @@ pub fn write_manifest(
     path: &Path,
     log: &Signer,
     snapshot_date: &str,
+    block_number: u64,
     log_position: u64,
     anchor_block_hash: &str,
     content_digest_value: &str,
@@ -531,6 +673,7 @@ pub fn write_manifest(
         path,
         log,
         snapshot_date,
+        block_number,
         log_position,
         anchor_block_hash,
         content_digest_value,
@@ -546,6 +689,7 @@ pub fn write_manifest_with_tier1(
     path: &Path,
     log: &Signer,
     snapshot_date: &str,
+    block_number: u64,
     log_position: u64,
     anchor_block_hash: &str,
     content_digest_value: &str,
@@ -558,6 +702,7 @@ pub fn write_manifest_with_tier1(
         path,
         log,
         snapshot_date,
+        block_number,
         log_position,
         anchor_block_hash,
         content_digest_value,
@@ -635,25 +780,92 @@ pub fn resign_state_with_wrong_key(dir: &Path, log: &Signer, other: &Signer, sna
     std::fs::write(&manifest_path, serde_json::to_vec(&menv).unwrap()).unwrap();
 }
 
-pub fn resign_checkpoint_with_wrong_key(dir: &Path, other: &Signer) {
-    let path = dir.join("log/checkpoint.json");
-    let doc: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    let checkpoint = doc["checkpoint"].clone();
-    let env = sign_envelope(&checkpoint, "checkpoint", "log1", &other.sk).unwrap();
-    std::fs::write(&path, serde_json::to_vec(&env).unwrap()).unwrap();
+pub fn resign_checkpoint_with_wrong_key(fx: &Fixture, other: &Signer) {
+    let head = fx.log_state().head().clone();
+    let mut forged = WistCheckpoint::new(
+        head.origin(),
+        head.tree_size(),
+        *head.root(),
+        head.block_number(),
+        head.sealed_at(),
+    )
+    .expect("checkpoint fields are well formed");
+    forged.sign(&other.sk);
+    fx.log_state().write_head_note(&forged.encode());
+}
+
+/// Seals one more Block, publishing the tree and its Checkpoint.
+pub fn seal_next(fx: &Fixture, sealed_at: &str, entries: &[Value]) -> u64 {
+    fx.log_state().seal(sealed_at, entries).block_number()
+}
+
+/// The `sealed_at` one cadence above the Log's head, on the hourly grid
+/// the fixtures seal on.
+pub fn next_instant(fx: &Fixture) -> String {
+    let at = fx.log_state().head().sealed_at_s().expect("a sealed head") + 3600;
+    jiff::Timestamp::from_second(at)
+        .expect("grid instant is in range")
+        .to_string()
+}
+
+/// A signed `aggregator_key_add` or `aggregator_key_remove` Entry, as
+/// WIST-4 §5.1 shapes it, under the Log key `signing_key_id` names.
+pub fn key_act(
+    fx: &Fixture,
+    action: &str,
+    signing_key_id: &str,
+    signer: &Signer,
+    key_id: &str,
+    public_key: Option<&Signer>,
+    effective_at: &str,
+) -> Value {
+    let mut details = serde_json::json!({ "key_id": key_id });
+    if let Some(key) = public_key {
+        details["alg"] = "Ed25519".into();
+        details["public_key"] = key.public_b64u().into();
+    }
+    let update = serde_json::json!({
+        "wist_version": "1.0.0",
+        "action": action,
+        "subject": key_id,
+        "details": details,
+        "effective_at": effective_at,
+    });
+    let _ = fx;
+    let body = sign_envelope(&update, "update", signing_key_id, &signer.sk).unwrap();
+    serde_json::json!({"type": "registry_update", "body": body})
+}
+
+/// A signed `parameter_change` Entry under the Log key
+/// `signing_key_id` names.
+pub fn parameter_act(
+    signing_key_id: &str,
+    signer: &Signer,
+    parameter: &str,
+    value: i64,
+    effective_at: &str,
+) -> Value {
+    let update = serde_json::json!({
+        "wist_version": "1.0.0",
+        "action": "parameter_change",
+        "subject": parameter,
+        "details": {"parameter": parameter, "value": value},
+        "effective_at": effective_at,
+    });
+    let body = sign_envelope(&update, "update", signing_key_id, &signer.sk).unwrap();
+    serde_json::json!({"type": "registry_update", "body": body})
+}
+
+/// The canonical Entry order WIST-3 §3.3 fixes for a Block's Entries.
+pub fn canonical_order(entries: &[Value]) -> Vec<Value> {
+    let mut ordered = entries.to_vec();
+    wist_core::block::sort_entries(&mut ordered).unwrap();
+    ordered
 }
 
 pub fn extend_fixture(fx: &Fixture) -> String {
     let publisher = Signer::new([1u8; 32]);
-    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
-    let doc: Value = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
-    let prev_hash = doc["checkpoint"]["block_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let next_number = prev_number + 1;
-
+    let next_number = fx.log_state().head_number() + 1;
     let url = format!("https://records.example/extra-{next_number}");
     let (id, delta_env, payload) = build_delta(
         &publisher,
@@ -663,21 +875,13 @@ pub fn extend_fixture(fx: &Fixture) -> String {
         "extra body",
         None,
     );
-    let hex = id.strip_prefix("sha256:").unwrap();
-    write_payload(fx.dir.path(), hex, &payload);
-    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
-
-    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
-    let (block, new_hash) = build_block(
-        &fx.log,
-        next_number,
-        &prev_hash,
-        &sealed_at,
-        &[wrapped_delta],
+    write_payload(fx.dir.path(), id.strip_prefix("sha256:").unwrap(), &payload);
+    let at = next_instant(fx);
+    seal_next(
+        fx,
+        &at,
+        &[serde_json::json!({"type": "publisher_delta", "body": delta_env})],
     );
-    write_block(fx.dir.path(), next_number, &block);
-    write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
-
     url
 }
 
@@ -687,7 +891,7 @@ pub fn build_delete_delta(publisher: &Signer, url: &str, prev: &str) -> (String,
         "publisher": reqwest::Url::parse(url).unwrap().host_str().unwrap(),
         "url": url,
         "change_type": "delete",
-        "observed_at": "2026-08-09T15:00:00Z",
+        "observed_at": "2026-08-09T12:00:00Z",
         "prev": prev,
         "meta": {"lang": "en"},
     });
@@ -699,15 +903,6 @@ pub fn build_delete_delta(publisher: &Signer, url: &str, prev: &str) -> (String,
 }
 
 pub fn extend_fixture_with_withdrawal(fx: &Fixture, delta_id: &str) {
-    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
-    let doc: Value = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
-    let prev_hash = doc["checkpoint"]["block_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let next_number = prev_number + 1;
-
     let update = serde_json::json!({
         "wist_version": "1.0.0",
         "action": "payload_withdrawal",
@@ -716,51 +911,28 @@ pub fn extend_fixture_with_withdrawal(fx: &Fixture, delta_id: &str) {
         "effective_at": "2026-08-09T15:00:00Z",
     });
     let body = sign_envelope(&update, "update", "log1", &fx.log.sk).unwrap();
-    let wrapped = serde_json::json!({"type": "registry_update", "body": body});
-
-    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
-    let (block, new_hash) = build_block(&fx.log, next_number, &prev_hash, &sealed_at, &[wrapped]);
-    write_block(fx.dir.path(), next_number, &block);
-    write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
+    let at = next_instant(fx);
+    seal_next(
+        fx,
+        &at,
+        &[serde_json::json!({"type": "registry_update", "body": body})],
+    );
 }
 
 pub fn extend_fixture_with_delete(fx: &Fixture, url: &str, prev: &str) {
     let publisher = Signer::new([1u8; 32]);
-    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
-    let doc: Value = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
-    let prev_hash = doc["checkpoint"]["block_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let next_number = prev_number + 1;
-
     let (_id, delta_env) = build_delete_delta(&publisher, url, prev);
-    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
-
-    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
-    let (block, new_hash) = build_block(
-        &fx.log,
-        next_number,
-        &prev_hash,
-        &sealed_at,
-        &[wrapped_delta],
+    let at = next_instant(fx);
+    seal_next(
+        fx,
+        &at,
+        &[serde_json::json!({"type": "publisher_delta", "body": delta_env})],
     );
-    write_block(fx.dir.path(), next_number, &block);
-    write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
 }
 
 pub fn extend_fixture_with_forged_delta(fx: &Fixture) {
     let attacker = Signer::new([7u8; 32]);
-    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
-    let doc: Value = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
-    let prev_hash = doc["checkpoint"]["block_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let next_number = prev_number + 1;
-
+    let next_number = fx.log_state().head_number() + 1;
     let url = format!("https://records.example/extra-{next_number}");
     let (_id, delta_env, _payload) = build_delta(
         &attacker,
@@ -770,34 +942,18 @@ pub fn extend_fixture_with_forged_delta(fx: &Fixture) {
         "extra body",
         None,
     );
-    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
-
-    let sealed_at = format!("2026-08-09T{:02}:00:00Z", 14 + next_number);
-    let (block, new_hash) = build_block(
-        &fx.log,
-        next_number,
-        &prev_hash,
-        &sealed_at,
-        &[wrapped_delta],
+    let at = next_instant(fx);
+    seal_next(
+        fx,
+        &at,
+        &[serde_json::json!({"type": "publisher_delta", "body": delta_env})],
     );
-    write_block(fx.dir.path(), next_number, &block);
-    write_checkpoint(fx.dir.path(), &fx.log, next_number, &new_hash, &sealed_at);
 }
 
 pub fn extend_fixture_with_rotation(fx: &Fixture, new_key: &Signer) -> String {
     let old = Signer::new([1u8; 32]);
-    let checkpoint_path = fx.dir.path().join("log/checkpoint.json");
-    let doc: Value = serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
-    let prev_number = doc["checkpoint"]["block_number"].as_u64().unwrap();
-    let prev_hash = doc["checkpoint"]["block_hash"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
     let decl0 = build_declaration(&old, &fx.domain);
     let hash0 = declaration_hash(&decl0);
-
-    let rotation_number = prev_number + 1;
     let rotation_decl = build_declaration_full(
         &old,
         &fx.domain,
@@ -805,19 +961,14 @@ pub fn extend_fixture_with_rotation(fx: &Fixture, new_key: &Signer) -> String {
         Some(&hash0),
         &[(new_key, "2026-08-09T00:00:00Z")],
     );
-    let wrapped_decl = serde_json::json!({"type": "publisher_declaration", "body": rotation_decl});
-    let sealed_at1 = format!("2026-08-09T{:02}:00:00Z", 14 + rotation_number);
-    let (block1, hash1) = build_block(
-        &fx.log,
-        rotation_number,
-        &prev_hash,
-        &sealed_at1,
-        &[wrapped_decl],
+    let at = next_instant(fx);
+    seal_next(
+        fx,
+        &at,
+        &[serde_json::json!({"type": "publisher_declaration", "body": rotation_decl})],
     );
-    write_block(fx.dir.path(), rotation_number, &block1);
-    write_checkpoint(fx.dir.path(), &fx.log, rotation_number, &hash1, &sealed_at1);
 
-    let delta_number = rotation_number + 1;
+    let delta_number = fx.log_state().head_number() + 1;
     let url = format!("https://records.example/extra-{delta_number}");
     let (id, delta_env, payload) = build_delta(
         new_key,
@@ -827,14 +978,13 @@ pub fn extend_fixture_with_rotation(fx: &Fixture, new_key: &Signer) -> String {
         "rotated body",
         None,
     );
-    let hex = id.strip_prefix("sha256:").unwrap();
-    write_payload(fx.dir.path(), hex, &payload);
-    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
-    let sealed_at2 = format!("2026-08-09T{:02}:00:00Z", 14 + delta_number);
-    let (block2, hash2) = build_block(&fx.log, delta_number, &hash1, &sealed_at2, &[wrapped_delta]);
-    write_block(fx.dir.path(), delta_number, &block2);
-    write_checkpoint(fx.dir.path(), &fx.log, delta_number, &hash2, &sealed_at2);
-
+    write_payload(fx.dir.path(), id.strip_prefix("sha256:").unwrap(), &payload);
+    let at = next_instant(fx);
+    seal_next(
+        fx,
+        &at,
+        &[serde_json::json!({"type": "publisher_delta", "body": delta_env})],
+    );
     url
 }
 
@@ -891,6 +1041,56 @@ pub fn build_pack(
     pack_path
 }
 
+/// Serves a directory over loopback and records the paths it was asked
+/// for, so a test can tell which tile a Consumer fetched.
+pub fn serve_recording(dir: PathBuf) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let Ok(clone) = stream.try_clone() else {
+                continue;
+            };
+            let mut reader = BufReader::new(clone);
+            let mut request = String::new();
+            if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                continue;
+            }
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 || header.trim().is_empty() {
+                    break;
+                }
+            }
+            let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+            recorded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(path.clone());
+            match std::fs::read(dir.join(path.trim_start_matches('/'))) {
+                Ok(bytes) => {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&bytes);
+                }
+                Err(_) => {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            }
+        }
+    });
+    (addr, seen)
+}
+
 pub fn serve_static(dir: PathBuf) -> String {
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -917,11 +1117,57 @@ pub struct Fixture {
     pub domain: String,
     pub snapshot_date: String,
     pub base_url: String,
+    state: RefCell<Log>,
 }
 
 impl Fixture {
     pub fn anchor_path(&self) -> PathBuf {
-        self.dir.path().join("anchor.json")
+        self.dir.path().join("log/anchor.json")
+    }
+
+    pub fn log_state(&self) -> RefMut<'_, Log> {
+        self.state.borrow_mut()
+    }
+
+    pub fn head_number(&self) -> u64 {
+        self.state.borrow().head_number()
+    }
+
+    pub fn head_tree_size(&self) -> u64 {
+        self.state.borrow().tree_size()
+    }
+}
+
+/// Serves, at `/checkpoint`, a Checkpoint of the head's Block stating
+/// another root: what a Log equivocating about a Block it already
+/// published would serve. `signer` is the key that signs it, so a test
+/// can offer a note no key valid at that height authenticates.
+pub fn forge_head_note(fx: &Fixture, root: [u8; 32], signer: &Signer) {
+    let head = fx.log_state().head().clone();
+    let mut forged = WistCheckpoint::new(
+        head.origin(),
+        head.tree_size(),
+        root,
+        head.block_number(),
+        head.sealed_at(),
+    )
+    .expect("checkpoint fields are well formed");
+    forged.sign(&signer.sk);
+    fx.log_state().write_head_note(&forged.encode());
+}
+
+/// Copies a served Log directory, so a second source can serve what the
+/// first served before it was tampered with.
+pub fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
     }
 }
 
@@ -985,7 +1231,7 @@ fn build_fixture_state(
     let domain = "records.example".to_string();
     let snapshot_date = "2026-08-09".to_string();
 
-    write_anchor(&dir.path().join("anchor.json"), &log, log_id);
+    let mut state = Log::new(dir.path(), Signer::new([seed; 32]), log_id);
 
     let declaration_env = build_declaration(&publisher, &domain);
     let wrapped_declaration =
@@ -1003,14 +1249,12 @@ fn build_fixture_state(
     write_payload(dir.path(), hex1, &payload1);
     let wrapped_delta1 = serde_json::json!({"type": "publisher_delta", "body": delta1_env});
 
-    let (block0, block0_hash) = build_block(
-        &log,
-        0,
-        "sha256:genesis",
+    let block0 = state.seal(
         "2026-08-09T12:00:00Z",
         &[wrapped_declaration, wrapped_delta1],
     );
-    write_block(dir.path(), 0, &block0);
+    let block0_root = block0.root_token();
+    let block0_size = block0.tree_size();
 
     let record1 = RecordFixture {
         url: "https://records.example/alpha".into(),
@@ -1040,7 +1284,7 @@ fn build_fixture_state(
         3600,
         &[(domain.clone(), declaration_env.clone())],
         std::slice::from_ref(&record1),
-        0,
+        block0_size,
         extra_state,
         floor,
     );
@@ -1062,7 +1306,8 @@ fn build_fixture_state(
             &log,
             &snapshot_date,
             0,
-            &block0_hash,
+            block0_size,
+            &block0_root,
             &content_digest_value,
             &state_bytes,
             &state_digest_value,
@@ -1078,7 +1323,8 @@ fn build_fixture_state(
             &log,
             &snapshot_date,
             0,
-            &block0_hash,
+            block0_size,
+            &block0_root,
             &content_digest_value,
             &state_bytes,
             &state_digest_value,
@@ -1090,7 +1336,7 @@ fn build_fixture_state(
         &dir.path().join("snapshots/index.json"),
         &log,
         &snapshot_date,
-        0,
+        block0_size,
         &format!("/snapshots/{snapshot_date}/manifest.json"),
         &content_digest_value,
     );
@@ -1109,16 +1355,7 @@ fn build_fixture_state(
     }
     let wrapped_delta2 = serde_json::json!({"type": "publisher_delta", "body": delta2_env});
 
-    let (block1, block1_hash) = build_block(
-        &log,
-        1,
-        &block0_hash,
-        "2026-08-09T13:00:00Z",
-        &[wrapped_delta2],
-    );
-    write_block(dir.path(), 1, &block1);
-
-    write_checkpoint(dir.path(), &log, 1, &block1_hash, "2026-08-09T13:00:00Z");
+    state.seal("2026-08-09T13:00:00Z", &[wrapped_delta2]);
 
     let base_url = format!("http://{}", serve_static(dir.path().to_path_buf()));
 
@@ -1129,15 +1366,6 @@ fn build_fixture_state(
         domain,
         snapshot_date,
         base_url,
+        state: RefCell::new(state),
     }
-}
-
-pub fn block_frame(bytes: &[u8]) -> Vec<u8> {
-    use std::io::Write;
-    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
-    encoder
-        .set_pledged_src_size(Some(bytes.len() as u64))
-        .unwrap();
-    encoder.write_all(bytes).unwrap();
-    encoder.finish().unwrap()
 }

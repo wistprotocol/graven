@@ -1,8 +1,8 @@
 mod common;
 
 use common::{
-    key_entry, serve_static, write_anchor, write_block, write_checkpoint, write_index,
-    write_manifest, write_payload, write_state, write_tier0, Signer,
+    key_entry, serve_static, write_index, write_manifest, write_payload, write_state, write_tier0,
+    Signer,
 };
 use graven::store::Store;
 use rusqlite::Connection;
@@ -104,9 +104,7 @@ fn wrap_delta(d: &Value) -> Value {
 struct Harness {
     dir: tempfile::TempDir,
     target: tempfile::TempDir,
-    log: Signer,
-    prev_hash: String,
-    next_number: u64,
+    state: common::Log,
     base_url: String,
 }
 
@@ -115,9 +113,9 @@ impl Harness {
         let dir = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
         let log = Signer::new([61u8; 32]);
-        write_anchor(
-            &dir.path().join("anchor.json"),
-            &log,
+        let mut state = common::Log::new(
+            dir.path(),
+            Signer::new([61u8; 32]),
             "materialization-test-log",
         );
 
@@ -128,16 +126,15 @@ impl Harness {
         let (state_bytes, state_digest_value) =
             write_state(&snapdir.join("state.json"), &log, 60, &[], &[], 0);
 
-        let (block0, block0_hash) =
-            write_block_at(&dir, &log, 0, "sha256:genesis", "2026-08-09T00:00:00Z", &[]);
-        let _ = block0;
+        let block0 = state.seal("2026-08-09T00:00:00Z", &[]);
 
         write_manifest(
             &snapdir.join("manifest.json"),
             &log,
             snapshot_date,
             0,
-            &block0_hash,
+            block0.tree_size(),
+            &block0.root_token(),
             &content_digest_value,
             &state_bytes,
             &state_digest_value,
@@ -147,20 +144,17 @@ impl Harness {
             &dir.path().join("snapshots/index.json"),
             &log,
             snapshot_date,
-            0,
+            block0.tree_size(),
             &format!("/snapshots/{snapshot_date}/manifest.json"),
             &content_digest_value,
         );
-        write_checkpoint(dir.path(), &log, 0, &block0_hash, "2026-08-09T00:00:00Z");
 
         let base_url = format!("http://{}", serve_static(dir.path().to_path_buf()));
 
         Harness {
             dir,
             target,
-            log,
-            prev_hash: block0_hash,
-            next_number: 1,
+            state,
             base_url,
         }
     }
@@ -171,23 +165,12 @@ impl Harness {
     }
 
     fn seal(&mut self, sealed_at: &str, wrapped_entries: &[Value]) {
-        let number = self.next_number;
-        let (_, hash) = write_block_at(
-            &self.dir,
-            &self.log,
-            number,
-            &self.prev_hash,
-            sealed_at,
-            wrapped_entries,
-        );
-        write_checkpoint(self.dir.path(), &self.log, number, &hash, sealed_at);
-        self.prev_hash = hash;
-        self.next_number += 1;
+        self.state.seal(sealed_at, wrapped_entries);
     }
 
     fn sync(&self, tier1: bool) {
         graven::sync::run(
-            self.dir.path().join("anchor.json").to_str().unwrap(),
+            self.dir.path().join("log/anchor.json").to_str().unwrap(),
             &self.base_url,
             self.target.path(),
             true,
@@ -207,19 +190,6 @@ impl Harness {
     fn conn(&self) -> Connection {
         Connection::open(self.log_dir().join("index.sqlite")).unwrap()
     }
-}
-
-fn write_block_at(
-    dir: &tempfile::TempDir,
-    log: &Signer,
-    number: u64,
-    prev_hash: &str,
-    sealed_at: &str,
-    wrapped_entries: &[Value],
-) -> (Value, String) {
-    let (block, hash) = common::build_block(log, number, prev_hash, sealed_at, wrapped_entries);
-    write_block(dir.path(), number, &block);
-    (block, hash)
 }
 
 fn excluded_count(conn: &Connection, url: &str, publisher: &str) -> i64 {

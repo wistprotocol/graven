@@ -14,5 +14,5 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 jiff = { workspace = true }
 zerovec = { workspace = true }
-zstd = { workspace = true }
+base64 = { workspace = true }
 tempfile = "3"
