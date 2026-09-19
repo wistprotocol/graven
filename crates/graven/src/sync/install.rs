@@ -2,7 +2,7 @@ use super::history::{default_recovery_window_days, persist_declaration, ChainSta
 use super::persist::{record_withdrawal, save_aggregator_keys, save_chain_tips};
 use super::source::Sources;
 use crate::error::{Error, Result};
-use crate::fetch::{resolve, Client};
+use crate::fetch::Client;
 use crate::keyset::KeyHistory;
 use crate::registry::{self};
 use crate::store::{CREATE_DECLARATIONS, CREATE_TIER1, CREATE_UNIQUE_INDEX};
@@ -20,8 +20,8 @@ use wist_core::envelope::verify_envelope;
 use wist_core::objects::GenesisKey;
 use wist_core::objects::LogAnchorEnvelope;
 use wist_core::objects::{
-    SnapshotIndexEnvelope, SnapshotManifest, SnapshotManifestEnvelope, SnapshotStateEnvelope,
-    StateEntry,
+    SnapshotIndexEntry, SnapshotIndexEnvelope, SnapshotManifest, SnapshotManifestEnvelope,
+    SnapshotState, SnapshotStateEnvelope, StateEntry,
 };
 use wist_core::snapshot::content_digest;
 use wist_core::snapshot::state_digest;
@@ -146,6 +146,149 @@ impl Installation {
     }
 }
 
+const SNAPSHOT_INDEX_PATH: &str = "/snapshots/index.json";
+
+/// A WIST-3 §8 document the trust key's signature authenticates.
+fn signed<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    kind: &str,
+    trust_key: &PublicKey,
+) -> Result<T> {
+    let value = wist_core::json::parse(bytes)?;
+    verify_envelope(&value, kind, trust_key)?;
+    Ok(serde_json::from_value(value)?)
+}
+
+/// One Snapshot's documents and files, each verified against the trust
+/// key or the manifest before it is used. `tier0` is absent where the
+/// manifest lists no tier-0 index.
+struct Documents {
+    manifest: SnapshotManifest,
+    state: SnapshotState,
+    tier0: Option<Vec<u8>>,
+    tier1_extracts: Vec<Vec<u8>>,
+    tier1_links: Vec<Vec<u8>>,
+}
+
+/// WIST-3 §8 step 1: the Snapshot the index of one source names. The
+/// index is one of the two mutable files (§6), so each source states its
+/// own and it is read from one source at a time rather than from the
+/// first source that answers.
+fn index_entry(sources: &Sources, at: usize, trust_key: &PublicKey) -> Result<SnapshotIndexEntry> {
+    sources.whole_at(SNAPSHOT_INDEX_PATH, at, |bytes| {
+        let envelope: SnapshotIndexEnvelope = signed(bytes, "index", trust_key)?;
+        envelope
+            .index
+            .snapshots
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Verify("snapshot index is empty".into()))
+    })
+}
+
+/// WIST-3 §8 step 2: the index entry and the manifest are two
+/// independently signed statements about the same Snapshot, so they must
+/// agree before either is trusted (`WIST3-E04`).
+fn check_index_agreement(entry: &SnapshotIndexEntry, manifest: &SnapshotManifest) -> Result<()> {
+    for (field, from_index, from_manifest) in [
+        (
+            "snapshot_date",
+            &entry.snapshot_date,
+            &manifest.snapshot_date,
+        ),
+        (
+            "content_digest",
+            &entry.content_digest,
+            &manifest.content_digest,
+        ),
+    ] {
+        if from_index != from_manifest {
+            return Err(Error::Verify(format!(
+                "WIST3-E04: snapshot index names {field} {from_index}, its manifest {from_manifest}"
+            )));
+        }
+    }
+    if entry.tree_size != manifest.tree_size {
+        return Err(Error::Verify(format!(
+            "WIST3-E04: snapshot index names tree_size {}, its manifest {}",
+            entry.tree_size, manifest.tree_size
+        )));
+    }
+    Ok(())
+}
+
+/// WIST-3 §8 steps 1–4 against the index of source `at`: the manifest that
+/// entry points to, the state artifact, and every file the manifest lists.
+/// §6 verifies each file "by hash, signature, or commitment, never by
+/// source", so a source that does not hold a path, or serves octets the
+/// manifest's `sha256` and `bytes` or the trust key's signature refuse,
+/// sends that same path to the next source.
+fn documents(
+    sources: &Sources,
+    trust_key: &PublicKey,
+    at: usize,
+    tier1: bool,
+) -> Result<Documents> {
+    let entry = index_entry(sources, at, trust_key)?;
+    let manifest = sources.whole(&entry.manifest_url, |bytes| {
+        let envelope: SnapshotManifestEnvelope = signed(bytes, "manifest", trust_key)?;
+        check_index_agreement(&entry, &envelope.manifest)?;
+        Ok(envelope.manifest)
+    })?;
+    let snapshot_base = format!("/snapshots/{}/", manifest.snapshot_date);
+
+    let state_path = format!("{snapshot_base}{}", manifest.state.path);
+    let state: SnapshotState = sources.whole(&state_path, |bytes| {
+        verify_file_integrity(bytes, &manifest.state.sha256, manifest.state.bytes)?;
+        let envelope: SnapshotStateEnvelope = signed(bytes, "state", trust_key)?;
+        Ok(envelope.state)
+    })?;
+    // WIST-3 §8 step 4: a state file at another tree size than its
+    // manifest describes another tree, and the Snapshot is rejected.
+    wist_core::snapshot::check_state_tree_size(&manifest, state.tree_size)?;
+
+    let mut documents = Documents {
+        manifest,
+        state,
+        tier0: None,
+        tier1_extracts: Vec::new(),
+        tier1_links: Vec::new(),
+    };
+    for f in &documents.manifest.files {
+        let path = format!("{snapshot_base}{}", f.path);
+        let bytes = sources.whole(&path, |bytes| {
+            verify_file_integrity(bytes, &f.sha256, f.bytes)?;
+            Ok(bytes.to_vec())
+        })?;
+        if f.tier == 0 && f.path == "tier0/index.sqlite" {
+            documents.tier0 = Some(bytes);
+        } else if tier1 && f.path.ends_with("tier1/extracts.parquet") {
+            documents.tier1_extracts.push(bytes);
+        } else if tier1 && f.path.ends_with("tier1/links.parquet") {
+            documents.tier1_links.push(bytes);
+        }
+    }
+    Ok(documents)
+}
+
+/// WIST-3 §9's `WIST3-E04`: a Snapshot whose documents disagree with each
+/// other is rejected entirely and "re-fetch[ed], from another Mirror if
+/// needed". Each source's index names a Snapshot of its own, so the whole
+/// Snapshot is retried against the next source's index, and the
+/// disagreement stands only where no source yields one that verifies.
+fn snapshot_documents(sources: &Sources, trust_key: &PublicKey, tier1: bool) -> Result<Documents> {
+    let mut last: Option<Error> = None;
+    for at in 0..sources.count() {
+        match documents(sources, trust_key, at, tier1) {
+            Ok(documents) => return Ok(documents),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        Error::Fetch(format!("WIST3-E01 no source holds {SNAPSHOT_INDEX_PATH}"))
+    }))
+}
+
 /// Fetches the newest Snapshot, verifies its index, manifest, state and
 /// files against the trust key and each other, writes the tier-0 index to
 /// a temporary file and adopts every state tuple into it.
@@ -159,62 +302,17 @@ pub(super) fn snapshot(
 ) -> Result<Installation> {
     let client = sources.client();
     let base = sources.primary();
-    let index_url = resolve(base, "/snapshots/index.json")?;
-    let (_, index_value) = client.get_json(&index_url)?;
-    verify_envelope(&index_value, "index", trust_key)?;
-    let index_env: SnapshotIndexEnvelope = serde_json::from_value(index_value)?;
-    let newest = index_env
-        .index
-        .snapshots
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::Verify("snapshot index is empty".into()))?;
+    let Documents {
+        manifest,
+        state,
+        tier0,
+        tier1_extracts,
+        tier1_links,
+    } = snapshot_documents(sources, trust_key, tier1)?;
 
-    let manifest_url = resolve(base, &newest.manifest_url)?;
-    let (_, manifest_value) = client.get_json(&manifest_url)?;
-    verify_envelope(&manifest_value, "manifest", trust_key)?;
-    let manifest_env: SnapshotManifestEnvelope = serde_json::from_value(manifest_value)?;
-    let manifest = manifest_env.manifest;
-    // WIST-3 §8 step 2: the index entry and the manifest are two
-    // independently signed statements about the same Snapshot, so they
-    // must agree before either is trusted.
-    for (field, from_index, from_manifest) in [
-        (
-            "snapshot_date",
-            &newest.snapshot_date,
-            &manifest.snapshot_date,
-        ),
-        (
-            "content_digest",
-            &newest.content_digest,
-            &manifest.content_digest,
-        ),
-    ] {
-        if from_index != from_manifest {
-            return Err(Error::Verify(format!(
-                "WIST3-E04: snapshot index names {field} {from_index}, its manifest {from_manifest}"
-            )));
-        }
-    }
-    if newest.tree_size != manifest.tree_size {
-        return Err(Error::Verify(format!(
-            "WIST3-E04: snapshot index names tree_size {}, its manifest {}",
-            newest.tree_size, manifest.tree_size
-        )));
-    }
-    let snapshot_base = format!("/snapshots/{}/", manifest.snapshot_date);
-
-    let state_url = resolve(base, &format!("{snapshot_base}{}", manifest.state.path))?;
-    let state_bytes = client.get_bytes(&state_url)?;
-    verify_file_integrity(&state_bytes, &manifest.state.sha256, manifest.state.bytes)?;
-    let state_value = wist_core::json::parse(&state_bytes)?;
-    verify_envelope(&state_value, "state", trust_key)?;
-    let state_env: SnapshotStateEnvelope = serde_json::from_value(state_value)?;
-    // WIST-3 §8 step 4: a state file at another tree size than its
-    // manifest describes another tree, and the Snapshot is rejected.
-    wist_core::snapshot::check_state_tree_size(&manifest, state_env.state.tree_size)?;
-    let state_entry_values: Vec<Value> = state_env
-        .state
+    // WIST-3 §9: a digest that disagrees with the Consumer's own rebuild
+    // is not a transport fault and no other source can mend it.
+    let state_entry_values: Vec<Value> = state
         .entries
         .iter()
         .map(serde_json::to_value)
@@ -225,24 +323,8 @@ pub(super) fn snapshot(
             "state_digest mismatch: recomputed state digest does not match manifest".into(),
         ));
     }
-
-    let mut tier0_bytes: Option<Vec<u8>> = None;
-    let mut tier1_extracts: Vec<Vec<u8>> = Vec::new();
-    let mut tier1_links: Vec<Vec<u8>> = Vec::new();
-    for f in &manifest.files {
-        let file_url = resolve(base, &format!("{snapshot_base}{}", f.path))?;
-        let bytes = client.get_bytes(&file_url)?;
-        verify_file_integrity(&bytes, &f.sha256, f.bytes)?;
-        if f.tier == 0 && f.path == "tier0/index.sqlite" {
-            tier0_bytes = Some(bytes);
-        } else if tier1 && f.path.ends_with("tier1/extracts.parquet") {
-            tier1_extracts.push(bytes);
-        } else if tier1 && f.path.ends_with("tier1/links.parquet") {
-            tier1_links.push(bytes);
-        }
-    }
-    let tier0_bytes = tier0_bytes
-        .ok_or_else(|| Error::Verify("manifest has no tier0/index.sqlite file".into()))?;
+    let tier0_bytes =
+        tier0.ok_or_else(|| Error::Verify("manifest has no tier0/index.sqlite file".into()))?;
 
     let tmp_sqlite_path = dir.join("index.sqlite.verifying");
     std::fs::write(&tmp_sqlite_path, &tier0_bytes)?;
@@ -281,7 +363,7 @@ pub(super) fn snapshot(
     let mut adopted_windows: Vec<(String, String, Value, u64)> = Vec::new();
     let mut adopted_pending: Vec<(String, Value, u64, u64)> = Vec::new();
     let mut adopted_parameters: Vec<(String, String, i64)> = Vec::new();
-    for entry in &state_env.state.entries {
+    for entry in &state.entries {
         match entry {
             StateEntry::Parameter(p) => {
                 adopted_parameters.push((p.name.clone(), p.effective_at.clone(), p.value));
@@ -387,7 +469,7 @@ pub(super) fn snapshot(
         tmp_sqlite_path,
         conn,
         content_digest: manifest.content_digest.clone(),
-        state_tree_size: state_env.state.tree_size,
+        state_tree_size: state.tree_size,
         manifest,
         history,
         aggregator_keys,

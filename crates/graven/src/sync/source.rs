@@ -80,8 +80,44 @@ impl<'a> Sources<'a> {
         Ok(bytes)
     }
 
-    /// The same fetch, remembering the verified octets: every path this
-    /// serves but `/checkpoint` names an immutable file (§6).
+    /// Fetches one path whose format carries no octet bound and returns
+    /// what `read` makes of the first source's octets it accepts. A
+    /// Snapshot's documents and files are bounded by nothing and held to
+    /// the manifest's `sha256` and `bytes` or to an envelope signature
+    /// instead, so a source that does not hold the path, or serves octets
+    /// those checks refuse, sends the same path to the next source.
+    pub fn whole<T>(&self, path: &str, read: impl Fn(&[u8]) -> Result<T>) -> Result<T> {
+        let mut last: Option<Error> = None;
+        for base in &self.bases {
+            match resolve(base, path)
+                .and_then(|url| self.client.get_bytes(&url))
+                .and_then(|bytes| read(&bytes))
+            {
+                Ok(value) => return Ok(value),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| Error::Fetch(format!("WIST3-E01 no source holds {path}"))))
+    }
+
+    /// The same unbounded fetch from one named source, for a path each
+    /// source states for itself because the file is mutable (§6).
+    pub fn whole_at<T>(
+        &self,
+        path: &str,
+        index: usize,
+        read: impl Fn(&[u8]) -> Result<T>,
+    ) -> Result<T> {
+        let base = self
+            .bases
+            .get(index)
+            .ok_or_else(|| Error::Fetch(format!("WIST3-E01 no source holds {path}")))?;
+        let url = resolve(base, path)?;
+        read(&self.client.get_bytes(&url)?)
+    }
+
+    /// The same bounded fetch, remembering the verified octets: every path
+    /// this serves but `/checkpoint` names an immutable file (§6).
     pub fn cached(
         &self,
         path: &str,
