@@ -1,8 +1,8 @@
 use e2e::{
-    fetch_status, graven_bin, grid_instant, now_rfc3339, resolve_sibling_bin, run,
-    run_in_fresh_env, run_with_env, s, seal_epoch, serve_sites, start_aggregator, synced_heads,
-    wait_until_pull_recorded, wait_until_pulled_since, wait_until_status_active,
-    wait_until_unreachable, workspace_root, McpClient,
+    checkpoint_verifier_key, fetch_status, graven_bin, grid_instant, now_rfc3339,
+    resolve_sibling_bin, run, run_in_fresh_env, run_with_env, s, seal_epoch, serve_sites,
+    start_aggregator, synced_heads, wait_until_pull_recorded, wait_until_pulled_since,
+    wait_until_status_active, wait_until_unreachable, workspace_root, McpClient,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -315,6 +315,73 @@ fn validate_artifacts(site: &Path, clave_data: &Path) {
         .status()
         .unwrap_or_else(|e| panic!("failed to spawn validate_artifacts.py: {e}"));
     assert!(status.success(), "validate_artifacts.py reported failures");
+}
+
+fn fetch_text(http: &reqwest::blocking::Client, url: &str) -> String {
+    let response = http
+        .get(url)
+        .send()
+        .unwrap_or_else(|e| panic!("GET {url}: {e}"));
+    let status = response.status();
+    assert!(status.is_success(), "GET {url} answered {status}");
+    response
+        .text()
+        .unwrap_or_else(|e| panic!("read the body of {url}: {e}"))
+}
+
+fn parse_note(note: &str) -> wist_core::checkpoint::Checkpoint {
+    wist_core::checkpoint::Checkpoint::parse(note)
+        .unwrap_or_else(|e| panic!("parse the Checkpoint note: {e}\n{note}"))
+}
+
+/// The note key IDs (WIST-3 §3.4) of a Checkpoint's Log signature lines —
+/// the lines whose key name is the Log's origin — in the order the note
+/// carries them. A `key_id` never appears in a note, so a rotation is read
+/// off the notes through these.
+fn log_signature_key_ids(note: &str, log_id: &str) -> Vec<String> {
+    parse_note(note)
+        .signatures()
+        .iter()
+        .filter(|line| line.name == log_id)
+        .map(|line| wist_core::crypto::hex_encode(&line.key_id))
+        .collect()
+}
+
+/// One line of `clave log-key list`: an Aggregator key's `key_id`, its
+/// note key ID and the heights that admitted and retired it.
+struct LogKey {
+    key_id: String,
+    note_key_id: String,
+    added: Option<u64>,
+    removed: Option<u64>,
+}
+
+fn log_keys(clave: &Path, data: &Path) -> Vec<LogKey> {
+    let output = run(clave, &["log-key", "list", "--data", s(data)]);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            assert!(
+                fields.len() >= 6 && fields[2] == "added" && fields[4] == "removed",
+                "unexpected log-key list line {line:?}"
+            );
+            LogKey {
+                key_id: fields[0].to_string(),
+                note_key_id: fields[1].to_string(),
+                added: fields[3].parse().ok(),
+                removed: fields[5].parse().ok(),
+            }
+        })
+        .collect()
+}
+
+fn log_key<'a>(keys: &'a [LogKey], key_id: &str) -> &'a LogKey {
+    keys.iter()
+        .find(|key| key.key_id == key_id)
+        .unwrap_or_else(|| panic!("no Aggregator key {key_id} in the Log's key list"))
 }
 
 fn verify_with_external_tlog_client(base_url: &str, verifier_key: &str) {
@@ -1883,6 +1950,251 @@ fn end_to_end() {
     );
     drop(mcp16);
 
+    // Both checks read the Log under the Anchor's genesis key, so they run
+    // before the Log retires it below.
+    validate_artifacts(&site, &clave_data);
+    verify_with_external_tlog_client(&aggregator.base_url, &aggregator.verifier_key);
+
+    // --- the Log admits a second Aggregator key in band ---
+    let log_anchor = read_json(&anchor_path);
+    let genesis_key_id = log_anchor["anchor"]["genesis_key"]["key_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the Log Anchor declares no genesis key_id: {log_anchor}"))
+        .to_string();
+    assert_eq!(
+        log_key(&log_keys(&clave, &clave_data), &genesis_key_id).added,
+        Some(0),
+        "the Anchor's genesis key is not the key admitted at height 0"
+    );
+    let key_added = run(&clave, &["log-key", "add", "--data", s(&clave_data)]);
+    let admitted_verifier_key =
+        checkpoint_verifier_key(&String::from_utf8_lossy(&key_added.stdout));
+    let keys = log_keys(&clave, &clave_data);
+    let genesis_note_key_id = log_key(&keys, &genesis_key_id).note_key_id.clone();
+    let admitted = keys
+        .iter()
+        .find(|key| key.added.is_none())
+        .unwrap_or_else(|| panic!("log-key add queued no unsealed key"));
+    let admitted_key_id = admitted.key_id.clone();
+    let admitted_note_key_id = admitted.note_key_id.clone();
+    assert_ne!(
+        admitted_note_key_id, genesis_note_key_id,
+        "the admitted key carries the genesis key's note key ID"
+    );
+
+    let addition_seal = grid_instant(12 + 24 * 7 + 3);
+    let addition_epoch = seal_epoch(&clave, &clave_data, &addition_seal);
+    record.exercised("log_key_addition", addition_epoch);
+
+    // WIST-3 §3.4: the Epoch that seals an addition is signed by the
+    // admitting key and the new one.
+    let mut admitting_signers = vec![genesis_note_key_id.clone(), admitted_note_key_id.clone()];
+    admitting_signers.sort();
+    let head_note = fetch_text(&http, &format!("{clave_base}/checkpoint"));
+    let archived_note = fetch_text(
+        &http,
+        &format!(
+            "{clave_base}{}",
+            wist_core::checkpoint::archive_path(addition_epoch)
+        ),
+    );
+    assert_eq!(
+        parse_note(&head_note).epoch_number(),
+        addition_epoch,
+        "the served head is not the Epoch that sealed the addition"
+    );
+    assert_eq!(
+        parse_note(&head_note).note_text(),
+        parse_note(&archived_note).note_text(),
+        "the archived Checkpoint states another tree than the served head"
+    );
+    for (source, note) in [
+        ("the served head", &head_note),
+        ("the archive", &archived_note),
+    ] {
+        let mut signers = log_signature_key_ids(note, &clave_host);
+        assert_eq!(
+            signers.len(),
+            2,
+            "{source} carries {} Log signature lines, not the admitting key's and the new one's: {note}",
+            signers.len()
+        );
+        signers.sort();
+        assert_eq!(
+            signers, admitting_signers,
+            "{source} is not signed under the admitting key and the admitted one: {note}"
+        );
+    }
+    let synced = run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+    let heads = synced_heads(&String::from_utf8_lossy(&synced.stdout));
+    assert_eq!(
+        heads[&clave_host].epoch, addition_epoch,
+        "the Consumer did not advance to the Epoch that admitted the key: {heads:?}"
+    );
+
+    // An Entry sealed after the addition verifies under the key set the
+    // addition left in force.
+    let keystone_url = format!("https://{pruned_host}/second-key.html");
+    add_page(
+        &pruned_site,
+        &pruned_host,
+        "second-key.html",
+        "Pruned second key",
+        "keystone notes sealed while the Log held two Aggregator keys",
+    );
+    let keystone_since = now_rfc3339();
+    build_site(&spake, &pruned_host, &pruned_site, &pruned_state, &[]);
+    ping(&spake, &clave_base, &pruned_host);
+    wait_until_pulled_since(
+        &http,
+        &clave_base,
+        &pruned_host,
+        &keystone_since,
+        &clave_stderr,
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let keystone_epoch = seal_epoch(&clave, &clave_data, &grid_instant(12 + 24 * 7 + 4));
+    let advanced = run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+    let heads = synced_heads(&String::from_utf8_lossy(&advanced.stdout));
+    assert_eq!(
+        heads[&clave_host].epoch, keystone_epoch,
+        "the Consumer did not advance over the Epoch sealed above the addition: {heads:?}"
+    );
+    let mut mcp_admitted = McpClient::start(&graven, &gdir);
+    assert_eq!(
+        mcp_admitted.get_record(&keystone_url)["url"],
+        keystone_url,
+        "a Delta sealed after the key addition did not reach the index"
+    );
+    assert!(
+        mcp_admitted
+            .search("keystone")
+            .iter()
+            .any(|h| h["url"] == keystone_url.as_str()),
+        "a Delta sealed after the key addition is not searchable"
+    );
+    drop(mcp_admitted);
+
+    // --- the Log retires its genesis key ---
+    run(
+        &clave,
+        &[
+            "log-key",
+            "remove",
+            "--data",
+            s(&clave_data),
+            "--key-id",
+            &genesis_key_id,
+        ],
+    );
+    let removal_epoch = seal_epoch(&clave, &clave_data, &grid_instant(12 + 24 * 7 + 5));
+    record.exercised("log_key_removal_of_the_genesis_key", removal_epoch);
+    assert_eq!(
+        log_key(&log_keys(&clave, &clave_data), &genesis_key_id).removed,
+        Some(removal_epoch),
+        "the genesis key was not retired at the Epoch that sealed its removal"
+    );
+
+    // WIST-3 §3.4: a key removed at height N is invalid at N, so the Epoch
+    // that seals the removal is not signed by the removed key.
+    let removal_note = fetch_text(
+        &http,
+        &format!(
+            "{clave_base}{}",
+            wist_core::checkpoint::archive_path(removal_epoch)
+        ),
+    );
+    assert_eq!(
+        log_signature_key_ids(&removal_note, &clave_host),
+        std::slice::from_ref(&admitted_note_key_id),
+        "the Checkpoint sealing the genesis key's removal is not signed by the remaining key alone: {removal_note}"
+    );
+
+    let lodestar_url = format!("https://{pruned_host}/retired-key.html");
+    add_page(
+        &pruned_site,
+        &pruned_host,
+        "retired-key.html",
+        "Pruned retired key",
+        "lodestar notes sealed after the genesis key was retired",
+    );
+    let lodestar_since = now_rfc3339();
+    build_site(&spake, &pruned_host, &pruned_site, &pruned_state, &[]);
+    ping(&spake, &clave_base, &pruned_host);
+    wait_until_pulled_since(
+        &http,
+        &clave_base,
+        &pruned_host,
+        &lodestar_since,
+        &clave_stderr,
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let lodestar_epoch = seal_epoch(&clave, &clave_data, &grid_instant(12 + 24 * 7 + 6));
+    let later_note = fetch_text(&http, &format!("{clave_base}/checkpoint"));
+    assert_eq!(
+        parse_note(&later_note).epoch_number(),
+        lodestar_epoch,
+        "the served head is not the Epoch sealed above the removal"
+    );
+    assert_eq!(
+        log_signature_key_ids(&later_note, &clave_host),
+        std::slice::from_ref(&admitted_note_key_id),
+        "a Checkpoint above the removal carries a key other than the remaining one: {later_note}"
+    );
+
+    // The Consumer replaying the Log crosses the removal Epoch and the one
+    // above it in one run, and serves what the second sealed.
+    let resumed = run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+    let heads = synced_heads(&String::from_utf8_lossy(&resumed.stdout));
+    assert_eq!(
+        heads[&clave_host].epoch, lodestar_epoch,
+        "the replaying Consumer did not sync across the genesis key's removal: {heads:?}"
+    );
+    let mut mcp_retired = McpClient::start(&graven, &gdir);
+    assert_eq!(
+        mcp_retired.get_record(&lodestar_url)["url"],
+        lodestar_url,
+        "a Delta sealed after the genesis key's removal did not reach the index"
+    );
+    assert!(
+        mcp_retired
+            .search("lodestar")
+            .iter()
+            .any(|h| h["url"] == lodestar_url.as_str()),
+        "a Delta sealed after the genesis key's removal is not searchable"
+    );
+    drop(mcp_retired);
+    run(&clave, &["verify-history", "--data", s(&clave_data)]);
+
+    // The Aggregator restarts holding only the remaining key.
+    aggregator.stop();
+    wait_until_unreachable(&http, &clave_base, &pruned_host);
+    aggregator.start(&clave, Some(&site_proxy));
+    wait_until_status_active(&http, &clave_base, &pruned_host);
+    let restarted_epoch = seal_epoch(&clave, &clave_data, &grid_instant(12 + 24 * 7 + 7));
+    let restarted_note = fetch_text(&http, &format!("{clave_base}/checkpoint"));
+    assert_eq!(
+        parse_note(&restarted_note).epoch_number(),
+        restarted_epoch,
+        "the restarted Aggregator serves another Epoch than the one it sealed"
+    );
+    assert_eq!(
+        log_signature_key_ids(&restarted_note, &clave_host),
+        std::slice::from_ref(&admitted_note_key_id),
+        "the restarted Aggregator signed under a key the removal retired: {restarted_note}"
+    );
+    let restarted = run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+    let heads = synced_heads(&String::from_utf8_lossy(&restarted.stdout));
+    assert_eq!(
+        heads[&clave_host].epoch, restarted_epoch,
+        "the Consumer did not advance over the Epoch the restarted Aggregator sealed: {heads:?}"
+    );
+    assert_eq!(
+        log_key(&log_keys(&clave, &clave_data), &admitted_key_id).removed,
+        None,
+        "the remaining key was retired with the genesis key"
+    );
+
     let run_record = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-run.json");
     record.write(&run_record);
     println!("run record: {}", run_record.display());
@@ -1901,8 +2213,8 @@ fn end_to_end() {
         "the run record lists every scenario the run exercised: {written}"
     );
 
-    validate_artifacts(&site, &clave_data);
-    verify_with_external_tlog_client(&aggregator.base_url, &aggregator.verifier_key);
+    // The external client reads the Log under the key that signs it now.
+    verify_with_external_tlog_client(&aggregator.base_url, &admitted_verifier_key);
 
     eprintln!("end_to_end completed in {:?}", harness_start.elapsed());
 }

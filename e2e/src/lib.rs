@@ -293,14 +293,14 @@ pub fn spawn_clave_serve_with(
     (ChildGuard(child), addr, stderr_buf)
 }
 
-/// The `checkpoint verifier key: …` line `clave init` prints: the
-/// signed-note verifier key a Witness or any external client is
-/// configured with (WIST-3 §3.4).
+/// The `checkpoint verifier key: …` line `clave init` and `clave log-key
+/// add` print: the signed-note verifier key a Witness or any external
+/// client is configured with (WIST-3 §3.4).
 pub fn checkpoint_verifier_key(stdout: &str) -> String {
     stdout
         .lines()
         .find_map(|line| line.trim().strip_prefix("checkpoint verifier key: "))
-        .unwrap_or_else(|| panic!("clave init printed no verifier key:\n{stdout}"))
+        .unwrap_or_else(|| panic!("no checkpoint verifier key printed:\n{stdout}"))
         .to_string()
 }
 

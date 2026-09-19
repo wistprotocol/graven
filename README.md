@@ -361,8 +361,10 @@ missing). It then reads the served Log with an independent client,
 `e2e/tlog-client`, built on Go's `golang.org/x/mod/sumdb/note` and `tlog`:
 the head Checkpoint's signature under the Log's verifier key, the root
 recomputed from the tiles, an Inclusion Proof for every leaf and a
-Consistency Proof from every smaller size; it needs a Go toolchain and is
-skipped without one, or fails under `CI=1`. A second suite in the same crate drives the Consumer against
+Consistency Proof from every smaller size; it reads the Log once before
+the Log rotates its own signing keys and once after, each time under the
+verifier key of a key valid at the head it reads. It needs a Go toolchain
+and is skipped without one, or fails under `CI=1`. A second suite in the same crate drives the Consumer against
 an Aggregator with no Publisher: a cold start at a Snapshot's Epoch
 followed by continuous sync, a source serving an old head leaving the
 verified head where it is, and a Checkpoint adopted only once a Witness
