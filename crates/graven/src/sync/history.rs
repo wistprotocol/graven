@@ -696,8 +696,12 @@ pub(super) fn persist_declaration(
     envelope: &Value,
 ) -> Result<()> {
     let env: PublisherEnvelope = serde_json::from_value(envelope.clone())?;
+    // One Declaration reaches the store from more than one WIST-3 §7 tuple
+    // of one Snapshot — a `declaration`, a `recovery_window` head and a
+    // `pending_declaration` head can all name it at one sealing height —
+    // and the row is one record of that Declaration either way.
     conn.execute(
-        "INSERT INTO declarations(domain, seq, height, sealed_at, baseline, envelope, recovery_window_days) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR IGNORE INTO declarations(domain, seq, height, sealed_at, baseline, envelope, recovery_window_days) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         (
             env.publisher.domain,
             env.publisher.seq as i64,

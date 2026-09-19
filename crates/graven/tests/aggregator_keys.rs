@@ -53,36 +53,77 @@ fn accepted_parameter(dir: &Path, parameter: &str) -> i64 {
 }
 
 /// Seals the Epochs that admit a second Aggregator key and retire the
-/// genesis key, leaving `second` the only key valid at the head.
+/// genesis key, leaving `second` the only key valid at the head, and
+/// re-signs the Snapshot documents the retired key signed under it, as
+/// WIST-3 §3.4 obliges an Aggregator that removes a key to do.
 fn retire_the_genesis_key(fx: &common::Fixture, second: &common::Signer) {
-    let at = common::next_instant(fx);
-    common::seal_next(
-        fx,
-        &at,
-        &[common::key_act(
-            fx,
-            "aggregator_key_add",
-            "log1",
-            &fx.log,
-            "log2",
-            Some(second),
-            EFFECTIVE_AT,
-        )],
+    common::seal_the_genesis_keys_removal(fx, second);
+    common::resign_snapshot_documents(fx.dir.path(), &fx.snapshot_date, "log2", second);
+}
+
+/// The logs `logs.json` lists, so a failed cold start can be shown to
+/// have registered nothing.
+fn registered_logs(dir: &Path) -> Vec<String> {
+    match std::fs::read(dir.join("logs.json")) {
+        Err(_) => Vec::new(),
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["logs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["log_id"].as_str().unwrap().to_string())
+            .collect(),
+    }
+}
+
+/// WIST-3 §3.4 and §8 step 8: the Snapshot index, manifest and state file
+/// verify "under the keys valid at the height of the Checkpoint it
+/// adopts", so documents an Aggregator left signed by the key its walked
+/// Epochs retire reject the whole Snapshot (`WIST3-E04`), and §8's "Until
+/// all verify, the Consumer MUST NOT persist or act on anything derived
+/// from the Snapshot" leaves the Log unregistered.
+#[test]
+fn a_snapshot_signed_by_a_key_the_adopted_epoch_retired_is_rejected_and_registers_nothing() {
+    let fx = common::build_fixture(true, false);
+    let second = common::Signer::new([36u8; 32]);
+    common::seal_the_genesis_keys_removal(&fx, &second);
+
+    let target = tempfile::tempdir().unwrap();
+    let error = sync(&fx, target.path()).unwrap_err().to_string();
+    assert!(
+        error.contains("WIST3-E04") && error.contains("the Snapshot index"),
+        "the rejection names the document and the code: {error}"
     );
-    // The removal is authenticated at the height below its Epoch, where
-    // the genesis key is still valid; Checkpoint N is signed by the key
-    // valid at N, which the removal leaves as `log2` alone.
-    let at = common::next_instant(fx);
-    let removal = common::key_act(
-        fx,
-        "aggregator_key_remove",
-        "log1",
-        &fx.log,
-        "log1",
-        None,
-        EFFECTIVE_AT,
+    assert!(
+        error.contains("log1") && error.contains("height 3"),
+        "the rejection names the key and the height it was judged at: {error}"
     );
-    fx.log_state().seal_signed_by(second, &at, &[removal]);
+    assert!(
+        registered_logs(target.path()).is_empty(),
+        "a rejected Snapshot leaves the Log unregistered"
+    );
+    assert!(!common::synced_log_dir(target.path())
+        .join("index.sqlite")
+        .exists());
+}
+
+/// WIST-3 §3.4: the documents the removing Aggregator re-signs verify at
+/// the adopted head, and the Snapshot's own tuples — which name only the
+/// genesis key at the Snapshot's Epoch — are not what they are judged
+/// against.
+#[test]
+fn a_snapshot_re_signed_under_the_remaining_key_cold_starts_across_the_removal() {
+    let fx = common::build_fixture(true, false);
+    let second = common::Signer::new([37u8; 32]);
+    retire_the_genesis_key(&fx, &second);
+
+    let target = tempfile::tempdir().unwrap();
+    let report = sync(&fx, target.path()).unwrap();
+    assert_eq!(report.head, 3);
+    assert_eq!(
+        registered_logs(target.path()),
+        vec!["graven-test-log".to_string()],
+        "an accepted Snapshot registers the Log with the state it adopts"
+    );
 }
 
 #[test]
@@ -403,6 +444,7 @@ fn an_epochs_other_acts_and_checkpoint_read_the_key_set_its_own_key_acts_leave()
         ),
     ];
     fx.log_state().seal_signed_by(&second, &at, &entries);
+    common::resign_snapshot_documents(fx.dir.path(), &fx.snapshot_date, "log2", &second);
 
     let target = tempfile::tempdir().unwrap();
     assert_eq!(sync(&fx, target.path()).unwrap().head, 3);
@@ -439,37 +481,53 @@ fn a_snapshot_state_that_omits_the_anchors_genesis_key_does_not_verify() {
             public_key: other.public_b64u(),
             added_height: 0,
             removed_height: None,
+            adding_act: None,
+            removing_act: None,
         })],
         0,
     );
     let target = tempfile::tempdir().unwrap();
     let error = sync(&fx, target.path()).unwrap_err().to_string();
     assert!(
-        error.contains("genesis key"),
+        error.contains("genesis key") && error.contains("WIST3-E04"),
         "the Snapshot is refused rather than resumed without the key: {error}"
     );
 }
 
-/// WIST-3 §7: a Snapshot's `aggregator_key` tuples carry removed keys, so
-/// a resuming Consumer evaluates key acts and lower Checkpoints against
-/// them exactly as a replaying one does.
+/// WIST-3 §7: a Snapshot's `aggregator_key` tuples carry every key the
+/// Log admitted, each with the accepted act that admitted it, so a
+/// resuming Consumer judges the key acts above the Snapshot against them
+/// exactly as a replaying one does — and keeps the tuple of a key those
+/// Epochs retire.
 #[test]
 fn a_snapshot_resume_keeps_a_retired_keys_tuple() {
     use wist_core::objects::{AggregatorKeyEntry, StateEntry};
+    let log = common::Signer::new([9u8; 32]);
     let retired = common::Signer::new([32u8; 32]);
     let fx = common::build_fixture_with_state(
         vec![
             StateEntry::AggregatorKey(AggregatorKeyEntry {
                 key_id: "log1".into(),
-                public_key: common::Signer::new([9u8; 32]).public_b64u(),
+                public_key: log.public_b64u(),
                 added_height: 0,
                 removed_height: None,
+                adding_act: None,
+                removing_act: None,
             }),
             StateEntry::AggregatorKey(AggregatorKeyEntry {
-                key_id: "retired".into(),
+                key_id: "log2".into(),
                 public_key: retired.public_b64u(),
                 added_height: 0,
-                removed_height: Some(0),
+                removed_height: None,
+                adding_act: Some(common::key_act_envelope(
+                    "aggregator_key_add",
+                    "log1",
+                    &log,
+                    "log2",
+                    Some(&retired),
+                    EFFECTIVE_AT,
+                )),
+                removing_act: None,
             }),
         ],
         0,
@@ -478,8 +536,22 @@ fn a_snapshot_resume_keeps_a_retired_keys_tuple() {
     common::seal_next(
         &fx,
         &at,
+        &[common::key_act(
+            &fx,
+            "aggregator_key_remove",
+            "log1",
+            &fx.log,
+            "log2",
+            None,
+            EFFECTIVE_AT,
+        )],
+    );
+    let at = common::next_instant(&fx);
+    common::seal_next(
+        &fx,
+        &at,
         &[common::parameter_act(
-            "retired",
+            "log2",
             &retired,
             "record_seal_epochs",
             48,
@@ -488,12 +560,12 @@ fn a_snapshot_resume_keeps_a_retired_keys_tuple() {
     );
 
     let target = tempfile::tempdir().unwrap();
-    assert_eq!(sync(&fx, target.path()).unwrap().head, 2);
+    assert_eq!(sync(&fx, target.path()).unwrap().head, 3);
     assert_eq!(
         registry_rows(target.path()),
         vec![
             ("log1".to_string(), 0, None),
-            ("retired".to_string(), 0, Some(0)),
+            ("log2".to_string(), 0, Some(2)),
         ],
         "the resumed registry keeps the retired key's tuple"
     );

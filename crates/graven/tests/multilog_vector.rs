@@ -78,6 +78,8 @@ fn build_log_fixture(vector: &Value, log: &Value) -> LogFixture {
                 public_key: genesis["public_key"].as_str().unwrap().to_string(),
                 added_height: 0,
                 removed_height: None,
+                adding_act: None,
+                removing_act: None,
             },
         )],
         0,
@@ -103,6 +105,16 @@ fn build_log_fixture(vector: &Value, log: &Value) -> LogFixture {
         anchor_size,
         &format!("/snapshots/{snapshot_date}/manifest.json"),
         &content_digest_value,
+    );
+
+    // WIST-3 §3.4: the three documents verify under the keys valid at the
+    // Checkpoint the Consumer adopts, so they are signed under the key ID
+    // this Log's Anchor names rather than the fixtures' default.
+    common::resign_snapshot_documents(
+        dir.path(),
+        &snapshot_date,
+        genesis["key_id"].as_str().unwrap(),
+        &signer,
     );
 
     let base_url = format!("http://{}", common::serve_static(dir.path().to_path_buf()));

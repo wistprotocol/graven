@@ -216,6 +216,68 @@ impl RunRecord {
     }
 }
 
+/// Copies a directory tree, replacing whatever stands at `to`, so a
+/// served directory can be put back as it was.
+fn copy_tree(from: &Path, to: &Path) {
+    let _ = std::fs::remove_dir_all(to);
+    std::fs::create_dir_all(to).expect("create the copy's directory");
+    for entry in std::fs::read_dir(from).expect("read the directory to copy") {
+        let entry = entry.expect("directory entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy a file");
+        }
+    }
+}
+
+fn log_store_dir(dir: &Path, log_id: &str) -> PathBuf {
+    let sanitized: String = log_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    dir.join("logs").join(sanitized)
+}
+
+/// The cursor a synced store keeps for one Log: the head Epoch, the tree
+/// it states and the root.
+fn synced_cursor(dir: &Path, log_id: &str) -> serde_json::Value {
+    read_json(&log_store_dir(dir, log_id).join("sync.json"))
+}
+
+/// WIST-3 §7's `content_digest` recomputed over a Consumer's own index,
+/// so two Consumers that reached one head are compared on the state they
+/// materialized rather than on the Snapshot each resumed from.
+fn index_content_digest(dir: &Path, log_id: &str) -> String {
+    let path = log_store_dir(dir, log_id).join("index.sqlite");
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    let mut statement = conn
+        .prepare("SELECT url, publisher, delta_id, observed_at FROM records")
+        .expect("the index carries the records table");
+    let records: Vec<serde_json::Value> = statement
+        .query_map([], |row| {
+            Ok(serde_json::json!({
+                "url": row.get::<_, String>(0)?,
+                "publisher": row.get::<_, String>(1)?,
+                "delta_id": row.get::<_, String>(2)?,
+                "observed_at": row.get::<_, String>(3)?,
+            }))
+        })
+        .expect("read the records")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read the records");
+    wist_core::snapshot::content_digest(&records).expect("digest the records")
+}
+
 fn read_json(path: &Path) -> serde_json::Value {
     serde_json::from_slice(
         &std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
@@ -1950,9 +2012,10 @@ fn end_to_end() {
     );
     drop(mcp16);
 
-    // Both checks read the Log under the Anchor's genesis key, so they run
-    // before the Log retires it below.
     validate_artifacts(&site, &clave_data);
+    // The external client reads the Log under one verifier key, so it runs
+    // once here under the Anchor's genesis key and again below under the
+    // key that replaces it.
     verify_with_external_tlog_client(&aggregator.base_url, &aggregator.verifier_key);
 
     // --- the Log admits a second Aggregator key in band ---
@@ -2076,6 +2139,10 @@ fn end_to_end() {
     drop(mcp_admitted);
 
     // --- the Log retires its genesis key ---
+    // The Snapshots as the genesis key signed them, kept so that a
+    // Consumer can be offered documents no key valid at the head signed.
+    let stale_snapshots = tmp.path().join("snapshots-before-the-removal");
+    copy_tree(&clave_data.join("snapshots"), &stale_snapshots);
     run(
         &clave,
         &[
@@ -2195,6 +2262,114 @@ fn end_to_end() {
         "the remaining key was retired with the genesis key"
     );
 
+    // --- a fresh Consumer cold-starts from a Snapshot after the removal ---
+    // WIST-3 §3.4: the Aggregator re-signed every unsealed document the
+    // retired key signed, so a Snapshot still resumes once the genesis key
+    // is gone, and reaches the state the Consumer that followed throughout
+    // holds.
+    let fresh_snapshots = tmp.path().join("snapshots-after-the-removal");
+    copy_tree(&clave_data.join("snapshots"), &fresh_snapshots);
+
+    let resumed_dir = tmp.path().join("graven-store-resumed");
+    let resumed_start = run(
+        &graven,
+        &[
+            "follow",
+            "--anchor",
+            s(&anchor_path),
+            "--log",
+            &clave_base,
+            "--dir",
+            s(&resumed_dir),
+            "--tier1",
+            "--allow-http",
+        ],
+    );
+    let resumed_heads = synced_heads(&String::from_utf8_lossy(&resumed_start.stdout));
+    record.exercised("cold_start_after_the_genesis_keys_removal", restarted_epoch);
+    assert_eq!(
+        resumed_heads[&clave_host].epoch, restarted_epoch,
+        "the fresh Consumer did not cold-start to the head the followed one holds: {resumed_heads:?}"
+    );
+    let followed_cursor = synced_cursor(&gdir, &clave_host);
+    let resumed_cursor = synced_cursor(&resumed_dir, &clave_host);
+    for field in ["epoch_number", "tree_size", "root"] {
+        assert_eq!(
+            resumed_cursor[field], followed_cursor[field],
+            "the cold-started Consumer's {field} differs from the one that followed throughout: {resumed_cursor} vs {followed_cursor}"
+        );
+    }
+    assert_eq!(
+        index_content_digest(&resumed_dir, &clave_host),
+        index_content_digest(&gdir, &clave_host),
+        "the two Consumers materialized different state at one head"
+    );
+    let mut mcp_resumed = McpClient::start(&graven, &resumed_dir);
+    assert_eq!(
+        mcp_resumed.get_record(&lodestar_url)["url"],
+        lodestar_url,
+        "the cold-started Consumer does not serve the record sealed after the removal"
+    );
+    // The records a query answers with, without the ranking signals: a
+    // Consumer that resumed from a Snapshot reads each record's seal
+    // height from the Snapshot's Epoch, which no §7 tuple carries, so its
+    // freshness signal differs from a replaying Consumer's while the
+    // records themselves are the same.
+    let answered = |hits: &[serde_json::Value]| -> Vec<serde_json::Value> {
+        hits.iter()
+            .map(|hit| serde_json::json!([&hit["url"], &hit["publisher"], &hit["delta_id"]]))
+            .collect()
+    };
+    let resumed_hits = answered(&mcp_resumed.search("lodestar"));
+    drop(mcp_resumed);
+    let mut mcp_followed = McpClient::start(&graven, &gdir);
+    let followed_hits = answered(&mcp_followed.search("lodestar"));
+    drop(mcp_followed);
+    assert!(
+        !resumed_hits.is_empty() && resumed_hits == followed_hits,
+        "the two Consumers answer the same query differently: {resumed_hits:?} vs {followed_hits:?}"
+    );
+
+    // --- a Snapshot the retired key signed is rejected whole ---
+    // WIST-3 §8 step 8: the index, manifest and state file verify under the
+    // keys valid at the adopted Checkpoint's height, so the copies kept
+    // from before the removal reject the Snapshot (`WIST3-E04`) and the
+    // Consumer persists nothing derived from it.
+    copy_tree(&stale_snapshots, &clave_data.join("snapshots"));
+    let stale_dir = tmp.path().join("graven-store-stale-snapshot");
+    let refused = Command::new(&graven)
+        .args([
+            "follow",
+            "--anchor",
+            s(&anchor_path),
+            "--log",
+            &clave_base,
+            "--dir",
+            s(&stale_dir),
+            "--allow-http",
+        ])
+        .output()
+        .expect("run graven follow against the stale Snapshot");
+    let refusal = String::from_utf8_lossy(&refused.stderr).to_string();
+    record.exercised(
+        "snapshot_signed_by_the_removed_genesis_key",
+        restarted_epoch,
+    );
+    assert!(
+        !refused.status.success(),
+        "the Consumer accepted a Snapshot signed by the retired genesis key: {refusal}"
+    );
+    assert!(
+        refusal.contains("WIST3-E04") && refusal.contains("the Snapshot index"),
+        "the refusal names neither the code nor the document: {refusal}"
+    );
+    assert!(
+        !stale_dir.join("logs.json").exists(),
+        "a rejected Snapshot left the Log registered in {}",
+        stale_dir.display()
+    );
+    copy_tree(&fresh_snapshots, &clave_data.join("snapshots"));
+
     let run_record = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-run.json");
     record.write(&run_record);
     println!("run record: {}", run_record.display());
@@ -2213,7 +2388,10 @@ fn end_to_end() {
         "the run record lists every scenario the run exercised: {written}"
     );
 
-    // The external client reads the Log under the key that signs it now.
+    // Both read the Log as it now stands: every Checkpoint under the keys
+    // valid at its own height and every unsealed document under the keys
+    // valid at the served head, the retired genesis key among neither.
+    validate_artifacts(&site, &clave_data);
     verify_with_external_tlog_client(&aggregator.base_url, &admitted_verifier_key);
 
     eprintln!("end_to_end completed in {:?}", harness_start.elapsed());

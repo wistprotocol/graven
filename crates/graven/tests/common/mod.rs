@@ -561,6 +561,8 @@ pub fn write_state_with(
             public_key: log.public_b64u(),
             added_height: 0,
             removed_height: None,
+            adding_act: None,
+            removing_act: None,
         }));
     }
     entries.push(StateEntry::Parameter(ParameterEntry {
@@ -782,6 +784,71 @@ pub fn resign_state_with_wrong_key(dir: &Path, log: &Signer, other: &Signer, sna
     std::fs::write(&manifest_path, serde_json::to_vec(&menv).unwrap()).unwrap();
 }
 
+/// Seals the Epochs that admit `second` as `log2` and retire the
+/// Anchor's genesis key, leaving `second` the only key valid at the head.
+/// The Snapshot documents the genesis key signed are left as they are:
+/// re-signing them is what `resign_snapshot_documents` does, as WIST-3
+/// §3.4 obliges the Aggregator to.
+pub fn seal_the_genesis_keys_removal(fx: &Fixture, second: &Signer) {
+    let effective_at = "2026-08-09T15:00:00Z";
+    let at = next_instant(fx);
+    seal_next(
+        fx,
+        &at,
+        &[key_act(
+            fx,
+            "aggregator_key_add",
+            "log1",
+            &fx.log,
+            "log2",
+            Some(second),
+            effective_at,
+        )],
+    );
+    // The removal is authenticated at the height below its Epoch, where
+    // the genesis key is still valid; Checkpoint N is signed by the key
+    // valid at N, which the removal leaves as `log2` alone.
+    let at = next_instant(fx);
+    let removal = key_act(
+        fx,
+        "aggregator_key_remove",
+        "log1",
+        &fx.log,
+        "log1",
+        None,
+        effective_at,
+    );
+    fx.log_state().seal_signed_by(second, &at, &[removal]);
+}
+
+/// WIST-3 §3.4: "An Aggregator that removes a key MUST re-sign, under a
+/// key valid at the removing Epoch's height, every such document that key
+/// signed and the Aggregator still serves". The state file is re-signed
+/// first, then the manifest that hashes its octets, then the index.
+pub fn resign_snapshot_documents(dir: &Path, snapshot_date: &str, key_id: &str, signer: &Signer) {
+    let snapdir = dir.join("snapshots").join(snapshot_date);
+
+    let state_path = snapdir.join("state.json");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    let state_bytes =
+        serde_json::to_vec(&sign_envelope(&doc["state"], "state", key_id, &signer.sk).unwrap())
+            .unwrap();
+    std::fs::write(&state_path, &state_bytes).unwrap();
+
+    let manifest_path = snapdir.join("manifest.json");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let mut manifest = doc["manifest"].clone();
+    manifest["state"]["sha256"] = serde_json::json!(sha256_hex(&state_bytes));
+    manifest["state"]["bytes"] = serde_json::json!(state_bytes.len() as u64);
+    let envelope = sign_envelope(&manifest, "manifest", key_id, &signer.sk).unwrap();
+    std::fs::write(&manifest_path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+    let index_path = dir.join("snapshots/index.json");
+    let doc: Value = serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+    let envelope = sign_envelope(&doc["index"], "index", key_id, &signer.sk).unwrap();
+    std::fs::write(&index_path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+}
+
 pub fn resign_checkpoint_with_wrong_key(fx: &Fixture, other: &Signer) {
     let head = fx.log_state().head().clone();
     let mut forged = WistCheckpoint::new(
@@ -821,6 +888,28 @@ pub fn key_act(
     public_key: Option<&Signer>,
     effective_at: &str,
 ) -> Value {
+    let _ = fx;
+    let body = key_act_envelope(
+        action,
+        signing_key_id,
+        signer,
+        key_id,
+        public_key,
+        effective_at,
+    );
+    serde_json::json!({"type": "registry_update", "body": body})
+}
+
+/// The Registry Update Envelope of a key act on its own, as an
+/// `aggregator_key` tuple carries it verbatim (WIST-3 §7).
+pub fn key_act_envelope(
+    action: &str,
+    signing_key_id: &str,
+    signer: &Signer,
+    key_id: &str,
+    public_key: Option<&Signer>,
+    effective_at: &str,
+) -> Value {
     let mut details = serde_json::json!({ "key_id": key_id });
     if let Some(key) = public_key {
         details["alg"] = "Ed25519".into();
@@ -833,9 +922,7 @@ pub fn key_act(
         "details": details,
         "effective_at": effective_at,
     });
-    let _ = fx;
-    let body = sign_envelope(&update, "update", signing_key_id, &signer.sk).unwrap();
-    serde_json::json!({"type": "registry_update", "body": body})
+    sign_envelope(&update, "update", signing_key_id, &signer.sk).unwrap()
 }
 
 /// A signed `parameter_change` Entry under the Log key

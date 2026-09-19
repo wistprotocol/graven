@@ -175,21 +175,33 @@ fn cold_sync_rejects_wrong_state_digest_in_manifest() {
         .exists());
 }
 
+/// WIST-3 §8 step 8: "A signature whose `sig.key_id` names a tuple's key
+/// and does not verify under that key verifies at no height, and the
+/// Consumer MAY reject the Snapshot as soon as it has authenticated the
+/// tuples" — before any Epoch above the Snapshot is walked.
 #[test]
 fn cold_sync_rejects_state_signed_by_wrong_key() {
     let fx = common::build_fixture(true, false);
     common::resign_state_with_wrong_key(fx.dir.path(), &fx.log, &fx.other, &fx.snapshot_date);
 
     let target = tempfile::tempdir().unwrap();
-    let result = graven::sync::run(
+    let error = graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
         &fx.base_url,
         target.path(),
         true,
         false,
-    );
+    )
+    .unwrap_err()
+    .to_string();
 
-    assert!(result.is_err());
+    assert!(
+        error.contains("WIST3-E04")
+            && error.contains("the Snapshot state file")
+            && error.contains("verifies at no height"),
+        "error was: {error}"
+    );
+    assert!(!target.path().join("logs.json").exists());
     assert!(!common::synced_log_dir(target.path())
         .join("sync.json")
         .exists());
@@ -677,6 +689,61 @@ fn rotation_then_new_key_delta_syncs() {
     let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
     let record = store.get(&new_url).unwrap().unwrap();
     assert_eq!(record.title, "Rotated Title");
+}
+
+/// WIST-3 §7: a Snapshot's `declaration`, `recovery_window` and
+/// `pending_declaration` tuples can all name one Declaration at one
+/// sealing height, and the resume records it once rather than failing on
+/// the second tuple that names it.
+#[test]
+fn a_cold_start_adopts_one_declaration_named_by_several_tuples() {
+    use wist_core::objects::{PendingDeclarationEntry, RecoveryWindowEntry, StateEntry};
+    let publisher = common::Signer::new([1u8; 32]);
+    let declaration = common::build_declaration(&publisher, "records.example");
+    let fx = common::build_fixture_with_state(
+        vec![
+            StateEntry::RecoveryWindow(RecoveryWindowEntry {
+                domain: "records.example".into(),
+                declaration_height: 0,
+                window_end: "2026-08-16T12:00:00Z".into(),
+                head: declaration.clone(),
+                head_height: 0,
+            }),
+            StateEntry::PendingDeclaration(PendingDeclarationEntry {
+                domain: "records.example".into(),
+                head: declaration.clone(),
+                sealing_height: 0,
+                activation_height: 4,
+            }),
+        ],
+        0,
+    );
+
+    let target = tempfile::tempdir().unwrap();
+    assert_eq!(
+        graven::sync::run(
+            fx.anchor_path().to_str().unwrap(),
+            &fx.base_url,
+            target.path(),
+            true,
+            false,
+        )
+        .unwrap()
+        .head,
+        1
+    );
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM declarations WHERE domain = 'records.example' AND height = 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1,
+        "the Declaration the three tuples name is recorded once"
+    );
 }
 
 #[test]
@@ -1320,10 +1387,9 @@ fn failed_migration_restores_legacy_layout_and_registers_nothing() {
     )
     .unwrap();
 
-    // The second Log's Checkpoints carry its own origin line and its own
-    // key, so its Checkpoint 1 differs from the one the migrated store
-    // retains at that Epoch and no key valid there signs it: WIST3-E03,
-    // and the migration is rolled back.
+    // The migrated store holds the first Log's key registry, whose tuples
+    // do not chain to the second Log's Anchor (WIST-3 §7, `WIST3-E04`),
+    // so the sync fails and the migration is rolled back.
 
     let result = graven::sync::run(
         fx_b.anchor_path().to_str().unwrap(),
@@ -1333,7 +1399,7 @@ fn failed_migration_restores_legacy_layout_and_registers_nothing() {
         false,
     );
     let err = result.unwrap_err();
-    assert!(err.to_string().contains("WIST3-E03"), "error was: {err}");
+    assert!(err.to_string().contains("WIST3-E04"), "error was: {err}");
     assert!(
         !graven::registry::log_dir(legacy.path(), "other-log")
             .join("evidence")

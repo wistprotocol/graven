@@ -44,6 +44,25 @@ pub fn save(dir: &Path, reg: &Registry) -> Result<()> {
     Ok(())
 }
 
+/// The registry file's octets as they stand, `None` where no log has been
+/// registered yet, so a run that must leave no registration behind can
+/// put the file back exactly — its absence included.
+pub fn held(dir: &Path) -> Option<Vec<u8>> {
+    std::fs::read(registry_path(dir)).ok()
+}
+
+pub fn restore(dir: &Path, held: Option<Vec<u8>>) -> Result<()> {
+    let path = registry_path(dir);
+    match held {
+        Some(bytes) => std::fs::write(&path, bytes)?,
+        None => match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        },
+    }
+    Ok(())
+}
+
 pub fn sanitize(log_id: &str) -> String {
     log_id
         .chars()

@@ -35,9 +35,7 @@ use wist_core::checkpoint::{Adoption, Checkpoint, WitnessKey};
 
 use wist_core::aggregator_keys::Registry;
 
-use wist_core::crypto::PublicKey;
-
-use wist_core::objects::GenesisKey;
+use wist_core::objects::Anchor;
 
 #[derive(Debug, Clone)]
 pub struct SyncReport {
@@ -81,9 +79,11 @@ impl std::fmt::Display for SyncReport {
 /// The format the sync state is written in. A store written before the
 /// Log became one growing tree carries no `format` member and names a
 /// Block hash rather than a tree size; one written before `block_number`
-/// and `log_position` became `epoch_number` and `tree_size` carries an
-/// older `format` member. Either is refused rather than reinterpreted.
-pub const SYNC_STATE_FORMAT: u32 = 4;
+/// and `log_position` became `epoch_number` and `tree_size`, or before
+/// the key registry kept the accepted act behind each key's heights
+/// (WIST-3 §7), carries an older `format` member. Each is refused rather
+/// than reinterpreted.
+pub const SYNC_STATE_FORMAT: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncState {
@@ -143,12 +143,13 @@ pub fn follow(config: &Follow, dir: &Path) -> Result<SyncReport> {
     std::fs::create_dir_all(dir)?;
 
     let client = Client::new(config.allow_http);
-    let (trust_key, log_id, genesis) = load_anchor(config.anchor, &client)?;
+    let anchor = load_anchor(config.anchor, &client)?;
+    let log_id = anchor.log_id.clone();
     registry::validate_log_id(&log_id)?;
 
     let migrated = migrate_legacy_layout(dir, &log_id)?;
 
-    match run_registered(config, &client, &trust_key, &genesis, dir, &log_id) {
+    match run_registered(config, &client, &anchor, dir, &log_id) {
         Ok(report) => Ok(report),
         Err(err) => {
             if migrated {
@@ -233,14 +234,40 @@ fn register(dir: &Path, config: &Follow, log_id: &str) -> Result<LogEntry> {
     Ok(entry)
 }
 
+/// Whether the log's store holds a verified head. A cold start that
+/// committed one leaves state to act on, so its registration stands and
+/// its failure above that head is reported as an incremental sync's is.
+fn holds_verified_head(log_dir: &Path) -> bool {
+    let index = log_dir.join("index.sqlite");
+    index.exists()
+        && Connection::open(&index)
+            .ok()
+            .and_then(|conn| load_sync_state(&conn).ok())
+            .flatten()
+            .is_some()
+}
+
+/// WIST-3 §8: "Until all verify, the Consumer MUST NOT persist or act on
+/// anything derived from the Snapshot" — the registration this run made
+/// included. The registry file is put back as the run found it, so a cold
+/// start that committed nothing leaves the Log unfollowed.
+fn undo_registration(dir: &Path, before: Option<Vec<u8>>, error: Error) -> Error {
+    match registry::restore(dir, before) {
+        Ok(()) => error,
+        Err(undo) => Error::Verify(format!(
+            "{error}; additionally, the registration this run made could not be undone: {undo}"
+        )),
+    }
+}
+
 fn run_registered(
     config: &Follow,
     client: &Client,
-    trust_key: &PublicKey,
-    genesis: &GenesisKey,
+    anchor: &Anchor,
     dir: &Path,
     log_id: &str,
 ) -> Result<SyncReport> {
+    let before = registry::held(dir);
     let entry = register(dir, config, log_id)?;
     let witnesses = parse_roster(&entry.witnesses)?;
     let mut bases = vec![crate::fetch::parse_base(&entry.base)?];
@@ -279,26 +306,26 @@ fn run_registered(
         sources: &sources,
         log_id,
         witnesses: &witnesses,
-        trust_key,
-        genesis,
+        anchor,
         log_dir: &log_dir,
         sync_path: &sync_path,
         tier1: entry.tier1,
         subscriptions: &subscriptions,
     };
     if synced {
-        run_incremental(&context)
-    } else {
-        run_cold_start(&context)
+        return run_incremental(&context);
     }
+    run_cold_start(&context).map_err(|error| match holds_verified_head(&log_dir) {
+        true => error,
+        false => undo_registration(dir, before, error),
+    })
 }
 
 struct SyncContext<'a> {
     sources: &'a Sources<'a>,
     log_id: &'a str,
     witnesses: &'a [WitnessKey],
-    trust_key: &'a PublicKey,
-    genesis: &'a GenesisKey,
+    anchor: &'a Anchor,
     log_dir: &'a Path,
     sync_path: &'a Path,
     tier1: bool,
@@ -318,7 +345,7 @@ struct Restored {
 
 fn restore(conn: &Connection, context: &SyncContext, local: &SyncState) -> Result<Restored> {
     Ok(Restored {
-        keys: load_aggregator_keys(conn, context.log_id, context.genesis)?,
+        keys: load_aggregator_keys(conn, context.anchor, local.epoch_number)?,
         chain: ChainState::restore(local, load_parameters(conn)?),
         withdrawals: load_withdrawn(conn)?,
         suffix_lists: SuffixLists::load(conn)?,
@@ -514,7 +541,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
         withdrawn: 0,
     };
 
-    let keys = load_aggregator_keys(&conn, context.log_id, context.genesis)?;
+    let keys = load_aggregator_keys(&conn, context.anchor, local.epoch_number)?;
     let offered = match offered_above(context, &conn, local.epoch_number, &keys) {
         Ok(offered) => offered,
         // No source served a head: the verified head is the newest
@@ -634,15 +661,64 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
     }
 }
 
+/// What a cold start against one source's Snapshot leaves. WIST-3 §9
+/// answers `WIST3-E04` with "reject the entire Snapshot and re-fetch,
+/// from another Mirror if needed", so a Snapshot whose documents do not
+/// verify at the adopted Checkpoint's height sends the whole cold start
+/// to the next source.
+enum ColdStart {
+    Done(SyncReport),
+    Rejected { error: Error, next: usize },
+}
+
 fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
+    let mut from = 0;
+    loop {
+        match cold_start_at(context, from)? {
+            ColdStart::Done(report) => return Ok(report),
+            ColdStart::Rejected { error, next } => {
+                if next >= context.sources.count() {
+                    return Err(error);
+                }
+                eprintln!(
+                    "log {}: {error}; re-fetching the Snapshot from another source",
+                    context.log_id
+                );
+                from = next;
+            }
+        }
+    }
+}
+
+/// WIST-3 §8 step 8: the index, the manifest and every state file loaded
+/// verify under the keys valid at the adopted Checkpoint's height — the
+/// Snapshot's tuples as the Epochs walked above it amended them.
+fn verify_unsealed(
+    installed: &install::Installation,
+    keys: &Registry,
+    adopted: &Checkpoint,
+) -> Result<()> {
+    for unsealed in &installed.unsealed {
+        wist_core::unsealed::verify(
+            unsealed.document,
+            &unsealed.envelope,
+            keys,
+            adopted.epoch_number(),
+        )
+        .map_err(|error| Error::Verify(format!("{error}, served from {}", unsealed.url)))?;
+    }
+    Ok(())
+}
+
+fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
     let mut installed = install::snapshot(
         context.sources,
-        context.trust_key,
-        context.log_id,
-        context.genesis,
+        context.anchor,
         context.log_dir,
         context.tier1,
+        from,
     )?;
+    let next_source = installed.source + 1;
     // WIST-3 §8 steps 4–5: the Checkpoint the manifest's `epoch_number`
     // selects, verified under the `aggregator_key` tuples just loaded,
     // states the tree the manifest names or the Snapshot describes another
@@ -746,6 +822,20 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
         }
     };
 
+    // WIST-3 §8 step 8: the Checkpoint to adopt is settled, so the three
+    // Snapshot signatures are judged at its height before anything the
+    // Snapshot carries is written into the store.
+    let walked_keys = match &state {
+        Some(state) => &state.keys,
+        None => &installed.aggregator_keys,
+    };
+    if let Err(error) = verify_unsealed(&installed, walked_keys, &adopted) {
+        return Ok(ColdStart::Rejected {
+            error,
+            next: next_source,
+        });
+    }
+
     if let Some(state) = state {
         save_parameters(&installed.conn, &state.chain)?;
         state.suffix_lists.save(&installed.conn)?;
@@ -813,7 +903,7 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
         withdrawn: stats.withdrawn,
     };
     match stopped {
-        None => Ok(report),
+        None => Ok(ColdStart::Done(report)),
         Some(stop) => Err(stopped_run(&report, stop)),
     }
 }

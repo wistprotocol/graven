@@ -5,25 +5,28 @@ use crate::keyset::KeyHistory;
 use rusqlite::{Connection, OptionalExtension};
 use wist_core::aggregator_keys::Registry;
 use wist_core::chain::ChainTips;
-use wist_core::objects::{AggregatorKeyEntry, GenesisKey};
+use wist_core::objects::{AggregatorKeyEntry, Anchor};
 use wist_core::parameters::Amendment;
 use wist_core::withdrawal::WithdrawalReplay;
 
-/// WIST-3 §3.4: every key the Log has admitted, the genesis key and
-/// retired ones included, with the heights that bound its validity — the
-/// set a Checkpoint at any height is verified under, and the set a later
-/// `aggregator_key_add` must not collide with. A store that has walked
-/// nothing carries no row and starts from the Anchor's genesis key; one
-/// that has walked a removal carries the genesis key's own removal
-/// height, so a reload never restores it.
+/// WIST-3 §3.4 and §7: every key the Log has admitted, the genesis key
+/// and retired ones included, with the heights that bound its validity
+/// and the accepted acts that set them — the set a Checkpoint at any
+/// height is verified under, and the set a later `aggregator_key_add`
+/// must not collide with. The rows are the Consumer's own tuples, so they
+/// are re-authenticated from the Anchor at `at` as a state file's are: a
+/// store that has walked nothing carries no row and starts from the
+/// Anchor's genesis key, and one that has walked a removal carries the
+/// genesis key's own removal height, so a reload never restores it.
 pub(super) fn load_aggregator_keys(
     conn: &Connection,
-    log_id: &str,
-    genesis: &GenesisKey,
+    anchor: &Anchor,
+    at: u64,
 ) -> Result<Registry> {
     conn.execute_batch(crate::store::CREATE_AGGREGATOR_KEYS)?;
-    let mut stmt = conn
-        .prepare("SELECT key_id, public_key, added_height, removed_height FROM aggregator_keys")?;
+    let mut stmt = conn.prepare(
+        "SELECT key_id, public_key, added_height, removed_height, adding_act, removing_act FROM aggregator_keys",
+    )?;
     let entries = stmt
         .query_map([], |row| {
             Ok(AggregatorKeyEntry {
@@ -33,31 +36,47 @@ pub(super) fn load_aggregator_keys(
                 removed_height: row
                     .get::<_, Option<i64>>(3)?
                     .map(|height| height.max(0) as u64),
+                adding_act: row.get::<_, Option<String>>(4)?.map(act_value),
+                removing_act: row.get::<_, Option<String>>(5)?.map(act_value),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if entries.is_empty() {
-        return Ok(Registry::from_genesis(log_id, genesis)?);
+        return Ok(Registry::from_genesis(&anchor.log_id, &anchor.genesis_key)?);
     }
-    if !entries.iter().any(|entry| entry.key_id == genesis.key_id) {
-        return Err(Error::Verify(
-            "the store's Aggregator key registry carries no record for the Anchor's genesis key; remove the log's directory and sync again".into(),
-        ));
-    }
-    Ok(Registry::from_entries(log_id, &entries)?)
+    Registry::from_state_tuples(anchor, at, &entries).map_err(|error| {
+        Error::Verify(format!(
+            "the store's Aggregator key registry does not authenticate from the Anchor's genesis key ({error}); remove the log's directory and follow the Log again"
+        ))
+    })
+}
+
+/// A stored key act. A row whose text is not JSON leaves a value no key
+/// act's field validation accepts, so the registry is refused by §7's
+/// rules rather than read as if the act were absent.
+fn act_value(text: String) -> serde_json::Value {
+    serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
 }
 
 pub(super) fn save_aggregator_keys(conn: &Connection, keys: &Registry) -> Result<()> {
     conn.execute_batch(crate::store::CREATE_AGGREGATOR_KEYS)?;
     for entry in keys.entries() {
+        let act_text = |act: &Option<serde_json::Value>| -> Result<Option<String>> {
+            act.as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(Error::from)
+        };
         conn.execute(
-            "INSERT INTO aggregator_keys(key_id, public_key, added_height, removed_height) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(key_id) DO UPDATE SET public_key = excluded.public_key, added_height = excluded.added_height, removed_height = excluded.removed_height",
+            "INSERT INTO aggregator_keys(key_id, public_key, added_height, removed_height, adding_act, removing_act) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(key_id) DO UPDATE SET public_key = excluded.public_key, added_height = excluded.added_height, removed_height = excluded.removed_height, adding_act = excluded.adding_act, removing_act = excluded.removing_act",
             (
                 &entry.key_id,
                 &entry.public_key,
                 entry.added_height as i64,
                 entry.removed_height.map(|height| height as i64),
+                act_text(&entry.adding_act)?,
+                act_text(&entry.removing_act)?,
             ),
         )?;
     }
@@ -198,15 +217,18 @@ pub const CREATE_SYNC_STATE: &str = "CREATE TABLE IF NOT EXISTS sync_state(id IN
 
 /// Reads a stored sync state, refusing one written before the Log became
 /// one growing tree — such a record names a Block hash where a tree size
-/// and root now stand — or one written before `block_number`/`log_position`
-/// became `epoch_number`/`tree_size`; reinterpreting either would silently
-/// place the verified head at a tree the Consumer never verified.
+/// and root now stand — one written before
+/// `block_number`/`log_position` became `epoch_number`/`tree_size`, or
+/// one written before the key registry kept each key's accepted acts,
+/// which no store can supply after the fact; reinterpreting any of them
+/// would silently place the verified head at a tree the Consumer never
+/// verified, or leave a registry that never chained to the Anchor.
 pub fn read_sync_state(bytes: &[u8]) -> Result<SyncState> {
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
     let format = value.get("format").and_then(serde_json::Value::as_u64);
     if format != Some(u64::from(super::SYNC_STATE_FORMAT)) {
         return Err(Error::Verify(
-            "the stored sync state is in a superseded format, from before the Log became one growing tree or from before its fields were renamed to epoch_number/tree_size; remove the log's directory and sync again".into(),
+            "the stored sync state is in a superseded format, from before the Log became one growing tree, from before its fields were renamed to epoch_number/tree_size, or from before the Aggregator key registry carried each key's accepted acts; remove the log's directory and follow the Log again".into(),
         ));
     }
     Ok(serde_json::from_value(value)?)

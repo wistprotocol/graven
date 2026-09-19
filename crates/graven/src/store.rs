@@ -17,10 +17,13 @@ pub const CREATE_DECLARATIONS: &str =
 pub const CREATE_CHAIN_TIPS: &str =
     "CREATE TABLE IF NOT EXISTS chain_tips(publisher TEXT NOT NULL, url TEXT NOT NULL, tip TEXT NOT NULL, PRIMARY KEY(publisher, url))";
 
-/// WIST-3 §3.4: the Aggregator keys valid for this Log, with the
-/// permanently retired ones kept so a later add naming one is rejected.
+/// WIST-3 §3.4 and §7: the Aggregator keys valid for this Log, with the
+/// permanently retired ones kept so a later add naming one is rejected,
+/// and each key's accepted adding and removing act verbatim, so a reload
+/// re-authenticates the registry from the Anchor's genesis key instead of
+/// trusting the store's own rows.
 pub const CREATE_AGGREGATOR_KEYS: &str =
-    "CREATE TABLE IF NOT EXISTS aggregator_keys(key_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, added_height INTEGER NOT NULL, removed_height INTEGER)";
+    "CREATE TABLE IF NOT EXISTS aggregator_keys(key_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, added_height INTEGER NOT NULL, removed_height INTEGER, adding_act TEXT, removing_act TEXT)";
 
 /// WIST-3 §6.2: every withdrawn Delta, adopted from the Snapshot's
 /// `withdrawal` tuples and extended by each walked `payload_withdrawal`,

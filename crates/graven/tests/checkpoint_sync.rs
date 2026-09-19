@@ -1132,6 +1132,36 @@ fn an_archived_checkpoint_no_source_holds_applies_the_epochs_below_it_and_report
     assert!(holds(target.path(), &in_three));
 }
 
+/// WIST-3 §8 step 8 at cold start: a Checkpoint no source holds above the
+/// adopted one leaves the Snapshot's own Epoch adopted and committed, so
+/// the Log stays followed and the run reports the `WIST3-E01` that stopped
+/// it, exactly as an incremental sync reports one.
+#[test]
+fn a_cold_start_that_adopted_the_snapshots_epoch_stays_registered_when_the_walk_stops() {
+    let fx = common::build_fixture(true, false);
+    common::extend_fixture(&fx);
+    std::fs::remove_file(fx.dir.path().join("log/checkpoints/000000001")).unwrap();
+
+    let target = tempfile::tempdir().unwrap();
+    let error = sync_with(&fx, target.path(), &[]).unwrap_err().to_string();
+    assert!(error.contains("WIST3-E01"), "{error}");
+    assert!(error.contains("Epoch 1"), "{error}");
+    assert_eq!(
+        recorded_head(target.path()),
+        0,
+        "the Snapshot's own Epoch is the verified head"
+    );
+    let registered: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(target.path().join("logs.json")).unwrap()).unwrap();
+    assert_eq!(
+        registered["logs"][0]["log_id"], "graven-test-log",
+        "a cold start that committed state left the Log unregistered: {registered}"
+    );
+
+    fx.log_state().publish();
+    assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 2);
+}
+
 /// WIST-3 §5 and §9's `WIST3-E02`: a Checkpoint that diverges from the
 /// Log's chain is a hard failure — "MUST NOT apply the data" — so no Epoch
 /// of the run is applied, not even one verified below it, and the halt is
@@ -1412,8 +1442,9 @@ fn an_empty_roster_at_quorum_zero_adopts_the_head_and_records_it_unwitnessed() {
 }
 
 /// A store written before the Log became one growing tree names a Block
-/// hash where a tree size and root now stand; it is refused rather than
-/// reinterpreted.
+/// hash where a tree size and root now stand, and one written before the
+/// key registry kept each key's accepted acts can supply none; either is
+/// refused rather than reinterpreted.
 #[test]
 fn a_sync_state_in_the_superseded_format_is_refused_with_an_instruction_to_resync() {
     let fx = common::build_fixture(true, false);
@@ -1429,7 +1460,7 @@ fn a_sync_state_in_the_superseded_format_is_refused_with_an_instruction_to_resyn
     drop(conn);
     let error = sync_with(&fx, target.path(), &[]).unwrap_err().to_string();
     assert!(
-        error.contains("superseded format") && error.contains("sync again"),
+        error.contains("superseded format") && error.contains("follow the Log again"),
         "{error}"
     );
 }

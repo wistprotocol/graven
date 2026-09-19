@@ -81,19 +81,46 @@ impl<'a> Sources<'a> {
     }
 
     /// Fetches one path whose format carries no octet bound and returns
-    /// what `read` makes of the first source's octets it accepts. A
-    /// Snapshot's documents and files are bounded by nothing and held to
-    /// the manifest's `sha256` and `bytes` or to an envelope signature
-    /// instead, so a source that does not hold the path, or serves octets
-    /// those checks refuse, sends the same path to the next source.
-    pub fn whole<T>(&self, path: &str, read: impl Fn(&[u8]) -> Result<T>) -> Result<T> {
+    /// what `read` makes of the first source's octets it accepts, with
+    /// the URL those octets came from. A Snapshot's documents and files
+    /// are bounded by nothing and held to the manifest's `sha256` and
+    /// `bytes`, to the index entry or to a signature judged at the
+    /// adopted Checkpoint's height instead, so a source that does not
+    /// hold the path, or serves octets those checks refuse, sends the
+    /// same path to the next source.
+    pub fn whole<T>(&self, path: &str, read: impl Fn(&[u8]) -> Result<T>) -> Result<(T, Url)> {
+        self.whole_from(path, 0, read)
+    }
+
+    /// The same fetch, preferring the source at `from` and the ones after
+    /// it: a Snapshot rejected as a whole is re-fetched from the next
+    /// source (§9), which only moves if the documents that source's index
+    /// names are read from it before the ones already refused.
+    pub fn whole_from<T>(
+        &self,
+        path: &str,
+        from: usize,
+        read: impl Fn(&[u8]) -> Result<T>,
+    ) -> Result<(T, Url)> {
         let mut last: Option<Error> = None;
-        for base in &self.bases {
-            match resolve(base, path)
-                .and_then(|url| self.client.get_bytes(&url))
+        let ordered = self.bases[from.min(self.bases.len())..]
+            .iter()
+            .chain(&self.bases[..from.min(self.bases.len())]);
+        for base in ordered {
+            let url = match resolve(base, path) {
+                Ok(url) => url,
+                Err(error) => {
+                    last = Some(error);
+                    continue;
+                }
+            };
+            match self
+                .client
+                .get_bytes(&url)
                 .and_then(|bytes| read(&bytes))
+                .map(|value| (value, url))
             {
-                Ok(value) => return Ok(value),
+                Ok(served) => return Ok(served),
                 Err(error) => last = Some(error),
             }
         }
@@ -107,13 +134,14 @@ impl<'a> Sources<'a> {
         path: &str,
         index: usize,
         read: impl Fn(&[u8]) -> Result<T>,
-    ) -> Result<T> {
+    ) -> Result<(T, Url)> {
         let base = self
             .bases
             .get(index)
             .ok_or_else(|| Error::Fetch(format!("WIST3-E01 no source holds {path}")))?;
         let url = resolve(base, path)?;
-        read(&self.client.get_bytes(&url)?)
+        let value = read(&self.client.get_bytes(&url)?)?;
+        Ok((value, url))
     }
 
     /// The same bounded fetch, remembering the verified octets: every path

@@ -42,15 +42,18 @@ equivocation bundle survive a restart; `tree_tiles` holds the tree
 hashes it verified, so continuing needs no refetch of the Log's history.
 Publisher declarations, chain tips, the Aggregator key registry — every
 key the Log admitted, the genesis key and retired ones included, with
-the heights that bound each one's validity, so a reload restores no key
-a removal retired and a Checkpoint at any height is judged under the
-keys valid there — parameters and withdrawals are persisted in
-`index.sqlite` too, so an incremental sync
+the heights that bound each one's validity and the accepted acts that
+set them, so a reload re-authenticates the registry from the Anchor's
+genesis key, restores no key a removal retired, and judges a Checkpoint
+at any height under the keys valid there — parameters and withdrawals
+are persisted in `index.sqlite` too, so an incremental sync
 reloads them without re-walking the Log from genesis. A `sync_state` row
 written before the Log became one growing tree — one naming a Block hash
-where a tree size and root now stand — or before its fields were renamed
-to `epoch_number`/`tree_size` — is refused with an instruction to
-remove the log's directory and sync again, never reinterpreted.
+where a tree size and root now stand — before its fields were renamed
+to `epoch_number`/`tree_size`, or before the key registry kept those
+acts, which no store can supply after the fact — is refused with an
+instruction to remove the log's directory and follow the Log again,
+never reinterpreted.
 A divergence leaves an evidence bundle under
 `<dir>/logs/<sanitized-log-id>/evidence/`: `equivocation-epoch-<N>/` with
 the retained and offered Checkpoint notes, or `divergence-epoch-<N>/`
@@ -118,11 +121,26 @@ their evidence when the offered Checkpoint authenticates under the keys
 valid at its height (at the verified head's, where the Consumer has not
 reached that height), and `WIST3-E03` against the source otherwise. A
 fork's tiles are fetched into a scratch tree and never written over the
-tiles the Consumer has verified. On cold start, the snapshot
-index/manifest/state signatures and the recomputed
-`content_digest`/`state_digest` are checked against the manifest's
-claims, and the Checkpoint at the manifest's `epoch_number` must state
-its `tree_size` and `root_hash` (`WIST3-E02` otherwise).
+tiles the Consumer has verified. On cold start, the Snapshot index,
+manifest and state file are held to their schemas and to each other, the
+`content_digest` and `state_digest` recomputed from the files served
+beside the manifest are held to the manifest's claims, and the Checkpoint
+at the manifest's `epoch_number`
+must state its `tree_size` and `root_hash` (`WIST3-E02` otherwise). The
+state file's `aggregator_key` tuples are authenticated from the Anchor's
+genesis key before any of them is used — each carries the accepted act
+that admitted or retired its key, and WIST-3 §7's five rules chain every
+act to the genesis key — and the three documents' own signatures are
+verified only once the Checkpoint to adopt is settled, under the keys
+valid at that Checkpoint's height (WIST-3 §3.4, §8 step 8). Each of
+those failures is `WIST3-E04` against the whole Snapshot: it is
+re-fetched from the next source, and nothing it carries is written. A
+signature naming a tuple's key that the tuples' own copy of that key
+rejects verifies at no height and is refused as soon as the tuples are
+authenticated. A cold start that commits no state leaves the Log
+unregistered where this run was the one that registered it; one that
+adopted a Checkpoint keeps the registration and reports a failure above
+that head as an incremental sync does. A sync reads no Mirror list.
 The Checkpoint a Consumer adopts as its head must carry Cosignatures
 from at least `checkpoint_witness_quorum` distinct Witnesses of its
 roster, read as in force at that Checkpoint's `sealed_at` (WIST-3 §5,

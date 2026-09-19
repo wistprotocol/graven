@@ -5,14 +5,11 @@
 //! Consumer ends holding are the ones the vector records.
 //!
 //! The vector publishes no private key, so no Snapshot of these Logs can
-//! be signed: this Consumer verifies a Snapshot's index, manifest and
-//! state Envelopes under the Anchor's genesis key, and an Anchor naming
-//! a key the test controls is refused by the store's own rule that the
-//! `aggregator_key` tuples must carry the Anchor's genesis key. Each
-//! history is therefore installed at its Epoch 0 — the earliest Epoch a
-//! Snapshot can describe — with the vector's Epoch 0 tuples as the state
-//! a resume adopts, and every Epoch above it is fetched, verified and
-//! applied by the ordinary sync.
+//! be signed, and §8's cold start cannot run against them. Each history
+//! is therefore installed at its Epoch 0 — the earliest Epoch a Snapshot
+//! can describe — with the vector's Epoch 0 tuples, acts included, as the
+//! key state a resume holds, and every Epoch above it is fetched,
+//! verified and applied by the ordinary sync.
 mod common;
 
 use graven::fetch::Client;
@@ -62,8 +59,25 @@ fn key_entries(state: &Value) -> Vec<AggregatorKeyEntry> {
         .collect()
 }
 
-fn rows(entries: &[AggregatorKeyEntry]) -> Vec<(String, String, u64, Option<u64>)> {
-    let mut rows: Vec<(String, String, u64, Option<u64>)> = entries
+/// One `aggregator_key` tuple as the store and the vector both state it:
+/// the key, the heights that bound it and the accepted acts that set
+/// them, canonicalized so the store's text is compared by value.
+type Row = (
+    String,
+    String,
+    u64,
+    Option<u64>,
+    Option<String>,
+    Option<String>,
+);
+
+fn canonical(act: &Option<Value>) -> Option<String> {
+    act.as_ref()
+        .map(|act| String::from_utf8(wist_core::jcs::canonicalize(act).unwrap()).unwrap())
+}
+
+fn rows(entries: &[AggregatorKeyEntry]) -> Vec<Row> {
+    let mut rows: Vec<Row> = entries
         .iter()
         .map(|entry| {
             (
@@ -71,6 +85,8 @@ fn rows(entries: &[AggregatorKeyEntry]) -> Vec<(String, String, u64, Option<u64>
                 entry.public_key.clone(),
                 entry.added_height,
                 entry.removed_height,
+                canonical(&entry.adding_act),
+                canonical(&entry.removing_act),
             )
         })
         .collect();
@@ -78,12 +94,15 @@ fn rows(entries: &[AggregatorKeyEntry]) -> Vec<(String, String, u64, Option<u64>
     rows
 }
 
-fn stored_rows(target: &Path, log_id: &str) -> Vec<(String, String, u64, Option<u64>)> {
+fn stored_rows(target: &Path, log_id: &str) -> Vec<Row> {
     let index = graven::registry::log_dir(target, log_id).join("index.sqlite");
     let conn = Connection::open(index).expect("the store carries an index");
     let mut stmt = conn
-        .prepare("SELECT key_id, public_key, added_height, removed_height FROM aggregator_keys")
+        .prepare("SELECT key_id, public_key, added_height, removed_height, adding_act, removing_act FROM aggregator_keys")
         .unwrap();
+    let stored_act = |text: Option<String>| {
+        canonical(&text.map(|text| serde_json::from_str::<Value>(&text).unwrap()))
+    };
     let mut rows = stmt
         .query_map([], |row| {
             Ok((
@@ -92,6 +111,8 @@ fn stored_rows(target: &Path, log_id: &str) -> Vec<(String, String, u64, Option<
                 row.get::<_, i64>(2)?.max(0) as u64,
                 row.get::<_, Option<i64>>(3)?
                     .map(|height| height.max(0) as u64),
+                stored_act(row.get::<_, Option<String>>(4)?),
+                stored_act(row.get::<_, Option<String>>(5)?),
             ))
         })
         .unwrap()
@@ -164,13 +185,16 @@ fn install_at_epoch_0(served: &ServedHistory, target: &Path, history: &Value) {
         .unwrap();
     conn.execute_batch(CREATE_DECLARATION_STATE).unwrap();
     for entry in key_entries(&history["epochs"][0]["expected_state"]) {
+        let act = |act: &Option<Value>| act.as_ref().map(|act| serde_json::to_string(act).unwrap());
         conn.execute(
-            "INSERT INTO aggregator_keys(key_id, public_key, added_height, removed_height) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO aggregator_keys(key_id, public_key, added_height, removed_height, adding_act, removing_act) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             (
                 &entry.key_id,
                 &entry.public_key,
                 entry.added_height as i64,
                 entry.removed_height.map(|height| height as i64),
+                act(&entry.adding_act),
+                act(&entry.removing_act),
             ),
         )
         .unwrap();

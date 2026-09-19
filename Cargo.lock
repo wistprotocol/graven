@@ -506,6 +506,7 @@ dependencies = [
  "base64 0.22.1",
  "jiff",
  "reqwest",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "wist-core",
