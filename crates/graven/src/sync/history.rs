@@ -237,9 +237,20 @@ pub struct Verified {
     pub adoption: Adoption,
 }
 
+/// The Checkpoint a walk could not pass and the failure to report once the
+/// Epochs below it are applied. WIST-3 §8 step 8 adopts "the newest
+/// verified one", and "Entries above its tree size are not applied", so a
+/// Checkpoint that fails verification ends the walk instead of discarding
+/// the Epochs verified below it.
+pub struct Stop {
+    pub epoch_number: u64,
+    pub error: Error,
+}
+
 pub struct Walk {
     pub events: Vec<EpochEvent>,
     pub verified: Vec<Verified>,
+    pub stopped: Option<Stop>,
 }
 
 impl Walk {
@@ -280,6 +291,66 @@ pub fn walk_checkpoints(
     head: &Checkpoint,
     offered: &[Checkpoint],
 ) -> Result<Walk> {
+    let mut events: Vec<EpochEvent> = Vec::new();
+    let mut verified: Vec<Verified> = Vec::new();
+    let mut walked_deltas: BTreeMap<String, (String, u64)> = BTreeMap::new();
+    let mut previous = head.clone();
+    let reached = head.epoch_number();
+    let mut stopped: Option<Stop> = None;
+    for checkpoint in offered {
+        match verify_checkpoint(
+            inputs,
+            state,
+            reached,
+            &previous,
+            checkpoint,
+            &mut walked_deltas,
+        ) {
+            Ok((event, adoption)) => {
+                verified.push(Verified {
+                    checkpoint: checkpoint.clone(),
+                    adoption,
+                });
+                events.push(event);
+                previous = checkpoint.clone();
+            }
+            // WIST-3 §5 and §9: chain divergence applies nothing, because
+            // a Consumer verifying it "MUST stop applying new data from
+            // that Aggregator". Every other failure stops the walk at the
+            // Checkpoint it could not pass and leaves the Epochs verified
+            // below it to be adopted (§8 step 8).
+            Err(error) => {
+                if error.code().as_deref() == Some("WIST3-E02") {
+                    return Err(error);
+                }
+                stopped = Some(Stop {
+                    epoch_number: checkpoint.epoch_number(),
+                    error,
+                });
+                break;
+            }
+        }
+    }
+    Ok(Walk {
+        events,
+        verified,
+        stopped,
+    })
+}
+
+/// One Checkpoint above the verified head, with the Epoch it ends: the
+/// sequence rules, the Epoch's Entries against the tree the Checkpoint
+/// states, the Consistency Proof from the previous size, the Epoch's
+/// Registry Updates, then the Log's signature under the key set valid at
+/// its height (WIST-3 §5).
+fn verify_checkpoint(
+    inputs: &WalkInputs,
+    state: &mut WalkState,
+    reached: u64,
+    previous: &Checkpoint,
+    checkpoint: &Checkpoint,
+    walked_deltas: &mut BTreeMap<String, (String, u64)>,
+) -> Result<(EpochEvent, Adoption)> {
     let WalkState {
         keys,
         chain,
@@ -287,277 +358,208 @@ pub fn walk_checkpoints(
         suffix_lists,
         tree,
     } = state;
-    let mut events: Vec<EpochEvent> = Vec::new();
-    let mut verified: Vec<Verified> = Vec::new();
-    let mut walked_deltas: BTreeMap<String, (String, u64)> = BTreeMap::new();
-    let mut previous = head.clone();
-    let reached = head.epoch_number();
-    for checkpoint in offered {
-        let n = checkpoint.epoch_number();
-        let diverged = |detail: &str, tiles: Option<&Tree>| {
-            super::checkpoints::divergence(
-                inputs.log_dir,
-                inputs.log_id,
-                keys,
-                reached,
-                Some(&previous),
-                checkpoint,
-                tiles,
-                detail,
-            )
-        };
-        // WIST-3 §5, the first Equivocation form: two Checkpoints of one
-        // Log stating the same tree size and different root hashes. The
-        // two notes are the whole evidence, so no tile is fetched for it.
-        if matches!(
-            checkpoint::equivocation(&previous, checkpoint),
-            Some(checkpoint::Equivocation::SameSizeDifferentRoot)
-        ) {
-            return Err(diverged(
-                "two Checkpoints of one Log state one tree size and different root hashes",
-                None,
-            ));
-        }
-        // WIST-3 §3.1: the sequence rules at the verified head, judged
-        // under the key set valid at the previous height and against the
-        // tiles the Consumer holds, which reproduce the larger root.
-        if let Err(error) = super::checkpoints::sequence_at_head(
+    let n = checkpoint.epoch_number();
+    let diverged = |detail: &str, tiles: Option<&Tree>| {
+        super::checkpoints::divergence(
             inputs.log_dir,
             inputs.log_id,
             keys,
             reached,
-            &previous,
+            Some(previous),
             checkpoint,
-            chain.cadence(),
-            Some(tree),
-        ) {
-            if error.code().as_deref() == Some("WIST3-E02") {
-                return Err(error);
-            }
-            return Err(Error::Verify(format!("epoch {n}: {error}")));
+            tiles,
+            detail,
+        )
+    };
+    // WIST-3 §5, the first Equivocation form: two Checkpoints of one
+    // Log stating the same tree size and different root hashes. The
+    // two notes are the whole evidence, so no tile is fetched for it.
+    if matches!(
+        checkpoint::equivocation(previous, checkpoint),
+        Some(checkpoint::Equivocation::SameSizeDifferentRoot)
+    ) {
+        return Err(diverged(
+            "two Checkpoints of one Log state one tree size and different root hashes",
+            None,
+        ));
+    }
+    // WIST-3 §3.1: the sequence rules at the verified head, judged
+    // under the key set valid at the previous height and against the
+    // tiles the Consumer holds, which reproduce the larger root.
+    if let Err(error) = super::checkpoints::sequence_at_head(
+        inputs.log_dir,
+        inputs.log_id,
+        keys,
+        reached,
+        previous,
+        checkpoint,
+        chain.cadence(),
+        Some(tree),
+    ) {
+        if error.code().as_deref() == Some("WIST3-E02") {
+            return Err(error);
         }
-        let previous_size = previous.tree_size();
-        let tree_size = checkpoint.tree_size();
-        // WIST-3 §4: the root at size 0 is SHA-256(""), and an empty
-        // Consistency Proof exempts no root from comparison.
-        if tree_size == 0 && *checkpoint.root() != wist_core::merkle::EMPTY_ROOT {
-            return Err(super::checkpoints::divergence(
-                inputs.log_dir,
-                inputs.log_id,
-                keys,
-                reached,
-                None,
-                checkpoint,
-                None,
-                "a Checkpoint states tree size 0 with another root than the empty tree's",
-            ));
-        }
-        if let Err(range_error) = super::tree::extend(
-            inputs.sources,
-            tree,
-            previous_size,
-            tree_size,
-            checkpoint.root(),
-        ) {
-            // The verified tiles plus the ones this Epoch's leaves add do
-            // not reproduce the offered root. A source may be serving
-            // another tree entirely, so ask each for the whole tree that
-            // size requires — into a scratch tree, never over the tiles
-            // the Consumer has verified — and compare its prefix with the
-            // root the previous Checkpoint states.
-            match super::tree::offered_tree(inputs.sources, tree_size, checkpoint.root())? {
-                Some(offered_tree) => {
-                    let prefix =
-                        wist_core::merkle::root_from(offered_tree.reader(), previous_size)?;
-                    if prefix != *previous.root() {
-                        return Err(diverged(
-                            "the tree a Checkpoint states does not extend the verified head's",
-                            Some(&offered_tree),
-                        ));
-                    }
-                    **tree = offered_tree;
+        return Err(Error::Verify(format!("epoch {n}: {error}")));
+    }
+    let previous_size = previous.tree_size();
+    let tree_size = checkpoint.tree_size();
+    // WIST-3 §4: the root at size 0 is SHA-256(""), and an empty
+    // Consistency Proof exempts no root from comparison.
+    if tree_size == 0 && *checkpoint.root() != wist_core::merkle::EMPTY_ROOT {
+        return Err(super::checkpoints::divergence(
+            inputs.log_dir,
+            inputs.log_id,
+            keys,
+            reached,
+            None,
+            checkpoint,
+            None,
+            "a Checkpoint states tree size 0 with another root than the empty tree's",
+        ));
+    }
+    if let Err(range_error) = super::tree::extend(
+        inputs.sources,
+        tree,
+        previous_size,
+        tree_size,
+        checkpoint.root(),
+    ) {
+        // The verified tiles plus the ones this Epoch's leaves add do
+        // not reproduce the offered root. A source may be serving
+        // another tree entirely, so ask each for the whole tree that
+        // size requires — into a scratch tree, never over the tiles
+        // the Consumer has verified — and compare its prefix with the
+        // root the previous Checkpoint states.
+        match super::tree::offered_tree(inputs.sources, tree_size, checkpoint.root())? {
+            Some(offered_tree) => {
+                let prefix = wist_core::merkle::root_from(offered_tree.reader(), previous_size)?;
+                if prefix != *previous.root() {
+                    return Err(diverged(
+                        "the tree a Checkpoint states does not extend the verified head's",
+                        Some(&offered_tree),
+                    ));
                 }
-                None => return Err(Error::Verify(format!("epoch {n}: {range_error}"))),
+                **tree = offered_tree;
             }
+            None => return Err(Error::Verify(format!("epoch {n}: {range_error}"))),
         }
-        let proof = consistency_proof_from(tree.reader(), previous_size, tree_size)?;
-        if let Err(error) = check_consistency(&previous, checkpoint, &proof) {
-            return Err(diverged(&error.to_string(), Some(tree)));
-        }
-        let entries = super::tree::epoch_entries(
-            inputs.sources,
-            tree,
-            previous_size,
-            tree_size,
-            chain.transport_bound(),
-        )
-        .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
-        // WIST-3 §3.1 and §6: what an Epoch's own Entries fail is an
-        // invalid object; the tree they belong to was weighed against the
-        // verified head above.
-        let summary = verify_epoch(
-            previous_size,
-            checkpoint,
-            &entries,
-            tree.reader(),
-            chain.transport_bound(),
-        )
-        .map_err(|error| Error::Verify(format!("epoch {n}: {error}")))?;
+    }
+    let proof = consistency_proof_from(tree.reader(), previous_size, tree_size)?;
+    if let Err(error) = check_consistency(previous, checkpoint, &proof) {
+        return Err(diverged(&error.to_string(), Some(tree)));
+    }
+    let entries = super::tree::epoch_entries(
+        inputs.sources,
+        tree,
+        previous_size,
+        tree_size,
+        chain.transport_bound(),
+    )
+    .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
+    // WIST-3 §3.1 and §6: what an Epoch's own Entries fail is an
+    // invalid object; the tree they belong to was weighed against the
+    // verified head above.
+    let summary = verify_epoch(
+        previous_size,
+        checkpoint,
+        &entries,
+        tree.reader(),
+        chain.transport_bound(),
+    )
+    .map_err(|error| Error::Verify(format!("epoch {n}: {error}")))?;
 
-        // WIST-3 §3.3 and §3.4: Epoch N's key acts apply first, in
-        // canonical Entry index order, each authenticated under the keys
-        // valid at N−1; a key act that fails is ignored and the Epoch
-        // stays valid.
-        let key_acts: Vec<&Value> = entries
-            .iter()
-            .filter(|entry| entry["type"] == "registry_update")
-            .map(|entry| &entry["body"])
-            .filter(|body| {
-                matches!(
-                    body["update"]["action"].as_str(),
-                    Some("aggregator_key_add" | "aggregator_key_remove")
-                )
-            })
-            .collect();
-        for outcome in keys.apply_epoch(n, key_acts) {
-            if let Some(code) = outcome.code() {
-                eprintln!("ignoring an Aggregator key act at height {n}: {code}");
-            }
+    // WIST-3 §3.3 and §3.4: Epoch N's key acts apply first, in
+    // canonical Entry index order, each authenticated under the keys
+    // valid at N−1; a key act that fails is ignored and the Epoch
+    // stays valid.
+    let key_acts: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| entry["type"] == "registry_update")
+        .map(|entry| &entry["body"])
+        .filter(|body| {
+            matches!(
+                body["update"]["action"].as_str(),
+                Some("aggregator_key_add" | "aggregator_key_remove")
+            )
+        })
+        .collect();
+    for outcome in keys.apply_epoch(n, key_acts) {
+        if let Some(code) = outcome.code() {
+            eprintln!("ignoring an Aggregator key act at height {n}: {code}");
         }
-        // Every other Registry Update of Epoch N is authenticated under
-        // the keys valid at N, the set its own key acts leave in force.
-        let authenticators = keys.valid_at(n);
-        let authentic =
-            |body: &Value| wist_core::aggregator_keys::authenticate(body, &authenticators).is_ok();
+    }
+    // Every other Registry Update of Epoch N is authenticated under
+    // the keys valid at N, the set its own key acts leave in force.
+    let authenticators = keys.valid_at(n);
+    let authentic =
+        |body: &Value| wist_core::aggregator_keys::authenticate(body, &authenticators).is_ok();
 
-        let sealed_at = checkpoint.sealed_at().to_string();
-        let at = checkpoint
-            .sealed_at_s()
-            .map_err(|e| Error::Verify(format!("epoch {n}: WIST3-E03 {e}")))?;
-        let largest = chain.largest.max(summary.octets);
-        let schedule = chain.schedule_at(at);
-        for (index, entry) in entries.iter().enumerate() {
-            let update = &entry["body"]["update"];
-            if entry["type"] != "registry_update" || update["action"] != "parameter_change" {
-                continue;
-            }
-            let (Some(parameter), Some(value), Some(effective_at)) = (
-                update["details"]["parameter"].as_str(),
-                update["details"]["value"].as_i64(),
-                update["effective_at"].as_str(),
-            ) else {
-                continue;
-            };
-            let Ok(effective_at_s) = log_seconds(effective_at) else {
-                continue;
-            };
-            // WIST-4 §5.1: an act no key valid at this Epoch signed is
-            // WIST4-E11 and changes nothing.
-            if !authentic(&entry["body"]) {
-                eprintln!("ignoring a parameter_change at height {n}: WIST4-E11");
-                continue;
-            }
-            let _ = schedule.try_accept_with_epoch_size(
-                Amendment {
-                    parameter: parameter.to_owned(),
-                    value,
-                    epoch_number: n,
-                    entry_index: index as u64,
-                    sealed_at_s: at,
-                    effective_at_s,
-                },
-                largest,
-            );
+    let sealed_at = checkpoint.sealed_at().to_string();
+    let at = checkpoint
+        .sealed_at_s()
+        .map_err(|e| Error::Verify(format!("epoch {n}: WIST3-E03 {e}")))?;
+    let largest = chain.largest.max(summary.octets);
+    let schedule = chain.schedule_at(at);
+    for (index, entry) in entries.iter().enumerate() {
+        let update = &entry["body"]["update"];
+        if entry["type"] != "registry_update" || update["action"] != "parameter_change" {
+            continue;
         }
-        if largest > schedule.epoch_size_bounds(at).0 {
-            return Err(Error::Verify(format!(
-                "epoch {n}: WIST3-E03 Epoch exceeds the accepted size schedule"
-            )));
-        }
-        let profile = DeltaProfile::from_schedule(schedule, at);
-        let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
-        let declaration_activation_epochs = schedule
-            .value_at("declaration_activation_epochs", at)
-            .unwrap();
-        let caps = EpochCaps {
-            domain_epoch_entries_max: schedule
-                .value_at("domain_epoch_entries_max", at)
-                .unwrap()
-                .max(0) as u64,
-            labeler_epoch_entries_max: schedule
-                .value_at("labeler_epoch_entries_max", at)
-                .unwrap()
-                .max(0) as u64,
+        let (Some(parameter), Some(value), Some(effective_at)) = (
+            update["details"]["parameter"].as_str(),
+            update["details"]["value"].as_i64(),
+            update["effective_at"].as_str(),
+        ) else {
+            continue;
         };
-        suffix_lists.check_capacity(n, &entries, caps)?;
-        for entry in entries.iter().filter(|e| e["type"] == "registry_update") {
-            let body = &entry["body"];
-            if body["update"]["action"] == "suffix_list_update" {
-                suffix_lists.apply_act(
-                    inputs.sources.client(),
-                    inputs.sources.primary(),
-                    n,
-                    body,
-                    |key_id| {
-                        authenticators
-                            .iter()
-                            .find(|key| key.key_id == key_id)
-                            .map(|key| key.public_key.clone())
-                    },
-                )?;
-            }
+        let Ok(effective_at_s) = log_seconds(effective_at) else {
+            continue;
+        };
+        // WIST-4 §5.1: an act no key valid at this Epoch signed is
+        // WIST4-E11 and changes nothing.
+        if !authentic(&entry["body"]) {
+            eprintln!("ignoring a parameter_change at height {n}: WIST4-E11");
+            continue;
         }
-        chain.largest = largest;
-        chain.prior_at = Some(at);
-
-        let mut declarations = Vec::new();
-        let mut withdrawal_acts = Vec::new();
-        let mut delta_bodies = Vec::new();
-        let mut labels = Vec::new();
-        let mut disputes = Vec::new();
-
-        for (index, entry) in entries.iter().enumerate() {
-            match entry.get("type").and_then(Value::as_str) {
-                Some("label") => labels.push((index as u64, entry["body"].clone())),
-                Some("dispute") => disputes.push((index as u64, entry["body"].clone())),
-                Some("publisher_declaration") => {
-                    if entry.get("body").is_none() {
-                        return Err(Error::Verify(format!(
-                            "epoch {n}: publisher_declaration entry missing body"
-                        )));
-                    }
-                    declarations.push(entry.clone());
-                }
-                Some("registry_update") => {
-                    let body = entry.get("body").ok_or_else(|| {
-                        Error::Verify(format!("epoch {n}: registry_update entry missing body"))
-                    })?;
-                    if body["update"]["action"] == "payload_withdrawal" {
-                        withdrawal_acts.push(body.clone());
-                    }
-                }
-                Some("publisher_delta") => {
-                    let body = entry.get("body").ok_or_else(|| {
-                        Error::Verify(format!("epoch {n}: publisher_delta entry missing body"))
-                    })?;
-                    delta_bodies.push(body.clone());
-                }
-                _ => {}
-            }
-        }
-        for body in &delta_bodies {
-            if let (Ok(id), Some(publisher)) = (
-                wist_core::delta::delta_id(&body["delta"]),
-                body["delta"]["publisher"].as_str(),
-            ) {
-                walked_deltas
-                    .entry(id)
-                    .or_insert((publisher.to_string(), n));
-            }
-        }
-        let mut withdrawals = Vec::new();
-        for body in &withdrawal_acts {
-            let disposition = withdrawals_replay.apply(
+        let _ = schedule.try_accept_with_epoch_size(
+            Amendment {
+                parameter: parameter.to_owned(),
+                value,
+                epoch_number: n,
+                entry_index: index as u64,
+                sealed_at_s: at,
+                effective_at_s,
+            },
+            largest,
+        );
+    }
+    if largest > schedule.epoch_size_bounds(at).0 {
+        return Err(Error::Verify(format!(
+            "epoch {n}: WIST3-E03 Epoch exceeds the accepted size schedule"
+        )));
+    }
+    let profile = DeltaProfile::from_schedule(schedule, at);
+    let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
+    let declaration_activation_epochs = schedule
+        .value_at("declaration_activation_epochs", at)
+        .unwrap();
+    let caps = EpochCaps {
+        domain_epoch_entries_max: schedule
+            .value_at("domain_epoch_entries_max", at)
+            .unwrap()
+            .max(0) as u64,
+        labeler_epoch_entries_max: schedule
+            .value_at("labeler_epoch_entries_max", at)
+            .unwrap()
+            .max(0) as u64,
+    };
+    suffix_lists.check_capacity(n, &entries, caps)?;
+    for entry in entries.iter().filter(|e| e["type"] == "registry_update") {
+        let body = &entry["body"];
+        if body["update"]["action"] == "suffix_list_update" {
+            suffix_lists.apply_act(
+                inputs.sources.client(),
+                inputs.sources.primary(),
                 n,
                 body,
                 |key_id| {
@@ -566,61 +568,117 @@ pub fn walk_checkpoints(
                         .find(|key| key.key_id == key_id)
                         .map(|key| key.public_key.clone())
                 },
-                |delta_id| match walked_deltas.get(delta_id) {
-                    Some((publisher, height)) => SealedDelta::Known {
-                        publisher: publisher.clone(),
-                        height: *height,
-                    },
-                    None => SealedDelta::Unverifiable,
-                },
-            );
-            match disposition {
-                Disposition::Accepted {
-                    delta_id,
-                    publisher,
-                    withdrawn_height,
-                    ..
-                } => withdrawals.push((delta_id, publisher, withdrawn_height)),
-                Disposition::Rejected(code) => {
-                    eprintln!("ignoring a payload_withdrawal at height {n}: {code}");
-                }
-                Disposition::NotWithdrawal => {}
-            }
+            )?;
         }
-
-        // WIST-3 §5: the key set that can speak for Epoch N is the one the
-        // Log establishes at N, so the signature closes the loop only after
-        // this Epoch's Registry Updates have been applied.
-        let adoption = super::checkpoints::decide(
-            checkpoint,
-            inputs.log_id,
-            &authenticators,
-            inputs.witnesses,
-            chain.quorum_at(at),
-        )
-        .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
-        verified.push(Verified {
-            checkpoint: checkpoint.clone(),
-            adoption,
-        });
-
-        events.push(EpochEvent {
-            height: n,
-            epoch_root: checkpoint.root_token(),
-            sealed_at,
-            sealed_at_s: at,
-            profile,
-            recovery_window_days,
-            declaration_activation_epochs,
-            declarations,
-            withdrawals,
-            delta_bodies,
-            labels,
-            disputes,
-        });
-        previous = checkpoint.clone();
     }
-    Ok(Walk { events, verified })
+    chain.largest = largest;
+    chain.prior_at = Some(at);
+
+    let mut declarations = Vec::new();
+    let mut withdrawal_acts = Vec::new();
+    let mut delta_bodies = Vec::new();
+    let mut labels = Vec::new();
+    let mut disputes = Vec::new();
+
+    for (index, entry) in entries.iter().enumerate() {
+        match entry.get("type").and_then(Value::as_str) {
+            Some("label") => labels.push((index as u64, entry["body"].clone())),
+            Some("dispute") => disputes.push((index as u64, entry["body"].clone())),
+            Some("publisher_declaration") => {
+                if entry.get("body").is_none() {
+                    return Err(Error::Verify(format!(
+                        "epoch {n}: publisher_declaration entry missing body"
+                    )));
+                }
+                declarations.push(entry.clone());
+            }
+            Some("registry_update") => {
+                let body = entry.get("body").ok_or_else(|| {
+                    Error::Verify(format!("epoch {n}: registry_update entry missing body"))
+                })?;
+                if body["update"]["action"] == "payload_withdrawal" {
+                    withdrawal_acts.push(body.clone());
+                }
+            }
+            Some("publisher_delta") => {
+                let body = entry.get("body").ok_or_else(|| {
+                    Error::Verify(format!("epoch {n}: publisher_delta entry missing body"))
+                })?;
+                delta_bodies.push(body.clone());
+            }
+            _ => {}
+        }
+    }
+    for body in &delta_bodies {
+        if let (Ok(id), Some(publisher)) = (
+            wist_core::delta::delta_id(&body["delta"]),
+            body["delta"]["publisher"].as_str(),
+        ) {
+            walked_deltas
+                .entry(id)
+                .or_insert((publisher.to_string(), n));
+        }
+    }
+    let mut withdrawals = Vec::new();
+    for body in &withdrawal_acts {
+        let disposition = withdrawals_replay.apply(
+            n,
+            body,
+            |key_id| {
+                authenticators
+                    .iter()
+                    .find(|key| key.key_id == key_id)
+                    .map(|key| key.public_key.clone())
+            },
+            |delta_id| match walked_deltas.get(delta_id) {
+                Some((publisher, height)) => SealedDelta::Known {
+                    publisher: publisher.clone(),
+                    height: *height,
+                },
+                None => SealedDelta::Unverifiable,
+            },
+        );
+        match disposition {
+            Disposition::Accepted {
+                delta_id,
+                publisher,
+                withdrawn_height,
+                ..
+            } => withdrawals.push((delta_id, publisher, withdrawn_height)),
+            Disposition::Rejected(code) => {
+                eprintln!("ignoring a payload_withdrawal at height {n}: {code}");
+            }
+            Disposition::NotWithdrawal => {}
+        }
+    }
+
+    // WIST-3 §5: the key set that can speak for Epoch N is the one the
+    // Log establishes at N, so the signature closes the loop only after
+    // this Epoch's Registry Updates have been applied.
+    let adoption = super::checkpoints::decide(
+        checkpoint,
+        inputs.log_id,
+        &authenticators,
+        inputs.witnesses,
+        chain.quorum_at(at),
+    )
+    .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
+
+    let event = EpochEvent {
+        height: n,
+        epoch_root: checkpoint.root_token(),
+        sealed_at,
+        sealed_at_s: at,
+        profile,
+        recovery_window_days,
+        declaration_activation_epochs,
+        declarations,
+        withdrawals,
+        delta_bodies,
+        labels,
+        disputes,
+    };
+    Ok((event, adoption))
 }
 
 pub(super) fn default_recovery_window_days() -> i64 {

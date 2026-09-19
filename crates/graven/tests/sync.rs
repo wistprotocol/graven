@@ -85,9 +85,12 @@ fn cold_sync_records_post_snapshot_delta_with_unfetchable_payload_as_empty() {
 
 /// WIST-3 §6: an entry bundle is verified only by recomputation against
 /// the root a verified Checkpoint states, so altered octets are
-/// `WIST3-E03` and nothing above the head is applied.
+/// `WIST3-E03` and nothing above the Checkpoint they fail is applied. The
+/// Snapshot's own Checkpoint is verified, so WIST-3 §8 step 8 adopts it —
+/// "the newest verified one, the head of step 5 included" — and the run
+/// reports the Epoch it could not pass.
 #[test]
-fn cold_sync_rejects_a_tampered_entry_bundle() {
+fn cold_sync_rejects_a_tampered_entry_bundle_and_keeps_the_snapshots_checkpoint() {
     let fx = common::build_fixture(true, false);
     let bundle = fx
         .dir
@@ -99,21 +102,33 @@ fn cold_sync_rejects_a_tampered_entry_bundle() {
     std::fs::write(&bundle, bytes).unwrap();
 
     let target = tempfile::tempdir().unwrap();
-    let result = graven::sync::run(
+    let error = graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
         &fx.base_url,
         target.path(),
         true,
         false,
-    );
+    )
+    .unwrap_err()
+    .to_string();
 
-    assert!(result.is_err());
-    assert!(!common::synced_log_dir(target.path())
-        .join("sync.json")
-        .exists());
-    assert!(!common::synced_log_dir(target.path())
-        .join("index.sqlite")
-        .exists());
+    assert!(error.contains("WIST3-E03"), "{error}");
+    assert_eq!(
+        graven::store::synced_state(&common::synced_log_dir(target.path()))
+            .unwrap()
+            .epoch_number,
+        0,
+        "the Snapshot's Checkpoint is the head the run reached"
+    );
+    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
+    assert!(store
+        .get("https://records.example/alpha")
+        .unwrap()
+        .is_some());
+    assert!(
+        store.get("https://records.example/beta").unwrap().is_none(),
+        "no Entry above the adopted Checkpoint's tree size is applied"
+    );
 }
 
 #[test]
@@ -180,24 +195,38 @@ fn cold_sync_rejects_state_signed_by_wrong_key() {
         .exists());
 }
 
+/// WIST-3 §5: a Checkpoint whose line under a known key does not verify is
+/// `WIST3-E03`, so the Epoch it ends is not applied; the Snapshot's own
+/// Checkpoint stays the head WIST-3 §8 step 8 adopts.
 #[test]
-fn cold_sync_rejects_checkpoint_signed_by_wrong_key() {
+fn cold_sync_rejects_checkpoint_signed_by_wrong_key_and_keeps_the_snapshots_checkpoint() {
     let fx = common::build_fixture(true, false);
     common::resign_checkpoint_with_wrong_key(&fx, &fx.other);
 
     let target = tempfile::tempdir().unwrap();
-    let result = graven::sync::run(
+    let error = graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
         &fx.base_url,
         target.path(),
         true,
         false,
-    );
+    )
+    .unwrap_err()
+    .to_string();
 
-    assert!(result.is_err());
-    assert!(!common::synced_log_dir(target.path())
-        .join("sync.json")
-        .exists());
+    assert!(error.contains("WIST3-E03"), "{error}");
+    assert_eq!(
+        graven::store::synced_state(&common::synced_log_dir(target.path()))
+            .unwrap()
+            .epoch_number,
+        0,
+        "the Snapshot's Checkpoint is the head the run reached"
+    );
+    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
+    assert!(
+        store.get("https://records.example/beta").unwrap().is_none(),
+        "the Epoch whose Checkpoint failed the signature rules is not applied"
+    );
 }
 
 #[test]

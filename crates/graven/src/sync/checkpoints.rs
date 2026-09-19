@@ -93,6 +93,33 @@ pub fn archived(sources: &Sources, epoch_number: u64) -> Result<Checkpoint> {
     parse_note(&bytes, &path)
 }
 
+/// WIST-3 §9's `WIST3-E03`: "Re-download, from another source if needed,
+/// before concluding misbehavior". The archived Checkpoint of one Epoch
+/// whose signature a key of `aggregator_keys` verifies: a note a source
+/// serves that does not parse, sits at another Epoch's path or fails a
+/// known key's signature is that source's fault, so the same path is asked
+/// of the next source, and the `WIST3-E03` stands only where no source
+/// serves a note that verifies.
+fn archived_verified(
+    sources: &Sources,
+    epoch_number: u64,
+    log_id: &str,
+    aggregator_keys: &[AggregatorKey],
+    witnesses: &[WitnessKey],
+) -> Result<(Checkpoint, Verification)> {
+    let path = archive_path(epoch_number);
+    let verify = |bytes: &[u8]| -> Result<(Checkpoint, Verification)> {
+        let checkpoint = parse_note(bytes, &path)?;
+        check_archive_path(&checkpoint, &path)?;
+        let verification = checkpoint::verify(&checkpoint, log_id, aggregator_keys, witnesses)?;
+        Ok((checkpoint, verification))
+    };
+    let bytes = sources.cached(&path, CHECKPOINT_MAX_BYTES, |bytes| {
+        verify(bytes).map(|_| ())
+    })?;
+    verify(&bytes)
+}
+
 /// WIST-3 §8 steps 4 and 5: the Checkpoint a Snapshot manifest's
 /// `epoch_number` selects, with the state file's `tree_size` held to the
 /// manifest (`WIST3-E04`, rejecting the Snapshot), the Log's signature
@@ -100,7 +127,11 @@ pub fn archived(sources: &Sources, epoch_number: u64) -> Result<Checkpoint> {
 /// `tree_size` and `root_hash` held to the Checkpoint (`WIST3-E02`). The
 /// `epoch_number` selects the file and is never itself compared for
 /// divergence: a file at that path stating another Epoch is the source's
-/// `WIST3-E03` and the next source is asked for the same path.
+/// `WIST3-E03` and the next source is asked for the same path, as is one
+/// whose signature no known key verifies. The manifest match is judged on
+/// the note that verified and is never re-fetched: a Snapshot describing
+/// another tree from the one the Log signs is divergence, not a corrupt
+/// file.
 pub fn manifest_anchor(
     sources: &Sources,
     manifest: &SnapshotManifest,
@@ -110,8 +141,13 @@ pub fn manifest_anchor(
     witnesses: &[WitnessKey],
 ) -> Result<(Checkpoint, Verification)> {
     wist_core::snapshot::check_state_tree_size(manifest, state_tree_size)?;
-    let anchor = archived(sources, manifest.epoch_number)?;
-    let verification = checkpoint::verify(&anchor, log_id, aggregator_keys, witnesses)?;
+    let (anchor, verification) = archived_verified(
+        sources,
+        manifest.epoch_number,
+        log_id,
+        aggregator_keys,
+        witnesses,
+    )?;
     wist_core::snapshot::check_manifest_anchor(manifest, &anchor)?;
     Ok((anchor, verification))
 }

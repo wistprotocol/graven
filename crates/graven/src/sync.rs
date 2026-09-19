@@ -59,6 +59,25 @@ pub struct SyncReport {
     pub withdrawn: u64,
 }
 
+impl std::fmt::Display for SyncReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let from = self
+            .epoch_number_before
+            .map_or_else(|| "cold start".to_string(), |n| n.to_string());
+        let witnessing = if self.unwitnessed {
+            "unwitnessed"
+        } else {
+            "witnessed"
+        };
+        let staleness = if self.stale { ", stale" } else { "" };
+        write!(
+            f,
+            "[{}] synced from {from} to head epoch {} (tree size {}, root {}, {witnessing}{staleness}), withdrawn {}",
+            self.log_id, self.head, self.tree_size, self.root, self.withdrawn
+        )
+    }
+}
+
 /// The format the sync state is written in. A store written before the
 /// Log became one growing tree carries no `format` member and names a
 /// Block hash rather than a tree size; one written before `block_number`
@@ -307,6 +326,16 @@ fn restore(conn: &Connection, context: &SyncContext, local: &SyncState) -> Resul
     })
 }
 
+/// The Checkpoints a run has to verify above its head, and the Epoch whose
+/// Checkpoint no source served — which ends the sequence there, since
+/// WIST-3 §5 has a Consumer verify "every Checkpoint from its verified head
+/// to the one it adopts, in `epoch_number` order".
+#[derive(Default)]
+struct Offered {
+    checkpoints: Vec<Checkpoint>,
+    stopped: Option<Stop>,
+}
+
 /// WIST-3 §8's continuous operation, steps 1–3: the offered head, the
 /// archived Checkpoints between it and the verified head, and the newest
 /// of them the Witness quorum admits.
@@ -315,7 +344,7 @@ fn offered_above(
     conn: &Connection,
     head_epoch_number: u64,
     keys: &Registry,
-) -> Result<Vec<Checkpoint>> {
+) -> Result<Offered> {
     let Some(head) = checkpoints::offered_head(
         context.sources,
         context.log_dir,
@@ -325,14 +354,68 @@ fn offered_above(
         keys,
     )?
     else {
-        return Ok(Vec::new());
+        return Ok(Offered::default());
     };
-    let mut offered = Vec::new();
+    let mut checkpoints = Vec::new();
     for number in head_epoch_number + 1..head.epoch_number() {
-        offered.push(checkpoints::archived_between(context.sources, number)?);
+        match checkpoints::archived_between(context.sources, number) {
+            Ok(checkpoint) => checkpoints.push(checkpoint),
+            // WIST-3 §9: chain divergence applies nothing. A Checkpoint no
+            // source holds (`WIST3-E01`) or none serves validly
+            // (`WIST3-E03`) leaves the Epochs below it to be adopted (§8
+            // step 8), and is reported once they are applied.
+            Err(error) => {
+                if error.code().as_deref() == Some("WIST3-E02") {
+                    return Err(error);
+                }
+                return Ok(Offered {
+                    checkpoints,
+                    stopped: Some(Stop {
+                        epoch_number: number,
+                        error,
+                    }),
+                });
+            }
+        }
     }
-    offered.push(head);
-    Ok(offered)
+    checkpoints.push(head);
+    Ok(Offered {
+        checkpoints,
+        stopped: None,
+    })
+}
+
+/// WIST-3 §8 step 8: the Epochs up to the adopted Checkpoint are applied
+/// and committed, and the Checkpoint above them the run could not pass is
+/// reported with the head the run actually reached.
+fn stopped_run(report: &SyncReport, stop: Stop) -> Error {
+    eprintln!("{report}");
+    Error::Verify(format!(
+        "{}; this sync stopped at epoch {} and its verified head is epoch {}",
+        stop.error, stop.epoch_number, report.head
+    ))
+}
+
+/// The lower of the two Epochs a run could not pass — the Checkpoint it
+/// could not obtain and the one it could not verify below that — since the
+/// lower one is what holds the adopted head where it is.
+fn first_stop(fetching: Option<Stop>, walking: Option<Stop>) -> Option<Stop> {
+    match (fetching, walking) {
+        (Some(fetching), Some(walking)) => {
+            Some(match walking.epoch_number < fetching.epoch_number {
+                true => walking,
+                false => fetching,
+            })
+        }
+        (fetching, walking) => fetching.or(walking),
+    }
+}
+
+/// What a walk leaves a run: the Checkpoint it adopts with the state the
+/// walk built, and the Checkpoint above that one it could not verify.
+struct Walked {
+    adopted: Option<(Restored, Walk, Checkpoint, bool)>,
+    stopped: Option<Stop>,
 }
 
 /// The Checkpoint the Consumer adopts and the Epochs up to it, walked
@@ -345,8 +428,9 @@ fn walk_to_adoption(
     local: &SyncState,
     head: &Checkpoint,
     offered: &[Checkpoint],
-) -> Result<Option<(Restored, Walk, Checkpoint, bool)>> {
+) -> Result<Walked> {
     let mut end = offered.len();
+    let mut stopped: Option<Stop> = None;
     while end > 0 {
         let mut restored = restore(conn, context, local)?;
         let mut state = WalkState {
@@ -362,16 +446,36 @@ fn walk_to_adoption(
             witnesses: context.witnesses,
             log_dir: context.log_dir,
         };
-        let walk = walk_checkpoints(&inputs, &mut state, head, &offered[..end])?;
+        let mut walk = walk_checkpoints(&inputs, &mut state, head, &offered[..end])?;
+        // The Checkpoint the walk could not pass may have left part of its
+        // Epoch's Registry Updates in the walked state, so the Epochs below
+        // it are walked again from the committed state and nothing that
+        // Epoch established reaches the index (WIST-3 §8 step 8).
+        if let Some(stop) = walk.stopped.take() {
+            end = offered
+                .iter()
+                .position(|c| c.epoch_number() == stop.epoch_number)
+                .unwrap_or(0);
+            stopped = Some(stop);
+            continue;
+        }
         match walk.adopted() {
-            None => return Ok(None),
+            None => {
+                return Ok(Walked {
+                    adopted: None,
+                    stopped,
+                })
+            }
             Some(adopted) => {
                 let number = adopted.checkpoint.epoch_number();
                 let unwitnessed =
                     matches!(adopted.adoption, Adoption::Adopted { unwitnessed: true });
                 if number == offered[end - 1].epoch_number() {
                     let checkpoint = adopted.checkpoint.clone();
-                    return Ok(Some((restored, walk, checkpoint, unwitnessed)));
+                    return Ok(Walked {
+                        adopted: Some((restored, walk, checkpoint, unwitnessed)),
+                        stopped,
+                    });
                 }
                 end = offered
                     .iter()
@@ -381,7 +485,10 @@ fn walk_to_adoption(
             }
         }
     }
-    Ok(None)
+    Ok(Walked {
+        adopted: None,
+        stopped,
+    })
 }
 
 fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
@@ -426,26 +533,28 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
             )
         }
     };
-    if offered.is_empty() {
-        return Ok(unchanged(checkpoints::warn_if_stale(
-            context.log_id,
-            &head,
-            cadence,
-        )));
+    if offered.checkpoints.is_empty() {
+        let report = unchanged(checkpoints::warn_if_stale(context.log_id, &head, cadence));
+        return match offered.stopped {
+            None => Ok(report),
+            Some(stop) => Err(stopped_run(&report, stop)),
+        };
     }
 
-    let Some((restored, walk, adopted, unwitnessed)) =
-        walk_to_adoption(context, &conn, &local, &head, &offered)?
-    else {
-        eprintln!(
-            "log {}: no Checkpoint above epoch {} carries the Witness quorum in force; keeping the verified head",
-            context.log_id, local.epoch_number
-        );
-        return Ok(unchanged(checkpoints::warn_if_stale(
-            context.log_id,
-            &head,
-            cadence,
-        )));
+    let walked = walk_to_adoption(context, &conn, &local, &head, &offered.checkpoints)?;
+    let stopped = first_stop(offered.stopped, walked.stopped);
+    let Some((restored, walk, adopted, unwitnessed)) = walked.adopted else {
+        if stopped.is_none() {
+            eprintln!(
+                "log {}: no Checkpoint above epoch {} carries the Witness quorum in force; keeping the verified head",
+                context.log_id, local.epoch_number
+            );
+        }
+        let report = unchanged(checkpoints::warn_if_stale(context.log_id, &head, cadence));
+        return match stopped {
+            None => Ok(report),
+            Some(stop) => Err(stopped_run(&report, stop)),
+        };
     };
 
     let Restored {
@@ -509,7 +618,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
     mirror_sync_state(context.sync_path, &sync_state);
     let stale = checkpoints::warn_if_stale(context.log_id, &adopted, chain.cadence());
 
-    Ok(SyncReport {
+    let report = SyncReport {
         log_id: context.log_id.to_string(),
         epoch_number_before: Some(local.epoch_number),
         head: sync_state.epoch_number,
@@ -518,7 +627,11 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
         unwitnessed,
         stale,
         withdrawn: stats.withdrawn,
-    })
+    };
+    match stopped {
+        None => Ok(report),
+        Some(stop) => Err(stopped_run(&report, stop)),
+    }
 }
 
 fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
@@ -592,13 +705,23 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
         &installed.aggregator_keys,
     )?;
 
-    let walked = if offered.is_empty() {
-        None
+    let walked = if offered.checkpoints.is_empty() {
+        Walked {
+            adopted: None,
+            stopped: None,
+        }
     } else {
-        walk_to_adoption(context, &installed.conn, &anchor_state, &anchor, &offered)?
+        walk_to_adoption(
+            context,
+            &installed.conn,
+            &anchor_state,
+            &anchor,
+            &offered.checkpoints,
+        )?
     };
+    let stopped = first_stop(offered.stopped, walked.stopped);
 
-    let (adopted, unwitnessed, events, verified, state) = match walked {
+    let (adopted, unwitnessed, events, verified, state) = match walked.adopted {
         Some((restored, walk, adopted, unwitnessed)) => (
             adopted,
             unwitnessed,
@@ -679,7 +802,7 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
     mirror_sync_state(context.sync_path, &sync_state);
     let stale = checkpoints::warn_if_stale(context.log_id, &adopted, cadence);
 
-    Ok(SyncReport {
+    let report = SyncReport {
         log_id: context.log_id.to_string(),
         epoch_number_before: None,
         head: sync_state.epoch_number,
@@ -688,7 +811,11 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
         unwitnessed,
         stale,
         withdrawn: stats.withdrawn,
-    })
+    };
+    match stopped {
+        None => Ok(report),
+        Some(stop) => Err(stopped_run(&report, stop)),
+    }
 }
 
 /// Writes the committed sync state next to the index for readers of the

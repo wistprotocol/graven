@@ -1058,6 +1058,174 @@ fn an_archived_checkpoint_no_source_serves_below_an_offered_one_is_that_epochs_e
     );
 }
 
+/// The head the store records, as a later run resumes from it.
+fn recorded_head(target: &Path) -> u64 {
+    graven::store::synced_state(&common::synced_log_dir(target))
+        .unwrap()
+        .epoch_number
+}
+
+fn holds(target: &Path, url: &str) -> bool {
+    graven::store::Store::open(&common::synced_log_dir(target))
+        .unwrap()
+        .get(url)
+        .unwrap()
+        .is_some()
+}
+
+/// WIST-3 §8 step 8: the Consumer adopts "the newest verified one" and
+/// "Entries above its tree size are not applied", so a Checkpoint no source
+/// serves validly (`WIST3-E03`) leaves the Epochs verified below it
+/// applied, and the run reports the Epoch it could not pass.
+#[test]
+fn a_corrupt_checkpoint_at_every_source_applies_the_epochs_below_it_and_reports_its_e03() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+    assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 1);
+
+    let in_two = common::extend_fixture(&fx);
+    let in_three = common::extend_fixture(&fx);
+    let in_four = common::extend_fixture(&fx);
+    let archived = fx.dir.path().join("log/checkpoints/000000003");
+    std::fs::write(&archived, b"not a Checkpoint\n").unwrap();
+
+    let error = sync_with(&fx, target.path(), &[]).unwrap_err().to_string();
+    assert!(error.contains("WIST3-E03"), "{error}");
+    assert!(error.contains("epoch 3"), "{error}");
+    assert_eq!(recorded_head(target.path()), 2);
+    assert!(holds(target.path(), &in_two));
+    assert!(!holds(target.path(), &in_three));
+
+    // The source serves the Checkpoint it archived: the next run continues
+    // from the head the stopped one left.
+    fx.log_state().publish();
+    let report = sync_with(&fx, target.path(), &[]).unwrap();
+    assert_eq!(report.epoch_number_before, Some(2));
+    assert_eq!(report.head, 4);
+    assert!(holds(target.path(), &in_three));
+    assert!(holds(target.path(), &in_four));
+}
+
+/// The same disposition for `WIST3-E01`: a Checkpoint no source holds ends
+/// the walk at its Epoch, and the Epochs below it stay applied (WIST-3 §9,
+/// §8 step 8).
+#[test]
+fn an_archived_checkpoint_no_source_holds_applies_the_epochs_below_it_and_reports_its_e01() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+    assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 1);
+
+    let in_two = common::extend_fixture(&fx);
+    let in_three = common::extend_fixture(&fx);
+    common::extend_fixture(&fx);
+    std::fs::remove_file(fx.dir.path().join("log/checkpoints/000000003")).unwrap();
+
+    let error = sync_with(&fx, target.path(), &[]).unwrap_err().to_string();
+    assert!(error.contains("WIST3-E01"), "{error}");
+    assert!(error.contains("Epoch 3"), "{error}");
+    assert_eq!(recorded_head(target.path()), 2);
+    assert!(holds(target.path(), &in_two));
+    assert!(!holds(target.path(), &in_three));
+
+    fx.log_state().publish();
+    assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 4);
+    assert!(holds(target.path(), &in_three));
+}
+
+/// WIST-3 §5 and §9's `WIST3-E02`: a Checkpoint that diverges from the
+/// Log's chain is a hard failure — "MUST NOT apply the data" — so no Epoch
+/// of the run is applied, not even one verified below it, and the halt is
+/// recorded.
+#[test]
+fn a_divergent_checkpoint_applies_no_epoch_of_the_run_and_halts_the_log() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+    assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 1);
+
+    let in_two = common::extend_fixture(&fx);
+    common::extend_fixture(&fx);
+    common::extend_fixture(&fx);
+    // A Checkpoint of Epoch 3 stating Epoch 2's tree size under another
+    // root: WIST-3 §5's first Equivocation form.
+    let after_two = fx.log_state().checkpoints[2].clone();
+    let honest_three = fx.log_state().checkpoints[3].clone();
+    let mut forged = Checkpoint::new(
+        honest_three.origin(),
+        after_two.tree_size(),
+        [0x33; 32],
+        honest_three.epoch_number(),
+        honest_three.sealed_at(),
+    )
+    .unwrap();
+    forged.sign(&fx.log.sk);
+    std::fs::write(
+        fx.dir.path().join("log/checkpoints/000000003"),
+        forged.encode(),
+    )
+    .unwrap();
+
+    let error = sync_with(&fx, target.path(), &[]).unwrap_err().to_string();
+    assert!(error.contains("WIST3-E02"), "{error}");
+    assert_eq!(recorded_head(target.path()), 1);
+    assert!(
+        !holds(target.path(), &in_two),
+        "chain divergence applies nothing, the Epochs verified below it included"
+    );
+    let log_dir = common::synced_log_dir(target.path());
+    assert!(log_dir.join(checkpoints::HALT_FILE).exists());
+    assert!(log_dir
+        .join("evidence/divergence-epoch-000000003/offered.checkpoint")
+        .exists());
+}
+
+/// WIST-3 §9's `WIST3-E03`: "Re-download, from another source if needed,
+/// before concluding misbehavior". A note whose signature under a known key
+/// fails is that source's fault, so the archived Checkpoint a Snapshot
+/// manifest selects is asked of the next source, and the E03 stands only
+/// where no source serves a note that verifies.
+#[test]
+fn a_cold_start_asks_another_source_for_an_archived_checkpoint_whose_signature_fails() {
+    let fx = common::build_fixture(true, false);
+    let mirror_dir = tempfile::tempdir().unwrap();
+    common::copy_dir(fx.dir.path(), mirror_dir.path());
+    let (mirror_addr, mirror_requests) = common::serve_recording(mirror_dir.path().to_path_buf());
+    let mirror = format!("http://{mirror_addr}");
+
+    let selected = fx.log_state().checkpoints[0].clone();
+    let mut forged = Checkpoint::new(
+        selected.origin(),
+        selected.tree_size(),
+        *selected.root(),
+        selected.epoch_number(),
+        selected.sealed_at(),
+    )
+    .unwrap();
+    forged.sign(&fx.other.sk);
+    std::fs::write(
+        fx.dir.path().join("log/checkpoints/000000000"),
+        forged.encode(),
+    )
+    .unwrap();
+
+    let only_source = tempfile::tempdir().unwrap();
+    let error = sync_with(&fx, only_source.path(), &[])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("WIST3-E03"), "{error}");
+
+    let target = tempfile::tempdir().unwrap();
+    let report = sync_from(&fx, target.path(), std::slice::from_ref(&mirror), &[])
+        .expect("the second source serves a Checkpoint that verifies");
+    assert_eq!(report.head, 1);
+    assert!(
+        mirror_requests
+            .lock()
+            .unwrap()
+            .contains(&"/log/checkpoints/000000000".to_string()),
+        "the same path is asked of the next source"
+    );
+}
+
 /// WIST-3 §5: "consumers verifying it MUST stop applying new data from
 /// that Aggregator" — the halt outlives the run that established it.
 #[test]

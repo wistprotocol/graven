@@ -116,19 +116,7 @@ enum PackCommand {
 }
 
 fn print_report(report: &SyncReport) {
-    let from = report
-        .epoch_number_before
-        .map_or_else(|| "cold start".to_string(), |n| n.to_string());
-    let witnessing = if report.unwitnessed {
-        "unwitnessed"
-    } else {
-        "witnessed"
-    };
-    let staleness = if report.stale { ", stale" } else { "" };
-    println!(
-        "[{}] synced from {from} to head epoch {} (tree size {}, root {}, {witnessing}{staleness}), withdrawn {}",
-        report.log_id, report.head, report.tree_size, report.root, report.withdrawn
-    );
+    println!("{report}");
 }
 
 fn main() -> Result<(), graven::Error> {
