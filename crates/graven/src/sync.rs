@@ -329,7 +329,7 @@ fn offered_above(
     };
     let mut offered = Vec::new();
     for number in head_epoch_number + 1..head.epoch_number() {
-        offered.push(checkpoints::archived(context.sources, number)?);
+        offered.push(checkpoints::archived_between(context.sources, number)?);
     }
     offered.push(head);
     Ok(offered)
@@ -530,19 +530,20 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
         context.log_dir,
         context.tier1,
     )?;
-    // WIST-3 §8 step 5: the Checkpoint at the Snapshot's Epoch, verified
-    // under the `aggregator_key` tuples just loaded, states the tree the
-    // manifest names or the Snapshot describes another tree entirely.
-    let anchor = checkpoints::archived(context.sources, installed.manifest.epoch_number)?;
-    let verification = wist_core::checkpoint::verify(
-        &anchor,
+    // WIST-3 §8 steps 4–5: the Checkpoint the manifest's `epoch_number`
+    // selects, verified under the `aggregator_key` tuples just loaded,
+    // states the tree the manifest names or the Snapshot describes another
+    // tree entirely.
+    let (anchor, verification) = checkpoints::manifest_anchor(
+        context.sources,
+        &installed.manifest,
+        installed.state_tree_size,
         context.log_id,
         &installed
             .aggregator_keys
             .valid_at(installed.manifest.epoch_number),
         context.witnesses,
     )?;
-    wist_core::snapshot::check_manifest_anchor(&installed.manifest, &anchor)?;
     let sealed_at_s = anchor.sealed_at_s()?;
     installed.chain.seed_prior(sealed_at_s);
     let anchor_adoption =

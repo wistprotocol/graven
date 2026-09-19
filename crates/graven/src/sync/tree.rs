@@ -5,9 +5,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use wist_core::epoch::parse_entries;
 use wist_core::tiles::{
-    check_entry_bundle, decode_entry_bundle, decode_tile, entry_bundles_for_range, required_tiles,
-    tiles_for_range, EntryBundle, Tile, TileSet, ENTRY_BUNDLE_MAX_BYTES, TILE_MAX_BYTES,
-    TILE_WIDTH,
+    check_entry_bundle, decode_entry_bundle_at, decode_tile_at, entry_bundles_for_range,
+    required_tiles, tiles_for_range, EntryBundle, Tile, TileSet, ENTRY_BUNDLE_MAX_BYTES,
+    TILE_MAX_BYTES, TILE_WIDTH,
 };
 
 pub const CREATE_TREE_TILES: &str = "CREATE TABLE IF NOT EXISTS tree_tiles(level INTEGER NOT NULL, idx INTEGER NOT NULL, hashes BLOB NOT NULL, PRIMARY KEY(level, idx))";
@@ -76,14 +76,10 @@ impl Tree {
     }
 }
 
-fn exact_tile(bytes: &[u8], path: &str, width: u32) -> Result<()> {
-    let hashes = decode_tile(bytes)?;
-    if hashes.len() as u32 != width {
-        return Err(invalid(&format!(
-            "the tile at {path} carries {} hashes, not the {width} its path states",
-            hashes.len()
-        )));
-    }
+/// WIST-3 §6: a served tile holds the hashes its path states — 256 at a
+/// full path, `W` at `.p/<W>` — and every other form is `WIST3-E03`.
+fn tile_form(path: &str, bytes: &[u8]) -> Result<()> {
+    decode_tile_at(path, bytes)?;
     Ok(())
 }
 
@@ -93,9 +89,7 @@ fn exact_tile(bytes: &[u8], path: &str, width: u32) -> Result<()> {
 fn tile_bytes(sources: &Sources, at: usize, tile: &Tile) -> Result<Vec<u8>> {
     let want = tile.width as usize * 32;
     let path = tile.path();
-    let exact = sources.at(&path, TILE_MAX_BYTES, at, |bytes| {
-        exact_tile(bytes, &path, tile.width)
-    });
+    let exact = sources.at(&path, TILE_MAX_BYTES, at, |bytes| tile_form(&path, bytes));
     match exact {
         Ok(bytes) => Ok(bytes),
         Err(error) if tile.width < TILE_WIDTH => {
@@ -105,7 +99,7 @@ fn tile_bytes(sources: &Sources, at: usize, tile: &Tile) -> Result<Vec<u8>> {
             };
             let full_path = full.path();
             match sources.at(&full_path, TILE_MAX_BYTES, at, |bytes| {
-                exact_tile(bytes, &full_path, TILE_WIDTH)
+                tile_form(&full_path, bytes)
             }) {
                 Ok(bytes) => Ok(bytes[..want].to_vec()),
                 Err(_) => Err(error),
@@ -216,33 +210,29 @@ pub fn offered_tree(sources: &Sources, tree_size: u64, root: &[u8; 32]) -> Resul
 fn bundle_bytes(sources: &Sources, tree: &Tree, bundle: &EntryBundle) -> Result<Vec<u8>> {
     let (start, _) = bundle.leaf_range();
     let width = bundle.width as usize;
+    let path = bundle.path();
     let check = |bytes: &[u8]| -> Result<()> {
-        let entries = decode_entry_bundle(bytes)?;
-        if entries.len() != width {
-            return Err(invalid("an entry bundle is not the width its path states"));
-        }
+        let entries = decode_entry_bundle_at(&path, bytes)?;
         check_entry_bundle(&entries, start, tree.reader())?;
         Ok(())
     };
-    match sources.cached(&bundle.path(), ENTRY_BUNDLE_MAX_BYTES, check) {
+    match sources.cached(&path, ENTRY_BUNDLE_MAX_BYTES, check) {
         Ok(bytes) => Ok(bytes),
         Err(error) if bundle.width < TILE_WIDTH => {
             let full = EntryBundle {
                 index: bundle.index,
                 width: TILE_WIDTH,
             };
+            let full_path = full.path();
             let truncate = |bytes: &[u8]| -> Result<Vec<u8>> {
-                let entries = decode_entry_bundle(bytes)?;
-                if entries.len() < width {
-                    return Err(invalid("an entry bundle is shorter than the tree requires"));
-                }
+                let entries = decode_entry_bundle_at(&full_path, bytes)?;
                 let held = entries[..width].to_vec();
                 check_entry_bundle(&held, start, tree.reader())?;
                 wist_core::tiles::encode_entry_bundle(&held).map_err(Into::into)
             };
             for at in 0..sources.count() {
                 let fetched = sources
-                    .at(&full.path(), ENTRY_BUNDLE_MAX_BYTES, at, |_| Ok(()))
+                    .at(&full_path, ENTRY_BUNDLE_MAX_BYTES, at, |_| Ok(()))
                     .and_then(|bytes| truncate(&bytes));
                 if let Ok(bytes) = fetched {
                     return Ok(bytes);
@@ -256,8 +246,9 @@ fn bundle_bytes(sources: &Sources, tree: &Tree, bundle: &EntryBundle) -> Result<
 
 /// WIST-3 §3.1 and §6: the Entries whose leaf indexes lie in Epoch N's
 /// range, read from the entry bundles that cover it, each verified
-/// against the tree's level-0 hashes, and stopped at the transport bound
-/// the verified prefix derives.
+/// against the tree's level-0 hashes, held to the range `size(N-1)`
+/// through `size(N) - 1`, and stopped at the transport bound the verified
+/// prefix derives.
 pub fn epoch_entries(
     sources: &Sources,
     tree: &Tree,
@@ -270,14 +261,19 @@ pub fn epoch_entries(
     }
     let over = || invalid("the Epoch's Entries exceed the transport bound of its prefix");
     let mut leaf_data: Vec<Vec<u8>> = Vec::new();
+    let mut leaf_indexes: Vec<u64> = Vec::new();
     let mut octets: u64 = 0;
     for bundle in entry_bundles_for_range(from, to, to) {
         if octets > transport_bound {
             return Err(over());
         }
+        let path = bundle.path();
         let bytes = bundle_bytes(sources, tree, &bundle)?;
         let (start, _) = bundle.leaf_range();
-        for (offset, entry) in decode_entry_bundle(&bytes)?.into_iter().enumerate() {
+        for (offset, entry) in decode_entry_bundle_at(&path, &bytes)?
+            .into_iter()
+            .enumerate()
+        {
             let index = start + offset as u64;
             if index < from || index >= to {
                 continue;
@@ -286,8 +282,10 @@ pub fn epoch_entries(
             if octets > transport_bound {
                 return Err(over());
             }
+            leaf_indexes.push(index);
             leaf_data.push(entry);
         }
     }
+    wist_core::epoch::check_leaf_range(from, to, &leaf_indexes)?;
     Ok(parse_entries(&leaf_data)?)
 }

@@ -13,9 +13,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use wist_core::aggregator_keys::Registry;
-use wist_core::checkpoint::{
-    self, check_consistency, check_sequence, Adoption, Checkpoint, WitnessKey,
-};
+use wist_core::checkpoint::{self, check_consistency, Adoption, Checkpoint, WitnessKey};
 use wist_core::delta::{content_bytes, verify_commitment};
 use wist_core::epoch::verify_epoch;
 use wist_core::merkle::consistency_proof_from;
@@ -320,14 +318,21 @@ pub fn walk_checkpoints(
                 None,
             ));
         }
-        if let Err(error) = check_sequence(Some(&previous), checkpoint, chain.cadence()) {
-            // A tree below the Epoch before it is §5's third form, and the
-            // tiles the Consumer holds reproduce the larger root.
-            if error.code() == Some("WIST3-E02") {
-                return Err(diverged(
-                    "a Checkpoint states a tree below the Epoch before it",
-                    Some(tree),
-                ));
+        // WIST-3 §3.1: the sequence rules at the verified head, judged
+        // under the key set valid at the previous height and against the
+        // tiles the Consumer holds, which reproduce the larger root.
+        if let Err(error) = super::checkpoints::sequence_at_head(
+            inputs.log_dir,
+            inputs.log_id,
+            keys,
+            reached,
+            &previous,
+            checkpoint,
+            chain.cadence(),
+            Some(tree),
+        ) {
+            if error.code().as_deref() == Some("WIST3-E02") {
+                return Err(error);
             }
             return Err(Error::Verify(format!("epoch {n}: {error}")));
         }
@@ -387,19 +392,17 @@ pub fn walk_checkpoints(
             chain.transport_bound(),
         )
         .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
-        let summary = match verify_epoch(
+        // WIST-3 §3.1 and §6: what an Epoch's own Entries fail is an
+        // invalid object; the tree they belong to was weighed against the
+        // verified head above.
+        let summary = verify_epoch(
             previous_size,
             checkpoint,
             &entries,
             tree.reader(),
             chain.transport_bound(),
-        ) {
-            Ok(summary) => summary,
-            Err(error) if error.code() == Some("WIST3-E02") => {
-                return Err(diverged(&error.to_string(), Some(tree)))
-            }
-            Err(error) => return Err(Error::Verify(format!("epoch {n}: {error}"))),
-        };
+        )
+        .map_err(|error| Error::Verify(format!("epoch {n}: {error}")))?;
 
         // WIST-3 §3.3 and §3.4: Epoch N's key acts apply first, in
         // canonical Entry index order, each authenticated under the keys

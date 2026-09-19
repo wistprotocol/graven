@@ -10,10 +10,11 @@ use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use wist_core::aggregator_keys::Registry;
 use wist_core::checkpoint::{
-    self, archive_path, check_archive_path, witness_key_id, Checkpoint, Progression, WitnessKey,
-    WITNESS_KEY_TYPE,
+    self, archive_path, check_archive_path, witness_key_id, AggregatorKey, Checkpoint, Progression,
+    Verification, WitnessKey, WITNESS_KEY_TYPE,
 };
 use wist_core::crypto::{hex_encode, PublicKey};
+use wist_core::objects::SnapshotManifest;
 
 /// A Checkpoint is five short lines and its signature lines; the bound is
 /// the Consumer's own, since WIST-3 §6 gives the file no octet bound.
@@ -90,6 +91,84 @@ pub fn archived(sources: &Sources, epoch_number: u64) -> Result<Checkpoint> {
         Ok(())
     })?;
     parse_note(&bytes, &path)
+}
+
+/// WIST-3 §8 steps 4 and 5: the Checkpoint a Snapshot manifest's
+/// `epoch_number` selects, with the state file's `tree_size` held to the
+/// manifest (`WIST3-E04`, rejecting the Snapshot), the Log's signature
+/// verified under the key set valid at that height, and the manifest's
+/// `tree_size` and `root_hash` held to the Checkpoint (`WIST3-E02`). The
+/// `epoch_number` selects the file and is never itself compared for
+/// divergence: a file at that path stating another Epoch is the source's
+/// `WIST3-E03` and the next source is asked for the same path.
+pub fn manifest_anchor(
+    sources: &Sources,
+    manifest: &SnapshotManifest,
+    state_tree_size: u64,
+    log_id: &str,
+    aggregator_keys: &[AggregatorKey],
+    witnesses: &[WitnessKey],
+) -> Result<(Checkpoint, Verification)> {
+    wist_core::snapshot::check_state_tree_size(manifest, state_tree_size)?;
+    let anchor = archived(sources, manifest.epoch_number)?;
+    let verification = checkpoint::verify(&anchor, log_id, aggregator_keys, witnesses)?;
+    wist_core::snapshot::check_manifest_anchor(manifest, &anchor)?;
+    Ok((anchor, verification))
+}
+
+/// WIST-3 §3.1's sequence dispositions at the verified head. A Checkpoint
+/// stating a tree size below the previous one's has no Entries to walk, so
+/// the key set valid at its height is the one valid at the previous
+/// height: under that set a root the larger tree contradicts is §5's third
+/// Equivocation form (`WIST3-E02`), whose evidence is both Checkpoints and
+/// the larger tree's hashes. Every other failure of those rules is
+/// `WIST3-E03`, and an Epoch the Consumer has no Checkpoint for is
+/// `WIST3-E01`.
+#[allow(clippy::too_many_arguments)]
+pub fn sequence_at_head(
+    log_dir: &Path,
+    log_id: &str,
+    registry: &Registry,
+    reached: u64,
+    previous: &Checkpoint,
+    offered: &Checkpoint,
+    cadence_seconds: i64,
+    larger_tree: Option<&Tree>,
+) -> Result<()> {
+    let at_previous = registry.valid_at(previous.epoch_number());
+    let signature_verifies = checkpoint::verify(offered, log_id, &at_previous, &[]).is_ok();
+    let reader = larger_tree.map(|tree| tree.reader() as &dyn wist_core::merkle::HashReader);
+    match checkpoint::check_sequence_at_head(
+        previous,
+        offered,
+        cadence_seconds,
+        signature_verifies,
+        reader,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code() == Some("WIST3-E02") => Err(divergence(
+            log_dir,
+            log_id,
+            registry,
+            reached,
+            Some(previous),
+            offered,
+            larger_tree,
+            "a Checkpoint states a tree below the Epoch before it whose root is not that tree's root at the smaller size",
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// WIST-3 §3.1: an archived Checkpoint between the verified head and an
+/// offered one. A gap is never an object a Consumer holds, so one no
+/// source serves names its Epoch as the `WIST3-E01` that leaves the head
+/// where it is.
+pub fn archived_between(sources: &Sources, epoch_number: u64) -> Result<Checkpoint> {
+    archived(sources, epoch_number).map_err(|error| match error.code().as_deref() {
+        Some("WIST3-E01") => checkpoint::absent_checkpoint(epoch_number).into(),
+        _ => error,
+    })
 }
 
 pub fn save_checkpoint(

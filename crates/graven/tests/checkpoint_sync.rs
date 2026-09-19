@@ -234,39 +234,249 @@ fn the_archive_vector_rejects_a_checkpoint_filed_under_another_epochs_path() {
     }
 }
 
+/// The manifest the vector's members describe, with the digests the
+/// cold-start match does not read.
+fn vector_manifest(fields: &Value) -> wist_core::objects::SnapshotManifest {
+    serde_json::from_value(serde_json::json!({
+        "wist_version": "1.0.0",
+        "snapshot_date": "2026-08-02",
+        "epoch_number": fields["epoch_number"],
+        "tree_size": fields["tree_size"],
+        "root_hash": fields["root_hash"],
+        "content_digest": format!("sha256:{}", "0".repeat(64)),
+        "state": {
+            "path": "state.json",
+            "sha256": "0".repeat(64),
+            "bytes": 0,
+            "state_digest": format!("sha256:{}", "0".repeat(64)),
+        },
+        "files": [],
+    }))
+    .unwrap()
+}
+
+/// A source serving one archived Checkpoint at the path of one Epoch.
+fn serving_archive(epoch_number: u64, note: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir
+        .path()
+        .join(wist_core::checkpoint::archive_path(epoch_number).trim_start_matches('/'));
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, note).unwrap();
+    dir
+}
+
+/// WIST-3 §8 steps 4 and 5: the state file's `tree_size` against the
+/// manifest's (`WIST3-E04`), the manifest's `tree_size` and `root_hash`
+/// against the Checkpoint its `epoch_number` selects (`WIST3-E02`), and a
+/// file at that path stating another Epoch as the source's `WIST3-E03`,
+/// fetched again from the next source rather than read as divergence.
 #[test]
 fn the_cold_start_vector_matches_a_manifest_to_the_checkpoint_at_its_epoch() {
     let vector = vectors();
+    let (log_id, registry) = example_registry();
+    let client = Client::new(true);
+    let base = |addr: &str| graven::fetch::parse_base(&format!("http://{addr}")).unwrap();
     for case in vector["cold_start_cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
-        let manifest: wist_core::objects::SnapshotManifest =
-            serde_json::from_value(serde_json::json!({
-                "wist_version": "1.0.0",
-                "snapshot_date": "2026-08-02",
-                "epoch_number": case["manifest"]["epoch_number"],
-                "tree_size": case["manifest"]["tree_size"],
-                "root_hash": case["manifest"]["root_hash"],
-                "content_digest": format!("sha256:{}", "0".repeat(64)),
-                "state": {
-                    "path": "state.json",
-                    "sha256": "0".repeat(64),
-                    "bytes": 0,
-                    "state_digest": format!("sha256:{}", "0".repeat(64)),
-                },
-                "files": [],
-            }))
+        let manifest = vector_manifest(&case["manifest"]);
+        let state_tree_size = case["state_tree_size"].as_u64().unwrap();
+        let keys = registry.valid_at(manifest.epoch_number);
+        let served = serving_archive(manifest.epoch_number, case["checkpoint"].as_str().unwrap());
+        let (addr, _) = common::serve_recording(served.path().to_path_buf());
+        let sources = Sources::new(&client, vec![base(&addr)]);
+        let outcome =
+            checkpoints::manifest_anchor(&sources, &manifest, state_tree_size, &log_id, &keys, &[]);
+        let expected = case["expected"].as_str().unwrap();
+        match expected {
+            "valid" => {
+                let (anchor, _) = outcome.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(
+                    anchor.epoch_number(),
+                    case["expected_head_epoch_number"].as_u64().unwrap(),
+                    "{name}: the Checkpoint the manifest selects is the verified head"
+                );
+            }
+            "WIST3-E02" | "WIST3-E03" | "WIST3-E04" => {
+                let error = outcome.err().map(|e| e.to_string()).unwrap_or_default();
+                assert!(error.contains(expected), "{name}: {error}");
+                assert!(
+                    case["expected_head_epoch_number"].is_null(),
+                    "{name}: no Checkpoint becomes the verified head"
+                );
+            }
+            other => panic!("{name}: unknown expectation {other}"),
+        }
+        if expected != "WIST3-E03" {
+            continue;
+        }
+        // The file at the manifest's path stated another Epoch, which is
+        // the source's fault: the next source is asked for the same path.
+        let honest = vector["epochs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|epoch| epoch["epoch_number"].as_u64() == Some(manifest.epoch_number))
+            .map(|epoch| epoch["checkpoint"].as_str().unwrap())
             .unwrap();
-        let checkpoint = Checkpoint::parse(case["checkpoint"].as_str().unwrap()).unwrap();
-        let outcome = wist_core::snapshot::check_manifest_anchor(&manifest, &checkpoint);
-        match case["expected"].as_str().unwrap() {
-            "valid" => outcome.unwrap_or_else(|e| panic!("{name}: {e}")),
+        let second = serving_archive(manifest.epoch_number, honest);
+        let (honest_addr, _) = common::serve_recording(second.path().to_path_buf());
+        let sources = Sources::new(&client, vec![base(&addr), base(&honest_addr)]);
+        let (anchor, _) =
+            checkpoints::manifest_anchor(&sources, &manifest, state_tree_size, &log_id, &keys, &[])
+                .unwrap_or_else(|e| panic!("{name}: the second source serves the Checkpoint: {e}"));
+        assert_eq!(anchor.epoch_number(), manifest.epoch_number, "{name}");
+    }
+}
+
+/// The tree hashes the Consumer holds at a Checkpoint's size, as the tiles
+/// it fetched them in.
+fn held_tree(leaf_hashes: &[Value]) -> graven::sync::Tree {
+    let hashes: Vec<[u8; 32]> = leaf_hashes
+        .iter()
+        .map(|hash| {
+            wist_core::crypto::hex_decode(hash.as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .expect("32 octets")
+        })
+        .collect();
+    let set = wist_core::tiles::TileSet::build(&hashes);
+    let mut tree = graven::sync::Tree::new();
+    for tile in wist_core::tiles::required_tiles(hashes.len() as u64) {
+        let held = set.tile(tile.level, tile.index).expect("a built tile");
+        tree.insert(tile.level, tile.index, &wist_core::tiles::encode_tile(held))
+            .unwrap();
+    }
+    tree
+}
+
+/// WIST-3 §3.1: each sequence rule's disposition at the verified head — a
+/// gap as the `WIST3-E01` of the Checkpoint the Consumer lacks, a
+/// `sealed_at` that does not advance or sits off the grid as `WIST3-E03`
+/// whatever the signature does, and a tree size below the previous
+/// Checkpoint's as `WIST3-E02` only where a key valid at the previous
+/// height signs it and its root is not that tree's root at the smaller
+/// size, with both Checkpoints and the larger tree's hashes preserved.
+#[test]
+fn the_sequence_vector_applies_each_failures_disposition_at_the_verified_head() {
+    let vector = vectors();
+    let (log_id, registry) = example_registry();
+    let cadence = vector["epoch_cadence_seconds"].as_i64().unwrap();
+    for case in vector["sequence_cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let previous = Checkpoint::parse(case["verified_checkpoint"].as_str().unwrap()).unwrap();
+        let offered = Checkpoint::parse(case["offered_checkpoint"].as_str().unwrap()).unwrap();
+        let reached = case["verified_head_epoch_number"].as_u64().unwrap();
+        assert_eq!(previous.epoch_number(), reached, "{name}");
+        // A Checkpoint below the previous tree size has no Entries to
+        // walk, so the key set that can speak for it is the one valid at
+        // the previous height; the vector states what that set says.
+        assert_eq!(
+            wist_core::checkpoint::verify(&offered, &log_id, &registry.valid_at(reached), &[])
+                .is_ok(),
+            case["signature_verifies"].as_bool().unwrap(),
+            "{name}: the signature status the vector states"
+        );
+        let held = case["larger_tree_leaf_hashes"]
+            .as_array()
+            .map(|hashes| held_tree(hashes));
+        let log_dir = tempfile::tempdir().unwrap();
+        let outcome = checkpoints::sequence_at_head(
+            log_dir.path(),
+            &log_id,
+            &registry,
+            reached,
+            &previous,
+            &offered,
+            cadence,
+            held.as_ref(),
+        );
+        let expected = case["expected"].as_str().unwrap();
+        let head_after = case["expected_head_epoch_number"].as_u64().unwrap();
+        let bundle = log_dir
+            .path()
+            .join("evidence")
+            .join(format!("divergence-epoch-{:09}", offered.epoch_number()));
+        match expected {
+            "valid" => {
+                outcome.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(head_after, offered.epoch_number(), "{name}");
+                assert!(!log_dir.path().join("evidence").exists(), "{name}");
+            }
+            "WIST3-E01" | "WIST3-E03" => {
+                let error = outcome.unwrap_err();
+                assert_eq!(error.code().as_deref(), Some(expected), "{name}: {error}");
+                if let Some(absent) = case["unobtainable_epoch_number"].as_u64() {
+                    assert!(
+                        error.to_string().contains(&format!("Epoch {absent}")),
+                        "{name}: the Checkpoint no source serves is named: {error}"
+                    );
+                }
+                assert_eq!(head_after, reached, "{name}: the verified head stands");
+                assert!(
+                    !log_dir.path().join("evidence").exists(),
+                    "{name}: a rejected Checkpoint is preserved as nothing"
+                );
+                assert!(
+                    !log_dir.path().join(checkpoints::HALT_FILE).exists(),
+                    "{name}: nothing halts the Log"
+                );
+            }
             "WIST3-E02" => {
-                let error = outcome.unwrap_err().to_string();
-                assert!(error.contains("WIST3-E02"), "{name}: {error}");
+                let error = outcome.unwrap_err();
+                assert_eq!(error.code().as_deref(), Some(expected), "{name}: {error}");
+                assert_eq!(head_after, reached, "{name}: the verified head stands");
+                for item in case["evidence"].as_array().unwrap() {
+                    match item.as_str().unwrap() {
+                        "verified_checkpoint" => assert_eq!(
+                            std::fs::read_to_string(bundle.join("previous.checkpoint")).unwrap(),
+                            case["verified_checkpoint"].as_str().unwrap(),
+                            "{name}"
+                        ),
+                        "offered_checkpoint" => assert_eq!(
+                            std::fs::read_to_string(bundle.join("offered.checkpoint")).unwrap(),
+                            case["offered_checkpoint"].as_str().unwrap(),
+                            "{name}"
+                        ),
+                        "larger_tree_leaf_hashes" => {
+                            let preserved = preserved_tiles(&bundle.join("tiles"));
+                            assert_eq!(
+                                wist_core::merkle::root_from(&preserved, previous.tree_size())
+                                    .unwrap(),
+                                *previous.root(),
+                                "{name}: the preserved hashes reproduce the larger tree's root"
+                            );
+                        }
+                        other => panic!("{name}: unknown evidence {other}"),
+                    }
+                }
+                assert!(
+                    log_dir.path().join(checkpoints::HALT_FILE).exists(),
+                    "{name}: nothing more is applied from this Aggregator"
+                );
             }
             other => panic!("{name}: unknown expectation {other}"),
         }
     }
+}
+
+/// The tiles an evidence bundle preserved, read back as the tree hashes
+/// anyone verifying the bundle recomputes the larger root from.
+fn preserved_tiles(dir: &Path) -> wist_core::tiles::TileSet {
+    let mut set = wist_core::tiles::TileSet::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let (level, index) = name.split_once('-').expect("level-index");
+        set.insert_bytes(
+            level.parse().unwrap(),
+            index.parse().unwrap(),
+            &std::fs::read(entry.path()).unwrap(),
+        )
+        .unwrap();
+    }
+    set
 }
 
 #[test]
@@ -503,6 +713,51 @@ fn a_tampered_entry_bundle_at_one_source_is_fetched_from_another() {
         4,
         "the second source serves the Epoch's Entries"
     );
+}
+
+/// WIST-3 §6: a served file holds the count its path states, so a full
+/// entry-bundle path carrying fewer than 256 Entries is `WIST3-E03` — no
+/// fallback for the partial bundle the tree's size requires — even where
+/// the Entries it does carry verify against the tree.
+#[test]
+fn an_entry_bundle_at_a_full_path_holding_fewer_entries_than_it_states_is_refused() {
+    let all: Vec<Vec<u8>> = (0..512)
+        .map(|i| wist_core::jcs::canonicalize(&serde_json::json!({"n": i})).unwrap())
+        .collect();
+    let served = tree_dir(&all, 300);
+    let grown = tree_dir(&all, 512);
+    let partial = served.path().join("tile/entries/001.p/44");
+    let mut tampered = std::fs::read(&partial).unwrap();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0xFF;
+    std::fs::write(&partial, tampered).unwrap();
+    std::fs::write(
+        served.path().join("tile/entries/001"),
+        wist_core::tiles::encode_entry_bundle(&all[256..300]).unwrap(),
+    )
+    .unwrap();
+
+    let client = Client::new(true);
+    let base = |addr: &str| graven::fetch::parse_base(&format!("http://{addr}")).unwrap();
+    let (short_addr, _) = common::serve_recording(served.path().to_path_buf());
+    let sources = Sources::new(&client, vec![base(&short_addr)]);
+    let mut held = graven::sync::Tree::new();
+    tree::seed(&sources, &mut held, 300, &root_at(&all, 300)).unwrap();
+    let error = tree::epoch_entries(&sources, &held, 256, 300, 1 << 20)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("WIST3-E03"), "{error}");
+
+    // The same path, served at the 256 Entries a full bundle holds.
+    std::fs::copy(
+        grown.path().join("tile/entries/001"),
+        served.path().join("tile/entries/001"),
+    )
+    .unwrap();
+    let (full_addr, _) = common::serve_recording(served.path().to_path_buf());
+    let sources = Sources::new(&client, vec![base(&full_addr)]);
+    let read = tree::epoch_entries(&sources, &held, 256, 300, 1 << 20).unwrap();
+    assert_eq!(read.len(), 44, "the Epoch's leaf range is 256 through 299");
 }
 
 fn sync_with(
@@ -771,6 +1026,36 @@ fn a_size_zero_checkpoint_stating_another_root_is_divergence() {
         .to_string();
     assert!(error.contains("WIST3-E02"), "{error}");
     tree::seed(&sources, &mut held, 0, &wist_core::merkle::EMPTY_ROOT).unwrap();
+}
+
+/// WIST-3 §3.1: a Consumer verifies Checkpoints in `epoch_number` order,
+/// so a gap is never an object it holds: an archived Checkpoint between
+/// its verified head and the one offered that no source serves is that
+/// Epoch's `WIST3-E01`, and nothing above the head is applied.
+#[test]
+fn an_archived_checkpoint_no_source_serves_below_an_offered_one_is_that_epochs_e01() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+    assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 1);
+
+    let at = common::next_instant(&fx);
+    common::seal_next(&fx, &at, &[]);
+    let at = common::next_instant(&fx);
+    common::seal_next(&fx, &at, &[]);
+    std::fs::remove_file(fx.dir.path().join("log/checkpoints/000000002")).unwrap();
+
+    let error = sync_with(&fx, target.path(), &[]).unwrap_err().to_string();
+    assert!(
+        error.contains("WIST3-E01") && error.contains("Epoch 2"),
+        "{error}"
+    );
+    assert_eq!(
+        graven::store::synced_state(&common::synced_log_dir(target.path()))
+            .unwrap()
+            .epoch_number,
+        1,
+        "nothing above the verified head is applied"
+    );
 }
 
 /// WIST-3 §5: "consumers verifying it MUST stop applying new data from

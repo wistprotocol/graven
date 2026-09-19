@@ -118,6 +118,9 @@ pub(super) struct Installation {
     tmp_sqlite_path: PathBuf,
     pub(super) conn: Connection,
     pub(super) manifest: SnapshotManifest,
+    /// WIST-3 §8 step 4: the `tree_size` the state artifact states, which
+    /// the manifest's must be (`WIST3-E04`).
+    pub(super) state_tree_size: u64,
     pub(super) content_digest: String,
     pub(super) history: KeyHistory,
     pub(super) aggregator_keys: Registry,
@@ -207,6 +210,9 @@ pub(super) fn snapshot(
     let state_value = wist_core::json::parse(&state_bytes)?;
     verify_envelope(&state_value, "state", trust_key)?;
     let state_env: SnapshotStateEnvelope = serde_json::from_value(state_value)?;
+    // WIST-3 §8 step 4: a state file at another tree size than its
+    // manifest describes another tree, and the Snapshot is rejected.
+    wist_core::snapshot::check_state_tree_size(&manifest, state_env.state.tree_size)?;
     let state_entry_values: Vec<Value> = state_env
         .state
         .entries
@@ -381,6 +387,7 @@ pub(super) fn snapshot(
         tmp_sqlite_path,
         conn,
         content_digest: manifest.content_digest.clone(),
+        state_tree_size: state_env.state.tree_size,
         manifest,
         history,
         aggregator_keys,
