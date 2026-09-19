@@ -97,6 +97,94 @@ pub fn run_with_env(bin: &Path, args: &[&str], env: &[(&str, &str)]) -> std::pro
     output
 }
 
+/// Runs a command with nothing inherited from the caller's environment
+/// beyond `PATH` and the given variables, standing in for an operator
+/// invoking it again from a new shell with only its state directory.
+pub fn run_in_fresh_env(bin: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let mut command = Command::new(bin);
+    command.args(args).env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        command.env("PATH", path);
+    }
+    let output = command
+        .envs(env.iter().copied())
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {} {args:?}: {e}", bin.display()));
+    assert!(
+        output.status.success(),
+        "{} {args:?} failed in a fresh environment: status={:?}\nstdout={}\nstderr={}",
+        bin.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+/// Seals one Epoch at the given instant and returns its Epoch number,
+/// read from the `sealed epoch <n> …` line `clave seal` prints.
+pub fn seal_epoch(bin: &Path, data: &Path, at: &str) -> u64 {
+    let output = run(bin, &["seal", "--data", s(data), "--at", at]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("sealed epoch ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .unwrap_or_else(|| panic!("clave seal printed no Epoch number:\n{stdout}"))
+}
+
+/// One log's line of a `graven sync` report: the head Epoch, the tree size
+/// and the root it adopted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncedHead {
+    pub epoch: u64,
+    pub tree_size: u64,
+    pub root: String,
+}
+
+/// Parses the `[log] synced from … to head epoch N (tree size T, root R, …)`
+/// lines `graven sync` prints, keyed by log_id.
+pub fn synced_heads(stdout: &str) -> std::collections::BTreeMap<String, SyncedHead> {
+    let mut heads = std::collections::BTreeMap::new();
+    for line in stdout.lines() {
+        let Some(rest) = line.trim().strip_prefix('[') else {
+            continue;
+        };
+        let Some((log_id, rest)) = rest.split_once("] ") else {
+            continue;
+        };
+        let Some((_, rest)) = rest.split_once("to head epoch ") else {
+            continue;
+        };
+        let Some((epoch, rest)) = rest.split_once(" (tree size ") else {
+            continue;
+        };
+        let Some((tree_size, rest)) = rest.split_once(", root ") else {
+            continue;
+        };
+        let root = rest.split(',').next().unwrap_or_default();
+        let Ok(epoch) = epoch.trim().parse::<u64>() else {
+            continue;
+        };
+        let Ok(tree_size) = tree_size.trim().parse::<u64>() else {
+            continue;
+        };
+        heads.insert(
+            log_id.to_string(),
+            SyncedHead {
+                epoch,
+                tree_size,
+                root: root.trim().to_string(),
+            },
+        );
+    }
+    heads
+}
+
 pub struct ChildGuard(pub Child);
 
 impl Drop for ChildGuard {
@@ -224,7 +312,32 @@ pub struct Aggregator {
     pub base_url: String,
     pub verifier_key: String,
     pub stderr: Arc<Mutex<String>>,
-    _child: ChildGuard,
+    child: Option<ChildGuard>,
+}
+
+impl Aggregator {
+    /// Terminates the `clave serve` process and waits for it, leaving the
+    /// data directory as it stands.
+    pub fn stop(&mut self) {
+        self.child = None;
+    }
+
+    /// Serves the same data directory again at the same address, as an
+    /// operator restarting the process does.
+    pub fn start(&mut self, bin: &Path, proxy: Option<&str>) {
+        assert!(
+            self.child.is_none(),
+            "clave serve is already running for {}",
+            self.log_id
+        );
+        let (child, bound, stderr) = spawn_clave_serve_with(bin, &self.data, &self.log_id, proxy);
+        assert_eq!(
+            bound, self.log_id,
+            "the restarted clave serve bound a different address"
+        );
+        self.stderr = stderr;
+        self.child = Some(child);
+    }
 }
 
 /// Initializes an Aggregator at a pre-picked loopback address and serves
@@ -263,7 +376,7 @@ pub fn start_aggregator(
         log_id,
         verifier_key,
         stderr,
-        _child: child,
+        child: Some(child),
     }
 }
 
@@ -509,6 +622,14 @@ pub fn fetch_status(http: &reqwest::blocking::Client, base: &str, domain: &str) 
     resp.json::<Value>().ok()
 }
 
+/// Waits until the Aggregator no longer answers, which is how a stopped
+/// `clave serve` reads from the outside.
+pub fn wait_until_unreachable(http: &reqwest::blocking::Client, base: &str, domain: &str) {
+    poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
+        fetch_status(http, base, domain).is_none().then_some(())
+    });
+}
+
 pub fn wait_until_status_active(
     http: &reqwest::blocking::Client,
     base: &str,
@@ -516,6 +637,21 @@ pub fn wait_until_status_active(
 ) -> Value {
     poll_until(Duration::from_secs(30), Duration::from_millis(100), || {
         fetch_status(http, base, domain).filter(|v| v["state"] == "active")
+    })
+}
+
+/// Waits until the Aggregator records a pull of the domain at or after
+/// `since`, whatever rejections its status carries: a rejection the status
+/// endpoint keeps from an earlier Epoch never clears.
+pub fn wait_until_pull_recorded(
+    http: &reqwest::blocking::Client,
+    base: &str,
+    domain: &str,
+    since: &str,
+) -> Value {
+    poll_until(Duration::from_secs(30), Duration::from_millis(100), || {
+        fetch_status(http, base, domain)
+            .filter(|v| v["last_pull_at"].as_str().is_some_and(|t| t >= since))
     })
 }
 
@@ -630,6 +766,13 @@ impl McpClient {
     }
 
     pub fn call(&mut self, method: &str, params: Value) -> Value {
+        self.try_call(method, params)
+            .unwrap_or_else(|err| panic!("{method} returned JSON-RPC error: {err}"))
+    }
+
+    /// The response to one request, keeping a JSON-RPC error as the error
+    /// case instead of failing the caller.
+    pub fn try_call(&mut self, method: &str, params: Value) -> Result<Value, Value> {
         let id = self.next_id;
         self.next_id += 1;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
@@ -639,9 +782,9 @@ impl McpClient {
                 continue;
             }
             if let Some(err) = resp.get("error") {
-                panic!("{method} returned JSON-RPC error: {err}");
+                return Err(err.clone());
             }
-            return resp["result"].clone();
+            return Ok(resp["result"].clone());
         }
     }
 
@@ -685,6 +828,18 @@ impl McpClient {
 
     pub fn get_record(&mut self, url: &str) -> Value {
         self.tool_call("get_record", json!({"url": url}))
+    }
+
+    /// The JSON-RPC error `get_record` answers with when the index holds no
+    /// record for the URL.
+    pub fn get_record_error(&mut self, url: &str) -> Value {
+        match self.try_call(
+            "tools/call",
+            json!({"name": "get_record", "arguments": {"url": url}}),
+        ) {
+            Err(err) => err,
+            Ok(result) => panic!("get_record({url}) returned a record: {result}"),
+        }
     }
 
     pub fn get_extract(&mut self, url: &str) -> Value {

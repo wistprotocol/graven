@@ -1,6 +1,8 @@
 use e2e::{
-    graven_bin, grid_instant, now_rfc3339, resolve_sibling_bin, run, run_with_env, s, serve_sites,
-    start_aggregator, wait_until_pulled_since, wait_until_status_active, workspace_root, McpClient,
+    fetch_status, graven_bin, grid_instant, now_rfc3339, resolve_sibling_bin, run,
+    run_in_fresh_env, run_with_env, s, seal_epoch, serve_sites, start_aggregator, synced_heads,
+    wait_until_pull_recorded, wait_until_pulled_since, wait_until_status_active,
+    wait_until_unreachable, workspace_root, McpClient,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -55,6 +57,163 @@ fn stage_page_site(
     )
     .expect("write sitemap");
     dir
+}
+
+/// Adds a page to a staged site and relists every page of the directory in
+/// its sitemap, which is what a Publisher's site generator does.
+fn add_page(dir: &Path, host: &str, page: &str, title: &str, body: &str) {
+    std::fs::write(
+        dir.join(page),
+        format!(
+            "<!doctype html><html><head><title>{title}</title><meta name=\"description\" content=\"{title}\"></head><body><p>{body}</p></body></html>"
+        ),
+    )
+    .expect("write added page");
+    let mut pages: Vec<String> = std::fs::read_dir(dir)
+        .expect("read staged site dir")
+        .filter_map(|entry| {
+            let name = entry.expect("staged site entry").file_name();
+            let name = name.to_str().expect("non-utf8 file name").to_string();
+            name.ends_with(".html").then_some(name)
+        })
+        .collect();
+    pages.sort();
+    let urls: String = pages
+        .iter()
+        .map(|page| format!("<url><loc>https://{host}/{page}</loc></url>"))
+        .collect();
+    std::fs::write(
+        dir.join("sitemap.xml"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">{urls}</urlset>"
+        ),
+    )
+    .expect("write sitemap");
+}
+
+/// One publication pass over a staged site, with any further `build`
+/// arguments the scenario needs.
+fn build_site(spake: &Path, host: &str, dir: &Path, state: &Path, extra: &[&str]) {
+    let mut args = vec![
+        "build",
+        "--site",
+        s(dir),
+        "--domain",
+        host,
+        "--out",
+        s(dir),
+        "--state",
+        s(state),
+    ];
+    args.extend_from_slice(extra);
+    run(spake, &args);
+}
+
+fn ping(spake: &Path, log_base: &str, host: &str) {
+    run(
+        spake,
+        &[
+            "ping",
+            "--log",
+            log_base,
+            "--domain",
+            host,
+            "--allow-http",
+            "--no-retry",
+        ],
+    );
+}
+
+/// The Delta ID the Publisher's output tree carries for a URL, taking the
+/// newest by observation instant when a URL has been published more than
+/// once.
+fn published_delta_id(out: &Path, url: &str) -> String {
+    let mut newest: Option<(String, String)> = None;
+    let dir = out.join(".well-known/wist/deltas");
+    for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+        let path = entry.expect("delta directory entry").path();
+        let doc = read_json(&path);
+        if doc["delta"]["url"] != url {
+            continue;
+        }
+        let observed_at = doc["delta"]["observed_at"]
+            .as_str()
+            .expect("observed_at is a string")
+            .to_string();
+        let id = format!(
+            "sha256:{}",
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("delta file name")
+        );
+        if newest.as_ref().is_none_or(|(_, at)| *at <= observed_at) {
+            newest = Some((id, observed_at));
+        }
+    }
+    newest
+        .unwrap_or_else(|| panic!("no published Delta for {url} under {}", dir.display()))
+        .0
+}
+
+/// The scenarios one run exercised, in order, with the Epoch each was
+/// sealed at, and the revision of every repository it drove.
+struct RunRecord {
+    scenarios: Vec<serde_json::Value>,
+}
+
+/// `git rev-parse HEAD` and whether the working tree carries changes; both
+/// are null where no Git checkout answers.
+fn repo_revision(dir: &Path) -> serde_json::Value {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(["-C", s(dir)])
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+    };
+    let head = git(&["rev-parse", "HEAD"])
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    let dirty = git(&["status", "--porcelain"]).map(|output| !output.stdout.is_empty());
+    serde_json::json!({"head": head, "dirty": dirty})
+}
+
+impl RunRecord {
+    fn new() -> Self {
+        RunRecord {
+            scenarios: Vec::new(),
+        }
+    }
+
+    fn exercised(&mut self, scenario: &str, epoch: u64) {
+        self.scenarios
+            .push(serde_json::json!({"scenario": scenario, "sealed_at_epoch": epoch}));
+    }
+
+    fn write(&self, path: &Path) {
+        let siblings = workspace_root()
+            .parent()
+            .expect("graven repo has a parent directory")
+            .to_path_buf();
+        let spec = std::env::var("WIST_SPEC_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| siblings.join("spec"));
+        let record = serde_json::json!({
+            "repositories": {
+                "core": repo_revision(&siblings.join("core")),
+                "spake": repo_revision(&siblings.join("spake")),
+                "clave": repo_revision(&siblings.join("clave")),
+                "graven": repo_revision(&workspace_root()),
+                "spec": repo_revision(&spec),
+            },
+            "scenarios": self.scenarios,
+        });
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&record).expect("serialize the run record"),
+        )
+        .expect("write the run record");
+    }
 }
 
 fn read_json(path: &Path) -> serde_json::Value {
@@ -188,6 +347,7 @@ fn verify_with_external_tlog_client(base_url: &str, verifier_key: &str) {
 #[test]
 fn end_to_end() {
     let harness_start = Instant::now();
+    let mut record = RunRecord::new();
 
     let spake = resolve_sibling_bin("SPAKE_BIN", "spake");
     let clave = resolve_sibling_bin("CLAVE_BIN", "clave");
@@ -249,9 +409,38 @@ fn end_to_end() {
         );
         graph_sites.push((host, dir));
     }
+    let pruned_host = "pruned.localhost".to_string();
+    let pruned_site = stage_page_site(
+        tmp.path(),
+        &pruned_host,
+        "keep.html",
+        "Pruned keep",
+        "keepsake notes the publisher keeps serving",
+        &[],
+    );
+    add_page(
+        &pruned_site,
+        &pruned_host,
+        "gone.html",
+        "Pruned gone",
+        "vanishing notes the publisher later removes",
+    );
+    let kept_url = format!("https://{pruned_host}/keep.html");
+    let removed_url = format!("https://{pruned_host}/gone.html");
+    let recovered_host = "recovered.localhost".to_string();
+    let recovered_site = stage_page_site(
+        tmp.path(),
+        &recovered_host,
+        "first.html",
+        "Recovered first",
+        "custodian notes published before the key set was recovered",
+        &[],
+    );
     let mut sites: BTreeMap<String, PathBuf> = BTreeMap::from([
         (site_host.clone(), site.clone()),
         (labeler_host.clone(), labeler_site.clone()),
+        (pruned_host.clone(), pruned_site.clone()),
+        (recovered_host.clone(), recovered_site.clone()),
     ]);
     sites.extend(graph_sites.iter().cloned());
     let (proxy_addr, _) = serve_sites(sites);
@@ -259,12 +448,15 @@ fn end_to_end() {
 
     let spake_state = tmp.path().join("spake-state");
     let labeler_state = tmp.path().join("labeler-state");
+    let pruned_state = tmp.path().join("pruned-state");
+    let recovered_state = tmp.path().join("recovered-state");
+    let recovery_seed = tmp.path().join("offline/recovery.seed");
     let clave_data = tmp.path().join("clave-data");
     let gdir = tmp.path().join("graven-store");
 
     let suffix_list =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/public-suffix-list.dat");
-    let aggregator = start_aggregator(
+    let mut aggregator = start_aggregator(
         &clave,
         clave_data.clone(),
         Some(&suffix_list),
@@ -349,14 +541,9 @@ fn end_to_end() {
     wait_until_status_active(&http, &clave2_base, &site_host);
 
     let first_seal = grid_instant(0);
-    run(
-        &clave,
-        &["seal", "--data", s(&clave_data), "--at", &first_seal],
-    );
-    run(
-        &clave,
-        &["seal", "--data", s(&clave2_data), "--at", &first_seal],
-    );
+    let first_epoch = seal_epoch(&clave, &clave_data, &first_seal);
+    seal_epoch(&clave, &clave2_data, &first_seal);
+    record.exercised("publication", first_epoch);
 
     let anchor_path = clave_data.join("anchor.json");
     let anchor2_path = clave2_data.join("anchor.json");
@@ -523,6 +710,59 @@ fn end_to_end() {
         wait_until_status_active(&http, &clave_base, host);
     }
 
+    for (host, dir, state) in [
+        (&pruned_host, &pruned_site, &pruned_state),
+        (&recovered_host, &recovered_site, &recovered_state),
+    ] {
+        run(
+            &spake,
+            &[
+                "init",
+                "--domain",
+                host,
+                "--out",
+                s(dir),
+                "--state",
+                s(state),
+            ],
+        );
+        build_site(&spake, host, dir, state, &[]);
+        ping(&spake, &clave_base, host);
+        wait_until_status_active(&http, &clave_base, host);
+    }
+
+    // Only a Declaration already listing a recovery key can authorize a
+    // recovery, so the key is committed long before it is needed.
+    run(
+        &spake,
+        &[
+            "recovery-init",
+            "--out",
+            s(&recovered_site),
+            "--state",
+            s(&recovered_state),
+            "--seed-out",
+            s(&recovery_seed),
+        ],
+    );
+    let committed_since = now_rfc3339();
+    ping(&spake, &clave_base, &recovered_host);
+    wait_until_pulled_since(
+        &http,
+        &clave_base,
+        &recovered_host,
+        &committed_since,
+        &clave_stderr,
+    );
+    let committed = read_json(&recovered_site.join(".well-known/wist/publisher.json"));
+    assert_eq!(
+        committed["publisher"]["recovery_keys"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "recovery-init lists one recovery key: {committed}"
+    );
+
     mutate_fixture_page(&site);
     let since = now_rfc3339();
     run(
@@ -574,14 +814,9 @@ fn end_to_end() {
 
     std::thread::sleep(Duration::from_secs(2));
     let second_seal = grid_instant(1);
-    run(
-        &clave,
-        &["seal", "--data", s(&clave_data), "--at", &second_seal],
-    );
-    run(
-        &clave,
-        &["seal", "--data", s(&clave2_data), "--at", &second_seal],
-    );
+    let second_epoch = seal_epoch(&clave, &clave_data, &second_seal);
+    seal_epoch(&clave, &clave2_data, &second_seal);
+    record.exercised("revision", second_epoch);
 
     let disputed_since = now_rfc3339();
     run(
@@ -632,14 +867,9 @@ fn end_to_end() {
     );
     std::thread::sleep(Duration::from_secs(2));
     let third_seal = grid_instant(2);
-    run(
-        &clave,
-        &["seal", "--data", s(&clave_data), "--at", &third_seal],
-    );
-    run(
-        &clave,
-        &["seal", "--data", s(&clave2_data), "--at", &third_seal],
-    );
+    let third_epoch = seal_epoch(&clave, &clave_data, &third_seal);
+    seal_epoch(&clave, &clave2_data, &third_seal);
+    record.exercised("label_dispute", third_epoch);
     run(
         &graven,
         &["subscribe", "--dir", s(&gdir), "--labeler", &labeler_host],
@@ -808,10 +1038,8 @@ fn end_to_end() {
     );
     std::thread::sleep(Duration::from_secs(2));
     let fourth_seal = grid_instant(3);
-    run(
-        &clave,
-        &["seal", "--data", s(&clave_data), "--at", &fourth_seal],
-    );
+    let fourth_epoch = seal_epoch(&clave, &clave_data, &fourth_seal);
+    record.exercised("payload_withdrawal", fourth_epoch);
     run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
 
     let mut mcp2 = McpClient::start(&graven, &gdir);
@@ -915,9 +1143,9 @@ fn end_to_end() {
     );
     std::thread::sleep(Duration::from_secs(2));
     let fifth_seal = grid_instant(4);
-    for data in [&clave_data, &clave2_data] {
-        run(&clave, &["seal", "--data", s(data), "--at", &fifth_seal]);
-    }
+    let fifth_epoch = seal_epoch(&clave, &clave_data, &fifth_seal);
+    seal_epoch(&clave, &clave2_data, &fifth_seal);
+    record.exercised("publisher_key_rotation", fifth_epoch);
     run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
 
     let mut mcp3 = McpClient::start(&graven, &gdir);
@@ -982,10 +1210,8 @@ fn end_to_end() {
     );
     std::thread::sleep(Duration::from_secs(2));
     let sixth_seal = grid_instant(5);
-    run(
-        &clave,
-        &["seal", "--data", s(&clave_data), "--at", &sixth_seal],
-    );
+    let sixth_epoch = seal_epoch(&clave, &clave_data, &sixth_seal);
+    record.exercised("hijacked_declaration", sixth_epoch);
 
     let entries = snapshot_state_entries(&clave_data);
     let declaration_tuple = state_tuple(&entries, "declaration", &site_host)
@@ -1059,10 +1285,8 @@ fn end_to_end() {
     );
     std::thread::sleep(Duration::from_secs(2));
     let seventh_seal = grid_instant(6);
-    run(
-        &clave,
-        &["seal", "--data", s(&clave_data), "--at", &seventh_seal],
-    );
+    let seventh_epoch = seal_epoch(&clave, &clave_data, &seventh_seal);
+    record.exercised("hijack_reversal", seventh_epoch);
 
     let entries = snapshot_state_entries(&clave_data);
     assert_eq!(
@@ -1132,9 +1356,9 @@ fn end_to_end() {
     );
     std::thread::sleep(Duration::from_secs(2));
     let eighth_seal = grid_instant(7);
-    for data in [&clave_data, &clave2_data] {
-        run(&clave, &["seal", "--data", s(data), "--at", &eighth_seal]);
-    }
+    let eighth_epoch = seal_epoch(&clave, &clave_data, &eighth_seal);
+    seal_epoch(&clave, &clave2_data, &eighth_seal);
+    record.exercised("label_one_epoch_old", eighth_epoch);
     run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
 
     let mut mcp5 = McpClient::start(&graven, &gdir);
@@ -1156,9 +1380,9 @@ fn end_to_end() {
 
     // The same Label, still live an Epoch later, counts.
     let ninth_seal = grid_instant(8);
-    for data in [&clave_data, &clave2_data] {
-        run(&clave, &["seal", "--data", s(data), "--at", &ninth_seal]);
-    }
+    let ninth_epoch = seal_epoch(&clave, &clave_data, &ninth_seal);
+    seal_epoch(&clave, &clave2_data, &ninth_seal);
+    record.exercised("label_two_epochs_live", ninth_epoch);
     run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
     let mut mcp6 = McpClient::start(&graven, &gdir);
     let two_epochs = mcp6.tool_call(
@@ -1170,6 +1394,512 @@ fn end_to_end() {
         "a Label live through two consecutive Epochs must count: {two_epochs}"
     );
     drop(mcp6);
+
+    // --- the Publisher removes a URL and the record leaves the index ---
+    let mut mcp7 = McpClient::start(&graven, &gdir);
+    assert_eq!(
+        mcp7.get_record(&removed_url)["url"],
+        removed_url,
+        "the page to be removed is not indexed before its removal"
+    );
+    assert!(
+        mcp7.search("vanishing")
+            .iter()
+            .any(|h| h["url"] == removed_url.as_str()),
+        "the page to be removed is not searchable before its removal"
+    );
+    drop(mcp7);
+
+    let removed_since = now_rfc3339();
+    build_site(
+        &spake,
+        &pruned_host,
+        &pruned_site,
+        &pruned_state,
+        &["--remove", &removed_url],
+    );
+    ping(&spake, &clave_base, &pruned_host);
+    wait_until_pulled_since(
+        &http,
+        &clave_base,
+        &pruned_host,
+        &removed_since,
+        &clave_stderr,
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let deletion_seal = grid_instant(9);
+    let deletion_epoch = seal_epoch(&clave, &clave_data, &deletion_seal);
+    record.exercised("url_deletion", deletion_epoch);
+    run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+
+    let mut mcp8 = McpClient::start(&graven, &gdir);
+    let absent = mcp8.get_record_error(&removed_url);
+    assert_eq!(
+        absent["message"], "not found",
+        "get_record still answers for the removed URL: {absent}"
+    );
+    assert!(
+        mcp8.search("vanishing").is_empty(),
+        "the removed URL is still searchable"
+    );
+    assert_eq!(
+        mcp8.get_record(&kept_url)["url"],
+        kept_url,
+        "the domain's other record left the index with the removed one"
+    );
+    assert!(
+        mcp8.search("keepsake")
+            .iter()
+            .any(|h| h["url"] == kept_url.as_str()),
+        "the domain's other record is no longer searchable"
+    );
+    drop(mcp8);
+
+    // --- the Aggregator restarts with admitted Deltas still unsealed ---
+    let resumed_url = format!("https://{pruned_host}/resumed.html");
+    add_page(
+        &pruned_site,
+        &pruned_host,
+        "resumed.html",
+        "Pruned resumed",
+        "resumed notes admitted before the aggregator stopped",
+    );
+    let admitted_since = now_rfc3339();
+    build_site(&spake, &pruned_host, &pruned_site, &pruned_state, &[]);
+    ping(&spake, &clave_base, &pruned_host);
+    wait_until_pulled_since(
+        &http,
+        &clave_base,
+        &pruned_host,
+        &admitted_since,
+        &clave_stderr,
+    );
+    let synced = run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+    let heads_before = synced_heads(&String::from_utf8_lossy(&synced.stdout));
+    assert_eq!(
+        heads_before.len(),
+        2,
+        "the Consumer follows both Logs: {heads_before:?}"
+    );
+    let anchor_before = std::fs::read(&anchor_path).expect("read anchor.json");
+    let mut mcp_pending = McpClient::start(&graven, &gdir);
+    let unsealed = mcp_pending.get_record_error(&resumed_url);
+    assert_eq!(
+        unsealed["message"], "not found",
+        "the admitted Delta sealed before the Aggregator was stopped: {unsealed}"
+    );
+    drop(mcp_pending);
+
+    aggregator.stop();
+    wait_until_unreachable(&http, &clave_base, &pruned_host);
+    aggregator.start(&clave, Some(&site_proxy));
+    let clave_stderr = aggregator.stderr.clone();
+    wait_until_status_active(&http, &clave_base, &pruned_host);
+    assert_eq!(
+        std::fs::read(&anchor_path).expect("read anchor.json"),
+        anchor_before,
+        "the restarted Aggregator serves a different Log Anchor"
+    );
+
+    let restart_seal = grid_instant(10);
+    let restart_epoch = seal_epoch(&clave, &clave_data, &restart_seal);
+    record.exercised("aggregator_restart", restart_epoch);
+    run(&clave, &["verify-history", "--data", s(&clave_data)]);
+    let resynced = run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+    let heads_after = synced_heads(&String::from_utf8_lossy(&resynced.stdout));
+    for (log_id, before) in &heads_before {
+        let after = heads_after
+            .get(log_id)
+            .unwrap_or_else(|| panic!("log {log_id} missing after the restart: {heads_after:?}"));
+        assert!(
+            after.epoch >= before.epoch && after.tree_size >= before.tree_size,
+            "log {log_id} rolled back across the restart: {before:?} then {after:?}"
+        );
+        if after.epoch == before.epoch {
+            assert_eq!(
+                after.root, before.root,
+                "log {log_id} kept its head Epoch and changed its root: {before:?} then {after:?}"
+            );
+        }
+    }
+    assert!(
+        heads_after[&clave_host].epoch > heads_before[&clave_host].epoch,
+        "the restarted Aggregator sealed no Epoch: {heads_before:?} then {heads_after:?}"
+    );
+
+    let mut mcp9 = McpClient::start(&graven, &gdir);
+    assert_eq!(
+        mcp9.get_record(&resumed_url)["url"],
+        resumed_url,
+        "a Delta admitted before the restart did not seal after it"
+    );
+    drop(mcp9);
+
+    // --- the Publisher publishes again from its state directory alone ---
+    let beta_url = format!("https://{site_host}/b.html");
+    let mut mcp10 = McpClient::start(&graven, &gdir);
+    let beta_tip = mcp10.get_record(&beta_url)["delta_id"]
+        .as_str()
+        .expect("delta_id is a string")
+        .to_string();
+    drop(mcp10);
+    revise_fixture_page(
+        &site,
+        "beta page body content rotated",
+        "beta page body content restarted",
+    );
+    run_in_fresh_env(
+        &spake,
+        &[
+            "build",
+            "--site",
+            s(&site),
+            "--domain",
+            &site_host,
+            "--out",
+            s(&site),
+            "--state",
+            s(&spake_state),
+        ],
+        &[],
+    );
+    let restarted_since = now_rfc3339();
+    for base in [&clave_base, &clave2_base] {
+        ping(&spake, base, &site_host);
+    }
+    wait_until_pulled_since(
+        &http,
+        &clave_base,
+        &site_host,
+        &restarted_since,
+        &clave_stderr,
+    );
+    wait_until_pulled_since(
+        &http,
+        &clave2_base,
+        &site_host,
+        &restarted_since,
+        &clave2_stderr,
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let publisher_restart_seal = grid_instant(11);
+    let publisher_restart_epoch = seal_epoch(&clave, &clave_data, &publisher_restart_seal);
+    seal_epoch(&clave, &clave2_data, &publisher_restart_seal);
+    record.exercised("publisher_restart", publisher_restart_epoch);
+    run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+
+    let mut mcp11 = McpClient::start(&graven, &gdir);
+    let restarted_record = mcp11.get_record(&beta_url);
+    let restarted_tip = restarted_record["delta_id"]
+        .as_str()
+        .expect("delta_id is a string")
+        .to_string();
+    assert_ne!(
+        restarted_tip, beta_tip,
+        "the build from the persisted state directory published nothing new"
+    );
+    assert!(
+        mcp11
+            .search("restarted")
+            .iter()
+            .any(|h| h["url"] == beta_url.as_str()),
+        "the Delta built from the persisted state directory is not searchable"
+    );
+    drop(mcp11);
+    let restarted_delta = read_json(&site.join(format!(
+        ".well-known/wist/deltas/{}.json",
+        restarted_tip
+            .strip_prefix("sha256:")
+            .expect("delta id is prefixed")
+    )));
+    assert_eq!(
+        restarted_delta["delta"]["prev"], beta_tip,
+        "the Delta chain restarted instead of continuing from the sealed tip: {restarted_delta}"
+    );
+
+    // --- the selected ranking profile outlives the Consumer process ---
+    run(
+        &graven,
+        &["profile", "use", "--dir", s(&gdir), "--name", "text-only"],
+    );
+    let mut mcp12 = McpClient::start(&graven, &gdir);
+    let selected = mcp12.search("changed");
+    let selected_hit = selected
+        .iter()
+        .find(|h| h["url"].as_str().unwrap_or_default().ends_with("/a.html"))
+        .unwrap_or_else(|| {
+            panic!("a query naming no profile did not use the selected one: {selected:?}")
+        });
+    assert_eq!(selected_hit["ranking"]["profile"], "text-only");
+    drop(mcp12);
+    run(
+        &graven,
+        &["profile", "use", "--dir", s(&gdir), "--name", "default"],
+    );
+    let mut mcp13 = McpClient::start(&graven, &gdir);
+    assert!(
+        mcp13.search("changed").is_empty(),
+        "selecting the default profile again did not restore its treatment of the spam Label"
+    );
+    let defaulted = mcp13.search("orchard");
+    assert_eq!(
+        defaulted
+            .first()
+            .unwrap_or_else(|| panic!("no hit for orchard under the default profile"))["ranking"]
+            ["profile"],
+        "default"
+    );
+    drop(mcp13);
+    record.exercised("default_profile_persistence", publisher_restart_epoch);
+
+    // --- the Publisher recovers its Key Set with the offline recovery key ---
+    let stale_url = format!("https://{recovered_host}/stale.html");
+    let fresh_url = format!("https://{recovered_host}/fresh.html");
+    let first_url = format!("https://{recovered_host}/first.html");
+    add_page(
+        &recovered_site,
+        &recovered_host,
+        "stale.html",
+        "Recovered stale",
+        "brittle notes signed under the key set the recovery replaces",
+    );
+    let stale_since = now_rfc3339();
+    build_site(
+        &spake,
+        &recovered_host,
+        &recovered_site,
+        &recovered_state,
+        &[],
+    );
+    ping(&spake, &clave_base, &recovered_host);
+    wait_until_pulled_since(
+        &http,
+        &clave_base,
+        &recovered_host,
+        &stale_since,
+        &clave_stderr,
+    );
+    let stale_delta = published_delta_id(&recovered_site, &stale_url);
+
+    run(
+        &spake,
+        &[
+            "recover",
+            "--out",
+            s(&recovered_site),
+            "--state",
+            s(&recovered_state),
+            "--recovery-seed",
+            s(&recovery_seed),
+        ],
+    );
+    let recovered_declaration = read_json(&recovered_site.join(".well-known/wist/publisher.json"));
+    assert_eq!(
+        recovered_declaration["sig"]["key_id"], committed["publisher"]["recovery_keys"][0]["kid"],
+        "the recovery is signed by the committed recovery key: {recovered_declaration}"
+    );
+    assert_eq!(
+        recovered_declaration["publisher"]["keys"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "the recovery installs one signing key: {recovered_declaration}"
+    );
+    add_page(
+        &recovered_site,
+        &recovered_host,
+        "fresh.html",
+        "Recovered fresh",
+        "sturdy notes signed under the recovered key set",
+    );
+    let recovered_since = now_rfc3339();
+    build_site(
+        &spake,
+        &recovered_host,
+        &recovered_site,
+        &recovered_state,
+        &[],
+    );
+    ping(&spake, &clave_base, &recovered_host);
+    wait_until_pulled_since(
+        &http,
+        &clave_base,
+        &recovered_host,
+        &recovered_since,
+        &clave_stderr,
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let window_seal = grid_instant(12);
+    let window_epoch = seal_epoch(&clave, &clave_data, &window_seal);
+    record.exercised("publisher_key_recovery_window", window_epoch);
+    let entries = snapshot_state_entries(&clave_data);
+    let window = state_tuple(&entries, "recovery_window", &recovered_host)
+        .unwrap_or_else(|| panic!("no recovery_window tuple: {entries:?}"));
+    assert_eq!(
+        window[2], window_epoch,
+        "the window opens at the Epoch sealing the recovery Declaration: {window}"
+    );
+    run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+
+    let mut mcp14 = McpClient::start(&graven, &gdir);
+    assert_eq!(
+        mcp14.get_record(&first_url)["url"],
+        first_url,
+        "a record sealed before the window opened must stay visible"
+    );
+    for queued in [&stale_url, &fresh_url] {
+        let absent = mcp14.get_record_error(queued);
+        assert_eq!(
+            absent["message"], "not found",
+            "a Delta queued by the open recovery window is visible: {absent}"
+        );
+    }
+    drop(mcp14);
+
+    // A Delta published while the window stands open queues behind it too.
+    let later_url = format!("https://{recovered_host}/later.html");
+    add_page(
+        &recovered_site,
+        &recovered_host,
+        "later.html",
+        "Recovered later",
+        "patient notes published while the recovery window stood open",
+    );
+    let later_since = now_rfc3339();
+    build_site(
+        &spake,
+        &recovered_host,
+        &recovered_site,
+        &recovered_state,
+        &[],
+    );
+    ping(&spake, &clave_base, &recovered_host);
+    wait_until_pulled_since(
+        &http,
+        &clave_base,
+        &recovered_host,
+        &later_since,
+        &clave_stderr,
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let open_window_seal = grid_instant(13);
+    let open_window_epoch = seal_epoch(&clave, &clave_data, &open_window_seal);
+    record.exercised("delta_queued_inside_the_recovery_window", open_window_epoch);
+    let entries = snapshot_state_entries(&clave_data);
+    let window = state_tuple(&entries, "recovery_window", &recovered_host)
+        .unwrap_or_else(|| panic!("the window closed before its end: {entries:?}"));
+    assert_eq!(
+        window[2], window_epoch,
+        "a later Epoch moved the window's opening: {window}"
+    );
+    run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+    let mut mcp_queued = McpClient::start(&graven, &gdir);
+    let absent = mcp_queued.get_record_error(&later_url);
+    assert_eq!(
+        absent["message"], "not found",
+        "a Delta published inside the open window sealed instead of queueing: {absent}"
+    );
+    drop(mcp_queued);
+
+    let settlement_seal = grid_instant(12 + 24 * 7 + 1);
+    let settlement_epoch = seal_epoch(&clave, &clave_data, &settlement_seal);
+    record.exercised("publisher_key_recovery_settlement", settlement_epoch);
+    let entries = snapshot_state_entries(&clave_data);
+    assert!(
+        state_tuple(&entries, "recovery_window", &recovered_host).is_none(),
+        "the recovery window did not settle: {entries:?}"
+    );
+    let settled_status = fetch_status(&http, &clave_base, &recovered_host)
+        .unwrap_or_else(|| panic!("no status for {recovered_host} after settlement"));
+    let rejections = settled_status["rejections"]
+        .as_array()
+        .expect("rejections array");
+    assert!(
+        rejections
+            .iter()
+            .any(|r| r["code"] == "WIST1-E13" && r["delta_id"] == stale_delta.as_str()),
+        "settlement did not reject the Delta under the pre-recovery key: {rejections:?}"
+    );
+    run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+
+    let mut mcp15 = McpClient::start(&graven, &gdir);
+    for materialized in [&fresh_url, &later_url] {
+        assert_eq!(
+            mcp15.get_record(materialized)["url"],
+            materialized.as_str(),
+            "a Delta under the recovered Key Set did not materialize at settlement"
+        );
+    }
+    let absent = mcp15.get_record_error(&stale_url);
+    assert_eq!(
+        absent["message"], "not found",
+        "the Delta under the pre-recovery key is visible after settlement: {absent}"
+    );
+    drop(mcp15);
+
+    // --- the recovery key is itself replaced, which opens a window as any
+    // recovery rotation does ---
+    let rotated_seed = tmp.path().join("offline/recovery-next.seed");
+    run(
+        &spake,
+        &[
+            "recovery-rotate",
+            "--out",
+            s(&recovered_site),
+            "--state",
+            s(&recovered_state),
+            "--recovery-seed",
+            s(&recovery_seed),
+            "--seed-out",
+            s(&rotated_seed),
+        ],
+    );
+    let rotated_since = now_rfc3339();
+    ping(&spake, &clave_base, &recovered_host);
+    wait_until_pull_recorded(&http, &clave_base, &recovered_host, &rotated_since);
+    std::thread::sleep(Duration::from_secs(2));
+    let recovery_rotation_seal = grid_instant(12 + 24 * 7 + 2);
+    let recovery_rotation_epoch = seal_epoch(&clave, &clave_data, &recovery_rotation_seal);
+    record.exercised("recovery_key_rotation", recovery_rotation_epoch);
+    let entries = snapshot_state_entries(&clave_data);
+    let rotated_window = state_tuple(&entries, "recovery_window", &recovered_host)
+        .unwrap_or_else(|| panic!("the recovery-key rotation opened no window: {entries:?}"));
+    assert_eq!(
+        rotated_window[2], recovery_rotation_epoch,
+        "the window opens at the Epoch sealing the rotation: {rotated_window}"
+    );
+    let rotated_declaration = read_json(&recovered_site.join(".well-known/wist/publisher.json"));
+    assert_ne!(
+        rotated_declaration["publisher"]["recovery_keys"][0]["kid"],
+        committed["publisher"]["recovery_keys"][0]["kid"],
+        "the rotation kept the replaced recovery key: {rotated_declaration}"
+    );
+    run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+    let mut mcp16 = McpClient::start(&graven, &gdir);
+    assert_eq!(
+        mcp16.get_record(&fresh_url)["url"],
+        fresh_url,
+        "the settled records did not survive the recovery-key rotation"
+    );
+    drop(mcp16);
+
+    let run_record = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-run.json");
+    record.write(&run_record);
+    println!("run record: {}", run_record.display());
+    let written = read_json(&run_record);
+    for repo in ["core", "spake", "clave", "graven", "spec"] {
+        assert!(
+            written["repositories"][repo].is_object(),
+            "the run record carries no revision for {repo}: {written}"
+        );
+    }
+    assert_eq!(
+        written["scenarios"]
+            .as_array()
+            .map(|scenarios| scenarios.len()),
+        Some(record.scenarios.len()),
+        "the run record lists every scenario the run exercised: {written}"
+    );
 
     validate_artifacts(&site, &clave_data);
     verify_with_external_tlog_client(&aggregator.base_url, &aggregator.verifier_key);
