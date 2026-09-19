@@ -254,6 +254,7 @@ pub fn spawn_clave_serve_with(
         "--bind",
         bind_addr,
         "--allow-http",
+        "--no-seal",
     ]);
     if let Some(proxy) = proxy {
         command
