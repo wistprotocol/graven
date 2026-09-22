@@ -242,3 +242,95 @@ fn served_tool_list_includes_the_label_tools() {
     assert!(call.get("error").is_none(), "{call}");
     assert_eq!(call["result"]["structuredContent"], json!([]), "{call}");
 }
+
+fn clock_skew_seconds() -> i64 {
+    wist_core::parameters::spec("clock_skew_seconds")
+        .and_then(|p| p.default)
+        .unwrap()
+}
+
+fn instant(seconds: i64) -> String {
+    jiff::Timestamp::from_second(seconds).unwrap().to_string()
+}
+
+fn count(conn: &rusqlite::Connection, table: &str, column: &str, id: &str) -> i64 {
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+        [id],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn sealed_labels_and_disputes_beyond_the_clock_allowance_are_ignored() {
+    let fx = common::build_fixture(true, false);
+    let target = tempfile::tempdir().unwrap();
+    sync(&fx, target.path());
+    let sealed_at = common::next_instant(&fx);
+    let sealed_at_s = sealed_at.parse::<jiff::Timestamp>().unwrap().as_second();
+    let bound = instant(sealed_at_s + clock_skew_seconds());
+    let beyond = instant(sealed_at_s + clock_skew_seconds() + 1);
+    let labeler = common::Signer::new([1u8; 32]);
+    let (at_bound_id, at_bound) = label_entry(
+        &labeler,
+        json!({"wist_version": "1.0.0", "labeler": "records.example", "subject": SUBJECT, "name": "wist:spam", "asserted_at": bound}),
+    );
+    let (beyond_id, beyond_label) = label_entry(
+        &labeler,
+        json!({"wist_version": "1.0.0", "labeler": "records.example", "subject": "https://other.example/y", "name": "wist:spam", "asserted_at": beyond}),
+    );
+    let height = common::seal_next(&fx, &sealed_at, &[at_bound, beyond_label]);
+
+    let disputant = common::Signer::new([4u8; 32]);
+    let declaration = common::build_declaration(&disputant, "other.example");
+    let dispute_sealed_at = common::next_instant(&fx);
+    let dispute_sealed_at_s = dispute_sealed_at
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    let dispute = |asserted_at: String| {
+        let inner = json!({"wist_version": "1.0.0", "disputant": "other.example", "label": at_bound_id, "log": "log.example", "height": height, "asserted_at": asserted_at});
+        let id = wist_core::label::dispute_id(&inner).unwrap();
+        let body = sign_envelope(&inner, "dispute", &disputant.kid(), &disputant.sk).unwrap();
+        (id, json!({"type": "dispute", "body": body}))
+    };
+    let (dispute_at_bound_id, dispute_at_bound) =
+        dispute(instant(dispute_sealed_at_s + clock_skew_seconds()));
+    let (dispute_beyond_id, dispute_beyond) =
+        dispute(instant(dispute_sealed_at_s + clock_skew_seconds() + 1));
+    common::seal_next(
+        &fx,
+        &dispute_sealed_at,
+        &[
+            json!({"type": "publisher_declaration", "body": declaration}),
+            dispute_at_bound,
+            dispute_beyond,
+        ],
+    );
+    sync(&fx, target.path());
+
+    let conn =
+        rusqlite::Connection::open(common::synced_log_dir(target.path()).join("index.sqlite"))
+            .unwrap();
+    assert_eq!(count(&conn, "labels", "label_id", &at_bound_id), 1);
+    assert_eq!(count(&conn, "label_current", "label_id", &at_bound_id), 1);
+    assert_eq!(count(&conn, "labels", "label_id", &beyond_id), 0);
+    assert_eq!(count(&conn, "label_current", "label_id", &beyond_id), 0);
+    assert_eq!(
+        count(&conn, "disputes", "dispute_id", &dispute_at_bound_id),
+        1
+    );
+    assert_eq!(
+        count(&conn, "dispute_current", "dispute_id", &dispute_at_bound_id),
+        1
+    );
+    assert_eq!(
+        count(&conn, "disputes", "dispute_id", &dispute_beyond_id),
+        0
+    );
+    assert_eq!(
+        count(&conn, "dispute_current", "dispute_id", &dispute_beyond_id),
+        0
+    );
+}

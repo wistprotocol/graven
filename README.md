@@ -236,8 +236,11 @@ A Delta sealed below the Epochs the sync walked cannot be checked
 against the act, since no Snapshot tuple names sealed Deltas, and such
 an act is read as consistent. A `label` or `dispute` Entry is validated under its signer's Declaration
 at the Epoch as the Aggregator validated it — fields, the registry name,
-self-labeling, the disputed Label's sealing and authority, the signature
-— and one that fails is ignored like a forked Delta (WIST-2 §3.3). The
+self-labeling, the disputed Label's sealing and authority, the signature,
+and `asserted_at` within the Epoch's `sealed_at` plus the
+`clock_skew_seconds` in force then, the bound a sealed Delta's
+`observed_at` meets (WIST-1 §3.4) — and one that fails is ignored like a
+forked Delta (WIST-2 §3.3). The
 index keeps every walked Label and dispute, the current Label per
 (labeler, subject, name) and the current dispute per (Label ID,
 disputant) by `asserted_at` and Log order, a cold start adopting the

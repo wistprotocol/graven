@@ -1378,7 +1378,13 @@ pub(super) fn apply_labels(
             );
             continue;
         };
-        match wist_core::label::validate_label(body, &declaration, event.profile.url_cap_bytes) {
+        match wist_core::label::validate_label(
+            body,
+            &declaration,
+            event.profile.url_cap_bytes,
+            event.sealed_at_s,
+            event.profile.clock_skew_seconds,
+        ) {
             Ok(envelope) => {
                 let id = wist_core::label::label_id(&body["label"])
                     .map_err(|r| Error::Verify(format!("label id: {r:?}")))?;
@@ -1415,7 +1421,13 @@ pub(super) fn apply_labels(
             None if dispute_height <= walk_floor => wist_core::label::LabelLookup::Unverifiable,
             None => wist_core::label::LabelLookup::Absent,
         };
-        match wist_core::label::validate_dispute(body, &declaration, sealed) {
+        match wist_core::label::validate_dispute(
+            body,
+            &declaration,
+            sealed,
+            event.sealed_at_s,
+            event.profile.clock_skew_seconds,
+        ) {
             Ok(envelope) => {
                 let id = wist_core::label::dispute_id(&body["dispute"])
                     .map_err(|r| Error::Verify(format!("dispute id: {r:?}")))?;
