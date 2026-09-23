@@ -1,8 +1,4 @@
-//! WIST-3 §6 and §9 at cold start: a Snapshot's documents and files are
-//! verified "by hash, signature, or commitment, never by source", so a
-//! source that does not hold one or serves it corrupt sends the same path
-//! to the next source, and `WIST3-E04` stands only where no source yields
-//! a Snapshot whose documents agree.
+//! WIST-3 §6 and §9.
 mod common;
 
 use std::path::Path;
@@ -26,8 +22,6 @@ fn sync_from(
     )
 }
 
-/// A second source holding what the first held before it was tampered
-/// with, recording every path it is asked for.
 fn mirror_of(fx: &common::Fixture) -> (tempfile::TempDir, String, Arc<Mutex<Vec<String>>>) {
     let dir = tempfile::tempdir().unwrap();
     common::copy_dir(fx.dir.path(), dir.path());
@@ -54,9 +48,7 @@ fn snapshot_path(fx: &common::Fixture, file: &str) -> String {
     format!("/snapshots/{}/{file}", fx.snapshot_date)
 }
 
-/// WIST-3 §9's `WIST3-E04`: "A file hash or byte size that disagrees with
-/// the manifest … reject the entire Snapshot and re-fetch, from another
-/// Mirror if needed."
+/// WIST-3 §9's `WIST3-E04`.
 #[test]
 fn a_cold_start_asks_another_source_for_a_snapshot_file_whose_hash_fails() {
     let fx = common::build_fixture(true, false);
@@ -83,9 +75,7 @@ fn a_cold_start_asks_another_source_for_a_snapshot_file_whose_hash_fails() {
     );
 }
 
-/// WIST-3 §6: "integrity is verified by hash, signature, or commitment,
-/// never by source", so a state file one source does not hold is fetched
-/// from another.
+/// WIST-3 §6.
 #[test]
 fn a_cold_start_asks_another_source_for_a_state_file_the_first_source_lacks() {
     let fx = common::build_fixture(true, false);
@@ -108,10 +98,7 @@ fn a_cold_start_asks_another_source_for_a_state_file_the_first_source_lacks() {
     );
 }
 
-/// WIST-3 §8 step 2: the index entry and the manifest are independently
-/// signed statements about one Snapshot, so a manifest disagreeing with
-/// the chosen entry is `WIST3-E04` — and §9 re-fetches it "from another
-/// Mirror if needed" before the Snapshot is given up.
+/// WIST-3 §8 step 2 and §9.
 #[test]
 fn a_cold_start_takes_the_manifest_of_the_source_that_agrees_with_the_chosen_index() {
     let fx = common::build_fixture(true, false);
@@ -128,8 +115,7 @@ fn a_cold_start_takes_the_manifest_of_the_source_that_agrees_with_the_chosen_ind
     );
 }
 
-/// WIST-3 §9's `WIST3-E04`: the disagreement is reported only once no
-/// source yields a Snapshot whose manifest and index entry agree.
+/// WIST-3 §9's `WIST3-E04`.
 #[test]
 fn a_snapshot_no_source_serves_consistently_is_rejected_with_e04() {
     let fx = common::build_fixture(true, false);
@@ -148,11 +134,7 @@ fn a_snapshot_no_source_serves_consistently_is_rejected_with_e04() {
         .exists());
 }
 
-/// WIST-3 §8 step 8 and §9: a Snapshot whose documents do not verify
-/// "under the keys valid at the height of the Checkpoint it adopts" is
-/// rejected entirely and re-fetched "from another Mirror if needed", so
-/// the Consumer cold-starts from the source that re-signed them after the
-/// removal.
+/// WIST-3 §8 step 8 and §9.
 #[test]
 fn a_cold_start_takes_the_snapshot_of_the_source_whose_documents_verify_at_the_adopted_head() {
     let fx = common::build_fixture(true, false);
@@ -177,9 +159,7 @@ fn a_cold_start_takes_the_snapshot_of_the_source_whose_documents_verify_at_the_a
     );
 }
 
-/// WIST-3 §9's `WIST3-E04`: the rejection stands once no source serves a
-/// Snapshot whose documents verify at the adopted head, and nothing the
-/// Snapshot carried is persisted.
+/// WIST-3 §9's `WIST3-E04`.
 #[test]
 fn a_snapshot_no_source_signs_for_the_adopted_head_is_rejected_by_every_source() {
     let fx = common::build_fixture(true, false);
@@ -205,12 +185,8 @@ fn a_snapshot_no_source_signs_for_the_adopted_head_is_rejected_by_every_source()
         .exists());
 }
 
-/// WIST-3 §9's `WIST3-E04`: a manifest whose `state_digest` is not the one
-/// the state file served beside it recomputes is a disagreement among one
-/// source's documents, judged before any signature is, so the whole
-/// Snapshot is re-fetched "from another Mirror if needed". §9's no-refetch
-/// case is the narrower one: a digest "that disagrees with the Consumer's
-/// own rebuild at `tree_size`" from the Log.
+/// WIST-3 §9's `WIST3-E04`: §9's no-refetch case is only a digest the Consumer's own rebuild
+/// contradicts.
 #[test]
 fn a_cold_start_takes_the_snapshot_of_the_source_whose_manifest_agrees_with_its_state_file() {
     let fx = common::build_fixture(true, false);
@@ -233,9 +209,7 @@ fn a_cold_start_takes_the_snapshot_of_the_source_whose_manifest_agrees_with_its_
     );
 }
 
-/// The same `WIST3-E04` stands once no source serves a manifest its own
-/// state file agrees with, and the Consumer persists nothing derived from
-/// the Snapshot — the registration this run made included (§8 step 8).
+/// WIST-3 §8 step 8 and §9.
 #[test]
 fn a_manifest_no_source_agrees_with_its_state_file_is_rejected_and_registers_nothing() {
     let fx = common::build_fixture(true, false);

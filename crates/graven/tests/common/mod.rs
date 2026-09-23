@@ -81,9 +81,6 @@ fn record_projection(r: &RecordFixture) -> Value {
     })
 }
 
-/// WIST-3 §6 serves the Log's Anchor at `/log/anchor.json`, for
-/// convenience only: it is a trust root because of how it was obtained,
-/// never because of where it sits.
 pub fn write_anchor(path: &Path, log: &Signer, log_id: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let anchor = Anchor {
@@ -205,10 +202,7 @@ pub fn write_payload(dir: &Path, hex: &str, payload: &Value) {
     .unwrap();
 }
 
-/// A test Log: one growing RFC 6962 tree published as WIST-3 §6's static
-/// surface — the head Checkpoint at `/checkpoint`, every Checkpoint under
-/// `/log/checkpoints/`, the tree's hashes as tiles and its Entries as
-/// entry bundles.
+/// WIST-3 §6.
 pub struct Log {
     pub dir: PathBuf,
     pub log: Signer,
@@ -252,7 +246,6 @@ impl Log {
         Log::empty(dir, log, log_id)
     }
 
-    /// A Log whose Anchor another party wrote, as a spec vector's does.
     pub fn empty(dir: &Path, log: Signer, log_id: &str) -> Log {
         Log {
             dir: dir.to_path_buf(),
@@ -264,8 +257,6 @@ impl Log {
         }
     }
 
-    /// Publishes an Epoch whose Checkpoint another party signed, keeping
-    /// the note verbatim.
     pub fn adopt(&mut self, note: &str, entries: &[Value]) {
         for entry in entries {
             let bytes = jcs::canonicalize(entry).expect("entry canonicalizes");
@@ -277,8 +268,6 @@ impl Log {
         self.publish();
     }
 
-    /// Seals an Epoch under a `sealed_at` this suite's profile or cadence
-    /// grid rejects, which only a misbehaving Aggregator publishes.
     pub fn seal_off_profile(&mut self, sealed_at: &str, entries: &[Value]) {
         let mut ordered = entries.to_vec();
         wist_core::epoch::sort_entries(&mut ordered).expect("entries are well formed");
@@ -307,8 +296,6 @@ impl Log {
         self.publish_tree();
     }
 
-    /// Seals an Epoch from leaf data supplied verbatim, so that a test can
-    /// publish an Entry whose octets are not the JCS of anything.
     pub fn seal_leaf_bytes(&mut self, sealed_at: &str, leaves: &[Vec<u8>]) -> WistCheckpoint {
         for bytes in leaves {
             self.hashes.push(merkle::leaf_hash(bytes));
@@ -352,8 +339,6 @@ impl Log {
         self.seal_signed_by(&signer, sealed_at, entries)
     }
 
-    /// Seals the next Epoch under a named Aggregator key, which is how a
-    /// Log that rotated its key signs the Checkpoints after the rotation.
     pub fn seal_signed_by(
         &mut self,
         signer: &Signer,
@@ -382,8 +367,6 @@ impl Log {
         checkpoint
     }
 
-    /// Appends each Witness's Cosignature to the head Checkpoint, as the
-    /// Aggregator republishes it after `add-checkpoint` (WIST-3 §5).
     pub fn cosign_head(&mut self, witnesses: &[&Witness], timestamp_s: u64) {
         let head = self.checkpoints.last_mut().expect("a sealed Epoch");
         let note_text = head.note_text();
@@ -398,8 +381,6 @@ impl Log {
         self.publish();
     }
 
-    /// Writes the head Checkpoint note verbatim, for a source offering
-    /// something other than what this Log sealed.
     pub fn write_head_note(&self, note: &str) {
         std::fs::write(self.dir.join("checkpoint"), note).expect("write /checkpoint");
     }
@@ -549,9 +530,8 @@ pub fn write_state_with(
     floor: u64,
 ) -> (Vec<u8>, String) {
     let mut entries = extra;
-    // WIST-3 §7: the state carries an `aggregator_key` tuple for every
-    // key admitted at or below `tree_size`, removed ones included; a
-    // caller supplying its own set replaces the genesis-only default.
+    // WIST-3 §7: one `aggregator_key` tuple per key admitted at or below `tree_size`, removed ones
+    // included.
     if !entries
         .iter()
         .any(|entry| matches!(entry, StateEntry::AggregatorKey(_)))
@@ -784,11 +764,6 @@ pub fn resign_state_with_wrong_key(dir: &Path, log: &Signer, other: &Signer, sna
     std::fs::write(&manifest_path, serde_json::to_vec(&menv).unwrap()).unwrap();
 }
 
-/// Seals the Epochs that admit `second` as `log2` and retire the
-/// Anchor's genesis key, leaving `second` the only key valid at the head.
-/// The Snapshot documents the genesis key signed are left as they are:
-/// re-signing them is what `resign_snapshot_documents` does, as WIST-3
-/// §3.4 obliges the Aggregator to.
 pub fn seal_the_genesis_keys_removal(fx: &Fixture, second: &Signer) {
     let effective_at = "2026-08-09T15:00:00Z";
     let at = next_instant(fx);
@@ -805,9 +780,8 @@ pub fn seal_the_genesis_keys_removal(fx: &Fixture, second: &Signer) {
             effective_at,
         )],
     );
-    // The removal is authenticated at the height below its Epoch, where
-    // the genesis key is still valid; Checkpoint N is signed by the key
-    // valid at N, which the removal leaves as `log2` alone.
+    // WIST-3 §3.4: the removal is authenticated at the height below its Epoch; Checkpoint N under
+    // the keys valid at N.
     let at = next_instant(fx);
     let removal = key_act(
         fx,
@@ -821,10 +795,8 @@ pub fn seal_the_genesis_keys_removal(fx: &Fixture, second: &Signer) {
     fx.log_state().seal_signed_by(second, &at, &[removal]);
 }
 
-/// WIST-3 §3.4: "An Aggregator that removes a key MUST re-sign, under a
-/// key valid at the removing Epoch's height, every such document that key
-/// signed and the Aggregator still serves". The state file is re-signed
-/// first, then the manifest that hashes its octets, then the index.
+/// WIST-3 §3.4: the state file is re-signed first, then the manifest hashing its octets, then the
+/// index.
 pub fn resign_snapshot_documents(dir: &Path, snapshot_date: &str, key_id: &str, signer: &Signer) {
     let snapdir = dir.join("snapshots").join(snapshot_date);
 
@@ -863,13 +835,10 @@ pub fn resign_checkpoint_with_wrong_key(fx: &Fixture, other: &Signer) {
     fx.log_state().write_head_note(&forged.encode());
 }
 
-/// Seals one more Epoch, publishing the tree and its Checkpoint.
 pub fn seal_next(fx: &Fixture, sealed_at: &str, entries: &[Value]) -> u64 {
     fx.log_state().seal(sealed_at, entries).epoch_number()
 }
 
-/// The `sealed_at` one cadence above the Log's head, on the hourly grid
-/// the fixtures seal on.
 pub fn next_instant(fx: &Fixture) -> String {
     let at = fx.log_state().head().sealed_at_s().expect("a sealed head") + 3600;
     jiff::Timestamp::from_second(at)
@@ -877,8 +846,7 @@ pub fn next_instant(fx: &Fixture) -> String {
         .to_string()
 }
 
-/// A signed `aggregator_key_add` or `aggregator_key_remove` Entry, as
-/// WIST-4 §5.1 shapes it, under the Log key `signing_key_id` names.
+/// WIST-4 §5.1.
 pub fn key_act(
     fx: &Fixture,
     action: &str,
@@ -900,8 +868,7 @@ pub fn key_act(
     serde_json::json!({"type": "registry_update", "body": body})
 }
 
-/// The Registry Update Envelope of a key act on its own, as an
-/// `aggregator_key` tuple carries it verbatim (WIST-3 §7).
+/// WIST-3 §7.
 pub fn key_act_envelope(
     action: &str,
     signing_key_id: &str,
@@ -925,8 +892,6 @@ pub fn key_act_envelope(
     sign_envelope(&update, "update", signing_key_id, &signer.sk).unwrap()
 }
 
-/// A signed `parameter_change` Entry under the Log key
-/// `signing_key_id` names.
 pub fn parameter_act(
     signing_key_id: &str,
     signer: &Signer,
@@ -945,7 +910,7 @@ pub fn parameter_act(
     serde_json::json!({"type": "registry_update", "body": body})
 }
 
-/// The canonical Entry order WIST-3 §3.3 fixes for an Epoch's Entries.
+/// WIST-3 §3.3.
 pub fn canonical_order(entries: &[Value]) -> Vec<Value> {
     let mut ordered = entries.to_vec();
     wist_core::epoch::sort_entries(&mut ordered).unwrap();
@@ -1130,8 +1095,6 @@ pub fn build_pack(
     pack_path
 }
 
-/// Serves a directory over loopback and records the paths it was asked
-/// for, so a test can tell which tile a Consumer fetched.
 pub fn serve_recording(dir: PathBuf) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::{BufRead, BufReader, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1227,10 +1190,6 @@ impl Fixture {
     }
 }
 
-/// Serves, at `/checkpoint`, a Checkpoint of the head's Epoch stating
-/// another root: what a Log equivocating about an Epoch it already
-/// published would serve. `signer` is the key that signs it, so a test
-/// can offer a note no key valid at that height authenticates.
 pub fn forge_head_note(fx: &Fixture, root: [u8; 32], signer: &Signer) {
     let head = fx.log_state().head().clone();
     let mut forged = WistCheckpoint::new(
@@ -1245,8 +1204,6 @@ pub fn forge_head_note(fx: &Fixture, root: [u8; 32], signer: &Signer) {
     fx.log_state().write_head_note(&forged.encode());
 }
 
-/// Copies a served Log directory, so a second source can serve what the
-/// first served before it was tampered with.
 pub fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {

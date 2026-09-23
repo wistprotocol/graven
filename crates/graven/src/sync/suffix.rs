@@ -1,7 +1,4 @@
-//! WIST-4 §3.1 at the Consumer: the Public Suffix List snapshots the Log
-//! pinned, obtained from `/log/suffix-lists/` and verified by identifier,
-//! the acts that put each in force, and WIST-3 §3.2's per-domain capacity
-//! of every walked Epoch under the snapshot in force at it.
+//! WIST-4 §3.1 and WIST-3 §3.2.
 use crate::error::{Error, Result};
 use crate::fetch::{resolve, Client};
 use reqwest::Url;
@@ -81,8 +78,7 @@ impl SuffixLists {
         Ok(())
     }
 
-    /// WIST-3 §8 step 10: adopts the Snapshot's `suffix_list` tuple and
-    /// obtains its file before any Epoch's capacity is checked under it.
+    /// WIST-3 §8 step 10: the file is obtained before any Epoch's capacity is checked under it.
     pub fn adopt(
         &mut self,
         client: &Client,
@@ -98,7 +94,6 @@ impl SuffixLists {
         Ok(())
     }
 
-    /// The snapshot in force at Epoch `height`.
     pub fn in_force_at_epoch(&mut self, height: u64) -> Result<Option<Arc<SuffixList>>> {
         let Some((identifier, _)) = self.replay.in_force_at_epoch(height) else {
             return Ok(None);
@@ -117,8 +112,7 @@ impl SuffixLists {
         Ok(Some(list))
     }
 
-    /// WIST-3 §3.2: the Epoch's `publisher_delta`, `label` and `dispute`
-    /// Entries per Registrable Domain under the snapshot in force at it.
+    /// WIST-3 §3.2.
     pub fn check_capacity(&mut self, height: u64, epoch: &[Value], caps: EpochCaps) -> Result<()> {
         let list = self.in_force_at_epoch(height)?;
         let entries = epoch.iter().filter_map(|entry| {
@@ -135,11 +129,8 @@ impl SuffixLists {
             .map_err(|e| Error::Verify(format!("epoch {height}: {e}")))
     }
 
-    /// Replays one `suffix_list_update` sealed at `height`, obtaining the
-    /// named file when the act verifies; an act the Log key does not
-    /// authenticate or whose details fail their contract is ignored with
-    /// its code, and a file that cannot be obtained or does not hash to
-    /// its name fails the walk.
+    /// WIST-4 §3.1: an unauthenticated or failing act is ignored with its code; an unobtainable or
+    /// mismatched file fails the walk.
     pub fn apply_act(
         &mut self,
         client: &Client,

@@ -1,6 +1,4 @@
-//! WIST-3 §5 at the Consumer: the head and archived Checkpoints, the
-//! rollback rule, the Witness roster and quorum, and the evidence bundles
-//! a divergence leaves on disk.
+//! WIST-3 §5.
 use super::source::Sources;
 use super::tree::Tree;
 use crate::error::{Error, Result};
@@ -20,11 +18,7 @@ use wist_core::objects::SnapshotManifest;
 /// the Consumer's own, since WIST-3 §6 gives the file no octet bound.
 pub const CHECKPOINT_MAX_BYTES: u64 = 65_536;
 
-/// Every Checkpoint the Consumer acted on. `unwitnessed` is WIST-3 §5's
-/// record of an acceptance carrying no Cosignature from a trusted
-/// Witness, kept with the Checkpoint it belongs to; it is NULL for a
-/// Checkpoint the Consumer verified on the way to its head but never
-/// adopted, which is no acceptance to record.
+/// WIST-3 §5: `unwitnessed` is NULL for a Checkpoint verified but never adopted.
 pub const CREATE_CHECKPOINTS: &str =
     "CREATE TABLE IF NOT EXISTS checkpoints(epoch_number INTEGER PRIMARY KEY, note TEXT NOT NULL, unwitnessed INTEGER)";
 
@@ -32,9 +26,8 @@ fn invalid(message: &str) -> Error {
     Error::Verify(format!("WIST3-E03 {message}"))
 }
 
-/// WIST-3 §5: the Witness roster is the Consumer's configuration, in the
-/// `<name>+<hex key ID>+base64(0x04 || key)` verifier-key form
-/// [signed-note] defines for the cosignature/v1 type.
+/// WIST-3 §5: the `<name>+<hex key ID>+base64(0x04 || key)` verifier-key form [signed-note] defines
+/// for cosignature/v1.
 pub fn parse_witness_key(encoded: &str) -> Result<WitnessKey> {
     let bad = |detail: &str| Error::Verify(format!("witness verifier key {encoded:?}: {detail}"));
     let parts: Vec<&str> = encoded.splitn(3, '+').collect();
@@ -72,8 +65,6 @@ fn parse_note(bytes: &[u8], path: &str) -> Result<Checkpoint> {
     Checkpoint::parse(text).map_err(Into::into)
 }
 
-/// WIST-3 §8: the head Checkpoint, from the first source that serves one
-/// that parses.
 pub fn head(sources: &Sources) -> Result<Checkpoint> {
     let bytes = sources.verified("/checkpoint", CHECKPOINT_MAX_BYTES, |bytes| {
         parse_note(bytes, "/checkpoint").map(|_| ())
@@ -81,8 +72,7 @@ pub fn head(sources: &Sources) -> Result<Checkpoint> {
     parse_note(&bytes, "/checkpoint")
 }
 
-/// WIST-3 §6: the archived Checkpoint of one Epoch, rejected where the
-/// file's `epoch_number` line is not the path's number.
+/// WIST-3 §6: rejected where `epoch_number` is not the path's number.
 pub fn archived(sources: &Sources, epoch_number: u64) -> Result<Checkpoint> {
     let path = archive_path(epoch_number);
     let bytes = sources.cached(&path, CHECKPOINT_MAX_BYTES, |bytes| {
@@ -93,13 +83,8 @@ pub fn archived(sources: &Sources, epoch_number: u64) -> Result<Checkpoint> {
     parse_note(&bytes, &path)
 }
 
-/// WIST-3 §9's `WIST3-E03`: "Re-download, from another source if needed,
-/// before concluding misbehavior". The archived Checkpoint of one Epoch
-/// whose signature a key of `aggregator_keys` verifies: a note a source
-/// serves that does not parse, sits at another Epoch's path or fails a
-/// known key's signature is that source's fault, so the same path is asked
-/// of the next source, and the `WIST3-E03` stands only where no source
-/// serves a note that verifies.
+/// WIST-3 §9 `WIST3-E03`: a bad note is its source's fault; the error stands only where no source
+/// serves one that verifies.
 fn archived_verified(
     sources: &Sources,
     epoch_number: u64,
@@ -120,18 +105,8 @@ fn archived_verified(
     verify(&bytes)
 }
 
-/// WIST-3 §8 steps 4 and 5: the Checkpoint a Snapshot manifest's
-/// `epoch_number` selects, with the state file's `tree_size` held to the
-/// manifest (`WIST3-E04`, rejecting the Snapshot), the Log's signature
-/// verified under the key set valid at that height, and the manifest's
-/// `tree_size` and `root_hash` held to the Checkpoint (`WIST3-E02`). The
-/// `epoch_number` selects the file and is never itself compared for
-/// divergence: a file at that path stating another Epoch is the source's
-/// `WIST3-E03` and the next source is asked for the same path, as is one
-/// whose signature no known key verifies. The manifest match is judged on
-/// the note that verified and is never re-fetched: a Snapshot describing
-/// another tree from the one the Log signs is divergence, not a corrupt
-/// file.
+/// WIST-3 §8 steps 4 and 5: `epoch_number` only selects the file; a manifest mismatch on the
+/// verified note is divergence and is never re-fetched.
 pub fn manifest_anchor(
     sources: &Sources,
     manifest: &SnapshotManifest,
@@ -152,14 +127,8 @@ pub fn manifest_anchor(
     Ok((anchor, verification))
 }
 
-/// WIST-3 §3.1's sequence dispositions at the verified head. A Checkpoint
-/// stating a tree size below the previous one's has no Entries to walk, so
-/// the key set valid at its height is the one valid at the previous
-/// height: under that set a root the larger tree contradicts is §5's third
-/// Equivocation form (`WIST3-E02`), whose evidence is both Checkpoints and
-/// the larger tree's hashes. Every other failure of those rules is
-/// `WIST3-E03`, and an Epoch the Consumer has no Checkpoint for is
-/// `WIST3-E01`.
+/// WIST-3 §3.1 at the verified head: a smaller tree's contradicting root is §5's third Equivocation
+/// form (`WIST3-E02`), a missing Epoch `WIST3-E01`, any other failure `WIST3-E03`.
 #[allow(clippy::too_many_arguments)]
 pub fn sequence_at_head(
     log_dir: &Path,
@@ -196,10 +165,7 @@ pub fn sequence_at_head(
     }
 }
 
-/// WIST-3 §3.1: an archived Checkpoint between the verified head and an
-/// offered one. A gap is never an object a Consumer holds, so one no
-/// source serves names its Epoch as the `WIST3-E01` that leaves the head
-/// where it is.
+/// WIST-3 §3.1: a gap no source serves is `WIST3-E01` and leaves the head in place.
 pub fn archived_between(sources: &Sources, epoch_number: u64) -> Result<Checkpoint> {
     archived(sources, epoch_number).map_err(|error| match error.code().as_deref() {
         Some("WIST3-E01") => checkpoint::absent_checkpoint(epoch_number).into(),
@@ -225,8 +191,7 @@ pub fn save_checkpoint(
     Ok(())
 }
 
-/// Whether the acceptance of the Checkpoint at one Epoch was recorded as
-/// unwitnessed; absent where the Consumer retained it without adopting it.
+/// `None` where the Checkpoint was retained without being adopted.
 pub fn retained_unwitnessed(conn: &Connection, epoch_number: u64) -> Result<Option<bool>> {
     if !crate::store::table_exists(conn, "checkpoints")? {
         return Ok(None);
@@ -241,8 +206,6 @@ pub fn retained_unwitnessed(conn: &Connection, epoch_number: u64) -> Result<Opti
         .flatten())
 }
 
-/// The Checkpoint the Consumer retains at one Epoch, against whose note
-/// text a later offer of that Epoch is compared (WIST-3 §5).
 pub fn retained(conn: &Connection, epoch_number: u64) -> Result<Option<Checkpoint>> {
     if !crate::store::table_exists(conn, "checkpoints")? {
         return Ok(None);
@@ -264,8 +227,7 @@ fn evidence_dir(log_dir: &Path, kind: &str, epoch_number: u64) -> PathBuf {
         .join(format!("{kind}-epoch-{epoch_number:09}"))
 }
 
-/// WIST-3 §5 and §9: two Checkpoints that equivocate are kept as the
-/// self-contained bundle anyone can verify from the Anchor.
+/// WIST-3 §5 and §9.
 pub fn record_equivocation(
     log_dir: &Path,
     retained: &Checkpoint,
@@ -278,12 +240,8 @@ pub fn record_equivocation(
     Ok(dir)
 }
 
-/// WIST-3 §9: the two Checkpoints, and — where the divergence is the
-/// third Equivocation form or a failed Consistency Proof — the tree
-/// hashes that reproduce the larger root, from which anyone recomputes
-/// the prefix root the smaller Checkpoint contradicts. A Checkpoint
-/// stating tree size 0 with another root than §4's is its own whole
-/// evidence, so `previous` may be absent.
+/// WIST-3 §9: `previous` is absent for a size-0 Checkpoint with another root than §4's, its own
+/// whole evidence.
 pub fn record_divergence(
     log_dir: &Path,
     previous: Option<&Checkpoint>,
@@ -305,9 +263,7 @@ pub fn record_divergence(
     Ok(dir)
 }
 
-/// WIST-3 §5: "consumers verifying it MUST stop applying new data from
-/// that Aggregator". The halt is recorded beside the evidence and read
-/// before every later sync of the Log.
+/// WIST-3 §5: "MUST stop applying new data from that Aggregator".
 pub const HALT_FILE: &str = "halt.json";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -348,14 +304,8 @@ pub fn halted(log_dir: &Path) -> Result<()> {
     }
 }
 
-/// WIST-3 §5: Equivocation and chain divergence are established between
-/// Checkpoints "each validly signed under an Aggregator key valid at the
-/// height its `epoch_number` line states", so an offered Checkpoint is
-/// authenticated before it is treated as evidence — under the keys valid
-/// at its own height where the Consumer's verified history has reached
-/// it, and otherwise under those valid at the verified head, since a
-/// fork's own key acts are not trusted. One that does not authenticate
-/// is `WIST3-E03` against the source that served it.
+/// WIST-3 §5: authenticated before it is evidence, under the keys valid at its own height once
+/// verified history reaches it, else at the verified head, since a fork's key acts are not trusted.
 #[allow(clippy::too_many_arguments)]
 pub fn divergence(
     log_dir: &Path,
@@ -386,15 +336,8 @@ pub fn divergence(
     ))
 }
 
-/// WIST-3 §5's rollback rule, with the evidence an equivocating offer
-/// leaves behind: a Checkpoint at or below the verified head adopts
-/// nothing and carries no error code, unless its note text differs from
-/// the one retained at its `epoch_number`. Equivocation is two
-/// Checkpoints each validly signed under a key valid at the height its
-/// `epoch_number` line states, so a differing note is verified under the
-/// keys valid at that height before it is treated as evidence: one that
-/// does not verify is `WIST3-E03` against the source that served it and
-/// is preserved as nothing.
+/// WIST-3 §5 rollback rule: a differing note at a retained height is evidence only if the keys
+/// valid at that height verify it; otherwise `WIST3-E03`.
 pub fn progression(
     log_dir: &Path,
     conn: &Connection,
@@ -408,8 +351,6 @@ pub fn progression(
         Ok(progression) => Ok(progression),
         Err(error) => {
             if let (Some("WIST3-E02"), Some(held)) = (error.code(), held.as_ref()) {
-                // The Consumer has verified this Epoch, so the keys valid
-                // at its own height are the ones that can speak for it.
                 checkpoint::verify(
                     offered,
                     log_id,
@@ -433,12 +374,7 @@ pub fn progression(
     }
 }
 
-/// WIST-3 §8's continuous operation, step 1: the head Checkpoint each
-/// source offers, weighed against the verified head before any tile or
-/// bundle is fetched against it. A source serving a Checkpoint at or
-/// below the head, or one whose note the keys valid at its height do not
-/// authenticate, is asked nothing further and the next source is tried;
-/// equivocation stops the Log.
+/// WIST-3 §8 continuous operation step 1: weighed before any tile or bundle is fetched against it.
 pub fn offered_head(
     sources: &Sources,
     log_dir: &Path,
@@ -475,11 +411,7 @@ pub fn offered_head(
     }
 }
 
-/// WIST-3 §5 and §8 step 8: a Checkpoint the Log's signature
-/// authenticates under the keys valid at its height, weighed against the
-/// Witness quorum in force at its `sealed_at`. A Checkpoint short of the
-/// quorum is neither evidence nor an error; one whose known-key signature
-/// fails is `WIST3-E03`.
+/// WIST-3 §5 and §8 step 8: short of the quorum is neither evidence nor an error.
 pub fn decide(
     checkpoint: &Checkpoint,
     log_id: &str,
@@ -491,15 +423,11 @@ pub fn decide(
     Ok(checkpoint::adoption(&verification, quorum))
 }
 
-/// WIST-3 §5: the Log is stale when the newest acceptable Checkpoint's
-/// `sealed_at` lags the current time by more than three sealing cadences.
+/// WIST-3 §5.
 pub fn stale(sealed_at_s: i64, cadence_seconds: i64, now_s: i64) -> bool {
     cadence_seconds > 0 && now_s.saturating_sub(sealed_at_s) > 3 * cadence_seconds
 }
 
-/// Reports whether the newest Checkpoint the Consumer can accept — the
-/// one it adopted, or the verified head it kept — lags the current time
-/// by more than three sealing cadences, warning where it does.
 pub fn warn_if_stale(log_id: &str, checkpoint: &Checkpoint, cadence_seconds: i64) -> bool {
     let Ok(sealed_at_s) = checkpoint.sealed_at_s() else {
         return false;

@@ -42,17 +42,11 @@ pub struct SyncReport {
     pub log_id: String,
     pub epoch_number_before: Option<u64>,
     pub head: u64,
-    /// The tree size the adopted Checkpoint states (WIST-3 §7's
-    /// `tree_size`).
     pub tree_size: u64,
     pub root: String,
-    /// WIST-3 §5's interim: the adopted Checkpoint carried no Cosignature
-    /// from a Witness this Consumer trusts.
+    /// WIST-3 §5.
     pub unwitnessed: bool,
-    /// WIST-3 §5: the newest Checkpoint this Consumer can accept — the
-    /// one it adopted, or the verified head it kept where nothing above
-    /// it was acceptable — lags the current time by more than three
-    /// sealing cadences.
+    /// WIST-3 §5.
     pub stale: bool,
     pub withdrawn: u64,
 }
@@ -76,24 +70,14 @@ impl std::fmt::Display for SyncReport {
     }
 }
 
-/// The format the sync state is written in. A store written before the
-/// Log became one growing tree carries no `format` member and names a
-/// Block hash rather than a tree size; one written before `block_number`
-/// and `log_position` became `epoch_number` and `tree_size`, or before
-/// the key registry kept the accepted act behind each key's heights
-/// (WIST-3 §7), carries an older `format` member. Each is refused rather
-/// than reinterpreted.
 pub const SYNC_STATE_FORMAT: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncState {
     pub format: u32,
-    /// The tree size the verified head states (WIST-3 §7).
     pub tree_size: u64,
-    /// The Epoch the verified head ends.
     pub epoch_number: u64,
-    /// The root of the tree at `tree_size`, in the `sha256:` form of
-    /// WIST-3 §3.1.
+    /// The `sha256:` form of WIST-3 §3.1.
     pub root: String,
     #[serde(default)]
     pub unwitnessed: bool,
@@ -107,8 +91,6 @@ pub struct SyncState {
     pub largest_epoch_bytes: u64,
 }
 
-/// How a Log is configured: where its Anchor and its files come from, and
-/// which Witnesses this Consumer trusts (WIST-3 §5).
 #[derive(Debug, Clone)]
 pub struct Follow<'a> {
     pub anchor: &'a str,
@@ -185,8 +167,6 @@ pub fn run_all(dir: &Path, allow_http: bool) -> Result<Vec<SyncReport>> {
         .collect()
 }
 
-/// The registry entry this call registers or confirms, with the Mirror
-/// list and Witness roster it leaves in force.
 fn register(dir: &Path, config: &Follow, log_id: &str) -> Result<LogEntry> {
     let mut reg = registry::load(dir)?;
     if let Some(other) = registry::find_collision(&reg.logs, log_id) {
@@ -234,9 +214,6 @@ fn register(dir: &Path, config: &Follow, log_id: &str) -> Result<LogEntry> {
     Ok(entry)
 }
 
-/// Whether the log's store holds a verified head. A cold start that
-/// committed one leaves state to act on, so its registration stands and
-/// its failure above that head is reported as an incremental sync's is.
 fn holds_verified_head(log_dir: &Path) -> bool {
     let index = log_dir.join("index.sqlite");
     index.exists()
@@ -247,10 +224,8 @@ fn holds_verified_head(log_dir: &Path) -> bool {
             .is_some()
 }
 
-/// WIST-3 §8: "Until all verify, the Consumer MUST NOT persist or act on
-/// anything derived from the Snapshot" — the registration this run made
-/// included. The registry file is put back as the run found it, so a cold
-/// start that committed nothing leaves the Log unfollowed.
+/// WIST-3 §8: nothing derived from an unverified Snapshot persists, this run's registration
+/// included.
 fn undo_registration(dir: &Path, before: Option<Vec<u8>>, error: Error) -> Error {
     match registry::restore(dir, before) {
         Ok(()) => error,
@@ -278,8 +253,7 @@ fn run_registered(
 
     let log_dir = registry::log_dir(dir, log_id);
     std::fs::create_dir_all(&log_dir)?;
-    // WIST-3 §5: a Consumer that verified an equivocation or a chain
-    // divergence stops applying new data from that Aggregator.
+    // WIST-3 §5.
     checkpoints::halted(&log_dir)?;
     let sync_path = log_dir.join("sync.json");
     let index_path = log_dir.join("index.sqlite");
@@ -332,9 +306,8 @@ struct SyncContext<'a> {
     subscriptions: &'a std::collections::BTreeSet<String>,
 }
 
-/// The state a walk mutates, restored from the committed index before
-/// every attempt so that nothing an Epoch above the adopted Checkpoint
-/// establishes survives into the store.
+/// Restored from the committed index before every attempt, so nothing an Epoch above the adopted
+/// Checkpoint establishes survives.
 struct Restored {
     keys: Registry,
     chain: ChainState,
@@ -353,19 +326,14 @@ fn restore(conn: &Connection, context: &SyncContext, local: &SyncState) -> Resul
     })
 }
 
-/// The Checkpoints a run has to verify above its head, and the Epoch whose
-/// Checkpoint no source served — which ends the sequence there, since
-/// WIST-3 §5 has a Consumer verify "every Checkpoint from its verified head
-/// to the one it adopts, in `epoch_number` order".
+/// WIST-3 §5: a Checkpoint no source served ends the sequence.
 #[derive(Default)]
 struct Offered {
     checkpoints: Vec<Checkpoint>,
     stopped: Option<Stop>,
 }
 
-/// WIST-3 §8's continuous operation, steps 1–3: the offered head, the
-/// archived Checkpoints between it and the verified head, and the newest
-/// of them the Witness quorum admits.
+/// WIST-3 §8 continuous operation, steps 1–3.
 fn offered_above(
     context: &SyncContext,
     conn: &Connection,
@@ -387,10 +355,8 @@ fn offered_above(
     for number in head_epoch_number + 1..head.epoch_number() {
         match checkpoints::archived_between(context.sources, number) {
             Ok(checkpoint) => checkpoints.push(checkpoint),
-            // WIST-3 §9: chain divergence applies nothing. A Checkpoint no
-            // source holds (`WIST3-E01`) or none serves validly
-            // (`WIST3-E03`) leaves the Epochs below it to be adopted (§8
-            // step 8), and is reported once they are applied.
+            // WIST-3 §9: chain divergence applies nothing; `WIST3-E01` and `WIST3-E03` keep the
+            // Epochs below it (§8 step 8).
             Err(error) => {
                 if error.code().as_deref() == Some("WIST3-E02") {
                     return Err(error);
@@ -412,9 +378,7 @@ fn offered_above(
     })
 }
 
-/// WIST-3 §8 step 8: the Epochs up to the adopted Checkpoint are applied
-/// and committed, and the Checkpoint above them the run could not pass is
-/// reported with the head the run actually reached.
+/// WIST-3 §8 step 8.
 fn stopped_run(report: &SyncReport, stop: Stop) -> Error {
     eprintln!("{report}");
     Error::Verify(format!(
@@ -423,9 +387,6 @@ fn stopped_run(report: &SyncReport, stop: Stop) -> Error {
     ))
 }
 
-/// The lower of the two Epochs a run could not pass — the Checkpoint it
-/// could not obtain and the one it could not verify below that — since the
-/// lower one is what holds the adopted head where it is.
 fn first_stop(fetching: Option<Stop>, walking: Option<Stop>) -> Option<Stop> {
     match (fetching, walking) {
         (Some(fetching), Some(walking)) => {
@@ -438,17 +399,12 @@ fn first_stop(fetching: Option<Stop>, walking: Option<Stop>) -> Option<Stop> {
     }
 }
 
-/// What a walk leaves a run: the Checkpoint it adopts with the state the
-/// walk built, and the Checkpoint above that one it could not verify.
 struct Walked {
     adopted: Option<(Restored, Walk, Checkpoint, bool)>,
     stopped: Option<Stop>,
 }
 
-/// The Checkpoint the Consumer adopts and the Epochs up to it, walked
-/// from the committed state. A Checkpoint short of the quorum leaves the
-/// head where it is, so the walk is repeated at the newest Checkpoint the
-/// quorum admits; the Entries above it are never handed to the index.
+/// Entries above the newest Checkpoint the quorum admits never reach the index.
 fn walk_to_adoption(
     context: &SyncContext,
     conn: &Connection,
@@ -474,10 +430,8 @@ fn walk_to_adoption(
             log_dir: context.log_dir,
         };
         let mut walk = walk_checkpoints(&inputs, &mut state, head, &offered[..end])?;
-        // The Checkpoint the walk could not pass may have left part of its
-        // Epoch's Registry Updates in the walked state, so the Epochs below
-        // it are walked again from the committed state and nothing that
-        // Epoch established reaches the index (WIST-3 §8 step 8).
+        // WIST-3 §8 step 8: the failing Epoch may have applied part of its Registry Updates, so the
+        // Epochs below it are walked again from the committed state.
         if let Some(stop) = walk.stopped.take() {
             end = offered
                 .iter()
@@ -544,9 +498,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
     let keys = load_aggregator_keys(&conn, context.anchor, local.epoch_number)?;
     let offered = match offered_above(context, &conn, local.epoch_number, &keys) {
         Ok(offered) => offered,
-        // No source served a head: the verified head is the newest
-        // Checkpoint this Consumer can accept, and its staleness is
-        // reported with the failure.
+        // WIST-3 §5: with no head served, staleness is judged on the verified head.
         Err(error) => {
             return Err(
                 match checkpoints::warn_if_stale(context.log_id, &head, cadence) {
@@ -661,11 +613,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
     }
 }
 
-/// What a cold start against one source's Snapshot leaves. WIST-3 §9
-/// answers `WIST3-E04` with "reject the entire Snapshot and re-fetch,
-/// from another Mirror if needed", so a Snapshot whose documents do not
-/// verify at the adopted Checkpoint's height sends the whole cold start
-/// to the next source.
+/// WIST-3 §9 `WIST3-E04`: "reject the entire Snapshot and re-fetch, from another Mirror if needed".
 enum ColdStart {
     Done(SyncReport),
     Rejected { error: Error, next: usize },
@@ -690,9 +638,7 @@ fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
     }
 }
 
-/// WIST-3 §8 step 8: the index, the manifest and every state file loaded
-/// verify under the keys valid at the adopted Checkpoint's height — the
-/// Snapshot's tuples as the Epochs walked above it amended them.
+/// WIST-3 §8 step 8: verified under the keys valid at the adopted Checkpoint's height.
 fn verify_unsealed(
     installed: &install::Installation,
     keys: &Registry,
@@ -719,10 +665,7 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
         from,
     )?;
     let next_source = installed.source + 1;
-    // WIST-3 §8 steps 4–5: the Checkpoint the manifest's `epoch_number`
-    // selects, verified under the `aggregator_key` tuples just loaded,
-    // states the tree the manifest names or the Snapshot describes another
-    // tree entirely.
+    // WIST-3 §8 steps 4–5.
     let (anchor, verification) = checkpoints::manifest_anchor(
         context.sources,
         &installed.manifest,
@@ -822,9 +765,8 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
         }
     };
 
-    // WIST-3 §8 step 8: the Checkpoint to adopt is settled, so the three
-    // Snapshot signatures are judged at its height before anything the
-    // Snapshot carries is written into the store.
+    // WIST-3 §8 step 8: the signatures are judged at the adopted height before anything the
+    // Snapshot carries is written.
     let walked_keys = match &state {
         Some(state) => &state.keys,
         None => &installed.aggregator_keys,
@@ -908,9 +850,7 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
     }
 }
 
-/// Writes the committed sync state next to the index for readers of the
-/// file; the index row is authoritative, so a failure here changes
-/// nothing a later sync relies on.
+/// The index row is authoritative; this file is advisory.
 fn mirror_sync_state(sync_path: &Path, state: &SyncState) {
     if let Ok(bytes) = serde_json::to_vec(state) {
         let _ = std::fs::write(sync_path, bytes);

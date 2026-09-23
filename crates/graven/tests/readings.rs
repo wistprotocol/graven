@@ -1,6 +1,4 @@
-//! WIST-4 §6's recommended readings, applied by a profile over an index:
-//! a `wist:mismatch` or `wist:unavailable` Label counts only once it has
-//! persisted, and an unattended Labeler is ignored.
+//! WIST-4 §6.
 use graven::ranking::{load_profile, rank, DomainState, Profile};
 use graven::store::RecordHit;
 use rusqlite::Connection;
@@ -104,9 +102,7 @@ fn the_default_profile_counts_a_mismatch_label_only_once_it_has_persisted() {
     let mut cases = 0;
     for case in vector["persistence_cases"].as_array().unwrap() {
         let events = case["events"].as_array().unwrap();
-        // The vector's expiry height is the first height at which the Epoch
-        // instant reaches the expiry; the index reads it from the head's
-        // instant, so an expiring case is probed against that boundary.
+        // The vector's expiry height is the first at which the Epoch instant reaches the expiry.
         let expiry = case["expires_at_height"].as_u64();
         for probe in case["probes"].as_array().unwrap() {
             let height = probe["height"].as_u64().unwrap();
@@ -160,11 +156,8 @@ fn a_label_an_index_holds_only_as_a_snapshot_tuple_still_counts() {
     let events = serde_json::json!([
         {"height": 4000, "asserted_at": "2026-08-02T12:00:00Z", "retracted": false}
     ]);
-    // The Labeler has sealed something recently, so the inactivity rule
-    // leaves it in the profile's set.
     let conn = index(events.as_array().unwrap(), None, 4900);
-    // A Consumer that resumed from a Snapshot holds the tuple and none of
-    // the history behind it (WIST-3 §7).
+    // WIST-3 §7.
     conn.execute("DELETE FROM labels", []).unwrap();
     assert!(
         mismatch_at(&conn, &profile, 5000, None),

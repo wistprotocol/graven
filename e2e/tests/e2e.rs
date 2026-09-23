@@ -26,8 +26,6 @@ fn rewrite_sitemap_host(site: &Path, host: &str) {
     std::fs::write(&path, content.replace("__HOST__", host)).expect("write sitemap.xml");
 }
 
-/// Stages a one-page site for a host: a sitemap naming the page and the
-/// page's HTML with the given title, body text and outbound links.
 fn stage_page_site(
     tmp: &Path,
     host: &str,
@@ -59,8 +57,6 @@ fn stage_page_site(
     dir
 }
 
-/// Adds a page to a staged site and relists every page of the directory in
-/// its sitemap, which is what a Publisher's site generator does.
 fn add_page(dir: &Path, host: &str, page: &str, title: &str, body: &str) {
     std::fs::write(
         dir.join(page),
@@ -91,8 +87,6 @@ fn add_page(dir: &Path, host: &str, page: &str, title: &str, body: &str) {
     .expect("write sitemap");
 }
 
-/// One publication pass over a staged site, with any further `build`
-/// arguments the scenario needs.
 fn build_site(spake: &Path, host: &str, dir: &Path, state: &Path, extra: &[&str]) {
     let mut args = vec![
         "build",
@@ -124,9 +118,6 @@ fn ping(spake: &Path, log_base: &str, host: &str) {
     );
 }
 
-/// The Delta ID the Publisher's output tree carries for a URL, taking the
-/// newest by observation instant when a URL has been published more than
-/// once.
 fn published_delta_id(out: &Path, url: &str) -> String {
     let mut newest: Option<(String, String)> = None;
     let dir = out.join(".well-known/wist/deltas");
@@ -155,14 +146,10 @@ fn published_delta_id(out: &Path, url: &str) -> String {
         .0
 }
 
-/// The scenarios one run exercised, in order, with the Epoch each was
-/// sealed at, and the revision of every repository it drove.
 struct RunRecord {
     scenarios: Vec<serde_json::Value>,
 }
 
-/// `git rev-parse HEAD` and whether the working tree carries changes; both
-/// are null where no Git checkout answers.
 fn repo_revision(dir: &Path) -> serde_json::Value {
     let git = |args: &[&str]| {
         Command::new("git")
@@ -216,8 +203,6 @@ impl RunRecord {
     }
 }
 
-/// Copies a directory tree, replacing whatever stands at `to`, so a
-/// served directory can be put back as it was.
 fn copy_tree(from: &Path, to: &Path) {
     let _ = std::fs::remove_dir_all(to);
     std::fs::create_dir_all(to).expect("create the copy's directory");
@@ -246,15 +231,11 @@ fn log_store_dir(dir: &Path, log_id: &str) -> PathBuf {
     dir.join("logs").join(sanitized)
 }
 
-/// The cursor a synced store keeps for one Log: the head Epoch, the tree
-/// it states and the root.
 fn synced_cursor(dir: &Path, log_id: &str) -> serde_json::Value {
     read_json(&log_store_dir(dir, log_id).join("sync.json"))
 }
 
-/// WIST-3 §7's `content_digest` recomputed over a Consumer's own index,
-/// so two Consumers that reached one head are compared on the state they
-/// materialized rather than on the Snapshot each resumed from.
+/// WIST-3 §7's `content_digest`, recomputed over the Consumer's own index.
 fn index_content_digest(dir: &Path, log_id: &str) -> String {
     let path = log_store_dir(dir, log_id).join("index.sqlite");
     let conn =
@@ -285,7 +266,6 @@ fn read_json(path: &Path) -> serde_json::Value {
     .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
-/// The tuples of the newest Snapshot the aggregator published.
 fn snapshot_state_entries(clave_data: &Path) -> Vec<serde_json::Value> {
     let index = read_json(&clave_data.join("snapshots/index.json"));
     let manifest_url = index["index"]["snapshots"][0]["manifest_url"]
@@ -309,7 +289,6 @@ fn snapshot_state_entries(clave_data: &Path) -> Vec<serde_json::Value> {
         .clone()
 }
 
-/// The tuple of the given kind keyed by `domain`, if the Snapshot carries one.
 fn state_tuple(
     entries: &[serde_json::Value],
     kind: &str,
@@ -396,10 +375,7 @@ fn parse_note(note: &str) -> wist_core::checkpoint::Checkpoint {
         .unwrap_or_else(|e| panic!("parse the Checkpoint note: {e}\n{note}"))
 }
 
-/// The note key IDs (WIST-3 §3.4) of a Checkpoint's Log signature lines —
-/// the lines whose key name is the Log's origin — in the order the note
-/// carries them. A `key_id` never appears in a note, so a rotation is read
-/// off the notes through these.
+/// WIST-3 §3.4: a `key_id` never appears in a note, so a rotation is read off the note key IDs.
 fn log_signature_key_ids(note: &str, log_id: &str) -> Vec<String> {
     parse_note(note)
         .signatures()
@@ -409,8 +385,6 @@ fn log_signature_key_ids(note: &str, log_id: &str) -> Vec<String> {
         .collect()
 }
 
-/// One line of `clave log-key list`: an Aggregator key's `key_id`, its
-/// note key ID and the heights that admitted and retired it.
 struct LogKey {
     key_id: String,
     note_key_id: String,
@@ -860,8 +834,7 @@ fn end_to_end() {
         wait_until_status_active(&http, &clave_base, host);
     }
 
-    // Only a Declaration already listing a recovery key can authorize a
-    // recovery, so the key is committed long before it is needed.
+    // Only a Declaration already listing a recovery key can authorize a recovery.
     run(
         &spake,
         &[
@@ -1092,8 +1065,6 @@ fn end_to_end() {
         )
         .as_array()
         .is_some_and(Vec::is_empty));
-    // The subscribed Labeler marked the page as spam, so the default
-    // profile drops it; the text-only profile ranks it by relevance alone.
     assert!(
         mcp.search("changed").is_empty(),
         "the default profile did not drop the spam-labeled page"
@@ -1191,7 +1162,6 @@ fn end_to_end() {
     );
     drop(mcp2);
 
-    // --- a signing key rotates while the outgoing key keeps an overlap ---
     run(
         &spake,
         &[
@@ -1287,7 +1257,6 @@ fn end_to_end() {
     );
     drop(mcp3);
 
-    // --- a Declaration published from the web host alone is reversed ---
     let owner = read_json(&site.join(".well-known/wist/publisher.json"));
     let owner_seq = owner["publisher"]["seq"].as_u64().expect("owner seq");
     let thief = wist_core::crypto::SigningKey::from_seed(&[42u8; 32]);
@@ -1360,8 +1329,6 @@ fn end_to_end() {
         "the activation height follows the sealing height: {pending_tuple}"
     );
 
-    // The owner still holds a listed key and answers from the Declaration
-    // its own state directory retained, above the floor the hijack raised.
     run(
         &spake,
         &[
@@ -1439,7 +1406,6 @@ fn end_to_end() {
     );
     drop(mcp4);
 
-    // --- a one-Epoch mismatch Label is not counted yet ---
     run(
         &spake,
         &[
@@ -1507,7 +1473,6 @@ fn end_to_end() {
     );
     drop(mcp5);
 
-    // The same Label, still live an Epoch later, counts.
     let ninth_seal = grid_instant(8);
     let ninth_epoch = seal_epoch(&clave, &clave_data, &ninth_seal);
     seal_epoch(&clave, &clave2_data, &ninth_seal);
@@ -1524,7 +1489,6 @@ fn end_to_end() {
     );
     drop(mcp6);
 
-    // --- the Publisher removes a URL and the record leaves the index ---
     let mut mcp7 = McpClient::start(&graven, &gdir);
     assert_eq!(
         mcp7.get_record(&removed_url)["url"],
@@ -1584,7 +1548,6 @@ fn end_to_end() {
     );
     drop(mcp8);
 
-    // --- the Aggregator restarts with admitted Deltas still unsealed ---
     let resumed_url = format!("https://{pruned_host}/resumed.html");
     add_page(
         &pruned_site,
@@ -1664,7 +1627,6 @@ fn end_to_end() {
     );
     drop(mcp9);
 
-    // --- the Publisher publishes again from its state directory alone ---
     let beta_url = format!("https://{site_host}/b.html");
     let mut mcp10 = McpClient::start(&graven, &gdir);
     let beta_tip = mcp10.get_record(&beta_url)["delta_id"]
@@ -1746,7 +1708,6 @@ fn end_to_end() {
         "the Delta chain restarted instead of continuing from the sealed tip: {restarted_delta}"
     );
 
-    // --- the selected ranking profile outlives the Consumer process ---
     run(
         &graven,
         &["profile", "use", "--dir", s(&gdir), "--name", "text-only"],
@@ -1781,7 +1742,6 @@ fn end_to_end() {
     drop(mcp13);
     record.exercised("default_profile_persistence", publisher_restart_epoch);
 
-    // --- the Publisher recovers its Key Set with the offline recovery key ---
     let stale_url = format!("https://{recovered_host}/stale.html");
     let fresh_url = format!("https://{recovered_host}/fresh.html");
     let first_url = format!("https://{recovered_host}/first.html");
@@ -1885,7 +1845,6 @@ fn end_to_end() {
     }
     drop(mcp14);
 
-    // A Delta published while the window stands open queues behind it too.
     let later_url = format!("https://{recovered_host}/later.html");
     add_page(
         &recovered_site,
@@ -1966,8 +1925,6 @@ fn end_to_end() {
     );
     drop(mcp15);
 
-    // --- the recovery key is itself replaced, which opens a window as any
-    // recovery rotation does ---
     let rotated_seed = tmp.path().join("offline/recovery-next.seed");
     run(
         &spake,
@@ -2013,12 +1970,9 @@ fn end_to_end() {
     drop(mcp16);
 
     validate_artifacts(&site, &clave_data);
-    // The external client reads the Log under one verifier key, so it runs
-    // once here under the Anchor's genesis key and again below under the
-    // key that replaces it.
+    // The external client reads the Log under one verifier key.
     verify_with_external_tlog_client(&aggregator.base_url, &aggregator.verifier_key);
 
-    // --- the Log admits a second Aggregator key in band ---
     let log_anchor = read_json(&anchor_path);
     let genesis_key_id = log_anchor["anchor"]["genesis_key"]["key_id"]
         .as_str()
@@ -2049,8 +2003,7 @@ fn end_to_end() {
     let addition_epoch = seal_epoch(&clave, &clave_data, &addition_seal);
     record.exercised("log_key_addition", addition_epoch);
 
-    // WIST-3 §3.4: the Epoch that seals an addition is signed by the
-    // admitting key and the new one.
+    // WIST-3 §3.4: the Epoch that seals an addition is signed by the admitting key and the new one.
     let mut admitting_signers = vec![genesis_note_key_id.clone(), admitted_note_key_id.clone()];
     admitting_signers.sort();
     let head_note = fetch_text(&http, &format!("{clave_base}/checkpoint"));
@@ -2095,8 +2048,6 @@ fn end_to_end() {
         "the Consumer did not advance to the Epoch that admitted the key: {heads:?}"
     );
 
-    // An Entry sealed after the addition verifies under the key set the
-    // addition left in force.
     let keystone_url = format!("https://{pruned_host}/second-key.html");
     add_page(
         &pruned_site,
@@ -2138,9 +2089,6 @@ fn end_to_end() {
     );
     drop(mcp_admitted);
 
-    // --- the Log retires its genesis key ---
-    // The Snapshots as the genesis key signed them, kept so that a
-    // Consumer can be offered documents no key valid at the head signed.
     let stale_snapshots = tmp.path().join("snapshots-before-the-removal");
     copy_tree(&clave_data.join("snapshots"), &stale_snapshots);
     run(
@@ -2162,8 +2110,7 @@ fn end_to_end() {
         "the genesis key was not retired at the Epoch that sealed its removal"
     );
 
-    // WIST-3 §3.4: a key removed at height N is invalid at N, so the Epoch
-    // that seals the removal is not signed by the removed key.
+    // WIST-3 §3.4: a key removed at height N is invalid at N.
     let removal_note = fetch_text(
         &http,
         &format!(
@@ -2209,8 +2156,6 @@ fn end_to_end() {
         "a Checkpoint above the removal carries a key other than the remaining one: {later_note}"
     );
 
-    // The Consumer replaying the Log crosses the removal Epoch and the one
-    // above it in one run, and serves what the second sealed.
     let resumed = run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
     let heads = synced_heads(&String::from_utf8_lossy(&resumed.stdout));
     assert_eq!(
@@ -2233,7 +2178,6 @@ fn end_to_end() {
     drop(mcp_retired);
     run(&clave, &["verify-history", "--data", s(&clave_data)]);
 
-    // The Aggregator restarts holding only the remaining key.
     aggregator.stop();
     wait_until_unreachable(&http, &clave_base, &pruned_host);
     aggregator.start(&clave, Some(&site_proxy));
@@ -2262,11 +2206,7 @@ fn end_to_end() {
         "the remaining key was retired with the genesis key"
     );
 
-    // --- a fresh Consumer cold-starts from a Snapshot after the removal ---
-    // WIST-3 §3.4: the Aggregator re-signed every unsealed document the
-    // retired key signed, so a Snapshot still resumes once the genesis key
-    // is gone, and reaches the state the Consumer that followed throughout
-    // holds.
+    // WIST-3 §3.4: the Aggregator re-signed every unsealed document the retired key signed.
     let fresh_snapshots = tmp.path().join("snapshots-after-the-removal");
     copy_tree(&clave_data.join("snapshots"), &fresh_snapshots);
 
@@ -2310,11 +2250,8 @@ fn end_to_end() {
         lodestar_url,
         "the cold-started Consumer does not serve the record sealed after the removal"
     );
-    // The records a query answers with, without the ranking signals: a
-    // Consumer that resumed from a Snapshot reads each record's seal
-    // height from the Snapshot's Epoch, which no §7 tuple carries, so its
-    // freshness signal differs from a replaying Consumer's while the
-    // records themselves are the same.
+    // A resumed Consumer reads seal heights from the Snapshot's Epoch, which no WIST-3 §7 tuple
+    // carries, so its ranking signals differ.
     let answered = |hits: &[serde_json::Value]| -> Vec<serde_json::Value> {
         hits.iter()
             .map(|hit| serde_json::json!([&hit["url"], &hit["publisher"], &hit["delta_id"]]))
@@ -2330,11 +2267,7 @@ fn end_to_end() {
         "the two Consumers answer the same query differently: {resumed_hits:?} vs {followed_hits:?}"
     );
 
-    // --- a Snapshot the retired key signed is rejected whole ---
-    // WIST-3 §8 step 8: the index, manifest and state file verify under the
-    // keys valid at the adopted Checkpoint's height, so the copies kept
-    // from before the removal reject the Snapshot (`WIST3-E04`) and the
-    // Consumer persists nothing derived from it.
+    // WIST-3 §8 step 8: a Snapshot the retired key signed is rejected (`WIST3-E04`).
     copy_tree(&stale_snapshots, &clave_data.join("snapshots"));
     let stale_dir = tmp.path().join("graven-store-stale-snapshot");
     let refused = Command::new(&graven)
@@ -2388,9 +2321,6 @@ fn end_to_end() {
         "the run record lists every scenario the run exercised: {written}"
     );
 
-    // Both read the Log as it now stands: every Checkpoint under the keys
-    // valid at its own height and every unsealed document under the keys
-    // valid at the served head, the retired genesis key among neither.
     validate_artifacts(&site, &clave_data);
     verify_with_external_tlog_client(&aggregator.base_url, &admitted_verifier_key);
 

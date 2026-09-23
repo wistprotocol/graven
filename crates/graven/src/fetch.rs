@@ -5,8 +5,7 @@ use std::time::Duration;
 
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
-/// A loopback literal, `localhost` or a name under `.localhost`, which
-/// RFC 6761 §6.3 resolves to loopback by definition.
+/// RFC 6761 §6.3 resolves `localhost` and names under `.localhost` to loopback.
 pub fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
         || host
@@ -40,11 +39,8 @@ pub fn parse_base(log_base: &str) -> Result<Url> {
     }
 }
 
-/// WIST-3 §5 and §6: a Log's paths are rooted at a base URL — the
-/// Service Origin, or a Mirror's `mirror_urls` entry, "each ending in
-/// `/`" — so every path is resolved under that base's own path rather
-/// than at its origin, and a Mirror serving the Log under a prefix is
-/// read at that prefix.
+/// WIST-3 §5 and §6: base URLs end in `/`, so a path resolves under the base's own path, not its
+/// origin.
 pub fn resolve(base: &Url, raw: &str) -> Result<Url> {
     if let Ok(direct) = Url::parse(raw) {
         if direct.scheme() == "http" || direct.scheme() == "https" {
@@ -100,10 +96,8 @@ impl Client {
         Ok((bytes, value))
     }
 
-    /// WIST-3 §6 and §10: reads a response while it streams and refuses it
-    /// at `limit` before buffering octets past it. Equality with the bound
-    /// is permitted; one octet more is `WIST3-E03`, and no more than that
-    /// one octet is ever held.
+    /// WIST-3 §6 and §10: equality with the bound is permitted; no more than one octet past it is
+    /// ever held.
     pub fn get_bounded(&self, url: &Url, limit: u64) -> Result<Vec<u8>> {
         guard_scheme(url, self.allow_http)?;
         let mut resp = self

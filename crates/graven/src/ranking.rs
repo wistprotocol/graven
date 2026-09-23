@@ -1,10 +1,4 @@
-//! Consumer ranking profiles: a profile is a file that names the signals a
-//! ranking reads from the local index — text relevance, trust propagated
-//! from seed domains along the signed link graph, distrust propagated
-//! backward from bad seeds, in-link counts with age decay and growth
-//! damping, domain age and record freshness — and how it combines them.
-//! A profile and a synced height reproduce a ranking; every rank comes
-//! with the signals behind it. Nothing here leaves the Consumer (ADR-0008).
+//! ADR-0008: nothing here leaves the Consumer.
 use crate::error::{Error, Result};
 use crate::store::{table_exists, RecordHit};
 use rmcp::schemars;
@@ -28,28 +22,19 @@ pub const SHIPPED: &[(&str, &str)] = &[
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Weights {
-    /// The trust a domain outside the trusted graph still scores with.
     pub trust_floor: f64,
     pub trust: f64,
     pub inlinks: f64,
     pub freshness: f64,
     pub distrust: f64,
-    /// How much a counted `wist:mismatch` or `wist:unavailable` Label
-    /// takes off the score.
     #[serde(default)]
     pub mismatch: f64,
 }
 
-/// WIST-4 §6's recommended readings of the Log, which a profile applies
-/// to the Labels it follows.
+/// WIST-4 §6's recommended readings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Readings {
-    /// Consecutive Epochs through which a `wist:mismatch` or
-    /// `wist:unavailable` Label must have been live before it counts: one
-    /// Epoch's disagreement is the ordinary course of publication.
     pub persistence_epochs: u64,
-    /// Epochs without a sealed Entry of any type after which a Labeler is
-    /// ignored.
     pub labeler_inactive_epochs: u64,
 }
 
@@ -64,13 +49,9 @@ impl Default for Readings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Filters {
-    /// Drop a record whose domain's propagated distrust reaches this.
     pub distrust_above: Option<f64>,
-    /// Drop a record its Labelers mark as spam, by URL or by domain.
     pub spam: bool,
-    /// Drop a record whose domain's first sealed Entry is younger than this.
     pub min_age_epochs: u64,
-    /// Drop a record whose domain no trust reaches.
     pub trusted_graph_only: bool,
 }
 
@@ -91,10 +72,7 @@ pub struct Profile {
     pub license: String,
     pub issues_url: String,
     pub superseded_by: Option<String>,
-    /// The Labelers whose Labels this profile reads; empty means the
-    /// index's subscription list.
     pub labelers: Vec<String>,
-    /// How many of those Labelers must agree before a Label applies.
     pub agreement_k: usize,
     pub seeds: Vec<String>,
     pub distrust_seeds: Vec<String>,
@@ -121,8 +99,6 @@ fn profiles_dir(dir: &Path) -> std::path::PathBuf {
     dir.join("profiles")
 }
 
-/// Loads a profile: a file under `<dir>/profiles/<name>.json` first, then
-/// the shipped profile of that name.
 pub fn load_profile(dir: &Path, name: &str) -> Result<Profile> {
     if name.contains('/') || name.contains('\\') || name.starts_with('.') {
         return Err(Error::Verify(format!(
@@ -149,8 +125,6 @@ pub fn load_profile(dir: &Path, name: &str) -> Result<Profile> {
     Ok(profile)
 }
 
-/// The profile a query uses when it names none: `<dir>/profile.json`'s
-/// `active`, else `default`.
 pub fn active_profile_name(dir: &Path) -> Result<String> {
     match std::fs::read(dir.join("profile.json")) {
         Ok(bytes) => {
@@ -172,8 +146,6 @@ pub fn set_active_profile(dir: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Every profile available: the shipped ones and the files under
-/// `<dir>/profiles/`, a file of a shipped name replacing it.
 pub fn list_profiles(dir: &Path) -> Result<Vec<ProfileSummary>> {
     let active = active_profile_name(dir)?;
     let mut names: BTreeMap<String, bool> = SHIPPED
@@ -236,8 +208,6 @@ pub struct Ranked {
     pub explanation: Vec<String>,
 }
 
-/// The per-domain state a profile derives from the index at a height,
-/// computed once per query set.
 pub struct DomainState {
     pub trust: HashMap<String, f64>,
     pub distrust: HashMap<String, f64>,
@@ -284,8 +254,6 @@ fn suffix_list_in_force(conn: &Connection) -> Result<Option<wist_core::suffix_li
     Ok(octets.and_then(|octets| wist_core::suffix_list::SuffixList::parse(&octets).ok()))
 }
 
-/// The hosts (or URLs) at least `k` of `labelers` currently label with
-/// `name`, unretracted and unexpired at `head_sealed_at`.
 fn agreed_subjects(
     conn: &Connection,
     labelers: &BTreeSet<String>,
@@ -326,8 +294,7 @@ fn agreed_subjects(
         .collect())
 }
 
-/// WIST-4 §6: the named Labelers with a sealed Entry inside the profile's
-/// inactivity window, the only ones whose Labels it reads.
+/// WIST-4 §6: only Labelers with a sealed Entry inside the inactivity window are read.
 fn active_labelers(
     conn: &Connection,
     named: &BTreeSet<String>,
@@ -359,8 +326,6 @@ fn active_labelers(
         .collect())
 }
 
-/// The subjects at least `k` of `labelers` carry a Label of one of `names`
-/// on that has been live through the profile's persistence window.
 fn counted_subjects(
     conn: &Connection,
     labelers: &BTreeSet<String>,
@@ -374,7 +339,7 @@ fn counted_subjects(
         return Ok(BTreeSet::new());
     }
     type Triple = (String, String, String);
-    // Ascending Log order, which WIST-2 §3.3 uses to break equal instants.
+    // WIST-2 §3.3 breaks equal instants by Log order.
     let mut events: HashMap<Triple, Vec<(u64, u64, String, bool)>> = HashMap::new();
     let mut stmt = conn.prepare(
         "SELECT labeler, subject, name, height, asserted_at, retracted, entry_index FROM labels WHERE name = ?1",
@@ -403,10 +368,8 @@ fn counted_subjects(
             ));
         }
     }
-    // A Label's expiry is read against the head's Epoch instant; an expiry
-    // later than that is later than every earlier Epoch's too. The current
-    // Label is also an event in its own right: an index resumed from a
-    // Snapshot holds the tuple and none of the history behind it.
+    // An expiry later than the head's instant is later than every earlier Epoch's. An index resumed
+    // from a Snapshot holds the current Label without its history.
     let mut expired: BTreeSet<Triple> = BTreeSet::new();
     if table_exists(conn, "label_current")? {
         let mut stmt = conn.prepare(
@@ -475,9 +438,7 @@ fn counted_subjects(
         .collect())
 }
 
-/// WIST-4 §6's persistence reading, widened to the profile's window: the
-/// Label must be live at the head and through the `persistence_epochs - 1`
-/// heights before it.
+/// WIST-4 §6's persistence reading, widened to the profile's window.
 fn counted(
     events: &[wist_core::label::LabelEvent<'_>],
     expires_at_height: Option<u64>,
@@ -497,9 +458,6 @@ fn counted(
 }
 
 impl DomainState {
-    /// Derives the profile's domain state from the index at its synced
-    /// head: the trusted and distrusted graph, the spam set, domain ages
-    /// and in-link figures.
     pub fn derive(
         conn: &Connection,
         profile: &Profile,
@@ -558,8 +516,6 @@ impl DomainState {
             }
         }
 
-        // The signed link graph between units, each edge weighted by its
-        // age at the head.
         let mut out: HashMap<String, HashMap<String, f64>> = HashMap::new();
         let mut inlinks: HashMap<String, f64> = HashMap::new();
         if table_exists(conn, "inlinks")? {
@@ -609,9 +565,7 @@ impl DomainState {
         }
         let max_inlinks = inlinks.values().copied().fold(0.0, f64::max);
 
-        // WIST-4 §6: a seed that links to a distrusted or spam-labeled
-        // domain vouches for less; its seed mass is scaled by the share
-        // of its links that stay clean.
+        // WIST-4 §6: a seed that links to a distrusted or spam-labeled domain vouches for less.
         let mut seed_mass: HashMap<String, f64> = HashMap::new();
         for seed in &seeds {
             let mass = match out.get(seed) {
@@ -643,8 +597,7 @@ impl DomainState {
                 first_height.insert(domain, height.max(0) as u64);
             }
         }
-        // WIST-4 §8: a domain that reset its identity is read from the
-        // activation height, not from the Declarations it superseded.
+        // WIST-4 §8: a reset identity is read from its activation height.
         if table_exists(conn, "identity_starts")? {
             let mut stmt = conn.prepare("SELECT domain, height FROM identity_starts")?;
             for row in stmt.query_map([], |row| {
@@ -671,10 +624,7 @@ impl DomainState {
     }
 }
 
-/// TrustRank-style propagation: `alpha` of the mass stays with the seeds
-/// each round and the rest flows along out-links, split evenly; with
-/// `backward` the flow runs against the links, so a domain that links to
-/// a bad seed inherits its distrust. Values are normalized to the largest.
+/// `alpha` of the mass stays with the seeds each round; values are normalized to the largest.
 fn propagate(
     out: &HashMap<String, HashMap<String, f64>>,
     seeds: &HashMap<String, f64>,
@@ -727,8 +677,7 @@ fn propagate(
         .collect()
 }
 
-/// Ranks hits under a profile. `hits` carry their text relevance in
-/// `(0, 1]`; the record's seal height comes from the index.
+/// `hits` carry their text relevance in `(0, 1]`.
 pub fn rank(
     conn: &Connection,
     profile: &Profile,

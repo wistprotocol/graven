@@ -98,9 +98,6 @@ fn wrap_delta(d: &Value) -> Value {
     json!({"type": "publisher_delta", "body": d})
 }
 
-/// A from-scratch Log with an empty Snapshot at `tree_size` 0, so every
-/// Declaration and Delta this suite cares about is a walked Epoch rather
-/// than adopted Snapshot state.
 struct Harness {
     dir: tempfile::TempDir,
     target: tempfile::TempDir,

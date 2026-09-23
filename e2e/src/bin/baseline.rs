@@ -1,7 +1,3 @@
-//! Capacity baseline: publishes N loopback sites of M pages each through
-//! the real publisher, aggregator and consumer executables and reports the
-//! wall time, bytes and request counts of every stage, so the numbers a
-//! capacity model extrapolates from are reproducible on any machine.
 use e2e::{
     fetch_status, free_loopback_addr, graven_bin, grid_instant, now_rfc3339, resolve_sibling_bin,
     run, s, serve_sites, spawn_clave_serve_with,
@@ -148,9 +144,7 @@ fn wait_all_pulled(
     start.elapsed().as_secs_f64()
 }
 
-/// Pings `host` until the aggregator admits it, retrying a 503 the
-/// admission gate answers when every pending slot is taken (WIST-2 §4
-/// has the Publisher honor the refusal); returns the refusals.
+/// WIST-2 §4: the Publisher honors a 503 admission refusal.
 fn ping_until_admitted(spake: &Path, clave_base: &str, host: &str) -> u64 {
     let deadline = Instant::now() + Duration::from_secs(600);
     let mut refused = 0;

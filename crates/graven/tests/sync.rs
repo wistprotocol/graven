@@ -83,12 +83,7 @@ fn cold_sync_records_post_snapshot_delta_with_unfetchable_payload_as_empty() {
     assert!(beta.r#abstract.is_none());
 }
 
-/// WIST-3 §6: an entry bundle is verified only by recomputation against
-/// the root a verified Checkpoint states, so altered octets are
-/// `WIST3-E03` and nothing above the Checkpoint they fail is applied. The
-/// Snapshot's own Checkpoint is verified, so WIST-3 §8 step 8 adopts it —
-/// "the newest verified one, the head of step 5 included" — and the run
-/// reports the Epoch it could not pass.
+/// WIST-3 §6 and §8 step 8.
 #[test]
 fn cold_sync_rejects_a_tampered_entry_bundle_and_keeps_the_snapshots_checkpoint() {
     let fx = common::build_fixture(true, false);
@@ -175,10 +170,7 @@ fn cold_sync_rejects_wrong_state_digest_in_manifest() {
         .exists());
 }
 
-/// WIST-3 §8 step 8: "A signature whose `sig.key_id` names a tuple's key
-/// and does not verify under that key verifies at no height, and the
-/// Consumer MAY reject the Snapshot as soon as it has authenticated the
-/// tuples" — before any Epoch above the Snapshot is walked.
+/// WIST-3 §8 step 8.
 #[test]
 fn cold_sync_rejects_state_signed_by_wrong_key() {
     let fx = common::build_fixture(true, false);
@@ -207,9 +199,7 @@ fn cold_sync_rejects_state_signed_by_wrong_key() {
         .exists());
 }
 
-/// WIST-3 §5: a Checkpoint whose line under a known key does not verify is
-/// `WIST3-E03`, so the Epoch it ends is not applied; the Snapshot's own
-/// Checkpoint stays the head WIST-3 §8 step 8 adopts.
+/// WIST-3 §5 and §8 step 8.
 #[test]
 fn cold_sync_rejects_checkpoint_signed_by_wrong_key_and_keeps_the_snapshots_checkpoint() {
     let fx = common::build_fixture(true, false);
@@ -691,10 +681,7 @@ fn rotation_then_new_key_delta_syncs() {
     assert_eq!(record.title, "Rotated Title");
 }
 
-/// WIST-3 §7: a Snapshot's `declaration`, `recovery_window` and
-/// `pending_declaration` tuples can all name one Declaration at one
-/// sealing height, and the resume records it once rather than failing on
-/// the second tuple that names it.
+/// WIST-3 §7.
 #[test]
 fn a_cold_start_adopts_one_declaration_named_by_several_tuples() {
     use wist_core::objects::{PendingDeclarationEntry, RecoveryWindowEntry, StateEntry};
@@ -1387,9 +1374,7 @@ fn failed_migration_restores_legacy_layout_and_registers_nothing() {
     )
     .unwrap();
 
-    // The migrated store holds the first Log's key registry, whose tuples
-    // do not chain to the second Log's Anchor (WIST-3 §7, `WIST3-E04`),
-    // so the sync fails and the migration is rolled back.
+    // WIST-3 §7 (`WIST3-E04`): the first Log's key tuples do not chain to the second Log's Anchor.
 
     let result = graven::sync::run(
         fx_b.anchor_path().to_str().unwrap(),
@@ -1826,8 +1811,6 @@ fn a_log_that_rotates_its_aggregator_key_stays_syncable() {
     let sealed_at = common::next_instant(&fx);
     common::seal_next(&fx, &sealed_at, &[add]);
 
-    // The next Epoch's Checkpoint is signed by the key the previous one
-    // admitted.
     let sealed_after = common::next_instant(&fx);
     let after = fx
         .log_state()
@@ -2068,9 +2051,7 @@ fn parameter_change(
     serde_json::json!({"type": "registry_update", "body": body})
 }
 
-/// An `epoch_cap_bytes` above WIST-4 §5's floor of 65 537 —
-/// the octets one Entry of the largest admissible size occupies — and low
-/// enough that a few hundred Deltas cross it.
+/// Above WIST-4 §5's floor of 65 537 octets; low enough that a few hundred Deltas cross it.
 const CAP: i64 = 70_000;
 
 fn bulk_deltas(fx: &common::Fixture, count: usize) -> Vec<serde_json::Value> {
@@ -2091,8 +2072,7 @@ fn bulk_deltas(fx: &common::Fixture, count: usize) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Seals the next Epoch, reporting its number and WIST-3 §6's Epoch
-/// size: the octets its Entries occupy in entry bundles.
+/// WIST-3 §6's Epoch size: the octets its Entries occupy in entry bundles.
 fn seal_next(fx: &common::Fixture, sealed_at: &str, entries: &[serde_json::Value]) -> (u64, u64) {
     let mut ordered = entries.to_vec();
     wist_core::epoch::sort_entries(&mut ordered).unwrap();

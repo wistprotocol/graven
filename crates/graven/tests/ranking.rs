@@ -52,8 +52,6 @@ fn sync(fx: &common::Fixture, target: &std::path::Path) {
     .unwrap();
 }
 
-/// A seed-cited page ranks above a farm-cited page under the default
-/// profile and below it under text-only, from the same index.
 #[test]
 fn a_profile_and_a_height_reproduce_a_ranking() {
     let fx = common::build_fixture_with_tier1();
@@ -214,9 +212,6 @@ fn profiles_are_listed_selected_and_overridden() {
     );
 }
 
-/// Reports the cost of deriving a profile's domain state for a synced log
-/// (the batch a snapshot pays once) and of one personal-seed query on top
-/// of it, over a graph of one hundred linked domains.
 #[test]
 fn ranking_costs_are_measured() {
     let fx = common::build_fixture_with_tier1();

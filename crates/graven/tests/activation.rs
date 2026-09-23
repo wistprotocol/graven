@@ -122,13 +122,10 @@ fn a_fresh_identity_activates_at_the_delay_the_parameter_map_fixes() {
     sync(&fx, target.path());
     assert!(present(target.path(), &activated_url));
     assert!(!present(target.path(), &replaced_url));
-    // WIST-4 §8: the domain's history restarts at the activation height, so
-    // a ranking policy reads its age from there and not from the
-    // Declarations the fresh identity superseded.
+    // WIST-4 §8.
     assert_eq!(identity_start(target.path(), &fx.domain), Some(activation));
 }
 
-/// The height the index records as the start of a domain's identity.
 fn identity_start(target: &std::path::Path, domain: &str) -> Option<u64> {
     rusqlite::Connection::open(common::synced_log_dir(target).join("index.sqlite"))
         .unwrap()

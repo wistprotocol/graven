@@ -23,8 +23,6 @@ pub enum Error {
 }
 
 impl Error {
-    /// The suite error code this failure carries, where it carries one:
-    /// the `WIST<n>-E<nn>` token the message names.
     pub fn code(&self) -> Option<String> {
         let text = self.to_string();
         text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-')

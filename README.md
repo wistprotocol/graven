@@ -304,7 +304,9 @@ operator's own seeds, edited in a copy under `profiles/`) and
 profile an install answers with, `profiles/<name>.json` in the store
 directory overrides or adds one, and `search`'s `profile` parameter
 selects one per query; `list_profiles` reports them with author,
-license and `superseded_by`. The ranking index — record seal heights,
+license and `superseded_by`. `profile use` records the choice as `active`
+in `<dir>/profile.json`; a query naming no profile uses it, or `default`
+where none is recorded. The ranking index — record seal heights,
 in-links with the height each was sealed at and the in-links each
 domain gained and lost per height — is kept by the sync from tier-1
 links, so link signals need the extract tier.

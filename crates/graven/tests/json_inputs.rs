@@ -34,9 +34,7 @@ fn cold_sync(
     .map_err(|e| e.to_string())
 }
 
-/// WIST-3 §4: an Entry's leaf data is its JCS serialization, so leaf
-/// octets that carry a repeated member are no Entry, whatever leaf hash
-/// the tree states for them.
+/// WIST-3 §4: an Entry's leaf data is its JCS serialization.
 #[test]
 fn an_entry_whose_leaf_data_repeats_a_member_fails_the_sync() {
     for (name, escaped) in [

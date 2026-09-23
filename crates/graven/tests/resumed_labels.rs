@@ -15,9 +15,6 @@ fn label_entry(signer: &Signer, inner: Value) -> (String, Value) {
     (id, json!({"type": "label", "body": body}))
 }
 
-/// Builds a Log whose only Snapshot is at `snapshot_height`, so a
-/// Consumer syncing this fixture resumes from it and never walks the
-/// Epochs the Snapshot's tuples stand in for.
 struct Resumed {
     dir: tempfile::TempDir,
     target: tempfile::TempDir,
@@ -107,11 +104,7 @@ fn opened(r: &Resumed) -> Store {
     Store::open(&graven::registry::log_dir(r.target.path(), &r.log_id)).unwrap()
 }
 
-/// WIST-3 §7: a Snapshot carries only the current Label per (labeler,
-/// subject, name), not the history behind it. A dispute naming a Label
-/// sealed at or below the walk floor cannot be told apart from one the
-/// Snapshot's tuples simply don't hold, so it is recorded rather than
-/// rejected as absent.
+/// WIST-3 §7.
 #[test]
 fn dispute_at_or_below_the_walk_floor_is_recorded_despite_missing_tuples() {
     let disputant = Signer::new([40u8; 32]);
@@ -148,9 +141,6 @@ fn dispute_at_or_below_the_walk_floor_is_recorded_despite_missing_tuples() {
     assert_eq!(disputes[0].disputant, "disputant.example");
 }
 
-/// The same reading does not excuse a dispute naming a Label sealed
-/// above the walk floor: nothing this index holds could have sealed it,
-/// so it is genuinely absent and rejected.
 #[test]
 fn dispute_above_the_walk_floor_naming_an_unknown_label_is_rejected() {
     let disputant = Signer::new([41u8; 32]);
@@ -184,10 +174,6 @@ fn dispute_above_the_walk_floor_naming_an_unknown_label_is_rejected() {
     );
 }
 
-/// A dispute naming a Label the adopted tuples do carry resolves as
-/// Known, and the authority check core's validate_dispute makes for a
-/// Known Label still applies: an unauthorized disputant is rejected
-/// while an authorized one still succeeds, over the very same tuple.
 #[test]
 fn dispute_naming_an_adopted_label_still_checks_authority() {
     let subject = "https://records.example/page";
@@ -276,17 +262,12 @@ fn default_profile_naming(labeler: &str) -> Profile {
     serde_json::from_str(&json).unwrap()
 }
 
-/// WIST-4 §6's inactivity reading measures against a Labeler's last
-/// sealed Entry. A resumed index only holds that height because
-/// adopting the Label tuple recorded it (WIST-3 §7); it must read the
-/// same verdict a Consumer that walked the Entry itself would, and mark
-/// the row as counting from the resume.
+/// WIST-4 §6 and WIST-3 §7.
 #[test]
 fn resumed_labeler_activity_matches_a_full_replay() {
     let domain = "spammer.example";
     let subject = "https://victim.example/page";
 
-    // The full replay: the Labeler's only Entry is walked at height 1.
     let genesis_dir = tempfile::tempdir().unwrap();
     let genesis_target = tempfile::tempdir().unwrap();
     let genesis_log = Signer::new([50u8; 32]);
@@ -357,8 +338,6 @@ fn resumed_labeler_activity_matches_a_full_replay() {
     ))
     .unwrap();
 
-    // The resumed index: the very same Label reaches it only as an
-    // adopted Snapshot tuple at height 1, under a Snapshot taken later.
     let label_tuple = StateEntry::Label(LabelEntry {
         labeler: domain.into(),
         subject: subject.into(),
@@ -404,8 +383,6 @@ fn resumed_labeler_activity_matches_a_full_replay() {
     let profile = default_profile_naming(domain);
     let empty: BTreeSet<String> = BTreeSet::new();
 
-    // Below the inactivity window from height 1: both read the Labeler
-    // as active, so its wist:spam Label counts.
     let genesis_conn = rusqlite::Connection::open(
         graven::registry::log_dir(genesis_target.path(), "resumed-labeler-genesis")
             .join("index.sqlite"),
@@ -420,8 +397,7 @@ fn resumed_labeler_activity_matches_a_full_replay() {
     assert!(near_genesis.spam_urls.contains(subject));
     assert!(near_resumed.spam_urls.contains(subject));
 
-    // Past the window from height 1 (720 Epochs): both must read the
-    // Labeler as inactive and stop counting its Label, in agreement.
+    // 720 Epochs: the default inactivity window.
     let far_height = 1 + 720 + 5;
     let far_genesis =
         DomainState::derive(&genesis_conn, &profile, &empty, far_height, None).unwrap();

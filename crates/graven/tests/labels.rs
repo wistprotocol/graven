@@ -171,10 +171,7 @@ fn snapshot_label_and_dispute_tuples_are_adopted() {
         .disputes_for(&format!("sha256:{}", "a".repeat(64)))
         .unwrap();
     assert_eq!(disputes.len(), 1);
-    // WIST-3 §7: adopting the Label tuple records the figures a resumed
-    // index can honestly hold — none of them a real count — but the
-    // dispute tuple's disputant gets no such row (only adopt_label_tuple
-    // seeds one).
+    // WIST-3 §7: only `adopt_label_tuple` seeds a labeler row.
     let labelers = store.labelers().unwrap();
     assert_eq!(labelers.len(), 1);
     assert_eq!(labelers[0].labeler, "labels.sample.net");
@@ -190,8 +187,6 @@ fn snapshot_label_and_dispute_tuples_are_adopted() {
     assert!(labelers[0].counts_from_resume);
 }
 
-/// The served tool list and a call reach the label tools through the
-/// combined router, not only the tools of the first router.
 #[test]
 fn served_tool_list_includes_the_label_tools() {
     use std::io::{BufRead, BufReader, Write};

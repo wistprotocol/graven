@@ -1,5 +1,3 @@
-//! Drives the real publisher, aggregator and consumer executables: shared
-//! by the end-to-end test and the capacity baseline.
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -16,8 +14,6 @@ pub fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// `WIST_BUILD_PROFILE=release` builds and runs the executables in release
-/// mode; the default is the debug profile.
 pub fn build_profile() -> &'static str {
     match std::env::var("WIST_BUILD_PROFILE").as_deref() {
         Ok("release") => "release",
@@ -78,8 +74,6 @@ pub fn run(bin: &Path, args: &[&str]) -> std::process::Output {
     run_with_env(bin, args, &[])
 }
 
-/// Runs a command to completion with extra environment variables, such
-/// as the proxy through which a loopback site stands in for a domain.
 pub fn run_with_env(bin: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let output = Command::new(bin)
         .args(args)
@@ -97,9 +91,6 @@ pub fn run_with_env(bin: &Path, args: &[&str], env: &[(&str, &str)]) -> std::pro
     output
 }
 
-/// Runs a command with nothing inherited from the caller's environment
-/// beyond `PATH` and the given variables, standing in for an operator
-/// invoking it again from a new shell with only its state directory.
 pub fn run_in_fresh_env(bin: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let mut command = Command::new(bin);
     command.args(args).env_clear();
@@ -121,8 +112,6 @@ pub fn run_in_fresh_env(bin: &Path, args: &[&str], env: &[(&str, &str)]) -> std:
     output
 }
 
-/// Seals one Epoch at the given instant and returns its Epoch number,
-/// read from the `sealed epoch <n> …` line `clave seal` prints.
 pub fn seal_epoch(bin: &Path, data: &Path, at: &str) -> u64 {
     let output = run(bin, &["seal", "--data", s(data), "--at", at]);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -137,8 +126,6 @@ pub fn seal_epoch(bin: &Path, data: &Path, at: &str) -> u64 {
         .unwrap_or_else(|| panic!("clave seal printed no Epoch number:\n{stdout}"))
 }
 
-/// One log's line of a `graven sync` report: the head Epoch, the tree size
-/// and the root it adopted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncedHead {
     pub epoch: u64,
@@ -146,8 +133,6 @@ pub struct SyncedHead {
     pub root: String,
 }
 
-/// Parses the `[log] synced from … to head epoch N (tree size T, root R, …)`
-/// lines `graven sync` prints, keyed by log_id.
 pub fn synced_heads(stdout: &str) -> std::collections::BTreeMap<String, SyncedHead> {
     let mut heads = std::collections::BTreeMap::new();
     for line in stdout.lines() {
@@ -237,8 +222,6 @@ pub fn spawn_clave_serve(
     spawn_clave_serve_with(bin, data, bind_addr, Some(proxy))
 }
 
-/// Starts `clave serve`; with a proxy every fetch the aggregator makes is
-/// routed through it, which is how loopback sites stand in for domains.
 pub fn spawn_clave_serve_with(
     bin: &Path,
     data: &Path,
@@ -294,9 +277,6 @@ pub fn spawn_clave_serve_with(
     (ChildGuard(child), addr, stderr_buf)
 }
 
-/// The `checkpoint verifier key: …` line `clave init` and `clave log-key
-/// add` print: the signed-note verifier key a Witness or any external
-/// client is configured with (WIST-3 §3.4).
 pub fn checkpoint_verifier_key(stdout: &str) -> String {
     stdout
         .lines()
@@ -305,8 +285,6 @@ pub fn checkpoint_verifier_key(stdout: &str) -> String {
         .to_string()
 }
 
-/// A running Aggregator: the data directory, the base URL it serves the
-/// Log at, and the verifier key its `init` printed.
 pub struct Aggregator {
     pub data: PathBuf,
     pub log_id: String,
@@ -317,14 +295,10 @@ pub struct Aggregator {
 }
 
 impl Aggregator {
-    /// Terminates the `clave serve` process and waits for it, leaving the
-    /// data directory as it stands.
     pub fn stop(&mut self) {
         self.child = None;
     }
 
-    /// Serves the same data directory again at the same address, as an
-    /// operator restarting the process does.
     pub fn start(&mut self, bin: &Path, proxy: Option<&str>) {
         assert!(
             self.child.is_none(),
@@ -341,9 +315,6 @@ impl Aggregator {
     }
 }
 
-/// Initializes an Aggregator at a pre-picked loopback address and serves
-/// it, optionally pinning a Public Suffix List and routing its own
-/// fetches through a proxy.
 pub fn start_aggregator(
     bin: &Path,
     data: PathBuf,
@@ -390,7 +361,6 @@ pub fn serve_static(dir: PathBuf) -> String {
     serve_static_counted(dir).0
 }
 
-/// Serves a directory over loopback and counts the requests it answers.
 pub fn serve_static_counted(dir: PathBuf) -> (String, Arc<AtomicU64>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind static fixture server");
     let addr = listener.local_addr().expect("local_addr").to_string();
@@ -407,9 +377,6 @@ pub fn serve_static_counted(dir: PathBuf) -> (String, Arc<AtomicU64>) {
     (addr, requests)
 }
 
-/// A forward proxy serving several loopback hosts from directories: the
-/// request line of a proxied request names the host, and each host's
-/// requests are counted.
 pub fn serve_sites(
     sites: std::collections::BTreeMap<String, PathBuf>,
 ) -> (String, std::collections::BTreeMap<String, Arc<AtomicU64>>) {
@@ -526,9 +493,7 @@ pub fn serve_one_request(mut stream: TcpStream, dir: &Path) {
     }
 }
 
-/// A minimal [tlog-witness] Witness: it answers `add-checkpoint` with a
-/// [tlog-cosignature] v1 Cosignature over the note text it was sent, which
-/// is what the Aggregator republishes its Checkpoint with (WIST-3 §5).
+/// [tlog-witness] and [tlog-cosignature] v1 (WIST-3 §5).
 pub struct TestWitness {
     pub name: String,
     pub verifier_key: String,
@@ -623,8 +588,6 @@ pub fn fetch_status(http: &reqwest::blocking::Client, base: &str, domain: &str) 
     resp.json::<Value>().ok()
 }
 
-/// Waits until the Aggregator no longer answers, which is how a stopped
-/// `clave serve` reads from the outside.
 pub fn wait_until_unreachable(http: &reqwest::blocking::Client, base: &str, domain: &str) {
     poll_until(Duration::from_secs(10), Duration::from_millis(50), || {
         fetch_status(http, base, domain).is_none().then_some(())
@@ -641,9 +604,7 @@ pub fn wait_until_status_active(
     })
 }
 
-/// Waits until the Aggregator records a pull of the domain at or after
-/// `since`, whatever rejections its status carries: a rejection the status
-/// endpoint keeps from an earlier Epoch never clears.
+/// A rejection the status endpoint keeps from an earlier Epoch never clears.
 pub fn wait_until_pull_recorded(
     http: &reqwest::blocking::Client,
     base: &str,
@@ -689,11 +650,7 @@ pub fn wait_until_pulled_since(
     }
 }
 
-/// WIST-3 §3.2 seals on the accepted cadence grid, hourly by default and
-/// amendable only with a seven-day grace, so the harness advances Log time
-/// by whole hours: the first Epoch seals at the next hour boundary and each
-/// later one an hour after it, while Deltas keep wall-clock `observed_at`
-/// values that stay inside every Epoch's clock allowance.
+/// WIST-3 §3.2: the accepted cadence grid, hourly by default.
 pub fn grid_instant(hours_ahead: i64) -> String {
     let now = jiff::Timestamp::now().as_second();
     let next_hour = now.div_euclid(3600) * 3600 + 3600;
@@ -771,8 +728,6 @@ impl McpClient {
             .unwrap_or_else(|err| panic!("{method} returned JSON-RPC error: {err}"))
     }
 
-    /// The response to one request, keeping a JSON-RPC error as the error
-    /// case instead of failing the caller.
     pub fn try_call(&mut self, method: &str, params: Value) -> Result<Value, Value> {
         let id = self.next_id;
         self.next_id += 1;
@@ -819,7 +774,6 @@ impl McpClient {
             .unwrap_or_default()
     }
 
-    /// Searches under a named ranking profile.
     pub fn search_with_profile(&mut self, query: &str, profile: &str) -> Vec<Value> {
         self.tool_call("search", json!({"query": query, "profile": profile}))
             .as_array()
@@ -831,8 +785,6 @@ impl McpClient {
         self.tool_call("get_record", json!({"url": url}))
     }
 
-    /// The JSON-RPC error `get_record` answers with when the index holds no
-    /// record for the URL.
     pub fn get_record_error(&mut self, url: &str) -> Value {
         match self.try_call(
             "tools/call",

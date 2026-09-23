@@ -25,10 +25,7 @@ use wist_core::suffix_list::EpochCaps;
 use wist_core::timestamp::log_seconds;
 use wist_core::withdrawal::{Disposition, SealedDelta, WithdrawalReplay};
 
-/// WIST-4 §9 and ADR-0020: the accepted parameter schedule, the largest
-/// Epoch seen and the previous Epoch's instant, carried across the walk
-/// and across restarts so amendments, size bounds and the cadence grid are
-/// checked as a replaying Consumer checks them.
+/// WIST-4 §9 and ADR-0020.
 pub struct ChainState {
     schedule: Option<Schedule>,
     adopted: Vec<Amendment>,
@@ -46,9 +43,8 @@ impl ChainState {
         }
     }
 
-    /// The schedule a Snapshot's `parameter` tuples restore (WIST-3 §7):
-    /// accepted amendments whose sealing position the Snapshot does not
-    /// carry, adopted before the first walked Epoch.
+    /// WIST-3 §7: accepted amendments these tuples restore are adopted before the first walked
+    /// Epoch.
     pub fn from_tuples(tuples: &[(String, String, i64)]) -> Result<Self> {
         let adopted = tuples
             .iter()
@@ -101,9 +97,8 @@ impl ChainState {
         self.schedule.as_mut().unwrap()
     }
 
-    /// WIST-3 §6: the greatest `epoch_cap_bytes` in the map
-    /// at the verified prefix's last `sealed_at` and at every accepted
-    /// future effective instant; with no verified Epoch, the default.
+    /// WIST-3 §6: the greatest `epoch_cap_bytes` at the last verified `sealed_at` and at every
+    /// accepted future effective instant.
     pub fn transport_bound(&self) -> u64 {
         match (&self.schedule, self.prior_at) {
             (Some(schedule), Some(at)) => schedule.epoch_size_bounds(at).1,
@@ -111,8 +106,7 @@ impl ChainState {
         }
     }
 
-    /// The sealing cadence in force at the previous Epoch's `sealed_at`,
-    /// which WIST-3 §3.1 puts the next Epoch's instant on the grid of.
+    /// WIST-3 §3.1: the cadence in force at the previous Epoch's `sealed_at`.
     pub fn cadence(&self) -> i64 {
         match (&self.schedule, self.prior_at) {
             (Some(schedule), Some(at)) => schedule.value_at("epoch_cadence_seconds", at),
@@ -121,8 +115,7 @@ impl ChainState {
         .unwrap_or_else(|| default_of("epoch_cadence_seconds") as i64)
     }
 
-    /// WIST-3 §5 and WIST-4 §5: `checkpoint_witness_quorum` as in force at
-    /// a Checkpoint's `sealed_at`.
+    /// WIST-3 §5 and WIST-4 §5.
     pub fn quorum_at(&self, at: i64) -> u64 {
         self.schedule
             .as_ref()
@@ -146,9 +139,8 @@ impl ChainState {
         self.prior_at
     }
 
-    /// Seeds the verified prefix's last `sealed_at` from the Checkpoint a
-    /// Snapshot resumes at, so the cadence grid, the transport bound and
-    /// the Witness quorum are read from that prefix (WIST-3 §§5, 6).
+    /// WIST-3 §§5, 6: the cadence grid, transport bound and Witness quorum are read from the prefix
+    /// a Snapshot resumes at.
     pub fn seed_prior(&mut self, at: i64) {
         self.prior_at = Some(at);
         self.schedule_at(at);
@@ -168,31 +160,24 @@ fn default_of(parameter: &str) -> u64 {
 
 pub struct EpochEvent {
     pub height: u64,
-    /// The root of the tree Checkpoint N states, in the `sha256:` form of
-    /// WIST-3 §3.1; an Epoch has no hash apart from it.
+    /// The `sha256:` form of WIST-3 §3.1.
     pub epoch_root: String,
     pub sealed_at: String,
     pub sealed_at_s: i64,
-    /// The caps and clock allowance accepted at `sealed_at`, under which
-    /// every Delta this Epoch seals is validated (WIST-1 §3.4).
+    /// WIST-1 §3.4: accepted at `sealed_at`.
     pub profile: DeltaProfile,
-    /// `recovery_window_days` in force at `sealed_at`, which freezes the
-    /// end of a recovery window opened in this Epoch (WIST-1 §5.2).
+    /// WIST-1 §5.2: in force at `sealed_at`; freezes the end of a recovery window opened in this
+    /// Epoch.
     pub recovery_window_days: i64,
-    /// `declaration_activation_epochs` in force at `sealed_at`, which
-    /// fixes the activation height of a fresh identity this Epoch seals
-    /// (WIST-1 §5.2).
+    /// WIST-1 §5.2: in force at `sealed_at`.
     pub declaration_activation_epochs: i64,
-    /// The `publisher_declaration` Entries in canonical Epoch order.
+    /// In canonical Epoch order.
     pub declarations: Vec<Value>,
-    /// Each `payload_withdrawal` this Epoch seals that core's replay
-    /// accepted (WIST-4 §5.1): the withdrawn Delta ID, its Publisher and
-    /// the earliest Epoch that withdrew it (WIST-3 §6.2).
+    /// WIST-3 §6.2: (withdrawn Delta ID, Publisher, earliest withdrawing Epoch).
     pub withdrawals: Vec<(String, String, u64)>,
     pub delta_bodies: Vec<Value>,
-    /// The `label` Entries with their canonical Entry index (WIST-2 §3.3).
+    /// WIST-2 §3.3: paired with the canonical Entry index.
     pub labels: Vec<(u64, Value)>,
-    /// The `dispute` Entries with their canonical Entry index.
     pub disputes: Vec<(u64, Value)>,
 }
 
@@ -230,18 +215,13 @@ pub(super) fn fetch_payload(
     })
 }
 
-/// One Checkpoint the walk verified, with what WIST-3 §5's quorum said
-/// about adopting it as the head.
 pub struct Verified {
     pub checkpoint: Checkpoint,
     pub adoption: Adoption,
 }
 
-/// The Checkpoint a walk could not pass and the failure to report once the
-/// Epochs below it are applied. WIST-3 §8 step 8 adopts "the newest
-/// verified one", and "Entries above its tree size are not applied", so a
-/// Checkpoint that fails verification ends the walk instead of discarding
-/// the Epochs verified below it.
+/// WIST-3 §8 step 8: a failing Checkpoint ends the walk; the Epochs verified below it are still
+/// adopted.
 pub struct Stop {
     pub epoch_number: u64,
     pub error: Error,
@@ -254,8 +234,7 @@ pub struct Walk {
 }
 
 impl Walk {
-    /// WIST-3 §8 step 8: the newest verified Checkpoint carrying the
-    /// quorum in force at its own `sealed_at`.
+    /// WIST-3 §8 step 8: quorum as in force at the Checkpoint's own `sealed_at`.
     pub fn adopted(&self) -> Option<&Verified> {
         self.verified
             .iter()
@@ -279,12 +258,7 @@ pub struct WalkState<'a> {
     pub tree: &'a mut Tree,
 }
 
-/// WIST-3 §5 and §8 steps 6–8: verifies every Checkpoint above the
-/// verified head in `epoch_number` order — the sequence rules, the
-/// Epoch's Entries against the tree the Checkpoint states, the
-/// Consistency Proof from the previous size, the Epoch's Registry
-/// Updates, then the Log's signature under the key set valid at its
-/// height — and reports what the Witness quorum says about each.
+/// WIST-3 §5 and §8 steps 6–8.
 pub fn walk_checkpoints(
     inputs: &WalkInputs,
     state: &mut WalkState,
@@ -314,11 +288,8 @@ pub fn walk_checkpoints(
                 events.push(event);
                 previous = checkpoint.clone();
             }
-            // WIST-3 §5 and §9: chain divergence applies nothing, because
-            // a Consumer verifying it "MUST stop applying new data from
-            // that Aggregator". Every other failure stops the walk at the
-            // Checkpoint it could not pass and leaves the Epochs verified
-            // below it to be adopted (§8 step 8).
+            // WIST-3 §5 and §9: chain divergence applies nothing; any other failure keeps the
+            // Epochs verified below it (§8 step 8).
             Err(error) => {
                 if error.code().as_deref() == Some("WIST3-E02") {
                     return Err(error);
@@ -338,11 +309,8 @@ pub fn walk_checkpoints(
     })
 }
 
-/// One Checkpoint above the verified head, with the Epoch it ends: the
-/// sequence rules, the Epoch's Entries against the tree the Checkpoint
-/// states, the Consistency Proof from the previous size, the Epoch's
-/// Registry Updates, then the Log's signature under the key set valid at
-/// its height (WIST-3 §5).
+/// WIST-3 §5 order: sequence rules, Entries, Consistency Proof, Registry Updates, then the
+/// signature.
 fn verify_checkpoint(
     inputs: &WalkInputs,
     state: &mut WalkState,
@@ -371,9 +339,7 @@ fn verify_checkpoint(
             detail,
         )
     };
-    // WIST-3 §5, the first Equivocation form: two Checkpoints of one
-    // Log stating the same tree size and different root hashes. The
-    // two notes are the whole evidence, so no tile is fetched for it.
+    // WIST-3 §5, the first Equivocation form: the two notes are the whole evidence.
     if matches!(
         checkpoint::equivocation(previous, checkpoint),
         Some(checkpoint::Equivocation::SameSizeDifferentRoot)
@@ -383,9 +349,7 @@ fn verify_checkpoint(
             None,
         ));
     }
-    // WIST-3 §3.1: the sequence rules at the verified head, judged
-    // under the key set valid at the previous height and against the
-    // tiles the Consumer holds, which reproduce the larger root.
+    // WIST-3 §3.1: judged under the key set valid at the previous height.
     if let Err(error) = super::checkpoints::sequence_at_head(
         inputs.log_dir,
         inputs.log_id,
@@ -403,8 +367,7 @@ fn verify_checkpoint(
     }
     let previous_size = previous.tree_size();
     let tree_size = checkpoint.tree_size();
-    // WIST-3 §4: the root at size 0 is SHA-256(""), and an empty
-    // Consistency Proof exempts no root from comparison.
+    // WIST-3 §4: an empty Consistency Proof exempts no root from comparison.
     if tree_size == 0 && *checkpoint.root() != wist_core::merkle::EMPTY_ROOT {
         return Err(super::checkpoints::divergence(
             inputs.log_dir,
@@ -424,12 +387,7 @@ fn verify_checkpoint(
         tree_size,
         checkpoint.root(),
     ) {
-        // The verified tiles plus the ones this Epoch's leaves add do
-        // not reproduce the offered root. A source may be serving
-        // another tree entirely, so ask each for the whole tree that
-        // size requires — into a scratch tree, never over the tiles
-        // the Consumer has verified — and compare its prefix with the
-        // root the previous Checkpoint states.
+        // Fetched into a scratch tree, never over the tiles the Consumer has verified.
         match super::tree::offered_tree(inputs.sources, tree_size, checkpoint.root())? {
             Some(offered_tree) => {
                 let prefix = wist_core::merkle::root_from(offered_tree.reader(), previous_size)?;
@@ -456,9 +414,7 @@ fn verify_checkpoint(
         chain.transport_bound(),
     )
     .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
-    // WIST-3 §3.1 and §6: what an Epoch's own Entries fail is an
-    // invalid object; the tree they belong to was weighed against the
-    // verified head above.
+    // WIST-3 §3.1 and §6: a failure of the Epoch's own Entries is an invalid object.
     let summary = verify_epoch(
         previous_size,
         checkpoint,
@@ -468,10 +424,8 @@ fn verify_checkpoint(
     )
     .map_err(|error| Error::Verify(format!("epoch {n}: {error}")))?;
 
-    // WIST-3 §3.3 and §3.4: Epoch N's key acts apply first, in
-    // canonical Entry index order, each authenticated under the keys
-    // valid at N−1; a key act that fails is ignored and the Epoch
-    // stays valid.
+    // WIST-3 §3.3 and §3.4: key acts apply first, in canonical Entry index order, under the keys
+    // valid at N−1; a failing key act is ignored.
     let key_acts: Vec<&Value> = entries
         .iter()
         .filter(|entry| entry["type"] == "registry_update")
@@ -488,8 +442,7 @@ fn verify_checkpoint(
             eprintln!("ignoring an Aggregator key act at height {n}: {code}");
         }
     }
-    // Every other Registry Update of Epoch N is authenticated under
-    // the keys valid at N, the set its own key acts leave in force.
+    // Authenticated under the keys valid at N, after this Epoch's key acts.
     let authenticators = keys.valid_at(n);
     let authentic =
         |body: &Value| wist_core::aggregator_keys::authenticate(body, &authenticators).is_ok();
@@ -515,8 +468,7 @@ fn verify_checkpoint(
         let Ok(effective_at_s) = log_seconds(effective_at) else {
             continue;
         };
-        // WIST-4 §5.1: an act no key valid at this Epoch signed is
-        // WIST4-E11 and changes nothing.
+        // WIST-4 §5.1: `WIST4-E11`, changing nothing.
         if !authentic(&entry["body"]) {
             eprintln!("ignoring a parameter_change at height {n}: WIST4-E11");
             continue;
@@ -652,9 +604,7 @@ fn verify_checkpoint(
         }
     }
 
-    // WIST-3 §5: the key set that can speak for Epoch N is the one the
-    // Log establishes at N, so the signature closes the loop only after
-    // this Epoch's Registry Updates have been applied.
+    // WIST-3 §5: the signature is checked only after this Epoch's Registry Updates apply.
     let adoption = super::checkpoints::decide(
         checkpoint,
         inputs.log_id,
@@ -696,10 +646,7 @@ pub(super) fn persist_declaration(
     envelope: &Value,
 ) -> Result<()> {
     let env: PublisherEnvelope = serde_json::from_value(envelope.clone())?;
-    // One Declaration reaches the store from more than one WIST-3 §7 tuple
-    // of one Snapshot — a `declaration`, a `recovery_window` head and a
-    // `pending_declaration` head can all name it at one sealing height —
-    // and the row is one record of that Declaration either way.
+    // WIST-3 §7: several tuples of one Snapshot can name one Declaration.
     conn.execute(
         "INSERT OR IGNORE INTO declarations(domain, seq, height, sealed_at, baseline, envelope, recovery_window_days) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         (
@@ -728,9 +675,7 @@ pub(super) fn remove_derived(conn: &Connection, delta_id: &str, url: &str) -> Re
     Ok(())
 }
 
-/// WIST-3 §7: a removed record's ranking signals must not linger for a
-/// page that no longer materializes, and the links it withdraws count as
-/// in-link deaths at the height that removed it.
+/// WIST-3 §7: the links a removed record withdraws count as in-link deaths at the removing height.
 fn remove_ranking_bookkeeping(
     conn: &Connection,
     url: &str,
@@ -790,8 +735,7 @@ pub(super) fn remove_by_url(
     Ok(())
 }
 
-/// WIST-3 §7: the publishers holding a live or excluded record for `url`,
-/// the candidate set `wist_core::materialization::preferred` chooses among.
+/// WIST-3 §7: excluded records are candidates too.
 fn candidates_for(conn: &Connection, url: &str) -> Result<Vec<String>> {
     let mut set: BTreeSet<String> = BTreeSet::new();
     let mut stmt = conn.prepare("SELECT publisher FROM records WHERE url = ?1")?;
@@ -869,10 +813,8 @@ fn write_excluded(
     Ok(())
 }
 
-/// WIST-3 §7: when a Delta's Publisher takes over a URL another Publisher
-/// currently materializes, that Publisher's record moves into
-/// `excluded_records` — carrying its tier-1 extract and links and the
-/// height it was recorded at — before the winner's own record is written.
+/// WIST-3 §7: the displaced record moves into `excluded_records` before the winner's record is
+/// written.
 fn shadow_into_excluded(
     conn: &Connection,
     url: &str,
@@ -987,9 +929,7 @@ fn restore_excluded_row(
     Ok(())
 }
 
-/// WIST-3 §7: called whenever a live `records` row for `url` is removed —
-/// a delete Delta, a withdrawal or the declaration sweep — to bring the
-/// next-preferred Publisher's excluded record back, if any is held.
+/// WIST-3 §7.
 fn recompute_and_restore(
     conn: &Connection,
     history: &KeyHistory,
@@ -1024,12 +964,8 @@ fn recompute_and_restore(
     restore_excluded_row(conn, url, &winner, &row, tier1)
 }
 
-/// WIST-3 §7: at the height a domain's own `seq`-0 Declaration Entry
-/// seals, every other Publisher's record and excluded record for that
-/// domain's URLs is excluded exactly as a `delete` excludes it — a parent
-/// scope no longer reaches URLs the subdomain now declares for itself.
-/// Idempotent, so running it once per Declaration Entry of the domain in
-/// an Epoch is safe.
+/// WIST-3 §7: at a domain's `seq`-0 Declaration height, other Publishers' records for its URLs are
+/// excluded as by `delete`. Idempotent.
 fn sweep_declared_domain(
     conn: &Connection,
     history: &KeyHistory,
@@ -1110,8 +1046,7 @@ pub fn apply_events(
             &event.declarations,
         )?;
         for entry in &event.declarations {
-            // WIST-4 §6 measures a Labeler's inactivity from its last sealed
-            // Entry of any type, a Declaration included.
+            // WIST-4 §6: a Declaration counts as a Labeler's sealed Entry.
             if let Some(domain) = entry["body"]["publisher"]["domain"].as_str() {
                 super::persist::touch_labeler(conn, domain, event.height)?;
             }
@@ -1136,17 +1071,14 @@ pub fn apply_events(
                 stats.withdrawn += 1;
                 recompute_and_restore(conn, history, &url, tier1)?;
             }
-            // WIST-3 §7: withdrawn content never materializes, so an
-            // excluded record the same Delta ID names never returns either.
+            // WIST-3 §7: withdrawn content never materializes, so its excluded record never
+            // returns.
             remove_excluded_by_delta_id(conn, delta_id)?;
         }
 
         for body in &event.delta_bodies {
-            // WIST-3 §3.3: a sealed Delta that fails the Key Set its own
-            // Epoch resolves is ignored exactly as a fork is — applied to
-            // nothing, moving no chain tip — never a reason to abandon
-            // the sync; field, version, cap and clock failures share
-            // that disposition.
+            // WIST-3 §3.3: a Delta failing its Epoch's Key Set, fields, version, caps or clock is
+            // ignored like a fork, never ending the sync.
             let verified =
                 match history.verify_delta(event.height, sealed_at_s, &event.profile, body) {
                     Ok(v) => v,
@@ -1158,19 +1090,16 @@ pub fn apply_events(
             let env: DeltaEnvelope = serde_json::from_value(body.clone())?;
             let id = verified.id;
             let publisher = verified.publisher;
-            // WIST-1 §3.5: a Delta whose prev is not the chain tip the
-            // state carries is a fork, and moves nothing.
+            // WIST-1 §3.5: a `prev` other than the chain tip is a fork.
             if !tips.apply(&publisher, &env.delta.url, &id, env.delta.prev.as_deref()) {
                 continue;
             }
-            // WIST-3 §7: once a host's own Declaration stands, a parent's
-            // Deltas for its URLs move the chain tip but materialize
-            // nothing and are never shadowed.
+            // WIST-3 §7: once a host self-declares, a parent's Deltas for its URLs move the chain
+            // tip but never materialize.
             if verified.self_declared && publisher != verified.host {
                 continue;
             }
-            // WIST-3 §6.2: a withdrawn Delta's content never materializes,
-            // even when the withdrawal sealed in the same Epoch.
+            // WIST-3 §6.2: even when the withdrawal sealed in the same Epoch.
             if withdrawn.is_withdrawn(&id) {
                 continue;
             }
@@ -1313,9 +1242,7 @@ pub fn apply_events(
                     recompute_and_restore(conn, history, &env.delta.url, tier1)?;
                 }
                 ChangeType::Attest => {
-                    // WIST-3 §7: an attest refreshes the record's
-                    // observed_at and leaves its anchor Delta in place,
-                    // whichever of the two tables currently holds it.
+                    // WIST-3 §7: an attest refreshes `observed_at` and keeps its anchor Delta.
                     conn.execute(
                         "UPDATE records SET observed_at = ?3 WHERE url = ?1 AND publisher = ?2",
                         (&env.delta.url, &publisher, &env.delta.observed_at),
@@ -1335,8 +1262,7 @@ pub fn apply_events(
     Ok(stats)
 }
 
-/// WIST-4 §8: a domain's history restarts at a fresh identity's activation
-/// height, which a ranking policy reads in place of its first Entry.
+/// WIST-4 §8: a fresh identity's activation height restarts the domain's history.
 fn record_identity_starts(conn: &Connection, history: &KeyHistory) -> Result<()> {
     conn.execute_batch(crate::store::CREATE_RANKING)?;
     for (domain, state) in history.declarations().domains() {
@@ -1352,11 +1278,8 @@ fn record_identity_starts(conn: &Connection, history: &KeyHistory) -> Result<()>
     Ok(())
 }
 
-/// WIST-2 §3.3 and WIST-3 §3.3: applies an Epoch's `label` and `dispute`
-/// Entries after its Deltas, each validated under its signer's Declaration
-/// as the Aggregator validated it; one that fails is ignored like a
-/// forked Delta. Every sealed Entry of a Labeler moves its last sealed
-/// height (WIST-4 §6).
+/// WIST-2 §3.3 and WIST-3 §3.3: applied after the Epoch's Deltas; a failing Entry is ignored like a
+/// forked Delta. Every sealed Labeler Entry moves its last sealed height (WIST-4 §6).
 pub(super) fn apply_labels(
     conn: &Connection,
     history: &KeyHistory,
@@ -1407,11 +1330,8 @@ pub(super) fn apply_labels(
             );
             continue;
         };
-        // WIST-3 §7: a Snapshot carries only the current Label per (labeler,
-        // subject, name), so a miss naming a height at or below the walk
-        // floor cannot be told apart from a Label the Snapshot's tuples
-        // simply don't hold; only a miss above the floor is genuinely
-        // absent.
+        // WIST-3 §7: a Snapshot carries only the current Label, so only a miss above the walk floor
+        // is genuinely absent.
         let dispute_height = body["dispute"]["height"].as_u64().unwrap_or(u64::MAX);
         let sealed = |label_id: &str| match super::persist::sealed_label_subject(conn, label_id)
             .ok()

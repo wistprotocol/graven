@@ -9,15 +9,8 @@ use wist_core::objects::{AggregatorKeyEntry, Anchor};
 use wist_core::parameters::Amendment;
 use wist_core::withdrawal::WithdrawalReplay;
 
-/// WIST-3 §3.4 and §7: every key the Log has admitted, the genesis key
-/// and retired ones included, with the heights that bound its validity
-/// and the accepted acts that set them — the set a Checkpoint at any
-/// height is verified under, and the set a later `aggregator_key_add`
-/// must not collide with. The rows are the Consumer's own tuples, so they
-/// are re-authenticated from the Anchor at `at` as a state file's are: a
-/// store that has walked nothing carries no row and starts from the
-/// Anchor's genesis key, and one that has walked a removal carries the
-/// genesis key's own removal height, so a reload never restores it.
+/// WIST-3 §3.4 and §7: re-authenticated from the Anchor at `at` as a state file's tuples are, so a
+/// reload never restores a retired key.
 pub(super) fn load_aggregator_keys(
     conn: &Connection,
     anchor: &Anchor,
@@ -51,9 +44,7 @@ pub(super) fn load_aggregator_keys(
     })
 }
 
-/// A stored key act. A row whose text is not JSON leaves a value no key
-/// act's field validation accepts, so the registry is refused by §7's
-/// rules rather than read as if the act were absent.
+/// A row that is not JSON yields a value §7's rules refuse, never an absent act.
 fn act_value(text: String) -> serde_json::Value {
     serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
 }
@@ -137,9 +128,7 @@ pub fn load_history(conn: &Connection) -> Result<KeyHistory> {
     }
 }
 
-/// WIST-3 §6.2: the withdrawals the store holds, from adopted tuples and
-/// walked acts alike, as core's replay so a later act of the same Delta
-/// keeps the first height.
+/// WIST-3 §6.2: a later act of the same Delta keeps the first height.
 pub(super) fn load_withdrawn(conn: &Connection) -> Result<WithdrawalReplay> {
     conn.execute_batch(crate::store::CREATE_WITHDRAWALS)?;
     let mut stmt = conn.prepare("SELECT delta_id, publisher, height FROM withdrawals")?;
@@ -211,18 +200,11 @@ pub(super) fn save_chain_tips(conn: &Connection, tips: &ChainTips) -> Result<()>
     Ok(())
 }
 
-/// The sync cursor and verification state, committed in the same
-/// transaction as the index rows it describes.
+/// Committed in the same transaction as the index rows it describes.
 pub const CREATE_SYNC_STATE: &str = "CREATE TABLE IF NOT EXISTS sync_state(id INTEGER PRIMARY KEY CHECK(id = 1), state TEXT NOT NULL)";
 
-/// Reads a stored sync state, refusing one written before the Log became
-/// one growing tree — such a record names a Block hash where a tree size
-/// and root now stand — one written before
-/// `block_number`/`log_position` became `epoch_number`/`tree_size`, or
-/// one written before the key registry kept each key's accepted acts,
-/// which no store can supply after the fact; reinterpreting any of them
-/// would silently place the verified head at a tree the Consumer never
-/// verified, or leave a registry that never chained to the Anchor.
+/// Reinterpreting an older format would place the verified head at a tree never verified, or keep a
+/// registry never chained to the Anchor.
 pub fn read_sync_state(bytes: &[u8]) -> Result<SyncState> {
     let value: serde_json::Value = serde_json::from_slice(bytes)?;
     let format = value.get("format").and_then(serde_json::Value::as_u64);
@@ -260,9 +242,7 @@ pub fn save_sync_state(conn: &Connection, state: &SyncState) -> Result<()> {
     Ok(())
 }
 
-/// WIST-2 §3.3: records one walked Label, keeps the current Label of its
-/// (labeler, subject, name) by asserted_at and Log order, and counts it
-/// in the labeler statistics.
+/// WIST-2 §3.3.
 pub(super) fn record_label(
     conn: &Connection,
     label: &wist_core::objects::Label,
@@ -345,8 +325,7 @@ fn supersedes(
     }
 }
 
-/// WIST-2 §3.3: records one walked dispute and keeps the current dispute
-/// of its (Label ID, disputant).
+/// WIST-2 §3.3.
 pub(super) fn record_dispute(
     conn: &Connection,
     dispute: &wist_core::objects::Dispute,
@@ -392,9 +371,7 @@ pub(super) fn record_dispute(
     touch_labeler(conn, &dispute.disputant, height)
 }
 
-/// The subject of a Label this index holds sealed, for a dispute's check
-/// (WIST-2 §3.3): one it walked, or the current Label a Snapshot tuple
-/// carried with its ID.
+/// WIST-2 §3.3.
 pub(super) fn sealed_label_subject(conn: &Connection, label_id: &str) -> Result<Option<String>> {
     if !crate::store::table_exists(conn, "labels")? {
         return Ok(None);
@@ -409,8 +386,7 @@ pub(super) fn sealed_label_subject(conn: &Connection, label_id: &str) -> Result<
     .map_err(Into::into)
 }
 
-/// WIST-4 §6: a Labeler's last sealed Entry of any type, for the
-/// recommended inactivity reading.
+/// WIST-4 §6.
 pub(super) fn touch_labeler(conn: &Connection, domain: &str, height: u64) -> Result<()> {
     if !crate::store::table_exists(conn, "labelers")? {
         return Ok(());
@@ -422,11 +398,8 @@ pub(super) fn touch_labeler(conn: &Connection, domain: &str, height: u64) -> Res
     Ok(())
 }
 
-/// WIST-3 §8 step 10: adopts a Snapshot's `label` tuple as the current
-/// Label of its triple, with the Label ID a later dispute names, and
-/// records the Labeler's first and last adopted tuple heights: the
-/// figures a resumed index can honestly hold, none of them a real count
-/// (WIST-3 §7).
+/// WIST-3 §8 step 10 and §7: a resumed index holds only first and last adopted tuple heights, none
+/// of them a real count.
 pub(super) fn adopt_label_tuple(
     conn: &Connection,
     entry: &wist_core::objects::LabelEntry,
@@ -460,8 +433,7 @@ pub(super) fn adopt_label_tuple(
     Ok(())
 }
 
-/// WIST-3 §8 step 10: adopts a Snapshot's `dispute` tuple as the current
-/// dispute of its pair.
+/// WIST-3 §8 step 10.
 pub(super) fn adopt_dispute_tuple(
     conn: &Connection,
     entry: &wist_core::objects::DisputeEntry,
@@ -481,9 +453,8 @@ pub(super) fn adopt_dispute_tuple(
     Ok(())
 }
 
-/// WIST-2 §3.3 and WIST-4 §6: fetches the definition of every name a
-/// subscribed Labeler has used, keeping the newest that verifies under
-/// the Labeler's Declaration; a name with none reads as `inform`.
+/// WIST-2 §3.3 and WIST-4 §6: the newest definition that verifies wins; a name with none reads as
+/// `inform`.
 pub(super) fn fetch_definitions(
     conn: &Connection,
     client: &crate::fetch::Client,
@@ -559,8 +530,6 @@ fn host_of(url: &str) -> String {
         .to_string()
 }
 
-/// The seal height of a record's Delta, read by a ranking profile for
-/// freshness and link age.
 pub(super) fn record_height(
     conn: &Connection,
     url: &str,
@@ -576,9 +545,6 @@ pub(super) fn record_height(
     Ok(())
 }
 
-/// Replaces the in-links a page declares with the links its newest Delta
-/// carries, recording per target host what the change added and removed
-/// at `height` so a profile can read in-link growth and death rates.
 pub(super) fn replace_inlinks(
     conn: &Connection,
     source_url: &str,
@@ -616,9 +582,6 @@ pub(super) fn replace_inlinks(
     Ok(())
 }
 
-/// Seeds the ranking index from an adopted Snapshot: every record and
-/// every tier-1 link is read as sealed at `height`, the Epoch the
-/// Snapshot stands at.
 pub(super) fn seed_ranking_index(conn: &Connection, height: u64) -> Result<()> {
     conn.execute_batch(crate::store::CREATE_RANKING)?;
     conn.execute(

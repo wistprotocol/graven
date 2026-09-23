@@ -16,9 +16,7 @@ fn invalid(message: &str) -> Error {
     Error::Verify(format!("WIST3-E03 {message}"))
 }
 
-/// WIST-3 §6: the tree hashes the Consumer holds, as the tiles it
-/// fetched them in. Keeping them is what lets a later Epoch be verified
-/// against the prefix without refetching the Log's history.
+/// WIST-3 §6.
 #[derive(Clone, Default)]
 pub struct Tree {
     raw: BTreeMap<(u8, u64), Vec<u8>>,
@@ -76,16 +74,14 @@ impl Tree {
     }
 }
 
-/// WIST-3 §6: a served tile holds the hashes its path states — 256 at a
-/// full path, `W` at `.p/<W>` — and every other form is `WIST3-E03`.
+/// WIST-3 §6: 256 hashes at a full path, `W` at `.p/<W>`; any other form is `WIST3-E03`.
 fn tile_form(path: &str, bytes: &[u8]) -> Result<()> {
     decode_tile_at(path, bytes)?;
     Ok(())
 }
 
-/// WIST-3 §6: a partial tile is fetched only where a Checkpoint's size
-/// requires that width, and the full tile is the fallback once the
-/// Aggregator has deleted the partial one.
+/// WIST-3 §6: partial only at the width a Checkpoint's size requires; the full tile is the
+/// fallback.
 fn tile_bytes(sources: &Sources, at: usize, tile: &Tile) -> Result<Vec<u8>> {
     let want = tile.width as usize * 32;
     let path = tile.path();
@@ -118,9 +114,7 @@ fn fetch_tiles(sources: &Sources, tree: &Tree, wanted: &[Tile], at: usize) -> Re
     Ok(candidate)
 }
 
-/// Fetches the tiles a tree size needs and keeps them only where they
-/// reproduce the root a Checkpoint states (WIST-3 §6); a source whose
-/// octets do not is asked no further and the next one is tried.
+/// WIST-3 §6.
 fn adopt_tiles(
     sources: &Sources,
     tree: &mut Tree,
@@ -148,10 +142,8 @@ fn adopt_tiles(
     Err(last.unwrap_or_else(|| Error::Fetch("WIST3-E01 no source holds the tree's tiles".into())))
 }
 
-/// WIST-3 §4: the root of the tree at size 0 is `SHA-256("")`, and no
-/// party holds a tile for it, so the root is compared rather than the
-/// comparison skipped. A Checkpoint stating another root there states a
-/// tree that is not this Log's (`WIST3-E02`).
+/// WIST-3 §4: no party holds a tile at size 0, so the root is compared, never skipped
+/// (`WIST3-E02`).
 fn check_empty_tree(root: &[u8; 32]) -> Result<()> {
     if *root != wist_core::merkle::EMPTY_ROOT {
         return Err(Error::Verify(
@@ -162,8 +154,7 @@ fn check_empty_tree(root: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
-/// WIST-3 §8 step 5: the tree hashes at a Snapshot's tree size, verified
-/// by recomputation against the root its Checkpoint states.
+/// WIST-3 §8 step 5.
 pub fn seed(sources: &Sources, tree: &mut Tree, tree_size: u64, root: &[u8; 32]) -> Result<()> {
     if tree_size == 0 {
         return check_empty_tree(root);
@@ -171,8 +162,7 @@ pub fn seed(sources: &Sources, tree: &mut Tree, tree_size: u64, root: &[u8; 32])
     adopt_tiles(sources, tree, &required_tiles(tree_size), tree_size, root)
 }
 
-/// The tiles Epoch N's leaves add to the tree, kept only where the whole
-/// tree reproduces Checkpoint N's root.
+/// Kept only where the whole tree reproduces Checkpoint N's root.
 pub fn extend(
     sources: &Sources,
     tree: &mut Tree,
@@ -187,10 +177,8 @@ pub fn extend(
     adopt_tiles(sources, tree, &wanted, to, root)
 }
 
-/// The whole tree a Checkpoint's size requires, from the first source
-/// whose tiles reproduce the root it states, built beside the tiles the
-/// Consumer has verified rather than over them: what a party offering a
-/// fork serves is never mixed into the tree the Consumer holds.
+/// Built beside the verified tiles, never over them, so a fork is never mixed into the tree the
+/// Consumer holds.
 pub fn offered_tree(sources: &Sources, tree_size: u64, root: &[u8; 32]) -> Result<Option<Tree>> {
     if tree_size == 0 {
         return Ok(None);
@@ -244,11 +232,8 @@ fn bundle_bytes(sources: &Sources, tree: &Tree, bundle: &EntryBundle) -> Result<
     }
 }
 
-/// WIST-3 §3.1 and §6: the Entries whose leaf indexes lie in Epoch N's
-/// range, read from the entry bundles that cover it, each verified
-/// against the tree's level-0 hashes, held to the range `size(N-1)`
-/// through `size(N) - 1`, and stopped at the transport bound the verified
-/// prefix derives.
+/// WIST-3 §3.1 and §6: held to leaves `size(N-1)` through `size(N) - 1` and stopped at the prefix's
+/// transport bound.
 pub fn epoch_entries(
     sources: &Sources,
     tree: &Tree,

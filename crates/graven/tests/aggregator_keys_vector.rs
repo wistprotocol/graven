@@ -1,15 +1,5 @@
-//! WIST-3 §3.4, §5 and §7 at the Consumer, against
-//! `vectors/wist3/aggregator-keys.json`: each history is served as a
-//! static Log and walked, so the key acts the vector dispositions, the
-//! Checkpoints the keys valid at each height admit, and the tuples a
-//! Consumer ends holding are the ones the vector records.
-//!
-//! The vector publishes no private key, so no Snapshot of these Logs can
-//! be signed, and §8's cold start cannot run against them. Each history
-//! is therefore installed at its Epoch 0 — the earliest Epoch a Snapshot
-//! can describe — with the vector's Epoch 0 tuples, acts included, as the
-//! key state a resume holds, and every Epoch above it is fetched,
-//! verified and applied by the ordinary sync.
+//! WIST-3 §3.4, §5 and §7. The vector publishes no private key, so no Snapshot can be signed and
+//! each history is installed at its Epoch 0.
 mod common;
 
 use graven::fetch::Client;
@@ -59,9 +49,6 @@ fn key_entries(state: &Value) -> Vec<AggregatorKeyEntry> {
         .collect()
 }
 
-/// One `aggregator_key` tuple as the store and the vector both state it:
-/// the key, the heights that bound it and the accepted acts that set
-/// them, canonicalized so the store's text is compared by value.
 type Row = (
     String,
     String,
@@ -122,8 +109,6 @@ fn stored_rows(target: &Path, log_id: &str) -> Vec<Row> {
     rows
 }
 
-/// A history's Epochs published as WIST-3 §6's static surface, with the
-/// Anchor the vector carries served at `/log/anchor.json`.
 struct ServedHistory {
     dir: tempfile::TempDir,
     log: common::Log,
@@ -132,10 +117,6 @@ struct ServedHistory {
     anchor_path: PathBuf,
 }
 
-/// Publishes the first `through` Epochs of a history, replacing the last
-/// one's Checkpoint with `note` where the caller supplies one — which is
-/// how a candidate Checkpoint, or the note an Epoch no Checkpoint verifies
-/// would need, is offered as the head.
 fn serve(history: &Value, through: usize, note: Option<&str>) -> ServedHistory {
     let dir = tempfile::tempdir().unwrap();
     let log_id = history["log_id"].as_str().unwrap().to_string();
@@ -168,9 +149,6 @@ fn serve(history: &Value, through: usize, note: Option<&str>) -> ServedHistory {
     }
 }
 
-/// The store a Consumer holds after WIST-3 §8's cold start at the
-/// history's Epoch 0: the Checkpoint it verified, the tree it holds and
-/// the `aggregator_key` tuples the state artifact carried.
 fn install_at_epoch_0(served: &ServedHistory, target: &Path, history: &Value) {
     let checkpoint = served.log.checkpoints[0].clone();
     let log_dir = graven::registry::log_dir(target, &served.log_id);
@@ -243,8 +221,6 @@ fn install_at_epoch_0(served: &ServedHistory, target: &Path, history: &Value) {
     tree.save(&conn).unwrap();
 }
 
-/// Every parameter amendment the store accepted, as the `subject` and
-/// value of the act that carried it and the Epoch that sealed it.
 fn stored_amendments(target: &Path, log_id: &str) -> Vec<(String, i64, u64)> {
     let index = graven::registry::log_dir(target, log_id).join("index.sqlite");
     let conn = Connection::open(index).unwrap();
@@ -266,9 +242,7 @@ fn stored_amendments(target: &Path, log_id: &str) -> Vec<(String, i64, u64)> {
     rows
 }
 
-/// The amendments the vector's dispositions leave accepted above the
-/// Epoch the store was installed at: a `parameter_change` no key valid at
-/// its own Epoch signed is `WIST4-E11` and changes nothing.
+/// WIST-4 §5.1: `WIST4-E11` changes nothing.
 fn accepted_amendments(history: &Value, through: usize) -> Vec<(String, i64, u64)> {
     let mut accepted = Vec::new();
     for epoch in history["epochs"].as_array().unwrap()[1..through].iter() {
@@ -345,10 +319,7 @@ fn a_checkpoint_no_key_valid_at_its_epoch_signs_leaves_the_head_where_it_was() {
     for history in histories() {
         let name = history["name"].as_str().unwrap();
         for (index, epoch) in history["epochs"].as_array().unwrap().iter().enumerate() {
-            // A candidate for Epoch 0 is judged against the Checkpoint the
-            // store was installed with, which states the same note text,
-            // so it decides nothing about the keys; core's conformance
-            // tests judge those candidates directly.
+            // Core's conformance tests judge Epoch 0 candidates directly.
             if index == 0 {
                 continue;
             }
@@ -431,8 +402,6 @@ fn an_epoch_no_checkpoint_verifies_is_never_applied() {
         assert_eq!(case["expected"], "WIST3-E03");
     }
 
-    // Served without any Checkpoint for its Epoch, the Epoch is not even
-    // offered: the head stays at the Epoch below it.
     let served = serve(&history, index, None);
     let target = tempfile::tempdir().unwrap();
     install_at_epoch_0(&served, target.path(), &history);

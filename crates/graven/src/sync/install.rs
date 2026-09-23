@@ -92,9 +92,7 @@ pub(super) fn recompute_content_digest(sqlite_path: &Path) -> Result<String> {
     Ok(content_digest(&records)?)
 }
 
-/// WIST-3 §3.4: the self-signed Log Anchor, with the genesis key every
-/// later key is admitted by and the `log_id` every Checkpoint's origin
-/// line carries.
+/// WIST-3 §3.4.
 pub(super) fn load_anchor(anchor: &str, client: &Client) -> Result<Anchor> {
     let anchor_bytes = load_anchor_bytes(anchor, client)?;
     let anchor_value = wist_core::json::parse(&anchor_bytes)?;
@@ -104,44 +102,32 @@ pub(super) fn load_anchor(anchor: &str, client: &Client) -> Result<Anchor> {
     Ok(anchor_env.anchor)
 }
 
-/// WIST-3 §3.4: an Aggregator-signed Snapshot document that no tree
-/// commits to, kept with the source that served it so that the signature
-/// check §8 step 8 defers to the adopted Checkpoint's height can name
-/// both the document and where it came from.
+/// WIST-3 §3.4: committed to by no tree; its signature is judged at the adopted height (§8 step 8).
 pub(super) struct Unsealed {
     pub(super) document: Document,
     pub(super) envelope: Value,
     pub(super) url: String,
 }
 
-/// A Snapshot installed into a temporary index with the state its tuples
-/// carry adopted (WIST-3 §8 steps 1–4), before any Epoch above
-/// `tree_size` has been walked and before the three signatures step 8
-/// judges have been checked.
+/// WIST-3 §8 steps 1–4; the three signatures step 8 judges are not yet checked.
 pub(super) struct Installation {
     guard: TempFileGuard,
     tmp_sqlite_path: PathBuf,
     pub(super) conn: Connection,
     pub(super) manifest: SnapshotManifest,
-    /// WIST-3 §8 step 4: the `tree_size` the state artifact states, which
-    /// the manifest's must be (`WIST3-E04`).
+    /// WIST-3 §8 step 4: must equal the manifest's (`WIST3-E04`).
     pub(super) state_tree_size: u64,
     pub(super) content_digest: String,
     pub(super) history: KeyHistory,
     pub(super) aggregator_keys: Registry,
     pub(super) chain: ChainState,
     pub(super) suffix_lists: super::suffix::SuffixLists,
-    /// The index, manifest and state file, to be verified at the height
-    /// of the Checkpoint the Consumer adopts (§8 step 8).
+    /// WIST-3 §8 step 8: verified at the adopted Checkpoint's height.
     pub(super) unsealed: Vec<Unsealed>,
-    /// The source whose index named this Snapshot, so a rejection can
-    /// re-fetch the whole Snapshot from the next one (§9, `WIST3-E04`).
     pub(super) source: usize,
 }
 
 impl Installation {
-    /// Moves the verified index into place once the walk above the
-    /// anchor has been applied to it.
     pub(super) fn commit(self, dir: &Path) -> Result<()> {
         let Installation {
             mut guard,
@@ -159,19 +145,15 @@ impl Installation {
 
 const SNAPSHOT_INDEX_PATH: &str = "/snapshots/index.json";
 
-/// WIST-3 §9's `WIST3-E04`: an index, manifest or state file that fails
-/// its schema rejects the whole Snapshot, which is re-fetched from
-/// another source.
+/// WIST-3 §9 `WIST3-E04`.
 fn malformed(document: Document, detail: &impl std::fmt::Display) -> Error {
     Error::Verify(format!(
         "WIST3-E04 {document} does not validate against its schema: {detail}"
     ))
 }
 
-/// WIST-3 §8 steps 1, 2 and 4: a Snapshot document parsed and held to its
-/// schema, with its Envelope kept verbatim. The signature is not checked
-/// here: §3.4 judges it under the keys valid at the Checkpoint the
-/// Consumer adopts, which no step before step 8 has established.
+/// WIST-3 §8 steps 1, 2 and 4. The signature is left unchecked: §3.4 judges it at the adopted
+/// Checkpoint's height.
 fn parse_document<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
     document: Document,
@@ -182,11 +164,7 @@ fn parse_document<T: serde::de::DeserializeOwned>(
     Ok((parsed, value))
 }
 
-/// One Snapshot's documents and files, each held to its schema, to the
-/// manifest's hashes and digests or to the index entry, with the
-/// `aggregator_key` tuples authenticated from the Anchor (§7). The tier-0
-/// index is already written to `tmp_sqlite_path`, whose guard removes it
-/// unless the Snapshot is installed.
+/// The guard of `tmp_sqlite_path` removes it unless the Snapshot is installed.
 struct Documents {
     manifest: SnapshotManifest,
     state: SnapshotState,
@@ -198,10 +176,8 @@ struct Documents {
     tier1_links: Vec<Vec<u8>>,
 }
 
-/// WIST-3 §8 step 1: the Snapshot the index of one source names, with the
-/// index Envelope itself. The index is one of the two mutable files (§6),
-/// so each source states its own and it is read from one source at a time
-/// rather than from the first source that answers.
+/// WIST-3 §8 step 1 and §6: the index is mutable, so it is read per source, never from the first
+/// source that answers.
 fn index_entry(sources: &Sources, at: usize) -> Result<(SnapshotIndexEntry, Unsealed)> {
     let ((envelope, value), url) = sources.whole_at(SNAPSHOT_INDEX_PATH, at, |bytes| {
         parse_document::<SnapshotIndexEnvelope>(bytes, Document::Index)
@@ -222,9 +198,7 @@ fn index_entry(sources: &Sources, at: usize) -> Result<(SnapshotIndexEntry, Unse
     ))
 }
 
-/// WIST-3 §8 step 2: the index entry and the manifest are two
-/// independently signed statements about the same Snapshot, so they must
-/// agree before either is trusted (`WIST3-E04`).
+/// WIST-3 §8 step 2 (`WIST3-E04`).
 fn check_index_agreement(entry: &SnapshotIndexEntry, manifest: &SnapshotManifest) -> Result<()> {
     for (field, from_index, from_manifest) in [
         (
@@ -253,13 +227,8 @@ fn check_index_agreement(entry: &SnapshotIndexEntry, manifest: &SnapshotManifest
     Ok(())
 }
 
-/// WIST-3 §8 steps 1–4 against the index of source `at`: the manifest that
-/// entry points to, every file the manifest lists, the state artifact and
-/// the `aggregator_key` tuples authenticated from the Anchor. §6 verifies
-/// each file "by hash, signature, or commitment, never by source", so a
-/// source that does not hold a path, or serves octets the manifest's
-/// `sha256`, `bytes` or digests or the index entry refuse, sends that same
-/// path to the next source.
+/// WIST-3 §6: files are verified "by hash, signature, or commitment, never by source", so a refused
+/// path is asked of the next source.
 fn documents(
     sources: &Sources,
     anchor: &Anchor,
@@ -318,11 +287,8 @@ fn documents(
         }
     }
 
-    // WIST-3 §8 step 4: a state file at another tree size than its
-    // manifest describes another tree, and the Snapshot is rejected. The
-    // tuples say which keys speak for the Log, so no signature under one
-    // of them authenticates them: §7's five rules chain each key act to
-    // the Anchor's genesis key before any tuple is used.
+    // WIST-3 §8 step 4 and §7: the tuples are chained to the Anchor's genesis key before any is
+    // used.
     wist_core::snapshot::check_state_tree_size(&manifest, state.tree_size)?;
     let tuples: Vec<AggregatorKeyEntry> = state
         .entries
@@ -334,12 +300,8 @@ fn documents(
         .collect();
     let keys = Registry::from_state_tuples(anchor, manifest.epoch_number, &tuples)?;
 
-    // WIST-3 §9's `WIST3-E04`: a manifest that disagrees with the files
-    // served beside it is a disagreement among one source's documents,
-    // found before any signature is judged, so the whole Snapshot is
-    // re-fetched from the next source. §9's no-refetch case is the
-    // narrower one — a digest the Consumer's own rebuild at `tree_size`
-    // from the Log contradicts.
+    // WIST-3 §9 `WIST3-E04`: a disagreement among one source's documents re-fetches the Snapshot;
+    // §9's no-refetch case is a digest the Consumer's own rebuild contradicts.
     let state_entry_values: Vec<Value> = state
         .entries
         .iter()
@@ -364,10 +326,8 @@ fn documents(
         )));
     }
 
-    // WIST-3 §8 step 8's early rejection, the last thing this step tries
-    // because §8 leaves it to the Consumer: a signature naming a tuple's
-    // key that fails under that key can never verify at any height, so the
-    // Snapshot is rejected before the Epochs above it are walked.
+    // WIST-3 §8 step 8's early rejection: a signature failing under the tuple key it names verifies
+    // at no height.
     for unsealed in &unsealed {
         if unsealed::verifies_at_no_height(unsealed.document, &unsealed.envelope, &keys) {
             return Err(Error::Verify(format!(
@@ -389,12 +349,7 @@ fn documents(
     })
 }
 
-/// WIST-3 §9's `WIST3-E04`: a Snapshot whose documents disagree with each
-/// other, fail their schema or carry tuples that do not authenticate from
-/// the Anchor is rejected entirely and "re-fetch[ed], from another Mirror
-/// if needed". Each source's index names a Snapshot of its own, so the
-/// whole Snapshot is retried against the next source's index from `from`
-/// on, and the rejection stands only where no source yields one that
+/// WIST-3 §9 `WIST3-E04`: the rejection stands only where no source's index yields a Snapshot that
 /// verifies.
 fn snapshot_documents(
     sources: &Sources,
@@ -415,12 +370,7 @@ fn snapshot_documents(
     }))
 }
 
-/// Fetches the newest Snapshot named by a source's index from `from` on,
-/// holds its index, manifest, state and files to their schemas, hashes
-/// and each other, authenticates the state file's key tuples from the
-/// Anchor, writes the tier-0 index to a temporary file and adopts every
-/// state tuple into it. The three Envelope signatures are left to §8
-/// step 8.
+/// The three Envelope signatures are left to WIST-3 §8 step 8.
 pub(super) fn snapshot(
     sources: &Sources,
     anchor: &Anchor,
@@ -458,10 +408,8 @@ pub(super) fn snapshot(
         }
     }
 
-    // WIST-3 §8 step 10: adopt the state the Snapshot carries. Without
-    // the chain tips, the first Delta continuing a chain the Snapshot
-    // already holds reads as a fork; without the recovery windows, an
-    // in-window rotation by a thief is invisible.
+    // WIST-3 §8 step 10: without the chain tips a continuing Delta reads as a fork; without the
+    // recovery windows an in-window rotation is invisible.
     let mut history = KeyHistory::new();
     let mut suffix_lists = super::suffix::SuffixLists::load(&conn)?;
     conn.execute_batch(crate::store::CREATE_CHAIN_TIPS)?;
@@ -506,9 +454,8 @@ pub(super) fn snapshot(
                     p.activation_height,
                 ));
             }
-            // WIST-3 §6.2 and §7: a Consumer resuming above a withdrawal's
-            // Epoch never sees its Entry, so the tuple is what excludes
-            // the content from every later materialization.
+            // WIST-3 §6.2 and §7: a Consumer resuming above the withdrawal's Epoch never sees its
+            // Entry.
             StateEntry::Withdrawal(w) => {
                 record_withdrawal(&conn, &w.delta_id, &w.publisher, w.sealing_height)?;
                 let _ = super::history::remove_by_delta_id(&conn, &w.delta_id, w.sealing_height)?;
@@ -519,8 +466,7 @@ pub(super) fn snapshot(
                 suffix_lists.adopt(client, base, &s.identifier, s.sealing_height)?;
             }
             StateEntry::Record(r) => tips.adopt(&r.publisher, &r.url, &r.delta_id),
-            // WIST-3 §7: the `aggregator_key` tuples were authenticated
-            // from the Anchor before any of this state was read.
+            // WIST-3 §7: authenticated from the Anchor before any of this state was read.
             StateEntry::AggregatorKey(_) => {}
         }
     }

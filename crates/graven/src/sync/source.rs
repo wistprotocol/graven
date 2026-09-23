@@ -4,11 +4,8 @@ use reqwest::Url;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-/// WIST-3 §5 and §8: the Aggregator's Service Origin and every Mirror the
-/// Consumer holds for the Log, tried in order. A file a source does not
-/// hold is `WIST3-E01` and a file whose octets do not verify is
-/// `WIST3-E03`; both are answered by asking the next source, since
-/// integrity never depends on where the octets came from.
+/// WIST-3 §5 and §8: `WIST3-E01` and `WIST3-E03` both move to the next source, since integrity
+/// never depends on where the octets came from.
 pub struct Sources<'a> {
     client: &'a Client,
     bases: Vec<Url>,
@@ -32,8 +29,6 @@ impl<'a> Sources<'a> {
         self.bases.len()
     }
 
-    /// Fetches one path from the first source whose octets `check`
-    /// accepts, under the octet bound the path's format carries.
     pub fn verified(
         &self,
         path: &str,
@@ -61,8 +56,7 @@ impl<'a> Sources<'a> {
         Err(last.unwrap_or_else(|| Error::Fetch(format!("WIST3-E01 no source holds {path}"))))
     }
 
-    /// Fetches one path from one named source, so that a group of files
-    /// that only verify together is re-fetched from one source at a time.
+    /// Files that only verify together are re-fetched from one source at a time.
     pub fn at(
         &self,
         path: &str,
@@ -80,22 +74,14 @@ impl<'a> Sources<'a> {
         Ok(bytes)
     }
 
-    /// Fetches one path whose format carries no octet bound and returns
-    /// what `read` makes of the first source's octets it accepts, with
-    /// the URL those octets came from. A Snapshot's documents and files
-    /// are bounded by nothing and held to the manifest's `sha256` and
-    /// `bytes`, to the index entry or to a signature judged at the
-    /// adopted Checkpoint's height instead, so a source that does not
-    /// hold the path, or serves octets those checks refuse, sends the
-    /// same path to the next source.
+    /// Snapshot documents carry no octet bound; the manifest, the index entry or the deferred
+    /// signature bounds them instead.
     pub fn whole<T>(&self, path: &str, read: impl Fn(&[u8]) -> Result<T>) -> Result<(T, Url)> {
         self.whole_from(path, 0, read)
     }
 
-    /// The same fetch, preferring the source at `from` and the ones after
-    /// it: a Snapshot rejected as a whole is re-fetched from the next
-    /// source (§9), which only moves if the documents that source's index
-    /// names are read from it before the ones already refused.
+    /// WIST-3 §9: a rejected Snapshot moves on only if the next source's documents are read before
+    /// those already refused.
     pub fn whole_from<T>(
         &self,
         path: &str,
@@ -127,8 +113,7 @@ impl<'a> Sources<'a> {
         Err(last.unwrap_or_else(|| Error::Fetch(format!("WIST3-E01 no source holds {path}"))))
     }
 
-    /// The same unbounded fetch from one named source, for a path each
-    /// source states for itself because the file is mutable (§6).
+    /// WIST-3 §6: the file is mutable, so each source states its own.
     pub fn whole_at<T>(
         &self,
         path: &str,
@@ -144,8 +129,7 @@ impl<'a> Sources<'a> {
         Ok((value, url))
     }
 
-    /// The same bounded fetch, remembering the verified octets: every path
-    /// this serves but `/checkpoint` names an immutable file (§6).
+    /// WIST-3 §6: every path but `/checkpoint` is immutable, so its verified octets are cached.
     pub fn cached(
         &self,
         path: &str,

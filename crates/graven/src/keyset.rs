@@ -1,7 +1,4 @@
-//! The Consumer's view of every Publisher's Declaration chain: core's
-//! WIST-1 §5.2 replay engine applied Epoch by Epoch, seeded from Snapshot
-//! state at a cold start and persisted between syncs, plus the WIST-3 §7
-//! reading of which Deltas materialize.
+//! WIST-1 §5.2 and WIST-3 §7.
 use crate::error::{Error, Result};
 use reqwest::Url;
 use serde_json::Value;
@@ -11,11 +8,8 @@ use wist_core::delta::delta_id;
 use wist_core::objects::PublisherEnvelope;
 use wist_core::objects::{DeltaEnvelope, Publisher};
 
-/// A sealed Delta that verifies under WIST-1 §5.2: its ID, the Publisher
-/// whose key signed it — the record key WIST-3 §7 uses — its URL's
-/// portless host, and whether that host's own `seq`-0 Declaration Entry is
-/// sealed, the two facts §7's one-URL-one-Publisher rule decides
-/// materialization from (`wist_core::materialization::preferred`).
+/// WIST-1 §5.2; WIST-3 §7's one-URL-one-Publisher rule decides materialization from `publisher` and
+/// `self_declared`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedDelta {
     pub id: String,
@@ -54,16 +48,13 @@ impl KeyHistory {
         &self.declarations
     }
 
-    /// Starts the accepted prefix at a Snapshot's `tree_size`.
     pub fn seed_head(&mut self, epoch_number: u64, epoch_root: &str, sealed_at_s: Option<i64>) {
         self.declarations
             .seed_head(epoch_number, epoch_root, sealed_at_s);
     }
 
-    /// WIST-3 §§7/8: adopts a Snapshot's `declaration` tuple — the
-    /// Declaration in force at its sealing height and the highest accepted
-    /// `seq`, which a settlement that restored a lower-sequence head leaves
-    /// above the current `seq` and every later Declaration must exceed.
+    /// WIST-3 §§7/8: every later Declaration must exceed the highest accepted `seq`, which a
+    /// settlement can leave above the current one.
     pub fn adopt_domain(
         &mut self,
         domain: &str,
@@ -87,10 +78,8 @@ impl KeyHistory {
             .map_err(history_error)
     }
 
-    /// WIST-3 §§7/8: restores an open recovery window from its tuple. The
-    /// tuple carries the chain head and the frozen end; a Consumer never
-    /// admits Deltas, so the owner and pre-recovery source it lacks are
-    /// seeded from the head and the current Declaration.
+    /// WIST-3 §§7/8: the owner and pre-recovery source the tuple lacks are seeded from the head and
+    /// the current Declaration.
     pub fn adopt_window(
         &mut self,
         domain: &str,
@@ -111,9 +100,7 @@ impl KeyHistory {
         self.readopt(domain, "recovery window", window, None)
     }
 
-    /// WIST-3 §§7/8: restores a pending fresh identity from its tuple —
-    /// the pending head, its sealing height and the activation height at
-    /// which WIST-1 §5.2 makes it current unless a reversal arrives first.
+    /// WIST-3 §§7/8 and WIST-1 §5.2.
     pub fn adopt_pending(
         &mut self,
         domain: &str,
@@ -184,10 +171,8 @@ impl KeyHistory {
             .map_err(history_error)
     }
 
-    /// Applies one sealed Epoch's `publisher_declaration` Entries under
-    /// WIST-1 §5.2 with the `recovery_window_days` and
-    /// `declaration_activation_epochs` in force at its `sealed_at`; an
-    /// Epoch whose Declarations the shared rules reject fails the sync.
+    /// WIST-1 §5.2 under the parameters in force at the Epoch's `sealed_at`; a rejected Declaration
+    /// fails the sync.
     pub fn apply_epoch(
         &mut self,
         epoch_number: u64,
@@ -209,9 +194,7 @@ impl KeyHistory {
             .map_err(history_error)
     }
 
-    /// True once the host's own Declaration chain exists, from which
-    /// height only that Publisher's Deltas materialize for its URLs
-    /// (WIST-3 §7).
+    /// WIST-3 §7.
     pub fn declared(&self, host: &str) -> bool {
         self.declarations.domains().contains_key(host)
     }
@@ -225,22 +208,15 @@ impl KeyHistory {
         Ok(&self.publishers[hash])
     }
 
-    /// WIST-2 §3.3: the Declaration a Label or dispute of `domain` is
-    /// validated under at the current projection — the one a Delta is
-    /// sealed under, none inside an open recovery window.
+    /// WIST-2 §3.3: none inside an open recovery window.
     pub fn declaration_for(&self, domain: &str) -> Option<PublisherEnvelope> {
         let state = self.declarations.domains().get(domain)?;
         let source = state.delta_sealing_source()?;
         serde_json::from_value(source.envelope().clone()).ok()
     }
 
-    /// WIST-1 §7's precedence for a sealed Delta: complete field validation
-    /// and §3.1 major support, the presence and parameter-profile caps, the
-    /// §5.2 author binding and scope under the Declaration in force for
-    /// sealing at the current projection, then the §3.4 clock check against
-    /// the committing Epoch's `sealed_at` and the allowance accepted there.
-    /// A Delta sealed inside an open recovery window, which WIST-1 §5.2
-    /// queues instead, verifies under nothing.
+    /// WIST-1 §7 check precedence; a Delta sealed inside an open recovery window (§5.2) verifies
+    /// under nothing.
     pub fn verify_delta(
         &mut self,
         height: u64,
@@ -310,9 +286,7 @@ impl KeyHistory {
     }
 }
 
-/// The parameter profile a sealed Delta is validated under: the caps and
-/// clock allowance the accepted schedule holds at its Epoch's `sealed_at`
-/// (WIST-1 §§3.2/3.4/3.6, WIST-4 §9).
+/// WIST-1 §§3.2/3.4/3.6 and WIST-4 §9: held at the Epoch's `sealed_at`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeltaProfile {
     pub url_cap_bytes: i64,
@@ -442,7 +416,6 @@ mod tests {
         sign_envelope(&delta, "delta", key_id, &signer.sk).unwrap()
     }
 
-    /// Seals one Epoch carrying the given Declarations at the next height.
     struct Chain {
         history: KeyHistory,
         height: Option<u64>,

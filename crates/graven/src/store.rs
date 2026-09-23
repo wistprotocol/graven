@@ -12,42 +12,26 @@ pub const CREATE_UNIQUE_INDEX: &str =
 pub const CREATE_DECLARATIONS: &str =
     "CREATE TABLE IF NOT EXISTS declarations(domain TEXT NOT NULL, seq INTEGER NOT NULL, height INTEGER NOT NULL, sealed_at TEXT NOT NULL, baseline INTEGER NOT NULL, envelope TEXT NOT NULL, recovery_window_days INTEGER NOT NULL DEFAULT 7, PRIMARY KEY(domain, seq, height))";
 
-/// WIST-3 §7: the chain tip per (Publisher domain, Normalized URL). A
-/// deleted URL keeps its tip, because a chain never restarts.
+/// WIST-3 §7: a deleted URL keeps its tip, because a chain never restarts.
 pub const CREATE_CHAIN_TIPS: &str =
     "CREATE TABLE IF NOT EXISTS chain_tips(publisher TEXT NOT NULL, url TEXT NOT NULL, tip TEXT NOT NULL, PRIMARY KEY(publisher, url))";
 
-/// WIST-3 §3.4 and §7: the Aggregator keys valid for this Log, with the
-/// permanently retired ones kept so a later add naming one is rejected,
-/// and each key's accepted adding and removing act verbatim, so a reload
-/// re-authenticates the registry from the Anchor's genesis key instead of
-/// trusting the store's own rows.
+/// WIST-3 §3.4 and §7: retired keys and each key's accepted acts are kept, so a reload
+/// re-authenticates the registry from the Anchor's genesis key.
 pub const CREATE_AGGREGATOR_KEYS: &str =
     "CREATE TABLE IF NOT EXISTS aggregator_keys(key_id TEXT PRIMARY KEY, public_key TEXT NOT NULL, added_height INTEGER NOT NULL, removed_height INTEGER, adding_act TEXT, removing_act TEXT)";
 
-/// WIST-3 §6.2: every withdrawn Delta, adopted from the Snapshot's
-/// `withdrawal` tuples and extended by each walked `payload_withdrawal`,
-/// so its content never materializes again.
+/// WIST-3 §6.2.
 pub const CREATE_WITHDRAWALS: &str =
     "CREATE TABLE IF NOT EXISTS withdrawals(delta_id TEXT PRIMARY KEY, publisher TEXT NOT NULL, height INTEGER NOT NULL)";
 
-/// WIST-3 §7's one-URL-one-Publisher rule: the content of a record a
-/// nearer or self-declared Publisher excludes from `records`, kept so it
-/// can return when the preferred Publisher's own record leaves. Never
-/// joined into search, resolve, stats or the content digest.
+/// WIST-3 §7. Never joined into search, resolve, stats or the content digest.
 pub const CREATE_EXCLUDED_RECORDS: &str = "CREATE TABLE IF NOT EXISTS excluded_records(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, observed_at TEXT NOT NULL, title TEXT NOT NULL, abstract TEXT, lang TEXT, extract TEXT, links TEXT, height INTEGER NOT NULL, PRIMARY KEY(url, publisher))";
 
-/// WIST-4 §3.1: every Public Suffix List snapshot the Log pinned, by its
-/// identifier, and the accepted acts that changed the snapshot in force,
-/// in Log order.
+/// WIST-4 §3.1.
 pub const CREATE_SUFFIX_LISTS: &str = "CREATE TABLE IF NOT EXISTS suffix_lists(sha256 TEXT PRIMARY KEY, octets BLOB NOT NULL); CREATE TABLE IF NOT EXISTS suffix_list_acts(seq INTEGER PRIMARY KEY AUTOINCREMENT, height INTEGER NOT NULL, sha256 TEXT NOT NULL)";
 
-/// WIST-2 §3.3 and WIST-3 §7: every sealed Label and dispute the sync
-/// walked, the current Label per (labeler, subject, name) and the current
-/// dispute per (Label ID, disputant) from adopted tuples and walked
-/// Entries alike, the labeler statistics (marking a Labeler this index
-/// only knows from an adopted tuple), and the definitions fetched for
-/// subscribed Labelers.
+/// WIST-2 §3.3 and WIST-3 §7.
 pub const CREATE_LABELS: &str = "CREATE TABLE IF NOT EXISTS labels(label_id TEXT PRIMARY KEY, labeler TEXT NOT NULL, subject TEXT NOT NULL, name TEXT NOT NULL, value INTEGER, asserted_at TEXT NOT NULL, retracted INTEGER NOT NULL, expires_at TEXT, delta TEXT, height INTEGER NOT NULL, entry_index INTEGER NOT NULL); \
 CREATE TABLE IF NOT EXISTS disputes(dispute_id TEXT PRIMARY KEY, label_id TEXT NOT NULL, disputant TEXT NOT NULL, reason TEXT, asserted_at TEXT NOT NULL, height INTEGER NOT NULL, entry_index INTEGER NOT NULL); \
 CREATE TABLE IF NOT EXISTS label_current(labeler TEXT NOT NULL, subject TEXT NOT NULL, name TEXT NOT NULL, label_id TEXT, value INTEGER, asserted_at TEXT NOT NULL, retracted INTEGER NOT NULL, expires_at TEXT, delta TEXT, height INTEGER NOT NULL, entry_index INTEGER NOT NULL, PRIMARY KEY(labeler, subject, name)); \
@@ -56,17 +40,13 @@ CREATE TABLE IF NOT EXISTS labelers(labeler TEXT PRIMARY KEY, label_count INTEGE
 CREATE TABLE IF NOT EXISTS labeler_subjects(labeler TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY(labeler, subject)); \
 CREATE TABLE IF NOT EXISTS label_definitions(labeler TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, treatment TEXT NOT NULL, asserted_at TEXT NOT NULL, PRIMARY KEY(labeler, name))";
 
-/// The ranking index a profile reads: each record's seal height, the
-/// in-links between hosts with the height each link was sealed at, and
-/// the in-links each target host gained and lost per height.
 pub const CREATE_RANKING: &str = "CREATE TABLE IF NOT EXISTS record_heights(url TEXT NOT NULL, publisher TEXT NOT NULL, height INTEGER NOT NULL, PRIMARY KEY(url, publisher)); \
 CREATE TABLE IF NOT EXISTS inlinks(source_url TEXT NOT NULL, source_host TEXT NOT NULL, target_url TEXT NOT NULL, target_host TEXT NOT NULL, height INTEGER NOT NULL, PRIMARY KEY(source_url, target_url)); \
 CREATE INDEX IF NOT EXISTS inlinks_target ON inlinks(target_host); \
 CREATE TABLE IF NOT EXISTS link_changes(target_host TEXT NOT NULL, height INTEGER NOT NULL, added INTEGER NOT NULL, removed INTEGER NOT NULL, PRIMARY KEY(target_host, height)); \
 CREATE TABLE IF NOT EXISTS identity_starts(domain TEXT PRIMARY KEY, height INTEGER NOT NULL)";
 
-/// WIST-4 §9: the accepted parameter amendments, so a restarted sync
-/// continues the schedule a replaying Consumer holds.
+/// WIST-4 §9.
 pub const CREATE_PARAMETERS: &str = "CREATE TABLE IF NOT EXISTS parameters(parameter TEXT NOT NULL, value INTEGER NOT NULL, epoch_number INTEGER NOT NULL, entry_index INTEGER NOT NULL, sealed_at_s INTEGER NOT NULL, effective_at_s INTEGER NOT NULL, PRIMARY KEY(parameter, epoch_number, entry_index))";
 
 pub const CREATE_TIER1: &str = "CREATE TABLE IF NOT EXISTS extracts(url TEXT NOT NULL, publisher TEXT NOT NULL, delta_id TEXT NOT NULL, extract TEXT NOT NULL, PRIMARY KEY(url, publisher)); CREATE VIRTUAL TABLE IF NOT EXISTS extracts_fts USING fts5(extract, content=extracts, content_rowid=rowid); CREATE TABLE IF NOT EXISTS links(source_url TEXT NOT NULL, target_url TEXT NOT NULL, position INTEGER NOT NULL)";
@@ -323,8 +303,6 @@ fn merge(rows: Vec<(ProvEntry, RecordHit)>) -> Vec<MergedHit> {
     by_url_publisher.into_values().collect()
 }
 
-/// The committed sync state of a Log directory: the index row, or the
-/// file a store written before the row carried.
 pub fn synced_state(dir: &Path) -> Result<SyncState> {
     let index_path = dir.join("index.sqlite");
     if index_path.exists() {
@@ -350,13 +328,10 @@ pub struct DomainCoverage {
 pub struct LogHandle {
     pub log_id: String,
     pub synced_height: u64,
-    /// WIST-3 §5: whether this log's verified head was adopted
-    /// unwitnessed.
+    /// WIST-3 §5.
     pub unwitnessed: bool,
-    /// WIST-3 §5: whether the Consumer has stopped applying new data
-    /// from this log's Aggregator after verifying a divergence.
+    /// WIST-3 §5.
     pub halted: bool,
-    /// The head Epoch's `sealed_at`, against which a Label's expiry is read.
     pub head_sealed_at: Option<String>,
     pub store: Store,
 }
@@ -429,9 +404,7 @@ pub struct LabelerView {
     pub provenance: Vec<ProvEntry>,
 }
 
-/// The Labelers a Consumer applies, kept in `labelers.json` beside the
-/// registry (WIST-4 §6: which Labelers a Consumer believes is its own
-/// subscription).
+/// WIST-4 §6.
 pub fn load_subscriptions(dir: &Path) -> Result<std::collections::BTreeSet<String>> {
     let path = dir.join("labelers.json");
     match std::fs::read(&path) {
@@ -503,9 +476,7 @@ impl MultiStore {
         &self.dir
     }
 
-    /// Ranks the text matches of `q` under a profile, per log, and merges
-    /// them by (URL, Publisher) keeping the best score; the profile and
-    /// each log's synced height reproduce the order.
+    /// The profile and each log's synced height reproduce the order.
     pub fn search_ranked(
         &self,
         q: &str,
@@ -573,9 +544,6 @@ impl MultiStore {
         &self.subscriptions
     }
 
-    /// The current Labels about `subject` across every log, one per
-    /// (labeler, name) with the later `asserted_at` prevailing, restricted
-    /// to subscribed Labelers unless `every_labeler` is set.
     pub fn labels(&self, subject: &str, every_labeler: bool) -> Result<Vec<LabelView>> {
         let mut views: BTreeMap<(String, String), LabelView> = BTreeMap::new();
         for handle in &self.logs {
@@ -632,9 +600,7 @@ impl MultiStore {
         Ok(views.into_values().collect())
     }
 
-    /// Every Labeler any log walked and whether it is subscribed. The same
-    /// Labels reach every Log the Labeler pings, so the counts are the
-    /// largest any one log holds rather than a sum across logs.
+    /// The same Labels reach every Log, so counts are the largest one log holds, not a sum.
     pub fn labelers(&self) -> Result<Vec<LabelerView>> {
         let mut views: BTreeMap<String, LabelerView> = BTreeMap::new();
         for handle in &self.logs {
@@ -721,10 +687,6 @@ impl MultiStore {
         }
     }
 
-    /// Every Publisher domain the local index carries, with the earliest
-    /// Declaration instant it holds for that domain and the record
-    /// count, so a caller can tell whether a domain is covered at all
-    /// before spending a query on it.
     pub fn coverage(&self, domain: Option<&str>) -> Result<Vec<DomainCoverage>> {
         let mut merged: BTreeMap<String, DomainCoverage> = BTreeMap::new();
         for handle in &self.logs {
@@ -773,9 +735,7 @@ impl Store {
         Ok(Store { conn })
     }
 
-    /// The text matches of `q` with a relevance in `(0, 1]` derived from
-    /// FTS5's BM25 over titles, abstracts and extracts, normalized within
-    /// the result set.
+    /// Relevance in `(0, 1]`, normalized within the result set.
     pub fn search_scored(&self, q: &str, limit: usize) -> Result<Vec<(RecordHit, f64)>> {
         let phrase = quote_phrase(q);
         let mut scored: Vec<(RecordHit, f64)> = Vec::new();
@@ -806,8 +766,7 @@ impl Store {
                 }
             }
         }
-        // BM25 in SQLite is lower for a better match and negative for any
-        // match; the worst match in the set scores just above zero.
+        // SQLite's BM25 is lower for a better match and negative for any match.
         let best = scored.iter().map(|(_, b)| *b).fold(f64::INFINITY, f64::min);
         let worst = scored
             .iter()
@@ -859,8 +818,7 @@ impl Store {
         Ok(rows)
     }
 
-    /// The current, unretracted Labels about `subject`; an expired one is
-    /// dropped when `head_sealed_at` is given (WIST-2 §3.3).
+    /// WIST-2 §3.3.
     pub fn labels_for(&self, subject: &str, head_sealed_at: Option<&str>) -> Result<Vec<LabelRow>> {
         if !table_exists(&self.conn, "label_current")? {
             return Ok(Vec::new());
@@ -894,7 +852,6 @@ impl Store {
             .collect())
     }
 
-    /// The current Label's ID, walked or adopted from its tuple.
     pub fn label_id_of(&self, row: &LabelRow) -> Result<Option<String>> {
         if !table_exists(&self.conn, "label_current")? {
             return Ok(None);
@@ -957,8 +914,7 @@ impl Store {
         Ok(rows)
     }
 
-    /// The treatment a Labeler's definition declares for `name`, none
-    /// where no definition verified (WIST-4 §6).
+    /// WIST-4 §6.
     pub fn treatment(&self, labeler: &str, name: &str) -> Result<Option<String>> {
         if !table_exists(&self.conn, "label_definitions")? {
             return Ok(None);

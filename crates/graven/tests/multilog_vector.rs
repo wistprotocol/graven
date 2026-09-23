@@ -62,8 +62,7 @@ fn build_log_fixture(vector: &Value, log: &Value) -> LogFixture {
     let sqlite_bytes = common::write_tier0(&snapdir.join("tier0/index.sqlite"), &[]);
     let content_digest_value = wist_core::snapshot::content_digest(&[]).unwrap();
 
-    // WIST-3 §7: the state carries an `aggregator_key` tuple for the
-    // Anchor's genesis key, which this Log's Anchor names itself.
+    // WIST-3 §7.
     let genesis = &log["anchor"]["anchor"]["genesis_key"];
     let (state_bytes, state_digest_value) = common::write_state_with(
         &snapdir.join("state.json"),
@@ -107,9 +106,7 @@ fn build_log_fixture(vector: &Value, log: &Value) -> LogFixture {
         &content_digest_value,
     );
 
-    // WIST-3 §3.4: the three documents verify under the keys valid at the
-    // Checkpoint the Consumer adopts, so they are signed under the key ID
-    // this Log's Anchor names rather than the fixtures' default.
+    // WIST-3 §3.4: the documents verify under the keys valid at the adopted Checkpoint.
     common::resign_snapshot_documents(
         dir.path(),
         &snapshot_date,

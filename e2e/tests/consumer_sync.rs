@@ -1,7 +1,4 @@
-//! WIST-3 §5 and §8 against the Aggregator's own static surface: the
-//! Consumer cold-starts from a Snapshot, continues from its persisted
-//! head across restarts, ignores a source serving an old head, and
-//! adopts a Checkpoint only under the Witness quorum in force.
+//! WIST-3 §5 and §8.
 use e2e::{
     graven_bin, grid_instant, resolve_sibling_bin, run, s, spawn_witness, start_aggregator,
     Aggregator,
@@ -16,8 +13,6 @@ fn seal(clave: &Path, log: &Aggregator, at: &str) {
     run(clave, &["seal", "--data", s(&log.data), "--at", at]);
 }
 
-/// Seals reaching a Witness at a loopback address, as `serve
-/// --allow-http` does for Publishers.
 fn seal_reaching_witnesses(clave: &Path, log: &Aggregator, at: &str) {
     run(
         clave,
@@ -25,8 +20,6 @@ fn seal_reaching_witnesses(clave: &Path, log: &Aggregator, at: &str) {
     );
 }
 
-/// The head Epoch, tree size and whether the acceptance was unwitnessed,
-/// as `graven sync` reports them.
 fn sync(graven: &Path, dir: &Path, log: &Aggregator, witnesses: &[&str]) -> (u64, u64, bool) {
     let anchor = log.data.join("anchor.json");
     let mut args: Vec<String> = vec![
@@ -70,8 +63,7 @@ fn sync(graven: &Path, dir: &Path, log: &Aggregator, witnesses: &[&str]) -> (u64
     (head, tree_size, line.contains("unwitnessed"))
 }
 
-/// WIST-3 §8: a Consumer cold-starts at the Snapshot's Epoch, keeps the
-/// verified head in its store, and each later run continues from it.
+/// WIST-3 §8.
 #[test]
 fn a_consumer_cold_starts_at_a_snapshot_and_continues_from_its_persisted_head() {
     let clave = resolve_sibling_bin("CLAVE_BIN", "clave");
@@ -107,9 +99,7 @@ fn a_consumer_cold_starts_at_a_snapshot_and_continues_from_its_persisted_head() 
     assert_eq!(head, 2, "a later run continues from the persisted head");
 }
 
-/// WIST-3 §5: a source serving a Checkpoint below the verified head has
-/// shown only that it is behind. The Consumer keeps its head, reports no
-/// error code, and advances again when the source catches up.
+/// WIST-3 §5: a source serving an older head has shown only that it is behind.
 #[test]
 fn a_source_serving_an_old_head_does_not_regress_the_consumer() {
     let clave = resolve_sibling_bin("CLAVE_BIN", "clave");
@@ -136,9 +126,7 @@ fn a_source_serving_an_old_head_does_not_regress_the_consumer() {
     assert_eq!(head, 2);
 }
 
-/// WIST-3 §5 and WIST-4 §5: once `checkpoint_witness_quorum` is 1, the
-/// Consumer keeps its head while no Witness it trusts has cosigned, and
-/// adopts — no longer unwitnessed — once one has.
+/// WIST-3 §5 and WIST-4 §5.
 #[test]
 fn a_checkpoint_is_adopted_only_once_a_trusted_witness_has_cosigned_it() {
     let clave = resolve_sibling_bin("CLAVE_BIN", "clave");
@@ -149,8 +137,7 @@ fn a_checkpoint_is_adopted_only_once_a_trusted_witness_has_cosigned_it() {
     let witness = spawn_witness("witness-a.localhost", [31u8; 32]);
 
     seal(&clave, &log, &grid_instant(0));
-    // WIST-4 §5 holds an amendment past the grace period, so the Log's
-    // time advances a week before the quorum takes effect.
+    // WIST-4 §5: an amendment takes effect only after its grace period.
     let effective_at = grid_instant(24 * 7 + 2);
     run(
         &clave,

@@ -8,13 +8,10 @@ pub struct LogEntry {
     pub anchor: String,
     pub base: String,
     pub tier1: bool,
-    /// WIST-3 §5: further sources for the Log's static files, each tried
-    /// when one does not hold a file.
+    /// WIST-3 §5.
     #[serde(default)]
     pub mirrors: Vec<String>,
-    /// WIST-3 §5: the Witnesses this Consumer trusts, as the
-    /// verifier-key strings they are configured in. Never read from the
-    /// Log.
+    /// WIST-3 §5: never read from the Log.
     #[serde(default)]
     pub witnesses: Vec<String>,
 }
@@ -44,9 +41,7 @@ pub fn save(dir: &Path, reg: &Registry) -> Result<()> {
     Ok(())
 }
 
-/// The registry file's octets as they stand, `None` where no log has been
-/// registered yet, so a run that must leave no registration behind can
-/// put the file back exactly — its absence included.
+/// `None` where no log has been registered yet.
 pub fn held(dir: &Path) -> Option<Vec<u8>> {
     std::fs::read(registry_path(dir)).ok()
 }

@@ -32,8 +32,6 @@ fn vectors() -> Value {
     read_json("vectors/wist3/checkpoints.json")
 }
 
-/// The Log the spec's Checkpoint vectors are signed by, as the key
-/// registry a Consumer replaying it holds.
 fn example_registry() -> (String, wist_core::aggregator_keys::Registry) {
     let anchor = read_json("examples/log-anchor.json");
     let anchor = &anchor["anchor"];
@@ -44,7 +42,6 @@ fn example_registry() -> (String, wist_core::aggregator_keys::Registry) {
     (log_id, registry)
 }
 
-/// The Log the spec's Checkpoint vectors are signed by.
 fn example_log() -> (String, AggregatorKey) {
     let anchor = read_json("examples/log-anchor.json");
     let anchor = &anchor["anchor"];
@@ -61,8 +58,6 @@ fn example_log() -> (String, AggregatorKey) {
     )
 }
 
-/// The roster the vectors name, in the verifier-key form a Consumer is
-/// configured with, so the roster parser is exercised beside the quorum.
 fn roster(vector: &Value) -> Vec<WitnessKey> {
     let encoded: Vec<String> = vector["witness_roster"]
         .as_object()
@@ -234,8 +229,6 @@ fn the_archive_vector_rejects_a_checkpoint_filed_under_another_epochs_path() {
     }
 }
 
-/// The manifest the vector's members describe, with the digests the
-/// cold-start match does not read.
 fn vector_manifest(fields: &Value) -> wist_core::objects::SnapshotManifest {
     serde_json::from_value(serde_json::json!({
         "wist_version": "1.0.0",
@@ -255,7 +248,6 @@ fn vector_manifest(fields: &Value) -> wist_core::objects::SnapshotManifest {
     .unwrap()
 }
 
-/// A source serving one archived Checkpoint at the path of one Epoch.
 fn serving_archive(epoch_number: u64, note: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let file = dir
@@ -266,11 +258,7 @@ fn serving_archive(epoch_number: u64, note: &str) -> tempfile::TempDir {
     dir
 }
 
-/// WIST-3 §8 steps 4 and 5: the state file's `tree_size` against the
-/// manifest's (`WIST3-E04`), the manifest's `tree_size` and `root_hash`
-/// against the Checkpoint its `epoch_number` selects (`WIST3-E02`), and a
-/// file at that path stating another Epoch as the source's `WIST3-E03`,
-/// fetched again from the next source rather than read as divergence.
+/// WIST-3 §8 steps 4 and 5.
 #[test]
 fn the_cold_start_vector_matches_a_manifest_to_the_checkpoint_at_its_epoch() {
     let vector = vectors();
@@ -310,8 +298,6 @@ fn the_cold_start_vector_matches_a_manifest_to_the_checkpoint_at_its_epoch() {
         if expected != "WIST3-E03" {
             continue;
         }
-        // The file at the manifest's path stated another Epoch, which is
-        // the source's fault: the next source is asked for the same path.
         let honest = vector["epochs"]
             .as_array()
             .unwrap()
@@ -329,8 +315,6 @@ fn the_cold_start_vector_matches_a_manifest_to_the_checkpoint_at_its_epoch() {
     }
 }
 
-/// The tree hashes the Consumer holds at a Checkpoint's size, as the tiles
-/// it fetched them in.
 fn held_tree(leaf_hashes: &[Value]) -> graven::sync::Tree {
     let hashes: Vec<[u8; 32]> = leaf_hashes
         .iter()
@@ -351,13 +335,7 @@ fn held_tree(leaf_hashes: &[Value]) -> graven::sync::Tree {
     tree
 }
 
-/// WIST-3 §3.1: each sequence rule's disposition at the verified head — a
-/// gap as the `WIST3-E01` of the Checkpoint the Consumer lacks, a
-/// `sealed_at` that does not advance or sits off the grid as `WIST3-E03`
-/// whatever the signature does, and a tree size below the previous
-/// Checkpoint's as `WIST3-E02` only where a key valid at the previous
-/// height signs it and its root is not that tree's root at the smaller
-/// size, with both Checkpoints and the larger tree's hashes preserved.
+/// WIST-3 §3.1.
 #[test]
 fn the_sequence_vector_applies_each_failures_disposition_at_the_verified_head() {
     let vector = vectors();
@@ -369,9 +347,8 @@ fn the_sequence_vector_applies_each_failures_disposition_at_the_verified_head() 
         let offered = Checkpoint::parse(case["offered_checkpoint"].as_str().unwrap()).unwrap();
         let reached = case["verified_head_epoch_number"].as_u64().unwrap();
         assert_eq!(previous.epoch_number(), reached, "{name}");
-        // A Checkpoint below the previous tree size has no Entries to
-        // walk, so the key set that can speak for it is the one valid at
-        // the previous height; the vector states what that set says.
+        // WIST-3 §3.1: below the previous tree size, the keys valid at the previous height speak
+        // for it.
         assert_eq!(
             wist_core::checkpoint::verify(&offered, &log_id, &registry.valid_at(reached), &[])
                 .is_ok(),
@@ -461,8 +438,6 @@ fn the_sequence_vector_applies_each_failures_disposition_at_the_verified_head() 
     }
 }
 
-/// The tiles an evidence bundle preserved, read back as the tree hashes
-/// anyone verifying the bundle recomputes the larger root from.
 fn preserved_tiles(dir: &Path) -> wist_core::tiles::TileSet {
     let mut set = wist_core::tiles::TileSet::new();
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -518,8 +493,7 @@ fn a_tile_or_entry_bundle_one_octet_over_its_bound_is_refused_while_it_streams()
     assert!(error.contains("WIST3-E03"), "{error}");
 }
 
-/// WIST-3 §3.3: an Entry's JCS serialization must not exceed 65 535
-/// octets, the largest length an entry bundle's prefix can carry.
+/// WIST-3 §3.3: 65 535 octets, the largest length an entry bundle's prefix carries.
 #[test]
 fn an_entry_over_its_leaf_bound_is_refused() {
     let vector: Value = read_json("vectors/wist3/tile-bounds.json");
@@ -571,9 +545,7 @@ fn root_at(leaves: &[Vec<u8>], size: usize) -> [u8; 32] {
     wist_core::merkle::merkle_root(&hashes)
 }
 
-/// WIST-3 §6: a partial tile is fetched only at the width a verified
-/// Checkpoint's size requires, and the full tile is the fallback once the
-/// Aggregator has deleted the partial one.
+/// WIST-3 §6.
 #[test]
 fn a_partial_tile_is_fetched_at_the_width_the_tree_requires_and_falls_back_to_the_full_one() {
     let all = leaves(512);
@@ -596,7 +568,6 @@ fn a_partial_tile_is_fetched_at_the_width_the_tree_requires_and_falls_back_to_th
         "the full tile is not fetched while the partial one is served: {paths:?}"
     );
 
-    // The Aggregator's tree has grown and the partial tile is gone.
     let grown = tree_dir(&all, 512);
     std::fs::remove_file(served.path().join("tile/0/001.p/44")).unwrap();
     std::fs::copy(
@@ -618,10 +589,7 @@ fn a_partial_tile_is_fetched_at_the_width_the_tree_requires_and_falls_back_to_th
     );
 }
 
-/// WIST-3 §9: a tile a source does not hold is `WIST3-E01`, and one whose
-/// octets do not reproduce the Checkpoint's tree is `WIST3-E03`; both are
-/// answered by the next source, since integrity never depends on where
-/// the octets came from.
+/// WIST-3 §9.
 #[test]
 fn a_missing_or_tampered_tile_at_one_source_is_fetched_from_another() {
     let all = leaves(300);
@@ -675,8 +643,7 @@ fn a_missing_or_tampered_tile_at_one_source_is_fetched_from_another() {
     }
 }
 
-/// WIST-3 §6: an entry bundle whose Entries do not hash to their leaves
-/// is `WIST3-E03`, and the next source is asked for the same octets.
+/// WIST-3 §6.
 #[test]
 fn a_tampered_entry_bundle_at_one_source_is_fetched_from_another() {
     let entries: Vec<Vec<u8>> = (0..4u8)
@@ -715,10 +682,7 @@ fn a_tampered_entry_bundle_at_one_source_is_fetched_from_another() {
     );
 }
 
-/// WIST-3 §6: a served file holds the count its path states, so a full
-/// entry-bundle path carrying fewer than 256 Entries is `WIST3-E03` — no
-/// fallback for the partial bundle the tree's size requires — even where
-/// the Entries it does carry verify against the tree.
+/// WIST-3 §6.
 #[test]
 fn an_entry_bundle_at_a_full_path_holding_fewer_entries_than_it_states_is_refused() {
     let all: Vec<Vec<u8>> = (0..512)
@@ -748,7 +712,6 @@ fn an_entry_bundle_at_a_full_path_holding_fewer_entries_than_it_states_is_refuse
         .to_string();
     assert!(error.contains("WIST3-E03"), "{error}");
 
-    // The same path, served at the 256 Entries a full bundle holds.
     std::fs::copy(
         grown.path().join("tile/entries/001"),
         served.path().join("tile/entries/001"),
@@ -787,11 +750,8 @@ fn sync_from(
     )
 }
 
-/// WIST-3 §5: Equivocation is two Checkpoints *each validly signed* under
-/// a key valid at the height its `epoch_number` line states, so a note
-/// no such key authenticates is `WIST3-E03` against the source that
-/// served it — never evidence, and never a reason to stop applying the
-/// Log while another source serves it honestly.
+/// WIST-3 §5: Equivocation needs two Checkpoints *each validly signed* under a key valid at their
+/// height.
 #[test]
 fn a_forged_note_at_the_verified_head_is_e03_against_its_source_and_leaves_no_evidence() {
     let fx = common::build_fixture(true, false);
@@ -817,8 +777,6 @@ fn a_forged_note_at_the_verified_head_is_e03_against_its_source_and_leaves_no_ev
         "an unverifiable note is preserved as nothing"
     );
 
-    // The same Epoch, this time under the key valid at its height: the
-    // two Checkpoints equivocate and the bundle is kept.
     common::forge_head_note(&fx, [0xcd; 32], &fx.log);
     let error = sync_from(&fx, target.path(), std::slice::from_ref(&mirror), &[])
         .unwrap_err()
@@ -830,10 +788,7 @@ fn a_forged_note_at_the_verified_head_is_e03_against_its_source_and_leaves_no_ev
         .exists());
 }
 
-/// WIST-3 §5: a Checkpoint at or below the verified head is judged under
-/// the key set valid at its own height, never at the head's, so a key
-/// valid then and retired since still speaks for the Epoch it signed —
-/// and a key not yet admitted at that height does not.
+/// WIST-3 §5.
 #[test]
 fn a_checkpoint_below_the_head_is_judged_under_the_keys_valid_at_its_own_height() {
     for (offered_epoch, expected, evidence) in
@@ -841,8 +796,6 @@ fn a_checkpoint_below_the_head_is_judged_under_the_keys_valid_at_its_own_height(
     {
         let fx = common::build_fixture(true, false);
         let second = common::Signer::new([41u8; 32]);
-        // k2 is admitted at Epoch 3 and retired at Epoch 8; the head is
-        // Epoch 10.
         for epoch in 2..=10u64 {
             let at = common::next_instant(&fx);
             let entries = match epoch {
@@ -871,8 +824,6 @@ fn a_checkpoint_below_the_head_is_judged_under_the_keys_valid_at_its_own_height(
         let target = tempfile::tempdir().unwrap();
         assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 10);
 
-        // A source offers a differing Checkpoint of an Epoch the Consumer
-        // retains, signed by k2.
         let retained = fx.log_state().checkpoints[offered_epoch as usize].clone();
         let mut forged = Checkpoint::new(
             retained.origin(),
@@ -897,9 +848,7 @@ fn a_checkpoint_below_the_head_is_judged_under_the_keys_valid_at_its_own_height(
     }
 }
 
-/// WIST-3 §5, the first Equivocation form: two Checkpoints of one Log
-/// stating one tree size and different root hashes. The two notes are the
-/// whole evidence, and no tile decides it.
+/// WIST-3 §5, the first Equivocation form.
 #[test]
 fn two_checkpoints_stating_one_tree_size_and_different_roots_are_divergence() {
     let fx = common::build_fixture(true, false);
@@ -929,9 +878,7 @@ fn two_checkpoints_stating_one_tree_size_and_different_roots_are_divergence() {
     );
 }
 
-/// WIST-3 §5, the third Equivocation form inside tiles the Consumer
-/// already holds: the offered tree does not extend the verified head's,
-/// and the tiles that reproduce the larger root are the evidence.
+/// WIST-3 §5, the third Equivocation form.
 #[test]
 fn a_fork_below_the_verified_head_is_divergence_with_the_forks_tiles_preserved() {
     let fx = common::build_fixture(true, false);
@@ -939,9 +886,6 @@ fn a_fork_below_the_verified_head_is_divergence_with_the_forks_tiles_preserved()
     assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 1);
     let honest_size = fx.head_tree_size();
 
-    // A second history under the same key and origin: its Epoch 1 seals
-    // other Entries, so the tree the Consumer holds at the head's size is
-    // not the prefix of the tree Epoch 2 states.
     let publisher = common::Signer::new([1u8; 32]);
     let fork_entries: Vec<Value> = (0..honest_size + 2)
         .map(|i| {
@@ -978,9 +922,7 @@ fn a_fork_below_the_verified_head_is_divergence_with_the_forks_tiles_preserved()
     );
 }
 
-/// WIST-3 §4 and §9: a Checkpoint stating tree size 0 with any root but
-/// `SHA-256("")` fails the Consistency Proof from the empty tree, and
-/// that one Checkpoint is the whole evidence.
+/// WIST-3 §4 and §9.
 #[test]
 fn a_size_zero_checkpoint_stating_another_root_is_divergence() {
     let dir = tempfile::tempdir().unwrap();
@@ -1028,10 +970,7 @@ fn a_size_zero_checkpoint_stating_another_root_is_divergence() {
     tree::seed(&sources, &mut held, 0, &wist_core::merkle::EMPTY_ROOT).unwrap();
 }
 
-/// WIST-3 §3.1: a Consumer verifies Checkpoints in `epoch_number` order,
-/// so a gap is never an object it holds: an archived Checkpoint between
-/// its verified head and the one offered that no source serves is that
-/// Epoch's `WIST3-E01`, and nothing above the head is applied.
+/// WIST-3 §3.1.
 #[test]
 fn an_archived_checkpoint_no_source_serves_below_an_offered_one_is_that_epochs_e01() {
     let fx = common::build_fixture(true, false);
@@ -1058,7 +997,6 @@ fn an_archived_checkpoint_no_source_serves_below_an_offered_one_is_that_epochs_e
     );
 }
 
-/// The head the store records, as a later run resumes from it.
 fn recorded_head(target: &Path) -> u64 {
     graven::store::synced_state(&common::synced_log_dir(target))
         .unwrap()
@@ -1073,10 +1011,7 @@ fn holds(target: &Path, url: &str) -> bool {
         .is_some()
 }
 
-/// WIST-3 §8 step 8: the Consumer adopts "the newest verified one" and
-/// "Entries above its tree size are not applied", so a Checkpoint no source
-/// serves validly (`WIST3-E03`) leaves the Epochs verified below it
-/// applied, and the run reports the Epoch it could not pass.
+/// WIST-3 §8 step 8.
 #[test]
 fn a_corrupt_checkpoint_at_every_source_applies_the_epochs_below_it_and_reports_its_e03() {
     let fx = common::build_fixture(true, false);
@@ -1096,8 +1031,6 @@ fn a_corrupt_checkpoint_at_every_source_applies_the_epochs_below_it_and_reports_
     assert!(holds(target.path(), &in_two));
     assert!(!holds(target.path(), &in_three));
 
-    // The source serves the Checkpoint it archived: the next run continues
-    // from the head the stopped one left.
     fx.log_state().publish();
     let report = sync_with(&fx, target.path(), &[]).unwrap();
     assert_eq!(report.epoch_number_before, Some(2));
@@ -1106,9 +1039,7 @@ fn a_corrupt_checkpoint_at_every_source_applies_the_epochs_below_it_and_reports_
     assert!(holds(target.path(), &in_four));
 }
 
-/// The same disposition for `WIST3-E01`: a Checkpoint no source holds ends
-/// the walk at its Epoch, and the Epochs below it stay applied (WIST-3 §9,
-/// §8 step 8).
+/// WIST-3 §9 and §8 step 8.
 #[test]
 fn an_archived_checkpoint_no_source_holds_applies_the_epochs_below_it_and_reports_its_e01() {
     let fx = common::build_fixture(true, false);
@@ -1132,10 +1063,7 @@ fn an_archived_checkpoint_no_source_holds_applies_the_epochs_below_it_and_report
     assert!(holds(target.path(), &in_three));
 }
 
-/// WIST-3 §8 step 8 at cold start: a Checkpoint no source holds above the
-/// adopted one leaves the Snapshot's own Epoch adopted and committed, so
-/// the Log stays followed and the run reports the `WIST3-E01` that stopped
-/// it, exactly as an incremental sync reports one.
+/// WIST-3 §8 step 8.
 #[test]
 fn a_cold_start_that_adopted_the_snapshots_epoch_stays_registered_when_the_walk_stops() {
     let fx = common::build_fixture(true, false);
@@ -1162,10 +1090,7 @@ fn a_cold_start_that_adopted_the_snapshots_epoch_stays_registered_when_the_walk_
     assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 2);
 }
 
-/// WIST-3 §5 and §9's `WIST3-E02`: a Checkpoint that diverges from the
-/// Log's chain is a hard failure — "MUST NOT apply the data" — so no Epoch
-/// of the run is applied, not even one verified below it, and the halt is
-/// recorded.
+/// WIST-3 §5 and §9's `WIST3-E02`.
 #[test]
 fn a_divergent_checkpoint_applies_no_epoch_of_the_run_and_halts_the_log() {
     let fx = common::build_fixture(true, false);
@@ -1175,8 +1100,7 @@ fn a_divergent_checkpoint_applies_no_epoch_of_the_run_and_halts_the_log() {
     let in_two = common::extend_fixture(&fx);
     common::extend_fixture(&fx);
     common::extend_fixture(&fx);
-    // A Checkpoint of Epoch 3 stating Epoch 2's tree size under another
-    // root: WIST-3 §5's first Equivocation form.
+    // WIST-3 §5's first Equivocation form.
     let after_two = fx.log_state().checkpoints[2].clone();
     let honest_three = fx.log_state().checkpoints[3].clone();
     let mut forged = Checkpoint::new(
@@ -1208,11 +1132,7 @@ fn a_divergent_checkpoint_applies_no_epoch_of_the_run_and_halts_the_log() {
         .exists());
 }
 
-/// WIST-3 §9's `WIST3-E03`: "Re-download, from another source if needed,
-/// before concluding misbehavior". A note whose signature under a known key
-/// fails is that source's fault, so the archived Checkpoint a Snapshot
-/// manifest selects is asked of the next source, and the E03 stands only
-/// where no source serves a note that verifies.
+/// WIST-3 §9's `WIST3-E03`.
 #[test]
 fn a_cold_start_asks_another_source_for_an_archived_checkpoint_whose_signature_fails() {
     let fx = common::build_fixture(true, false);
@@ -1256,8 +1176,7 @@ fn a_cold_start_asks_another_source_for_an_archived_checkpoint_whose_signature_f
     );
 }
 
-/// WIST-3 §5: "consumers verifying it MUST stop applying new data from
-/// that Aggregator" — the halt outlives the run that established it.
+/// WIST-3 §5.
 #[test]
 fn a_verified_divergence_halts_every_later_sync_of_that_log() {
     let fx = common::build_fixture(true, false);
@@ -1268,7 +1187,6 @@ fn a_verified_divergence_halts_every_later_sync_of_that_log() {
     let error = sync_with(&fx, target.path(), &[]).unwrap_err().to_string();
     assert!(error.contains("WIST3-E02"), "{error}");
 
-    // The source goes back to serving its honest history.
     fx.log_state().publish();
     common::extend_fixture(&fx);
     let error = sync_with(&fx, target.path(), &[]).unwrap_err().to_string();
@@ -1283,7 +1201,6 @@ fn a_verified_divergence_halts_every_later_sync_of_that_log() {
         1,
         "nothing more is applied from this Aggregator"
     );
-    // Queries over what was already applied keep working.
     let store = graven::store::Store::open(&common::synced_log_dir(target.path())).unwrap();
     assert!(store
         .get("https://records.example/alpha")
@@ -1291,9 +1208,7 @@ fn a_verified_divergence_halts_every_later_sync_of_that_log() {
         .is_some());
 }
 
-/// WIST-3 §5: staleness is judged on the newest Checkpoint the Consumer
-/// can ACCEPT — the verified head while everything above it is short of
-/// the quorum — not on whatever a source last offered.
+/// WIST-3 §5.
 #[test]
 fn a_head_kept_short_of_the_quorum_is_reported_stale() {
     let fx = common::build_fixture(true, false);
@@ -1316,16 +1231,13 @@ fn a_head_kept_short_of_the_quorum_is_reported_stale() {
         "the fixture's Epochs are sealed far in the past"
     );
 
-    // A fresh Checkpoint arrives, but no Witness of the roster cosigned
-    // it: the head stays where it is and stays stale.
     common::seal_next(&fx, "2026-08-16T14:00:00Z", &[]);
     let report = sync_with(&fx, target.path(), &roster).unwrap();
     assert_eq!(report.head, 2, "the Checkpoint is short of the quorum");
     assert!(report.stale, "the head it kept is the newest it can accept");
 }
 
-/// A head sealed within three cadences of now is not stale, whatever a
-/// source offers above it.
+/// WIST-3 §5.
 #[test]
 fn a_recent_head_is_not_reported_stale() {
     let fx = common::build_fixture(true, false);
@@ -1338,9 +1250,7 @@ fn a_recent_head_is_not_reported_stale() {
     assert!(!report.stale);
 }
 
-/// With no source serving a head, the verified head is the newest
-/// Checkpoint the Consumer can accept, and its staleness is reported with
-/// the failure.
+/// WIST-3 §5.
 #[test]
 fn a_head_no_source_serves_reports_the_verified_heads_staleness() {
     let fx = common::build_fixture(true, false);
@@ -1359,8 +1269,7 @@ fn a_head_no_source_serves_reports_the_verified_heads_staleness() {
     );
 }
 
-/// WIST-3 §5: the unwitnessed record belongs to the Checkpoint the
-/// Consumer retains, so a later witnessed adoption does not rewrite it.
+/// WIST-3 §5.
 #[test]
 fn the_unwitnessed_record_stays_with_the_checkpoint_it_belongs_to() {
     let fx = common::build_fixture(true, false);
@@ -1390,9 +1299,7 @@ fn the_unwitnessed_record_stays_with_the_checkpoint_it_belongs_to() {
     assert_eq!(recorded(2), Some(false), "Epoch 2 carries a Cosignature");
 }
 
-/// WIST-3 §6: an Epoch whose leaves cross a tile boundary is read from
-/// every entry bundle and tile its leaf range meets, the right-edge ones
-/// at the partial widths the Checkpoint's size requires.
+/// WIST-3 §6.
 #[test]
 fn an_epoch_whose_leaves_cross_a_tile_boundary_is_verified_and_applied() {
     let fx = common::build_fixture(true, false);
@@ -1428,8 +1335,7 @@ fn an_epoch_whose_leaves_cross_a_tile_boundary_is_verified_and_applied() {
         .is_some());
 }
 
-/// With an empty roster and the quorum this edition starts at, the head
-/// is adopted and the acceptance is recorded as unwitnessed (WIST-3 §5).
+/// WIST-3 §5.
 #[test]
 fn an_empty_roster_at_quorum_zero_adopts_the_head_and_records_it_unwitnessed() {
     let fx = common::build_fixture(true, false);
@@ -1441,10 +1347,6 @@ fn an_empty_roster_at_quorum_zero_adopts_the_head_and_records_it_unwitnessed() {
     assert_eq!(state.epoch_number, report.head);
 }
 
-/// A store written before the Log became one growing tree names a Block
-/// hash where a tree size and root now stand, and one written before the
-/// key registry kept each key's accepted acts can supply none; either is
-/// refused rather than reinterpreted.
 #[test]
 fn a_sync_state_in_the_superseded_format_is_refused_with_an_instruction_to_resync() {
     let fx = common::build_fixture(true, false);
