@@ -396,14 +396,27 @@ answering [tlog-witness] `add-checkpoint` with a cosignature/v1 line.
 The same crate's `baseline` binary drives the pipeline at scale
 for capacity measurements: `cargo run -p e2e --bin baseline -- --domains N
 --pages M [--changed-percent P] [--body-words W] [--extra-empty-seals K]
-[--no-tier1] [--out report.json]` publishes N loopback sites of M pages
+[--snapshot-shards S] [--compare-rebuild] [--withdraw] [--work-dir DIR] [--keep]
+[--no-tier1]
+[--out report.json]` publishes N loopback sites of M pages
 through the publisher, ingests them through one aggregator behind a
 request-counting proxy, seals, cold-starts a consumer, changes P percent of
 the pages, seals again, seals K further empty Epochs, verifies the history
 and catches the consumer up, reporting wall seconds, bytes and request
-counts per stage (each seal stage also carries the aggregator's own seal
-and Snapshot production seconds, parsed from `clave seal`'s output)
-together with every repository revision it ran. Set
+counts per stage together with every repository revision it ran. Each seal
+stage runs `clave seal --no-snapshot` and then `clave snapshot` as separate
+processes, reporting each one's wall seconds and peak resident set size in
+kB (`null` off Unix), the seconds, shard, byte and Payload-read counters
+parsed from their output (`null` for a line the executable did not print),
+and the sizes of the aggregator's SQLite database, its write-ahead log and
+its Snapshot directories. `--snapshot-shards` sets the store's `snapshot_shard_count` before ingestion
+(one shard otherwise). `--compare-rebuild` adds a full Snapshot rebuild
+at the same head (`clave snapshot --rebuild`) per seal stage, reported
+under `snapshot_rebuild`. `--withdraw` then withdraws the newest Delta of
+the first domain's Feed and reports one more seal stage under
+`withdrawal`, with the storage sizes before it under `before`.
+`--work-dir` places the temporary directory inside DIR, and `--keep`
+leaves it in place and reports its path as `work_dir`. Set
 `WIST_BUILD_PROFILE=release` to build and time release executables.
 
 ## Verification
