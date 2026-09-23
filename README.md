@@ -397,7 +397,7 @@ The same crate's `baseline` binary drives the pipeline at scale
 for capacity measurements: `cargo run -p e2e --bin baseline -- --domains N
 --pages M [--changed-percent P] [--body-words W] [--extra-empty-seals K]
 [--snapshot-shards S] [--compare-rebuild] [--withdraw] [--work-dir DIR] [--keep]
-[--no-tier1]
+[--no-tier1] [--skip-consumer]
 [--out report.json]` publishes N loopback sites of M pages
 through the publisher, ingests them through one aggregator behind a
 request-counting proxy, seals, cold-starts a consumer, changes P percent of
@@ -410,7 +410,8 @@ kB (`null` off Unix), the seconds, shard, byte and Payload-read counters
 parsed from their output (`null` for a line the executable did not print),
 and the sizes of the aggregator's SQLite database, its write-ahead log and
 its Snapshot directories. `--snapshot-shards` sets the store's `snapshot_shard_count` before ingestion
-(one shard otherwise). `--compare-rebuild` adds a full Snapshot rebuild
+(one shard otherwise). `--skip-consumer` omits the three consumer stages, which read only
+the unsharded Snapshot layout. `--compare-rebuild` adds a full Snapshot rebuild
 at the same head (`clave snapshot --rebuild`) per seal stage, reported
 under `snapshot_rebuild`. `--withdraw` then withdraws the newest Delta of
 the first domain's Feed and reports one more seal stage under

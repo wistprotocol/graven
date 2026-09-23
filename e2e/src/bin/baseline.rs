@@ -18,6 +18,7 @@ struct Args {
     tier1: bool,
     extra_empty_seals: usize,
     snapshot_shards: Option<i64>,
+    skip_consumer: bool,
     compare_rebuild: bool,
     withdraw: bool,
     work_dir: Option<PathBuf>,
@@ -34,6 +35,7 @@ fn args() -> Args {
         tier1: true,
         extra_empty_seals: 0,
         snapshot_shards: None,
+        skip_consumer: false,
         compare_rebuild: false,
         withdraw: false,
         work_dir: None,
@@ -51,6 +53,7 @@ fn args() -> Args {
             }
             "--body-words" => args.body_words = value().parse().expect("--body-words"),
             "--no-tier1" => args.tier1 = false,
+            "--skip-consumer" => args.skip_consumer = true,
             "--extra-empty-seals" => {
                 args.extra_empty_seals = value().parse().expect("--extra-empty-seals")
             }
@@ -408,6 +411,7 @@ fn main() {
         "changed_percent": args.changed_percent,
         "tier1": args.tier1,
         "snapshot_shards": args.snapshot_shards,
+        "skip_consumer": args.skip_consumer,
         "build_profile": e2e::build_profile(),
         "revisions": {
             "spake": git_revision(&siblings.join("spake")),
@@ -551,13 +555,15 @@ fn main() {
     if args.tier1 {
         sync_args.push("--tier1");
     }
-    let ((), cold_s) = timed(|| {
-        run(&graven, &sync_args);
-    });
-    report["stages"]["consumer_cold_start"] = json!({
-        "seconds": cold_s,
-        "store_bytes": dir_bytes(&gdir),
-    });
+    if !args.skip_consumer {
+        let ((), cold_s) = timed(|| {
+            run(&graven, &sync_args);
+        });
+        report["stages"]["consumer_cold_start"] = json!({
+            "seconds": cold_s,
+            "store_bytes": dir_bytes(&gdir),
+        });
+    }
 
     let changed = (args.pages * args.changed_percent).div_ceil(100);
     for (host, dir) in &sites {
@@ -650,13 +656,15 @@ fn main() {
     });
     report["stages"]["verify_history"] = json!({ "seconds": verify_s, "epochs": epochs });
 
-    let ((), catchup_s) = timed(|| {
-        run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
-    });
-    report["stages"]["consumer_catch_up"] = json!({
-        "seconds": catchup_s,
-        "store_bytes": dir_bytes(&gdir),
-    });
+    if !args.skip_consumer {
+        let ((), catchup_s) = timed(|| {
+            run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+        });
+        report["stages"]["consumer_catch_up"] = json!({
+            "seconds": catchup_s,
+            "store_bytes": dir_bytes(&gdir),
+        });
+    }
     let gdir2 = root.join("graven-store-2");
     let mut cold_args = vec![
         "sync",
@@ -671,14 +679,16 @@ fn main() {
     if args.tier1 {
         cold_args.push("--tier1");
     }
-    let ((), cold2_s) = timed(|| {
-        run(&graven, &cold_args);
-    });
-    report["stages"]["consumer_cold_start_after_all_seals"] = json!({
-        "epochs": epochs,
-        "seconds": cold2_s,
-        "store_bytes": dir_bytes(&gdir2),
-    });
+    if !args.skip_consumer {
+        let ((), cold2_s) = timed(|| {
+            run(&graven, &cold_args);
+        });
+        report["stages"]["consumer_cold_start_after_all_seals"] = json!({
+            "epochs": epochs,
+            "seconds": cold2_s,
+            "store_bytes": dir_bytes(&gdir2),
+        });
+    }
 
     if args.withdraw {
         let host = &hosts[0];
