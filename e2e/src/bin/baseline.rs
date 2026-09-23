@@ -117,6 +117,32 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, f64) {
     (value, start.elapsed().as_secs_f64())
 }
 
+struct SealTiming {
+    seconds: f64,
+    seal_seconds: Option<f64>,
+    snapshot_seconds: Option<f64>,
+}
+
+fn seal_timed(clave: &Path, data: &Path, at: &str) -> SealTiming {
+    let (output, seconds) = timed(|| run(clave, &["seal", "--data", s(data), "--at", at]));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let reported = |prefix: &str| {
+        stdout.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix(prefix)?
+                .strip_suffix(" ms")?
+                .parse::<f64>()
+                .ok()
+                .map(|ms| ms / 1000.0)
+        })
+    };
+    SealTiming {
+        seconds,
+        seal_seconds: reported("seal took "),
+        snapshot_seconds: reported("snapshot took "),
+    }
+}
+
 fn wait_all_pulled(
     http: &reqwest::blocking::Client,
     base: &str,
@@ -293,14 +319,11 @@ fn main() {
     });
 
     let first_seal = grid_instant(0);
-    let ((), seal_s) = timed(|| {
-        run(
-            &clave,
-            &["seal", "--data", s(&clave_data), "--at", &first_seal],
-        );
-    });
+    let seal_s = seal_timed(&clave, &clave_data, &first_seal);
     report["stages"]["seal_1"] = json!({
-        "seconds": seal_s,
+        "seconds": seal_s.seconds,
+        "seal_seconds": seal_s.seal_seconds,
+        "snapshot_seconds": seal_s.snapshot_seconds,
         "entry_bundle_bytes": dir_bytes(&clave_data.join("tile/entries")),
         "tile_bytes": dir_bytes(&clave_data.join("tile")),
         "checkpoint_bytes": dir_bytes(&clave_data.join("log/checkpoints")),
@@ -387,14 +410,11 @@ fn main() {
     });
 
     let second_seal = grid_instant(1);
-    let ((), seal2_s) = timed(|| {
-        run(
-            &clave,
-            &["seal", "--data", s(&clave_data), "--at", &second_seal],
-        );
-    });
+    let seal2_s = seal_timed(&clave, &clave_data, &second_seal);
     report["stages"]["seal_2"] = json!({
-        "seconds": seal2_s,
+        "seconds": seal2_s.seconds,
+        "seal_seconds": seal2_s.seal_seconds,
+        "snapshot_seconds": seal2_s.snapshot_seconds,
         "entry_bundle_bytes": dir_bytes(&clave_data.join("tile/entries")),
         "tile_bytes": dir_bytes(&clave_data.join("tile")),
         "checkpoint_bytes": dir_bytes(&clave_data.join("log/checkpoints")),
@@ -403,26 +423,29 @@ fn main() {
     });
 
     let third_seal = grid_instant(2);
-    let ((), seal3_s) = timed(|| {
-        run(
-            &clave,
-            &["seal", "--data", s(&clave_data), "--at", &third_seal],
-        );
+    let seal3_s = seal_timed(&clave, &clave_data, &third_seal);
+    report["stages"]["seal_3_empty"] = json!({
+        "seconds": seal3_s.seconds,
+        "seal_seconds": seal3_s.seal_seconds,
+        "snapshot_seconds": seal3_s.snapshot_seconds,
     });
-    report["stages"]["seal_3_empty"] = json!({ "seconds": seal3_s });
 
     let mut empty_seal_seconds = Vec::new();
+    let mut empty_seal_only_seconds = Vec::new();
+    let mut empty_snapshot_seconds = Vec::new();
     for k in 0..args.extra_empty_seals {
         let at = grid_instant(3 + k as i64);
-        let ((), seal_s) = timed(|| {
-            run(&clave, &["seal", "--data", s(&clave_data), "--at", &at]);
-        });
-        empty_seal_seconds.push(seal_s);
+        let timing = seal_timed(&clave, &clave_data, &at);
+        empty_seal_seconds.push(timing.seconds);
+        empty_seal_only_seconds.push(timing.seal_seconds);
+        empty_snapshot_seconds.push(timing.snapshot_seconds);
     }
     let epochs = 3 + args.extra_empty_seals;
     report["stages"]["extra_empty_seals"] = json!({
         "count": args.extra_empty_seals,
         "seconds_each": empty_seal_seconds,
+        "seal_seconds_each": empty_seal_only_seconds,
+        "snapshot_seconds_each": empty_snapshot_seconds,
         "log_bytes": dir_bytes(&clave_data.join("log")),
     });
 

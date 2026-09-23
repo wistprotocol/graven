@@ -401,7 +401,9 @@ through the publisher, ingests them through one aggregator behind a
 request-counting proxy, seals, cold-starts a consumer, changes P percent of
 the pages, seals again, seals K further empty Epochs, verifies the history
 and catches the consumer up, reporting wall seconds, bytes and request
-counts per stage together with every repository revision it ran. Set
+counts per stage (each seal stage also carries the aggregator's own seal
+and Snapshot production seconds, parsed from `clave seal`'s output)
+together with every repository revision it ran. Set
 `WIST_BUILD_PROFILE=release` to build and time release executables.
 
 ## Verification
