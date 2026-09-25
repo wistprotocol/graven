@@ -57,7 +57,7 @@ fn build_log_fixture(vector: &Value, log: &Value) -> LogFixture {
         .unwrap()
         .to_string();
     let snapshot_date = "2026-08-02".to_string();
-    let snapdir = dir.path().join("snapshots").join(&snapshot_date);
+    let snapdir = common::snapshot_dir(dir.path(), &snapshot_date, 0);
 
     let sqlite_bytes = common::write_tier0(&snapdir.join("tier0/index.sqlite"), &[]);
     let content_digest_value = wist_core::snapshot::content_digest(&[]).unwrap();
@@ -102,7 +102,7 @@ fn build_log_fixture(vector: &Value, log: &Value) -> LogFixture {
         &signer,
         &snapshot_date,
         anchor_size,
-        &format!("/snapshots/{snapshot_date}/manifest.json"),
+        &common::manifest_url(&snapshot_date, 0),
         &content_digest_value,
     );
 

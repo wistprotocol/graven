@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::fetch::Client;
 use crate::keyset::KeyHistory;
 use crate::registry::{self};
-use crate::store::{CREATE_DECLARATIONS, CREATE_TIER1, CREATE_UNIQUE_INDEX};
+use crate::store::{CREATE_DECLARATIONS, CREATE_RECORDS, CREATE_TIER1, CREATE_UNIQUE_INDEX};
 use crate::tier1;
 use reqwest::Url;
 use rusqlite::Connection;
@@ -76,20 +76,237 @@ pub(super) fn load_anchor_bytes(spec: &str, client: &Client) -> Result<Vec<u8>> 
     Ok(std::fs::read(spec)?)
 }
 
-pub(super) fn recompute_content_digest(sqlite_path: &Path) -> Result<String> {
+struct ShardRecord {
+    record: Value,
+    publisher: String,
+    filed_in: usize,
+}
+
+fn read_records(sqlite_path: &Path, filed_in: usize) -> Result<Vec<ShardRecord>> {
     let conn = Connection::open(sqlite_path)?;
     let mut stmt = conn.prepare("SELECT url, publisher, delta_id, observed_at FROM records")?;
     let records = stmt
         .query_map([], |row| {
-            Ok(serde_json::json!({
-                "url": row.get::<_, String>(0)?,
-                "publisher": row.get::<_, String>(1)?,
-                "delta_id": row.get::<_, String>(2)?,
-                "observed_at": row.get::<_, String>(3)?,
-            }))
+            let publisher = row.get::<_, String>(1)?;
+            Ok(ShardRecord {
+                record: serde_json::json!({
+                    "url": row.get::<_, String>(0)?,
+                    "publisher": publisher,
+                    "delta_id": row.get::<_, String>(2)?,
+                    "observed_at": row.get::<_, String>(3)?,
+                }),
+                publisher,
+                filed_in,
+            })
         })?
-        .collect::<rusqlite::Result<Vec<Value>>>()?;
-    Ok(content_digest(&records)?)
+        .collect::<rusqlite::Result<Vec<ShardRecord>>>()?;
+    Ok(records)
+}
+
+/// WIST-3 §7 "Sharding".
+fn shard_of(publisher: &str, count: usize) -> usize {
+    let digest = Sha256::digest(publisher.as_bytes());
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    (u64::from_be_bytes(prefix) % count as u64) as usize
+}
+
+const TIER0_PATH: &str = "tier0/index.sqlite";
+
+/// WIST-3 §6.
+fn manifest_directory(manifest_url: &str) -> &str {
+    manifest_url
+        .rfind('/')
+        .map_or("", |end| &manifest_url[..=end])
+}
+
+struct Layout<'m> {
+    shards: Option<&'m [String]>,
+    files: Vec<(usize, &'m str)>,
+}
+
+fn is_dot_segment(segment: &str) -> bool {
+    let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
+    decoded == "." || decoded == ".."
+}
+
+/// WIST-3 §6: a listed path names a file inside the manifest's directory.
+fn stays_in_directory(path: &str) -> bool {
+    let first_separator = path.find(['/', '\\']).unwrap_or(path.len());
+    !path.is_empty()
+        && !path.starts_with(['/', '\\'])
+        && !path[..first_separator].contains(':')
+        && !path.split(['/', '\\']).any(is_dot_segment)
+}
+
+/// WIST-3 §7 "Sharding" (`WIST3-E04`).
+fn shard_layout<'m>(manifest: &'m SnapshotManifest, manifest_url: &Url) -> Result<Layout<'m>> {
+    let refuse = |reason: String| {
+        Error::Verify(format!(
+            "WIST3-E04 the manifest served at {manifest_url} {reason}"
+        ))
+    };
+    if let Some(path) = std::iter::once(&manifest.state.path)
+        .chain(manifest.files.iter().map(|f| &f.path))
+        .find(|path| !stays_in_directory(path))
+    {
+        return Err(refuse(format!(
+            "lists {path:?}, which does not name a file inside the manifest's directory"
+        )));
+    }
+    let Some(shards) = &manifest.shards else {
+        return Ok(Layout {
+            shards: None,
+            files: manifest
+                .files
+                .iter()
+                .map(|f| (0, f.path.as_str()))
+                .collect(),
+        });
+    };
+    if shards.count == 0 {
+        return Err(refuse("declares a shard count of 0".into()));
+    }
+    if shards.digests.len() as u64 != shards.count {
+        return Err(refuse(format!(
+            "declares {} shards but carries {} shard digests",
+            shards.count,
+            shards.digests.len()
+        )));
+    }
+    let count = shards.digests.len();
+    let mut has_tier0 = vec![false; count];
+    let mut files = Vec::with_capacity(manifest.files.len());
+    for f in &manifest.files {
+        let shard = f
+            .shard
+            .ok_or_else(|| refuse(format!("lists {} without a shard index", f.path)))?;
+        if shard >= shards.count {
+            return Err(refuse(format!(
+                "lists {} under shard {shard} of {}",
+                f.path, shards.count
+            )));
+        }
+        let shard = shard as usize;
+        let relative = f
+            .path
+            .strip_prefix(&format!("shard-{shard}/"))
+            .ok_or_else(|| {
+                refuse(format!(
+                    "lists {} under shard {shard}, outside that shard's shard-{shard}/ directory",
+                    f.path
+                ))
+            })?;
+        if f.tier == 0 && relative == TIER0_PATH {
+            has_tier0[shard] = true;
+        }
+        files.push((shard, relative));
+    }
+    if let Some(missing) = has_tier0.iter().position(|held| !held) {
+        return Err(refuse(format!(
+            "lists shard {missing} without its {TIER0_PATH}"
+        )));
+    }
+    Ok(Layout {
+        shards: Some(&shards.digests),
+        files,
+    })
+}
+
+fn install_tier0(
+    dir: &Path,
+    tier0: Vec<Option<Vec<u8>>>,
+    manifest: &SnapshotManifest,
+    shard_digests: Option<&[String]>,
+    manifest_url: &Url,
+    snapshot_base: &str,
+) -> Result<(TempFileGuard, PathBuf)> {
+    let sharded = shard_digests.is_some();
+    let installed_path = dir.join("index.sqlite.verifying");
+    let mut paths = Vec::with_capacity(tier0.len());
+    let mut guards = Vec::with_capacity(tier0.len());
+    for (shard, bytes) in tier0.into_iter().enumerate() {
+        let bytes = bytes.ok_or_else(|| {
+            Error::Verify(format!(
+                "WIST3-E04 the manifest served at {manifest_url} lists no {TIER0_PATH} file"
+            ))
+        })?;
+        let path = if sharded {
+            dir.join(format!("index.sqlite.shard-{shard}.verifying"))
+        } else {
+            installed_path.clone()
+        };
+        std::fs::write(&path, &bytes)?;
+        guards.push(TempFileGuard::new(path.clone()));
+        paths.push(path);
+    }
+
+    let mut records = Vec::new();
+    for (shard, path) in paths.iter().enumerate() {
+        records.extend(read_records(path, shard)?);
+    }
+    let mismatch = |what: String| {
+        Error::Verify(format!(
+            "WIST3-E04 the {what} of the tier-0 index served under {snapshot_base} is not the one its manifest names"
+        ))
+    };
+    let whole: Vec<Value> = records.iter().map(|r| r.record.clone()).collect();
+    if content_digest(&whole)? != manifest.content_digest {
+        return Err(mismatch("content_digest".into()));
+    }
+    if let Some(digests) = shard_digests {
+        let mut grouped: Vec<Vec<Value>> = vec![Vec::new(); digests.len()];
+        for r in &records {
+            grouped[shard_of(&r.publisher, digests.len())].push(r.record.clone());
+        }
+        for (shard, (held, named)) in grouped.iter().zip(digests).enumerate() {
+            if &content_digest(held)? != named {
+                return Err(mismatch(format!("shard {shard} digest")));
+            }
+        }
+        if let Some(misfiled) = records
+            .iter()
+            .find(|r| shard_of(&r.publisher, digests.len()) != r.filed_in)
+        {
+            return Err(Error::Verify(format!(
+                "WIST3-E04 shard {}'s tier-0 index served under {snapshot_base} carries a record of {}, which WIST-3 §7 assigns to shard {}",
+                misfiled.filed_in,
+                misfiled.publisher,
+                shard_of(&misfiled.publisher, digests.len())
+            )));
+        }
+    }
+
+    if !sharded {
+        let mut guards = guards;
+        let guard = guards.pop().ok_or_else(|| {
+            Error::Verify(format!(
+                "WIST3-E04 the manifest served at {manifest_url} lists no {TIER0_PATH} file"
+            ))
+        })?;
+        return Ok((guard, installed_path));
+    }
+
+    if installed_path.exists() {
+        std::fs::remove_file(&installed_path)?;
+    }
+    let guard = TempFileGuard::new(installed_path.clone());
+    let conn = Connection::open(&installed_path)?;
+    conn.execute_batch(CREATE_RECORDS)?;
+    for path in &paths {
+        conn.execute(
+            "ATTACH DATABASE ?1 AS shard",
+            [path.to_string_lossy().as_ref()],
+        )?;
+        conn.execute(
+            "INSERT INTO main.records(url, publisher, delta_id, observed_at, title, abstract, lang) SELECT url, publisher, delta_id, observed_at, title, abstract, lang FROM shard.records",
+            [],
+        )?;
+        conn.execute("DETACH DATABASE shard", [])?;
+    }
+    drop(conn);
+    drop(guards);
+    Ok((guard, installed_path))
 }
 
 /// WIST-3 §3.4.
@@ -245,7 +462,8 @@ fn documents(
             Ok((envelope, value))
         })?;
     let manifest = manifest_envelope.manifest;
-    let snapshot_base = format!("/snapshots/{}/", manifest.snapshot_date);
+    let snapshot_base = manifest_directory(&entry.manifest_url);
+    let layout = shard_layout(&manifest, &manifest_url)?;
 
     let state_path = format!("{snapshot_base}{}", manifest.state.path);
     let ((state_envelope, state_value), state_url) =
@@ -269,20 +487,20 @@ fn documents(
     ];
 
     let state = state_envelope.state;
-    let mut tier0 = None;
+    let mut tier0: Vec<Option<Vec<u8>>> = vec![None; layout.shards.map_or(1, <[String]>::len)];
     let mut tier1_extracts = Vec::new();
     let mut tier1_links = Vec::new();
-    for f in &manifest.files {
+    for (f, &(shard, relative)) in manifest.files.iter().zip(&layout.files) {
         let path = format!("{snapshot_base}{}", f.path);
         let (bytes, _) = sources.whole(&path, |bytes| {
             verify_file_integrity(bytes, &f.sha256, f.bytes)?;
             Ok(bytes.to_vec())
         })?;
-        if f.tier == 0 && f.path == "tier0/index.sqlite" {
-            tier0 = Some(bytes);
-        } else if tier1 && f.path.ends_with("tier1/extracts.parquet") {
+        if f.tier == 0 && relative == TIER0_PATH {
+            tier0[shard] = Some(bytes);
+        } else if tier1 && relative.ends_with("tier1/extracts.parquet") {
             tier1_extracts.push(bytes);
-        } else if tier1 && f.path.ends_with("tier1/links.parquet") {
+        } else if tier1 && relative.ends_with("tier1/links.parquet") {
             tier1_links.push(bytes);
         }
     }
@@ -312,19 +530,14 @@ fn documents(
             "WIST3-E04 the state_digest of the state file served at {state_url} is not the one its manifest names"
         )));
     }
-    let tier0_bytes = tier0.ok_or_else(|| {
-        Error::Verify(format!(
-            "WIST3-E04 the manifest served at {manifest_url} lists no tier0/index.sqlite file"
-        ))
-    })?;
-    let tmp_sqlite_path = dir.join("index.sqlite.verifying");
-    std::fs::write(&tmp_sqlite_path, &tier0_bytes)?;
-    let guard = TempFileGuard::new(tmp_sqlite_path.clone());
-    if recompute_content_digest(&tmp_sqlite_path)? != manifest.content_digest {
-        return Err(Error::Verify(format!(
-            "WIST3-E04 the content_digest of the tier-0 index served under {snapshot_base} is not the one its manifest names"
-        )));
-    }
+    let (guard, tmp_sqlite_path) = install_tier0(
+        dir,
+        tier0,
+        &manifest,
+        layout.shards,
+        &manifest_url,
+        snapshot_base,
+    )?;
 
     // WIST-3 §8 step 8's early rejection: a signature failing under the tuple key it names verifies
     // at no height.
@@ -588,6 +801,58 @@ pub(super) fn rollback_migration(dir: &Path, log_id: &str) -> Result<()> {
         ))
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod shard_tests {
+    use super::*;
+
+    #[test]
+    fn shard_of_reads_the_first_eight_digest_octets_big_endian() {
+        assert_eq!(shard_of("alpha.example", 1_000_003), 119_713);
+        assert_eq!(shard_of("records.example", 1_000_003), 895_760);
+        assert_eq!(shard_of("records.example", 3), 2);
+        assert_eq!(shard_of("records.example", 1), 0);
+    }
+
+    #[test]
+    fn stays_in_directory_refuses_paths_leaving_the_manifests_directory() {
+        for path in [
+            "",
+            "/log/anchor.json",
+            "\\log\\anchor.json",
+            "https://other.example/x",
+            "c:x",
+            "shard-0/../../../log/anchor.json",
+            "shard-0/./tier0/index.sqlite",
+            "shard-0\\..\\x",
+            "shard-0/%2E%2e/x",
+            "..",
+        ] {
+            assert!(!stays_in_directory(path), "{path:?}");
+        }
+        for path in [
+            "state.json",
+            "tier0/index.sqlite",
+            "shard-12/tier1/links.parquet",
+            "a/b:c",
+            "...x/y",
+        ] {
+            assert!(stays_in_directory(path), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn manifest_directory_keeps_everything_through_the_last_slash() {
+        assert_eq!(
+            manifest_directory("/snapshots/2026-08-09/000000000/manifest.json"),
+            "/snapshots/2026-08-09/000000000/"
+        );
+        assert_eq!(
+            manifest_directory("https://mirror.example/any/where/manifest.json"),
+            "https://mirror.example/any/where/"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -123,8 +123,8 @@ reached that height), and `WIST3-E03` against the source otherwise. A
 fork's tiles are fetched into a scratch tree and never written over the
 tiles the Consumer has verified. On cold start, the Snapshot index,
 manifest and state file are held to their schemas and to each other, the
-`content_digest` and `state_digest` recomputed from the files served
-beside the manifest are held to the manifest's claims, and the Checkpoint
+`content_digest` and `state_digest` recomputed from the files the manifest
+lists are held to the manifest's claims, and the Checkpoint
 at the manifest's `epoch_number`
 must state its `tree_size` and `root_hash` (`WIST3-E02` otherwise). The
 state file's `aggregator_key` tuples are authenticated from the Anchor's
@@ -132,7 +132,18 @@ genesis key before any of them is used — each carries the accepted act
 that admitted or retired its key, and WIST-3 §7's five rules chain every
 act to the genesis key — and the three documents' own signatures are
 verified only once the Checkpoint to adopt is settled, under the keys
-valid at that Checkpoint's height (WIST-3 §3.4, §8 step 8). Each of
+valid at that Checkpoint's height (WIST-3 §3.4, §8 step 8). The state
+file and every listed file are fetched relative to the directory of the
+index entry's `manifest_url` (WIST-3 §6). A sharded manifest (WIST-3 §7)
+must carry one digest per shard, a `shard` index below the shard count on
+every file, every file under the `shard-<i>/` directory its `shard` names,
+and each shard's `tier0/index.sqlite`. The Consumer fetches every shard:
+the records of all tier-0 files are merged into one index, each shard's
+digest is recomputed over the records the Publisher-domain rule assigns
+to it, `content_digest` over all of them, and a record filed in another
+shard than the rule's is refused; tier-1 extracts and links are imported
+from every shard. A partial Consumer holding a subset of shards is not
+implemented. Each of
 those failures is `WIST3-E04` against the whole Snapshot: it is
 re-fetched from the next source, and nothing it carries is written. A
 signature naming a tuple's key that the tuples' own copy of that key
@@ -410,8 +421,8 @@ kB (`null` off Unix), the seconds, shard, byte and Payload-read counters
 parsed from their output (`null` for a line the executable did not print),
 and the sizes of the aggregator's SQLite database, its write-ahead log and
 its Snapshot directories. `--snapshot-shards` sets the store's `snapshot_shard_count` before ingestion
-(one shard otherwise). `--skip-consumer` omits the three consumer stages, which read only
-the unsharded Snapshot layout. `--compare-rebuild` adds a full Snapshot rebuild
+(one shard otherwise). `--skip-consumer` omits the three consumer stages, which read the
+sharded and the unsharded Snapshot layout. `--compare-rebuild` adds a full Snapshot rebuild
 at the same head (`clave snapshot --rebuild`) per seal stage, reported
 under `snapshot_rebuild`. `--withdraw` then withdraws the newest Delta of
 the first domain's Feed and reports one more seal stage under

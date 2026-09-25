@@ -487,7 +487,7 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
         lang: "en".into(),
     };
 
-    let snapdir = dir.path().join("snapshots").join(&snapshot_date);
+    let snapdir = common::snapshot_dir(dir.path(), &snapshot_date, 0);
     let sqlite_bytes = common::write_tier0(
         &snapdir.join("tier0/index.sqlite"),
         std::slice::from_ref(&record1),
@@ -527,7 +527,7 @@ fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
         &log,
         &snapshot_date,
         epoch0.tree_size(),
-        &format!("/snapshots/{snapshot_date}/manifest.json"),
+        &common::manifest_url(&snapshot_date, 0),
         &content_digest_value,
     );
 

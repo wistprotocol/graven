@@ -117,7 +117,7 @@ impl Harness {
         );
 
         let snapshot_date = "2026-08-09";
-        let snapdir = dir.path().join("snapshots").join(snapshot_date);
+        let snapdir = common::snapshot_dir(dir.path(), snapshot_date, 0);
         let sqlite_bytes = write_tier0(&snapdir.join("tier0/index.sqlite"), &[]);
         let content_digest_value = wist_core::snapshot::content_digest(&[]).unwrap();
         let (state_bytes, state_digest_value) =
@@ -142,7 +142,7 @@ impl Harness {
             &log,
             snapshot_date,
             epoch0.tree_size(),
-            &format!("/snapshots/{snapshot_date}/manifest.json"),
+            &common::manifest_url(snapshot_date, 0),
             &content_digest_value,
         );
 

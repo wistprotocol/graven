@@ -45,7 +45,7 @@ fn flip_last_byte(path: &Path) {
 }
 
 fn snapshot_path(fx: &common::Fixture, file: &str) -> String {
-    format!("/snapshots/{}/{file}", fx.snapshot_date)
+    format!("/snapshots/{}/000000000/{file}", fx.snapshot_date)
 }
 
 /// WIST-3 §9's `WIST3-E04`.
@@ -56,7 +56,7 @@ fn a_cold_start_asks_another_source_for_a_snapshot_file_whose_hash_fails() {
     flip_last_byte(
         &fx.dir
             .path()
-            .join("snapshots/2026-08-09/tier0/index.sqlite"),
+            .join("snapshots/2026-08-09/000000000/tier0/index.sqlite"),
     );
 
     let only_source = tempfile::tempdir().unwrap();
@@ -80,7 +80,12 @@ fn a_cold_start_asks_another_source_for_a_snapshot_file_whose_hash_fails() {
 fn a_cold_start_asks_another_source_for_a_state_file_the_first_source_lacks() {
     let fx = common::build_fixture(true, false);
     let (_mirror_dir, mirror, mirror_requests) = mirror_of(&fx);
-    std::fs::remove_file(fx.dir.path().join("snapshots/2026-08-09/state.json")).unwrap();
+    std::fs::remove_file(
+        fx.dir
+            .path()
+            .join("snapshots/2026-08-09/000000000/state.json"),
+    )
+    .unwrap();
 
     let only_source = tempfile::tempdir().unwrap();
     assert!(

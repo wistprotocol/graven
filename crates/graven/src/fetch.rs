@@ -202,10 +202,10 @@ mod tests {
                 "https://cdn.example/wist/tile/0/000"
             );
             assert_eq!(
-                resolve(&base, "/snapshots/2026-08-09/manifest.json")
+                resolve(&base, "/snapshots/2026-08-09/000000000/manifest.json")
                     .unwrap()
                     .as_str(),
-                "https://cdn.example/wist/snapshots/2026-08-09/manifest.json"
+                "https://cdn.example/wist/snapshots/2026-08-09/000000000/manifest.json"
             );
         }
         let origin = Url::parse("https://log.example").unwrap();

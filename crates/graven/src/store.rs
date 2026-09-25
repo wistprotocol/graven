@@ -6,6 +6,9 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+pub const CREATE_RECORDS: &str = "CREATE TABLE records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, title TEXT, abstract TEXT, lang TEXT); \
+CREATE VIRTUAL TABLE records_fts USING fts5(title, abstract, content=records, content_rowid=rowid)";
+
 pub const CREATE_UNIQUE_INDEX: &str =
     "CREATE UNIQUE INDEX IF NOT EXISTS records_url_publisher ON records(url, publisher)";
 
