@@ -53,12 +53,12 @@ pub fn import_extracts(conn: &Connection, parquet_bytes: &[u8]) -> Result<u64> {
         let row = row.map_err(|e| Error::Verify(format!("tier1 extracts: {e}")))?;
         let url = column_str(&row, "url")?.to_string();
         let publisher = column_str(&row, "publisher")?.to_string();
-        let delta_id = column_str(&row, "delta_id")?.to_string();
+        let item_id = column_str(&row, "item_id")?.to_string();
         let extract = column_str(&row, "extract")?.to_string();
         conn.execute(
-            "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(url, publisher) DO UPDATE SET delta_id = excluded.delta_id, extract = excluded.extract",
-            (&url, &publisher, &delta_id, &extract),
+            "INSERT INTO extracts(url, publisher, item_id, extract) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(url, publisher) DO UPDATE SET item_id = excluded.item_id, extract = excluded.extract",
+            (&url, &publisher, &item_id, &extract),
         )?;
         count += 1;
     }
@@ -130,7 +130,7 @@ mod tests {
 
     fn write_extracts_parquet(rows: &[(&str, &str, &str, &str)]) -> Vec<u8> {
         write_parquet(
-            "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary delta_id (UTF8); required binary extract (UTF8); }",
+            "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary item_id (UTF8); required binary extract (UTF8); }",
             &[
                 rows.iter().map(|r| r.0.as_bytes().to_vec()).collect(),
                 rows.iter().map(|r| r.1.as_bytes().to_vec()).collect(),
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn import_extracts_ignores_unknown_extra_column() {
         let bytes = write_parquet(
-            "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary delta_id (UTF8); required binary extract (UTF8); required binary embedding_hint (UTF8); }",
+            "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary item_id (UTF8); required binary extract (UTF8); required binary embedding_hint (UTF8); }",
             &[
                 vec![b"https://a.example/x".to_vec()],
                 vec![b"a.example".to_vec()],
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn import_extracts_errors_when_extract_column_missing() {
         let bytes = write_parquet(
-            "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary delta_id (UTF8); }",
+            "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary item_id (UTF8); }",
             &[
                 vec![b"https://a.example/x".to_vec()],
                 vec![b"a.example".to_vec()],

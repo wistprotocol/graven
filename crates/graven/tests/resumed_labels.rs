@@ -43,13 +43,12 @@ fn setup_resumed(
     let snapshot_date = "2026-08-09";
     let snapdir = common::snapshot_dir(dir.path(), snapshot_date, snapshot_height);
     let sqlite_bytes = common::write_tier0(&snapdir.join("tier0/index.sqlite"), &[]);
-    let content_digest_value = wist_core::snapshot::content_digest(&[]).unwrap();
+    let content_digest_value = common::content_digest(&[]);
     let (state_bytes, state_digest_value) = common::write_state_with(
         &snapdir.join("state.json"),
         &log,
         3600,
         declarations,
-        &[],
         anchor_size,
         state_entries,
         0,
@@ -284,13 +283,12 @@ fn resumed_labeler_activity_matches_a_full_replay() {
     let snapshot_date = "2026-08-09";
     let snapdir = common::snapshot_dir(genesis_dir.path(), snapshot_date, 0);
     let sqlite_bytes = common::write_tier0(&snapdir.join("tier0/index.sqlite"), &[]);
-    let content_digest_value = wist_core::snapshot::content_digest(&[]).unwrap();
+    let content_digest_value = common::content_digest(&[]);
     let (state_bytes, state_digest_value) = common::write_state_with(
         &snapdir.join("state.json"),
         &genesis_log,
         3600,
         &[(domain.to_string(), declaration.clone())],
-        &[],
         epoch0_size,
         Vec::new(),
         0,

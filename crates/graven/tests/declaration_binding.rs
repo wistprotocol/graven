@@ -12,6 +12,20 @@ fn spec_dir() -> std::path::PathBuf {
         })
 }
 
+fn limits() -> wist_core::collection::Limits {
+    let default = |name: &str| {
+        wist_core::parameters::spec(name)
+            .and_then(|p| p.default)
+            .unwrap()
+    };
+    wist_core::collection::Limits::new(
+        default("collections_max"),
+        default("scope_entries_max"),
+        default("url_cap_bytes"),
+    )
+    .unwrap()
+}
+
 fn entry(declaration: &Value) -> Value {
     json!({"type": "publisher_declaration", "body": declaration})
 }
@@ -33,6 +47,7 @@ fn outcome(stored: &Value, fetched: &Value) -> String {
                 "2026-08-02T12:00:00Z",
                 7,
                 24,
+                &limits(),
                 &[entry(stored)],
             )
             .unwrap();
@@ -45,6 +60,7 @@ fn outcome(stored: &Value, fetched: &Value) -> String {
         "2026-08-03T12:00:00Z",
         7,
         24,
+        &limits(),
         &[entry(fetched)],
     ) {
         Ok(effects) => match effects.installations.first().and_then(|i| i.decision) {
@@ -103,6 +119,7 @@ fn an_ordinary_rotation_keeps_the_identity_and_a_fresh_one_waits_for_activation(
                 "2026-08-02T12:00:00Z",
                 7,
                 24,
+                &limits(),
                 &[entry(&case["stored"])],
             )
             .unwrap();
@@ -113,6 +130,7 @@ fn an_ordinary_rotation_keeps_the_identity_and_a_fresh_one_waits_for_activation(
                 "2026-08-03T12:00:00Z",
                 7,
                 24,
+                &limits(),
                 &[entry(&case["fetched"])],
             )
             .unwrap();

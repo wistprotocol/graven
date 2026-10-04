@@ -70,7 +70,7 @@ impl std::fmt::Display for SyncReport {
     }
 }
 
-pub const SYNC_STATE_FORMAT: u32 = 5;
+pub const SYNC_STATE_FORMAT: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncState {
@@ -561,8 +561,6 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
     tx.execute(CREATE_DECLARATIONS, [])?;
     let stats = apply_events(
         &tx,
-        context.sources.client(),
-        context.sources.primary(),
         &mut history,
         &walk.events,
         context.tier1,
@@ -796,8 +794,6 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
 
     let stats = apply_events(
         &installed.conn,
-        context.sources.client(),
-        context.sources.primary(),
         &mut installed.history,
         &events,
         context.tier1,

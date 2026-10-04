@@ -244,7 +244,7 @@ fn a_sharded_cold_start_ignores_a_constrained_extra_column_in_a_shards_records()
     std::fs::remove_file(&path).unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
-        "CREATE TABLE records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, title TEXT, abstract TEXT, lang TEXT, rank INTEGER NOT NULL);
+        "CREATE TABLE records(url TEXT, publisher TEXT, item_id TEXT, observed_at TEXT, attested_at TEXT, title TEXT, abstract TEXT, lang TEXT, rank INTEGER NOT NULL);
          CREATE VIRTUAL TABLE records_fts USING fts5(title, abstract, content=records, content_rowid=rowid);",
     )
     .unwrap();
@@ -255,12 +255,13 @@ fn a_sharded_cold_start_ignores_a_constrained_extra_column_in_a_shards_records()
         .enumerate()
     {
         conn.execute(
-            "INSERT INTO records VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO records VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             (
                 &r.url,
                 &r.publisher,
-                &r.delta_id,
+                &r.item_id,
                 &r.observed_at,
+                &r.attested_at,
                 &r.title,
                 &r.abstract_text,
                 &r.lang,
@@ -312,7 +313,7 @@ fn a_listed_path_with_a_dot_dot_segment_is_wist3_e04() {
 /// WIST-3 §6.
 #[test]
 fn a_listed_state_path_with_a_leading_slash_is_wist3_e04() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let path = common::snapshot_dir(fx.dir.path(), &fx.snapshot_date, 0).join("manifest.json");
     rewrite_manifest(&path, &fx.log, |manifest| {
         manifest["state"]["path"] = "/log/anchor.json".into();

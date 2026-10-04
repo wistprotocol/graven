@@ -14,10 +14,11 @@ use std::sync::Arc;
 use wist_core::checkpoint::Checkpoint as WistCheckpoint;
 use wist_core::crypto::{b64u_encode, hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
+use wist_core::materialization::ContentTuple;
 use wist_core::objects::{
-    AggregatorKeyEntry, Anchor, DeclarationEntry, GenesisKey, ParameterEntry, RecordEntry,
-    SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest, SnapshotShards,
-    SnapshotState, SnapshotStateFile, StateEntry,
+    AggregatorKeyEntry, Anchor, DeclarationEntry, GenesisKey, ParameterEntry, SnapshotFile,
+    SnapshotIndex, SnapshotIndexEntry, SnapshotManifest, SnapshotShards, SnapshotState,
+    SnapshotStateFile, StateEntry,
 };
 use wist_core::tiles::TileSet;
 use wist_core::{jcs, merkle};
@@ -65,20 +66,46 @@ pub fn key_entry(signer: &Signer, not_before: &str) -> Value {
 pub struct RecordFixture {
     pub url: String,
     pub publisher: String,
-    pub delta_id: String,
+    pub item_id: String,
     pub observed_at: String,
+    pub attested_at: String,
     pub title: String,
     pub abstract_text: Option<String>,
     pub lang: String,
 }
 
-fn record_projection(r: &RecordFixture) -> Value {
-    serde_json::json!({
-        "url": r.url,
-        "publisher": r.publisher,
-        "delta_id": r.delta_id,
-        "observed_at": r.observed_at,
-    })
+impl RecordFixture {
+    pub fn new(url: &str, publisher: &str, title: &str) -> Self {
+        RecordFixture {
+            url: url.into(),
+            publisher: publisher.into(),
+            item_id: item_id_of(url),
+            observed_at: "2026-08-09T12:00:00Z".into(),
+            attested_at: "2026-08-09T12:00:00Z".into(),
+            title: title.into(),
+            abstract_text: None,
+            lang: "en".into(),
+        }
+    }
+}
+
+pub fn item_id_of(url: &str) -> String {
+    format!("sha256:{}", sha256_hex(url.as_bytes()))
+}
+
+pub fn content_tuple(r: &RecordFixture) -> ContentTuple {
+    ContentTuple {
+        url: r.url.clone(),
+        publisher: r.publisher.clone(),
+        item_id: r.item_id.clone(),
+        observed_at: r.observed_at.clone(),
+        attested_at: r.attested_at.clone(),
+    }
+}
+
+pub fn content_digest(records: &[RecordFixture]) -> String {
+    let tuples: Vec<ContentTuple> = records.iter().map(content_tuple).collect();
+    wist_core::snapshot::content_digest(&tuples).unwrap()
 }
 
 pub fn write_anchor(path: &Path, log: &Signer, log_id: &str) {
@@ -135,61 +162,6 @@ pub fn build_declaration(publisher: &Signer, domain: &str) -> Value {
 pub fn declaration_hash(envelope: &Value) -> String {
     let canon = jcs::canonicalize(&envelope["publisher"]).unwrap();
     format!("sha256:{}", hex_encode(&Sha256::digest(&canon)))
-}
-
-pub fn build_delta(
-    publisher: &Signer,
-    url: &str,
-    title: &str,
-    abstract_text: Option<&str>,
-    extract: &str,
-    prev: Option<&str>,
-) -> (String, Value, Value) {
-    build_delta_with_links(publisher, url, title, abstract_text, extract, &[], prev)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_delta_with_links(
-    publisher: &Signer,
-    url: &str,
-    title: &str,
-    abstract_text: Option<&str>,
-    extract: &str,
-    links: &[&str],
-    prev: Option<&str>,
-) -> (String, Value, Value) {
-    let salt = b64u_encode(&[5u8; 16]);
-    let mut summary = serde_json::json!({"title": title});
-    if let Some(a) = abstract_text {
-        summary["abstract"] = a.into();
-    }
-    let content = serde_json::json!({
-        "extract": extract,
-        "links": {"total": links.len() as u64, "urls": links},
-        "summary": summary,
-    });
-    let payload = serde_json::json!({
-        "wist_version": "1.0.0",
-        "salt": salt,
-        "content": content,
-    });
-    let commitment = wist_core::delta::make_commitment(&salt, &content).unwrap();
-    let bytes = wist_core::delta::content_bytes(&content).unwrap();
-    let mut delta = serde_json::json!({
-        "wist_version": "1.0.0",
-        "publisher": reqwest::Url::parse(url).unwrap().host_str().unwrap(),
-        "url": url,
-        "change_type": if prev.is_some() { "update" } else { "new" },
-        "observed_at": "2026-08-09T12:00:00Z",
-        "payload": {"commitment": commitment, "alg": "HMAC-SHA256", "bytes": bytes},
-        "meta": {"lang": "en"},
-    });
-    if let Some(p) = prev {
-        delta["prev"] = p.into();
-    }
-    let id = wist_core::delta::delta_id(&delta).unwrap();
-    let env = sign_envelope(&delta, "delta", &publisher.kid(), &publisher.sk).unwrap();
-    (id, env, payload)
 }
 
 pub fn write_payload(dir: &Path, hex: &str, payload: &Value) {
@@ -425,14 +397,14 @@ pub fn write_tier0(path: &Path, records: &[RecordFixture]) -> Vec<u8> {
     }
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
-        "CREATE TABLE records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, title TEXT, abstract TEXT, lang TEXT);
+        "CREATE TABLE records(url TEXT, publisher TEXT, item_id TEXT, observed_at TEXT, attested_at TEXT, title TEXT, abstract TEXT, lang TEXT);
          CREATE VIRTUAL TABLE records_fts USING fts5(title, abstract, content=records, content_rowid=rowid);",
     )
     .unwrap();
     for r in records {
         conn.execute(
-            "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            (&r.url, &r.publisher, &r.delta_id, &r.observed_at, &r.title, &r.abstract_text, &r.lang),
+            "INSERT INTO records(url, publisher, item_id, observed_at, attested_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (&r.url, &r.publisher, &r.item_id, &r.observed_at, &r.attested_at, &r.title, &r.abstract_text, &r.lang),
         )
         .unwrap();
     }
@@ -476,7 +448,7 @@ fn write_parquet(
 
 pub fn write_extracts_parquet(rows: &[(&str, &str, &str, &str)]) -> Vec<u8> {
     write_parquet(
-        "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary delta_id (UTF8); required binary extract (UTF8); }",
+        "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary item_id (UTF8); required binary extract (UTF8); }",
         &[
             rows.iter().map(|r| r.0.as_bytes().to_vec()).collect(),
             rows.iter().map(|r| r.1.as_bytes().to_vec()).collect(),
@@ -503,19 +475,9 @@ pub fn write_state(
     log: &Signer,
     cadence: i64,
     declarations: &[(String, Value)],
-    records: &[RecordFixture],
     tree_size: u64,
 ) -> (Vec<u8>, String) {
-    write_state_with(
-        path,
-        log,
-        cadence,
-        declarations,
-        records,
-        tree_size,
-        Vec::new(),
-        0,
-    )
+    write_state_with(path, log, cadence, declarations, tree_size, Vec::new(), 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -524,7 +486,6 @@ pub fn write_state_with(
     log: &Signer,
     cadence: i64,
     declarations: &[(String, Value)],
-    records: &[RecordFixture],
     tree_size: u64,
     extra: Vec<StateEntry>,
     floor: u64,
@@ -559,13 +520,6 @@ pub fn write_state_with(
                 .as_u64()
                 .unwrap_or(0)
                 .max(floor),
-        }));
-    }
-    for r in records {
-        entries.push(StateEntry::Record(RecordEntry {
-            publisher: r.publisher.clone(),
-            url: r.url.clone(),
-            delta_id: r.delta_id.clone(),
         }));
     }
     let state = SnapshotState {
@@ -921,51 +875,57 @@ pub fn canonical_order(entries: &[Value]) -> Vec<Value> {
     ordered
 }
 
+pub fn declaration_entry(publisher: &Signer, domain: &str) -> Value {
+    serde_json::json!({"type": "publisher_declaration", "body": build_declaration(publisher, domain)})
+}
+
 pub fn extend_fixture(fx: &Fixture) -> String {
     let publisher = Signer::new([1u8; 32]);
     let next_number = fx.log_state().head_number() + 1;
-    let url = format!("https://records.example/extra-{next_number}");
-    let (id, delta_env, payload) = build_delta(
-        &publisher,
-        &url,
-        "Extra Title",
-        Some("Extra abstract"),
-        "extra body",
-        None,
-    );
-    write_payload(fx.dir.path(), id.strip_prefix("sha256:").unwrap(), &payload);
+    let domain = format!("extra-{next_number}.example");
     let at = next_instant(fx);
-    seal_next(
-        fx,
-        &at,
-        &[serde_json::json!({"type": "publisher_delta", "body": delta_env})],
-    );
-    url
+    seal_next(fx, &at, &[declaration_entry(&publisher, &domain)]);
+    domain
 }
 
-pub fn build_delete_delta(publisher: &Signer, url: &str, prev: &str) -> (String, Value) {
-    let delta = serde_json::json!({
+pub fn label_by(signer: &Signer, labeler: &str, subject: &str) -> Value {
+    let label = serde_json::json!({
         "wist_version": "1.0.0",
-        "publisher": reqwest::Url::parse(url).unwrap().host_str().unwrap(),
-        "url": url,
-        "change_type": "delete",
-        "observed_at": "2026-08-09T12:00:00Z",
-        "prev": prev,
-        "meta": {"lang": "en"},
+        "labeler": labeler,
+        "subject": subject,
+        "name": "wist:spam",
+        "asserted_at": "2026-08-09T12:00:00Z",
     });
-    let id = wist_core::delta::delta_id(&delta).unwrap();
-    (
-        id,
-        sign_envelope(&delta, "delta", &publisher.kid(), &publisher.sk).unwrap(),
-    )
+    let body = sign_envelope(&label, "label", &signer.kid(), &signer.sk).unwrap();
+    serde_json::json!({"type": "label", "body": body})
 }
 
-pub fn extend_fixture_with_withdrawal(fx: &Fixture, delta_id: &str) {
+pub fn labeled(log_dir: &Path, subject: &str) -> bool {
+    !graven::store::Store::open(log_dir)
+        .unwrap()
+        .labels_for(subject, None)
+        .unwrap()
+        .is_empty()
+}
+
+pub fn holds_declaration(log_dir: &Path, domain: &str) -> bool {
+    Connection::open(log_dir.join("index.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM declarations WHERE domain = ?1",
+            [domain],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+        > 0
+}
+
+pub fn extend_fixture_with_withdrawal(fx: &Fixture, item_id: &str) {
     let update = serde_json::json!({
         "wist_version": "1.0.0",
         "action": "payload_withdrawal",
         "subject": fx.domain,
-        "details": {"delta_id": delta_id, "legal_basis": "court order", "jurisdiction": "EU"},
+        "details": {"delta_id": item_id, "legal_basis": "court order", "jurisdiction": "EU"},
         "effective_at": "2026-08-09T15:00:00Z",
     });
     let body = sign_envelope(&update, "update", "log1", &fx.log.sk).unwrap();
@@ -977,38 +937,7 @@ pub fn extend_fixture_with_withdrawal(fx: &Fixture, delta_id: &str) {
     );
 }
 
-pub fn extend_fixture_with_delete(fx: &Fixture, url: &str, prev: &str) {
-    let publisher = Signer::new([1u8; 32]);
-    let (_id, delta_env) = build_delete_delta(&publisher, url, prev);
-    let at = next_instant(fx);
-    seal_next(
-        fx,
-        &at,
-        &[serde_json::json!({"type": "publisher_delta", "body": delta_env})],
-    );
-}
-
-pub fn extend_fixture_with_forged_delta(fx: &Fixture) {
-    let attacker = Signer::new([7u8; 32]);
-    let next_number = fx.log_state().head_number() + 1;
-    let url = format!("https://records.example/extra-{next_number}");
-    let (_id, delta_env, _payload) = build_delta(
-        &attacker,
-        &url,
-        "Extra Title",
-        Some("Extra abstract"),
-        "extra body",
-        None,
-    );
-    let at = next_instant(fx);
-    seal_next(
-        fx,
-        &at,
-        &[serde_json::json!({"type": "publisher_delta", "body": delta_env})],
-    );
-}
-
-pub fn extend_fixture_with_rotation(fx: &Fixture, new_key: &Signer) -> String {
+pub fn extend_fixture_with_rotation(fx: &Fixture, new_key: &Signer) {
     let old = Signer::new([1u8; 32]);
     let decl0 = build_declaration(&old, &fx.domain);
     let hash0 = declaration_hash(&decl0);
@@ -1025,25 +954,6 @@ pub fn extend_fixture_with_rotation(fx: &Fixture, new_key: &Signer) -> String {
         &at,
         &[serde_json::json!({"type": "publisher_declaration", "body": rotation_decl})],
     );
-
-    let delta_number = fx.log_state().head_number() + 1;
-    let url = format!("https://records.example/extra-{delta_number}");
-    let (id, delta_env, payload) = build_delta(
-        new_key,
-        &url,
-        "Rotated Title",
-        Some("Rotated abstract"),
-        "rotated body",
-        None,
-    );
-    write_payload(fx.dir.path(), id.strip_prefix("sha256:").unwrap(), &payload);
-    let at = next_instant(fx);
-    seal_next(
-        fx,
-        &at,
-        &[serde_json::json!({"type": "publisher_delta", "body": delta_env})],
-    );
-    url
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1059,9 +969,9 @@ pub fn build_pack(
     std::fs::create_dir_all(dir).unwrap();
 
     let mut jsonl = String::new();
-    for (delta_id, url, publisher, vector) in rows {
+    for (item_id, url, publisher, vector) in rows {
         let row = serde_json::json!({
-            "delta_id": delta_id,
+            "item_id": item_id,
             "url": url,
             "publisher": publisher,
             "vector": vector,
@@ -1225,54 +1135,51 @@ pub fn synced_log_dir(dir: &Path) -> PathBuf {
     dir.join("logs/graven-test-log")
 }
 
-pub fn build_fixture(write_second_payload: bool, duplicate_tier0_record: bool) -> Fixture {
-    build_fixture_full(
-        "graven-test-log",
-        9,
-        write_second_payload,
-        duplicate_tier0_record,
-        false,
-    )
+pub fn build_fixture(duplicate_tier0_record: bool) -> Fixture {
+    build_fixture_full("graven-test-log", 9, duplicate_tier0_record, false)
 }
 
 pub fn build_fixture_with_log_id(log_id: &str, seed: u8) -> Fixture {
-    build_fixture_full(log_id, seed, true, false, false)
+    build_fixture_full(log_id, seed, false, false)
 }
 
 pub fn build_fixture_with_tier1() -> Fixture {
-    build_fixture_full("graven-test-log", 9, true, false, true)
+    build_fixture_full("graven-test-log", 9, false, true)
 }
 
 pub fn build_fixture_with_state(extra: Vec<StateEntry>, floor: u64) -> Fixture {
-    build_fixture_state("graven-test-log", 9, true, false, false, extra, floor)
+    build_fixture_state("graven-test-log", 9, false, false, extra, floor, Vec::new())
+}
+
+pub fn build_fixture_with_tier0(records: Vec<RecordFixture>) -> Fixture {
+    build_fixture_state("graven-test-log", 9, false, false, Vec::new(), 0, records)
 }
 
 fn build_fixture_full(
     log_id: &str,
     seed: u8,
-    write_second_payload: bool,
     duplicate_tier0_record: bool,
     include_tier1: bool,
 ) -> Fixture {
     build_fixture_state(
         log_id,
         seed,
-        write_second_payload,
         duplicate_tier0_record,
         include_tier1,
         Vec::new(),
         0,
+        Vec::new(),
     )
 }
 
 fn build_fixture_state(
     log_id: &str,
     seed: u8,
-    write_second_payload: bool,
     duplicate_tier0_record: bool,
     include_tier1: bool,
     extra_state: Vec<StateEntry>,
     floor: u64,
+    extra_records: Vec<RecordFixture>,
 ) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let log = Signer::new([seed; 32]);
@@ -1287,53 +1194,30 @@ fn build_fixture_state(
     let wrapped_declaration =
         serde_json::json!({"type": "publisher_declaration", "body": declaration_env});
 
-    let (id1, delta1_env, payload1) = build_delta(
-        &publisher,
-        "https://records.example/alpha",
-        "Alpha Title",
-        Some("Alpha abstract"),
-        "alpha body",
-        None,
-    );
-    let hex1 = id1.strip_prefix("sha256:").unwrap();
-    write_payload(dir.path(), hex1, &payload1);
-    let wrapped_delta1 = serde_json::json!({"type": "publisher_delta", "body": delta1_env});
-
-    let epoch0 = state.seal(
-        "2026-08-09T12:00:00Z",
-        &[wrapped_declaration, wrapped_delta1],
-    );
+    let epoch0 = state.seal("2026-08-09T12:00:00Z", &[wrapped_declaration]);
     let epoch0_root = epoch0.root_token();
     let epoch0_size = epoch0.tree_size();
 
     let record1 = RecordFixture {
-        url: "https://records.example/alpha".into(),
-        publisher: domain.clone(),
-        delta_id: id1.clone(),
-        observed_at: "2026-08-09T12:00:00Z".into(),
-        title: "Alpha Title".into(),
         abstract_text: Some("Alpha abstract".into()),
-        lang: "en".into(),
+        ..RecordFixture::new("https://records.example/alpha", &domain, "Alpha Title")
     };
 
     let snapdir = snapshot_dir(dir.path(), &snapshot_date, 0);
-    let tier0_records: Vec<RecordFixture> = if duplicate_tier0_record {
+    let mut tier0_records: Vec<RecordFixture> = if duplicate_tier0_record {
         vec![record1.clone(), record1.clone()]
     } else {
         vec![record1.clone()]
     };
+    tier0_records.extend(extra_records);
     let sqlite_bytes = write_tier0(&snapdir.join("tier0/index.sqlite"), &tier0_records);
-    let content_digest_projections: Vec<Value> =
-        tier0_records.iter().map(record_projection).collect();
-    let content_digest_value =
-        wist_core::snapshot::content_digest(&content_digest_projections).unwrap();
+    let content_digest_value = content_digest(&tier0_records);
 
     let (state_bytes, state_digest_value) = write_state_with(
         &snapdir.join("state.json"),
         &log,
         3600,
         &[(domain.clone(), declaration_env.clone())],
-        std::slice::from_ref(&record1),
         epoch0_size,
         extra_state,
         floor,
@@ -1343,7 +1227,7 @@ fn build_fixture_state(
         let extracts_bytes = write_extracts_parquet(&[(
             record1.url.as_str(),
             record1.publisher.as_str(),
-            record1.delta_id.as_str(),
+            record1.item_id.as_str(),
             "alpha body",
         )]);
         let links_bytes =
@@ -1391,21 +1275,10 @@ fn build_fixture_state(
         &content_digest_value,
     );
 
-    let (id2, delta2_env, payload2) = build_delta(
-        &publisher,
-        "https://records.example/beta",
-        "Beta Title",
-        Some("Beta abstract"),
-        "beta body",
-        None,
+    state.seal(
+        "2026-08-09T13:00:00Z",
+        &[declaration_entry(&Signer::new([2u8; 32]), BETA_DOMAIN)],
     );
-    let hex2 = id2.strip_prefix("sha256:").unwrap();
-    if write_second_payload {
-        write_payload(dir.path(), hex2, &payload2);
-    }
-    let wrapped_delta2 = serde_json::json!({"type": "publisher_delta", "body": delta2_env});
-
-    state.seal("2026-08-09T13:00:00Z", &[wrapped_delta2]);
 
     let base_url = format!("http://{}", serve_static(dir.path().to_path_buf()));
 
@@ -1419,6 +1292,8 @@ fn build_fixture_state(
         state: RefCell::new(state),
     }
 }
+
+pub const BETA_DOMAIN: &str = "beta.example";
 
 pub fn shard_of(publisher: &str, count: usize) -> usize {
     let digest = Sha256::digest(publisher.as_bytes());
@@ -1467,26 +1342,11 @@ pub fn build_sharded_fixture(
         let publisher = Signer::new([20 + i as u8; 32]);
         let declaration = build_declaration(&publisher, domain);
         let url = sharded_record_url(domain);
-        let (id, delta, payload) = build_delta(
-            &publisher,
-            &url,
-            &sharded_title(domain),
-            Some("Sharded abstract"),
-            &format!("{domain} body"),
-            None,
-        );
-        write_payload(dir.path(), id.strip_prefix("sha256:").unwrap(), &payload);
         entries.push(serde_json::json!({"type": "publisher_declaration", "body": declaration}));
-        entries.push(serde_json::json!({"type": "publisher_delta", "body": delta}));
         declarations.push((domain.to_string(), declaration));
         records.push(RecordFixture {
-            url,
-            publisher: domain.to_string(),
-            delta_id: id,
-            observed_at: "2026-08-09T12:00:00Z".into(),
-            title: sharded_title(domain),
             abstract_text: Some("Sharded abstract".into()),
-            lang: "en".into(),
+            ..RecordFixture::new(&url, domain, &sharded_title(domain))
         });
     }
     let epoch0 = state.seal("2026-08-09T12:00:00Z", &entries);
@@ -1537,7 +1397,7 @@ pub fn build_sharded_fixture(
                     (
                         r.url.as_str(),
                         r.publisher.as_str(),
-                        r.delta_id.as_str(),
+                        r.item_id.as_str(),
                         e.as_str(),
                     )
                 })
@@ -1566,18 +1426,15 @@ pub fn build_sharded_fixture(
                 shard: Some(shard as u64),
             });
         }
-        let projections: Vec<Value> = held.iter().map(record_projection).collect();
-        digests.push(wist_core::snapshot::content_digest(&projections).unwrap());
+        digests.push(content_digest(held));
     }
-    let projections: Vec<Value> = records.iter().map(record_projection).collect();
-    let content_digest_value = wist_core::snapshot::content_digest(&projections).unwrap();
+    let content_digest_value = content_digest(&records);
 
     let (state_bytes, state_digest_value) = write_state_with(
         &snapdir.join("state.json"),
         &log,
         3600,
         &declarations,
-        &records,
         epoch0.tree_size(),
         Vec::new(),
         0,

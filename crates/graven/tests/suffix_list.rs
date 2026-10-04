@@ -32,10 +32,13 @@ fn suffix_act(fx: &common::Fixture, identifier: &str, bytes: usize) -> Value {
     serde_json::json!({"type": "registry_update", "body": body})
 }
 
-fn delta_entry(url: &str) -> Value {
-    let publisher = common::Signer::new([7u8; 32]);
-    let (_, envelope, _) = common::build_delta(&publisher, url, "T", None, "body", None);
-    serde_json::json!({"type": "publisher_delta", "body": envelope})
+fn item_entry(url: &str) -> Value {
+    let host = reqwest::Url::parse(url)
+        .unwrap()
+        .host_str()
+        .unwrap()
+        .to_owned();
+    serde_json::json!({"type": "publisher_item", "body": {"item": {"publisher": host, "url": url}}})
 }
 
 fn sync(
@@ -75,7 +78,7 @@ fn held(target: &std::path::Path) -> (Vec<String>, Vec<(i64, String)>) {
 
 #[test]
 fn a_pinned_snapshot_is_obtained_verified_and_held() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     sync(&fx, target.path()).unwrap();
     assert_eq!(held(target.path()), (Vec::new(), Vec::new()));
@@ -103,7 +106,7 @@ fn a_pinned_snapshot_is_obtained_verified_and_held() {
 
 #[test]
 fn a_served_file_that_does_not_hash_to_its_name_fails_the_sync() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     sync(&fx, target.path()).unwrap();
     let identifier = serve_list(&fx, LIST);
@@ -143,8 +146,8 @@ fn capacity_is_counted_per_registrable_domain_under_the_adopted_tuple() {
     append_epoch(
         &fx,
         &[
-            delta_entry("https://a.example.com/x"),
-            delta_entry("https://b.example.com/x"),
+            item_entry("https://a.example.com/x"),
+            item_entry("https://b.example.com/x"),
         ],
     );
     let err = sync(&fx, target.path()).unwrap_err().to_string();
@@ -161,16 +164,16 @@ fn capacity_is_counted_per_registrable_domain_under_the_adopted_tuple() {
     append_epoch(
         &fx,
         &[
-            delta_entry("https://a.example.com/x"),
-            delta_entry("https://b.example.com/x"),
+            item_entry("https://a.example.com/x"),
+            item_entry("https://b.example.com/x"),
         ],
     );
     sync(&fx, target.path()).unwrap();
     append_epoch(
         &fx,
         &[
-            delta_entry("https://a.example.com/x"),
-            delta_entry("https://a.example.com/y"),
+            item_entry("https://a.example.com/x"),
+            item_entry("https://a.example.com/y"),
         ],
     );
     let err = sync(&fx, target.path()).unwrap_err().to_string();

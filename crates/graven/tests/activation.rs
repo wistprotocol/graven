@@ -29,14 +29,10 @@ fn sync(fx: &common::Fixture, target: &std::path::Path) -> graven::sync::SyncRep
     .unwrap()
 }
 
-fn delta(fx: &common::Fixture, signer: &common::Signer, path: &str) -> (String, Value) {
-    let url = format!("https://records.example/{path}");
-    let (id, envelope, payload) = common::build_delta(signer, &url, path, None, "body", None);
-    common::write_payload(fx.dir.path(), id.strip_prefix("sha256:").unwrap(), &payload);
-    (
-        url,
-        serde_json::json!({"type": "publisher_delta", "body": envelope}),
-    )
+fn label(fx: &common::Fixture, signer: &common::Signer, path: &str) -> (String, Value) {
+    let subject = format!("https://other.example/{path}");
+    let entry = common::label_by(signer, &fx.domain, &subject);
+    (subject, entry)
 }
 
 fn declaration_entry(envelope: Value) -> Value {
@@ -66,19 +62,23 @@ fn present(target: &std::path::Path, url: &str) -> bool {
         .is_some()
 }
 
+fn labeled(target: &std::path::Path, subject: &str) -> bool {
+    common::labeled(&common::synced_log_dir(target), subject)
+}
+
 #[test]
 fn a_fresh_identity_supplies_no_authority_while_pending_and_a_reversal_discards_it() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     let owner = owner();
     let thief = common::Signer::new([7u8; 32]);
     append(&fx, &[declaration_entry(fresh_declaration(&fx, &thief))]);
-    let (pending_url, pending_delta) = delta(&fx, &thief, "pending-a");
-    let (owner_url, owner_delta) = delta(&fx, &owner, "owner-a");
-    append(&fx, &[pending_delta, owner_delta]);
+    let (pending_url, pending_label) = label(&fx, &thief, "pending-a");
+    let (owner_url, owner_label) = label(&fx, &owner, "owner-a");
+    append(&fx, &[pending_label, owner_label]);
     sync(&fx, target.path());
-    assert!(present(target.path(), &owner_url));
-    assert!(!present(target.path(), &pending_url));
+    assert!(labeled(target.path(), &owner_url));
+    assert!(!labeled(target.path(), &pending_url));
 
     let first = common::build_declaration(&owner, &fx.domain);
     let reversal = common::build_declaration_full(
@@ -89,12 +89,12 @@ fn a_fresh_identity_supplies_no_authority_while_pending_and_a_reversal_discards_
         &[(&owner, NOT_BEFORE)],
     );
     append(&fx, &[declaration_entry(reversal)]);
-    let (pending_url, pending_delta) = delta(&fx, &thief, "pending-b");
-    let (owner_url, owner_delta) = delta(&fx, &owner, "owner-b");
-    append(&fx, &[pending_delta, owner_delta]);
+    let (pending_url, pending_label) = label(&fx, &thief, "pending-b");
+    let (owner_url, owner_label) = label(&fx, &owner, "owner-b");
+    append(&fx, &[pending_label, owner_label]);
     sync(&fx, target.path());
-    assert!(present(target.path(), &owner_url));
-    assert!(!present(target.path(), &pending_url));
+    assert!(labeled(target.path(), &owner_url));
+    assert!(!labeled(target.path(), &pending_url));
 }
 
 #[test]
@@ -111,17 +111,17 @@ fn a_fresh_identity_activates_at_the_delay_the_parameter_map_fixes() {
     let owner = owner();
     let thief = common::Signer::new([7u8; 32]);
     let sealed = append(&fx, &[declaration_entry(fresh_declaration(&fx, &thief))]);
-    let (activated_url, activated_delta) = delta(&fx, &thief, "activated-a");
-    let (replaced_url, replaced_delta) = delta(&fx, &owner, "replaced-a");
-    let activation = append(&fx, &[activated_delta, replaced_delta]);
+    let (activated_url, activated_label) = label(&fx, &thief, "activated-a");
+    let (replaced_url, replaced_label) = label(&fx, &owner, "replaced-a");
+    let activation = append(&fx, &[activated_label, replaced_label]);
     assert_eq!(
         activation,
         sealed + 1,
         "the parameter map fixes a one-Epoch delay"
     );
     sync(&fx, target.path());
-    assert!(present(target.path(), &activated_url));
-    assert!(!present(target.path(), &replaced_url));
+    assert!(labeled(target.path(), &activated_url));
+    assert!(!labeled(target.path(), &replaced_url));
     // WIST-4 §8.
     assert_eq!(identity_start(target.path(), &fx.domain), Some(activation));
 }
@@ -161,13 +161,14 @@ fn a_pending_declaration_tuple_resumes_into_its_activation() {
         1,
     );
     let target = tempfile::tempdir().unwrap();
-    let (activated_url, activated_delta) = delta(&fx, &thief, "activated-a");
-    append(&fx, &[activated_delta]);
+    let (activated_url, activated_label) = label(&fx, &thief, "activated-a");
+    let (replaced_url, replaced_label) = label(&fx, &owner, "replaced-a");
+    append(&fx, &[activated_label, replaced_label]);
     sync(&fx, target.path());
     assert!(present(target.path(), "https://records.example/alpha"));
     assert!(
-        !present(target.path(), "https://records.example/beta"),
+        !labeled(target.path(), &replaced_url),
         "the replaced key signs nothing from the activation Epoch on"
     );
-    assert!(present(target.path(), &activated_url));
+    assert!(labeled(target.path(), &activated_url));
 }

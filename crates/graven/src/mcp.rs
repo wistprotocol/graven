@@ -25,7 +25,7 @@ pub struct RankingOut {
 pub struct RecordOut {
     pub url: String,
     pub publisher: String,
-    pub delta_id: String,
+    pub item_id: String,
     pub observed_at: String,
     pub title: String,
     pub r#abstract: Option<String>,
@@ -38,7 +38,7 @@ fn to_record_out(hit: MergedHit) -> RecordOut {
     RecordOut {
         url: hit.url,
         publisher: hit.publisher,
-        delta_id: hit.delta_id,
+        item_id: hit.item_id,
         observed_at: hit.observed_at,
         title: hit.title,
         r#abstract: hit.r#abstract,
@@ -64,7 +64,7 @@ pub struct LinkOut {
 pub struct SimilarOut {
     pub url: String,
     pub publisher: String,
-    pub delta_id: String,
+    pub item_id: String,
     pub title: String,
     pub score: f64,
     pub provenance: Vec<ProvEntry>,
@@ -74,7 +74,7 @@ fn to_similar_out(hit: SimilarHit) -> SimilarOut {
     SimilarOut {
         url: hit.hit.url,
         publisher: hit.hit.publisher,
-        delta_id: hit.hit.delta_id,
+        item_id: hit.hit.item_id,
         title: hit.hit.title,
         score: hit.score,
         provenance: hit.hit.provenance,
@@ -191,7 +191,7 @@ signed."
                 .map(|hit| RecordOut {
                     url: hit.url,
                     publisher: hit.publisher,
-                    delta_id: hit.delta_id,
+                    item_id: hit.item_id,
                     observed_at: hit.observed_at,
                     title: hit.title,
                     r#abstract: hit.r#abstract,
@@ -411,12 +411,12 @@ mod tests {
         std::fs::create_dir_all(log_dir).unwrap();
         let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
         conn.execute_batch(
-            "CREATE TABLE records(url TEXT, publisher TEXT, delta_id TEXT, observed_at TEXT, title TEXT, abstract TEXT, lang TEXT);
+            "CREATE TABLE records(url TEXT, publisher TEXT, item_id TEXT, observed_at TEXT, title TEXT, abstract TEXT, lang TEXT);
              CREATE VIRTUAL TABLE records_fts USING fts5(title, abstract, content=records, content_rowid=rowid);",
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO records(url, publisher, item_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
                 "https://example.com/alpha",
                 "example.com",
@@ -429,7 +429,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO records(url, publisher, item_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
                 "https://example.com/beta",
                 "example.com",
@@ -449,7 +449,7 @@ mod tests {
         let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
         conn.execute_batch(crate::store::CREATE_TIER1).unwrap();
         conn.execute(
-            "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO extracts(url, publisher, item_id, extract) VALUES (?1, ?2, ?3, ?4)",
             (
                 "https://example.com/alpha",
                 "example.com",
@@ -558,7 +558,7 @@ mod tests {
             b
         };
         conn.execute(
-            "INSERT INTO embeddings(delta_id, url, publisher, vector) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO embeddings(item_id, url, publisher, vector) VALUES (?1, ?2, ?3, ?4)",
             (
                 "sha256:a",
                 "https://example.com/alpha",
@@ -568,7 +568,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO embeddings(delta_id, url, publisher, vector) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO embeddings(item_id, url, publisher, vector) VALUES (?1, ?2, ?3, ?4)",
             (
                 "sha256:b",
                 "https://example.com/beta",
@@ -784,7 +784,7 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].url, "https://example.com/beta");
-        assert_eq!(results[0].delta_id, "sha256:b");
+        assert_eq!(results[0].item_id, "sha256:b");
         assert_eq!(results[0].provenance.len(), 1);
         assert_eq!(results[0].provenance[0].log_id, "test-log");
     }

@@ -68,7 +68,7 @@ fn registered_logs(dir: &Path) -> Vec<String> {
 /// WIST-3 §3.4 and §8 step 8.
 #[test]
 fn a_snapshot_signed_by_a_key_the_adopted_epoch_retired_is_rejected_and_registers_nothing() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let second = common::Signer::new([36u8; 32]);
     common::seal_the_genesis_keys_removal(&fx, &second);
 
@@ -94,7 +94,7 @@ fn a_snapshot_signed_by_a_key_the_adopted_epoch_retired_is_rejected_and_register
 /// WIST-3 §3.4.
 #[test]
 fn a_snapshot_re_signed_under_the_remaining_key_cold_starts_across_the_removal() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let second = common::Signer::new([37u8; 32]);
     retire_the_genesis_key(&fx, &second);
 
@@ -110,7 +110,7 @@ fn a_snapshot_re_signed_under_the_remaining_key_cold_starts_across_the_removal()
 
 #[test]
 fn a_removed_genesis_key_stays_removed_across_a_reload() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let second = common::Signer::new([24u8; 32]);
     let target = tempfile::tempdir().unwrap();
     retire_the_genesis_key(&fx, &second);
@@ -141,7 +141,7 @@ fn a_removed_genesis_key_stays_removed_across_a_reload() {
 
 #[test]
 fn a_retired_genesis_key_authenticates_no_act_after_a_reload() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let second = common::Signer::new([25u8; 32]);
     let target = tempfile::tempdir().unwrap();
     retire_the_genesis_key(&fx, &second);
@@ -193,7 +193,7 @@ fn an_addition_and_a_removal_in_one_epoch_leave_the_same_registry_in_either_orde
         "2026-08-09T19:00:00Z",
         "2026-08-09T20:00:00Z",
     ] {
-        let fx = common::build_fixture(true, false);
+        let fx = common::build_fixture(false);
         let second = common::Signer::new([26u8; 32]);
         let third = common::Signer::new([27u8; 32]);
         let at = common::next_instant(&fx);
@@ -278,7 +278,7 @@ fn a_failed_key_act_is_ignored_and_leaves_its_epoch_valid() {
             ("aggregator_key_remove", "log9", None),
         ),
     ] {
-        let fx = common::build_fixture(true, false);
+        let fx = common::build_fixture(false);
         let at = common::next_instant(&fx);
         common::seal_next(
             &fx,
@@ -324,7 +324,7 @@ fn a_failed_key_act_is_ignored_and_leaves_its_epoch_valid() {
 /// WIST-3 §3.4.
 #[test]
 fn a_key_added_in_one_epoch_authenticates_no_key_act_of_that_epoch() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let second = common::Signer::new([30u8; 32]);
     let third = common::Signer::new([31u8; 32]);
     let at = common::next_instant(&fx);
@@ -365,7 +365,7 @@ fn a_key_added_in_one_epoch_authenticates_no_key_act_of_that_epoch() {
 /// WIST-3 §3.4.
 #[test]
 fn an_epochs_other_acts_and_checkpoint_read_the_key_set_its_own_key_acts_leave() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let second = common::Signer::new([33u8; 32]);
     let at = common::next_instant(&fx);
     let entries = [

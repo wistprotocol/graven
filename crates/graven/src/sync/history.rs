@@ -1,29 +1,22 @@
-use super::persist::{
-    load_chain_tips, load_withdrawn, record_withdrawal, save_chain_tips, save_history,
-};
+use super::persist::{record_withdrawal, save_history};
 use super::source::Sources;
 use super::tree::Tree;
 use super::SyncState;
 use crate::error::{Error, Result};
-use crate::fetch::{resolve, Client};
-use crate::keyset::{DeltaProfile, KeyHistory};
+use crate::keyset::KeyHistory;
 use crate::store::{table_exists, CREATE_TIER1};
-use reqwest::Url;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
 use wist_core::aggregator_keys::Registry;
 use wist_core::checkpoint::{self, check_consistency, Adoption, Checkpoint, WitnessKey};
-use wist_core::delta::{content_bytes, verify_commitment};
+use wist_core::collection::Limits;
 use wist_core::epoch::verify_epoch;
 use wist_core::merkle::consistency_proof_from;
-use wist_core::objects::{
-    ChangeType, DeltaEnvelope, DeltaPayloadCommitment, Payload, PublisherEnvelope,
-};
+use wist_core::objects::PublisherEnvelope;
 use wist_core::parameters::{Amendment, Schedule};
 use wist_core::suffix_list::EpochCaps;
 use wist_core::timestamp::log_seconds;
-use wist_core::withdrawal::{Disposition, SealedDelta, WithdrawalReplay};
+use wist_core::withdrawal::{Disposition, SealedItems, WithdrawalReplay};
 
 /// WIST-4 §9 and ADR-0020.
 pub struct ChainState {
@@ -164,8 +157,10 @@ pub struct EpochEvent {
     pub epoch_root: String,
     pub sealed_at: String,
     pub sealed_at_s: i64,
-    /// WIST-1 §3.4: accepted at `sealed_at`.
-    pub profile: DeltaProfile,
+    pub url_cap_bytes: i64,
+    pub clock_skew_seconds: i64,
+    /// WIST-1 §5.1: in force at `sealed_at`.
+    pub limits: Limits,
     /// WIST-1 §5.2: in force at `sealed_at`; freezes the end of a recovery window opened in this
     /// Epoch.
     pub recovery_window_days: i64,
@@ -173,46 +168,17 @@ pub struct EpochEvent {
     pub declaration_activation_epochs: i64,
     /// In canonical Epoch order.
     pub declarations: Vec<Value>,
-    /// WIST-3 §6.2: (withdrawn Delta ID, Publisher, earliest withdrawing Epoch).
+    /// WIST-3 §6.2: (withdrawn Item ID, Publisher, earliest withdrawing Epoch).
     pub withdrawals: Vec<(String, String, u64)>,
-    pub delta_bodies: Vec<Value>,
+    pub publishers: Vec<String>,
     /// WIST-2 §3.3: paired with the canonical Entry index.
     pub labels: Vec<(u64, Value)>,
     pub disputes: Vec<(u64, Value)>,
 }
 
 pub struct ApplyStats {
-    pub applied: u64,
     pub withdrawn: u64,
     pub labels: u64,
-}
-
-pub(super) struct PayloadFields {
-    title: String,
-    abstract_text: Option<String>,
-    extract: Option<String>,
-    links: Vec<String>,
-}
-
-pub(super) fn fetch_payload(
-    client: &Client,
-    base: &Url,
-    hex: &str,
-    commitment: &DeltaPayloadCommitment,
-) -> Result<PayloadFields> {
-    let url = resolve(base, &format!("/payloads/{hex}.json"))?;
-    let (_, value) = client.get_json(&url)?;
-    let payload: Payload = serde_json::from_value(value.clone())?;
-    verify_commitment(&payload.salt, &value["content"], &commitment.commitment)?;
-    if content_bytes(&value["content"])? != commitment.bytes {
-        return Err(Error::Verify("payload content bytes mismatch".into()));
-    }
-    Ok(PayloadFields {
-        title: payload.content.summary.title,
-        abstract_text: payload.content.summary.r#abstract,
-        extract: Some(payload.content.extract),
-        links: payload.content.links.urls,
-    })
 }
 
 pub struct Verified {
@@ -267,19 +233,11 @@ pub fn walk_checkpoints(
 ) -> Result<Walk> {
     let mut events: Vec<EpochEvent> = Vec::new();
     let mut verified: Vec<Verified> = Vec::new();
-    let mut walked_deltas: BTreeMap<String, (String, u64)> = BTreeMap::new();
     let mut previous = head.clone();
     let reached = head.epoch_number();
     let mut stopped: Option<Stop> = None;
     for checkpoint in offered {
-        match verify_checkpoint(
-            inputs,
-            state,
-            reached,
-            &previous,
-            checkpoint,
-            &mut walked_deltas,
-        ) {
+        match verify_checkpoint(inputs, state, reached, &previous, checkpoint) {
             Ok((event, adoption)) => {
                 verified.push(Verified {
                     checkpoint: checkpoint.clone(),
@@ -317,7 +275,6 @@ fn verify_checkpoint(
     reached: u64,
     previous: &Checkpoint,
     checkpoint: &Checkpoint,
-    walked_deltas: &mut BTreeMap<String, (String, u64)>,
 ) -> Result<(EpochEvent, Adoption)> {
     let WalkState {
         keys,
@@ -490,7 +447,19 @@ fn verify_checkpoint(
             "epoch {n}: WIST3-E03 Epoch exceeds the accepted size schedule"
         )));
     }
-    let profile = DeltaProfile::from_schedule(schedule, at);
+    let in_force = |name: &str| {
+        schedule
+            .value_at(name, at)
+            .ok_or_else(|| Error::Verify(format!("epoch {n}: no value of {name} is in force")))
+    };
+    let url_cap_bytes = in_force("url_cap_bytes")?;
+    let clock_skew_seconds = in_force("clock_skew_seconds")?;
+    let limits = Limits::new(
+        in_force("collections_max")?,
+        in_force("scope_entries_max")?,
+        url_cap_bytes,
+    )
+    .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
     let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
     let declaration_activation_epochs = schedule
         .value_at("declaration_activation_epochs", at)
@@ -528,7 +497,7 @@ fn verify_checkpoint(
 
     let mut declarations = Vec::new();
     let mut withdrawal_acts = Vec::new();
-    let mut delta_bodies = Vec::new();
+    let mut publishers = Vec::new();
     let mut labels = Vec::new();
     let mut disputes = Vec::new();
 
@@ -552,25 +521,16 @@ fn verify_checkpoint(
                     withdrawal_acts.push(body.clone());
                 }
             }
-            Some("publisher_delta") => {
-                let body = entry.get("body").ok_or_else(|| {
-                    Error::Verify(format!("epoch {n}: publisher_delta entry missing body"))
-                })?;
-                delta_bodies.push(body.clone());
+            Some(kind @ ("publisher_catalog" | "publisher_item")) => {
+                let outer = kind.trim_start_matches("publisher_");
+                if let Some(publisher) = entry["body"][outer]["publisher"].as_str() {
+                    publishers.push(publisher.to_owned());
+                }
             }
             _ => {}
         }
     }
-    for body in &delta_bodies {
-        if let (Ok(id), Some(publisher)) = (
-            wist_core::delta::delta_id(&body["delta"]),
-            body["delta"]["publisher"].as_str(),
-        ) {
-            walked_deltas
-                .entry(id)
-                .or_insert((publisher.to_string(), n));
-        }
-    }
+    let sealed_items = SealedItems::resumed();
     let mut withdrawals = Vec::new();
     for body in &withdrawal_acts {
         let disposition = withdrawals_replay.apply(
@@ -582,25 +542,19 @@ fn verify_checkpoint(
                     .find(|key| key.key_id == key_id)
                     .map(|key| key.public_key.clone())
             },
-            |delta_id| match walked_deltas.get(delta_id) {
-                Some((publisher, height)) => SealedDelta::Known {
-                    publisher: publisher.clone(),
-                    height: *height,
-                },
-                None => SealedDelta::Unverifiable,
-            },
+            &sealed_items,
         );
         match disposition {
             Disposition::Accepted {
-                delta_id,
+                item_id,
                 publisher,
                 withdrawn_height,
                 ..
-            } => withdrawals.push((delta_id, publisher, withdrawn_height)),
+            } => withdrawals.push((item_id, publisher, withdrawn_height)),
             Disposition::Rejected(code) => {
                 eprintln!("ignoring a payload_withdrawal at height {n}: {code}");
             }
-            Disposition::NotWithdrawal => {}
+            Disposition::Repeated { .. } | Disposition::NotWithdrawal => {}
         }
     }
 
@@ -619,12 +573,14 @@ fn verify_checkpoint(
         epoch_root: checkpoint.root_token(),
         sealed_at,
         sealed_at_s: at,
-        profile,
+        url_cap_bytes,
+        clock_skew_seconds,
+        limits,
         recovery_window_days,
         declaration_activation_epochs,
         declarations,
         withdrawals,
-        delta_bodies,
+        publishers,
         labels,
         disputes,
     };
@@ -662,15 +618,15 @@ pub(super) fn persist_declaration(
     Ok(())
 }
 
-pub(super) fn remove_derived(conn: &Connection, delta_id: &str, url: &str) -> Result<()> {
+pub(super) fn remove_derived(conn: &Connection, item_id: &str, url: &str) -> Result<()> {
     if table_exists(conn, "extracts")? {
-        conn.execute("DELETE FROM extracts WHERE delta_id = ?1", [delta_id])?;
+        conn.execute("DELETE FROM extracts WHERE item_id = ?1", [item_id])?;
     }
     if table_exists(conn, "links")? {
         conn.execute("DELETE FROM links WHERE source_url = ?1", [url])?;
     }
     if table_exists(conn, "embeddings")? {
-        conn.execute("DELETE FROM embeddings WHERE delta_id = ?1", [delta_id])?;
+        conn.execute("DELETE FROM embeddings WHERE item_id = ?1", [item_id])?;
     }
     Ok(())
 }
@@ -690,340 +646,35 @@ fn remove_ranking_bookkeeping(
     super::persist::replace_inlinks(conn, url, publisher, &[], height)
 }
 
-pub(super) fn remove_by_delta_id(
+pub(super) fn remove_by_item_id(
     conn: &Connection,
-    delta_id: &str,
+    item_id: &str,
     height: u64,
 ) -> Result<Option<String>> {
     let row: Option<(String, String)> = conn
         .query_row(
-            "SELECT url, publisher FROM records WHERE delta_id = ?1",
-            [delta_id],
+            "SELECT url, publisher FROM records WHERE item_id = ?1",
+            [item_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
     let Some((url, publisher)) = row else {
         return Ok(None);
     };
-    conn.execute("DELETE FROM records WHERE delta_id = ?1", [delta_id])?;
-    remove_derived(conn, delta_id, &url)?;
+    conn.execute("DELETE FROM records WHERE item_id = ?1", [item_id])?;
+    remove_derived(conn, item_id, &url)?;
     remove_ranking_bookkeeping(conn, &url, &publisher, height)?;
     Ok(Some(url))
 }
 
-pub(super) fn remove_by_url(
-    conn: &Connection,
-    url: &str,
-    publisher: &str,
-    height: u64,
-) -> Result<()> {
-    let delta_id: Option<String> = conn
-        .query_row(
-            "SELECT delta_id FROM records WHERE url = ?1 AND publisher = ?2",
-            [url, publisher],
-            |row| row.get(0),
-        )
-        .optional()?;
-    conn.execute(
-        "DELETE FROM records WHERE url = ?1 AND publisher = ?2",
-        [url, publisher],
-    )?;
-    if let Some(id) = delta_id {
-        remove_derived(conn, &id, url)?;
-    }
-    remove_ranking_bookkeeping(conn, url, publisher, height)?;
-    Ok(())
-}
-
-/// WIST-3 §7: excluded records are candidates too.
-fn candidates_for(conn: &Connection, url: &str) -> Result<Vec<String>> {
-    let mut set: BTreeSet<String> = BTreeSet::new();
-    let mut stmt = conn.prepare("SELECT publisher FROM records WHERE url = ?1")?;
-    for row in stmt.query_map([url], |r| r.get::<_, String>(0))? {
-        set.insert(row?);
-    }
-    drop(stmt);
-    let mut stmt = conn.prepare("SELECT publisher FROM excluded_records WHERE url = ?1")?;
-    for row in stmt.query_map([url], |r| r.get::<_, String>(0))? {
-        set.insert(row?);
-    }
-    Ok(set.into_iter().collect())
-}
-
-struct ExcludedRow {
-    delta_id: String,
-    observed_at: String,
-    title: String,
-    abstract_text: Option<String>,
-    lang: String,
-    extract: Option<String>,
-    links: Option<String>,
-    height: u64,
-}
-
-fn fetch_excluded(conn: &Connection, url: &str, publisher: &str) -> Result<Option<ExcludedRow>> {
-    conn.query_row(
-        "SELECT delta_id, observed_at, title, abstract, lang, extract, links, height
-         FROM excluded_records WHERE url = ?1 AND publisher = ?2",
-        (url, publisher),
-        |row| {
-            Ok(ExcludedRow {
-                delta_id: row.get(0)?,
-                observed_at: row.get(1)?,
-                title: row.get(2)?,
-                abstract_text: row.get(3)?,
-                lang: row.get(4)?,
-                extract: row.get(5)?,
-                links: row.get(6)?,
-                height: row.get::<_, i64>(7)?.max(0) as u64,
-            })
-        },
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_excluded(
-    conn: &Connection,
-    url: &str,
-    publisher: &str,
-    delta_id: &str,
-    observed_at: &str,
-    title: &str,
-    abstract_text: &Option<String>,
-    lang: &str,
-    extract: Option<&str>,
-    links: &[String],
-    height: u64,
-) -> Result<()> {
-    let links_json = serde_json::to_string(links)?;
-    conn.execute(
-        "INSERT INTO excluded_records(url, publisher, delta_id, observed_at, title, abstract, lang, extract, links, height)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-         ON CONFLICT(url, publisher) DO UPDATE SET
-            delta_id = excluded.delta_id, observed_at = excluded.observed_at, title = excluded.title,
-            abstract = excluded.abstract, lang = excluded.lang, extract = excluded.extract,
-            links = excluded.links, height = excluded.height",
-        (
-            url, publisher, delta_id, observed_at, title, abstract_text, lang, extract,
-            &links_json, height as i64,
-        ),
-    )?;
-    Ok(())
-}
-
-/// WIST-3 §7: the displaced record moves into `excluded_records` before the winner's record is
-/// written.
-fn shadow_into_excluded(
-    conn: &Connection,
-    url: &str,
-    publisher: &str,
-    tier1: bool,
-    at_height: u64,
-) -> Result<()> {
-    let record: Option<(String, String, String, Option<String>, String)> = conn
-        .query_row(
-            "SELECT delta_id, observed_at, title, abstract, lang FROM records WHERE url = ?1 AND publisher = ?2",
-            (url, publisher),
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-        )
-        .optional()?;
-    let Some((delta_id, observed_at, title, abstract_text, lang)) = record else {
-        return Ok(());
-    };
-    let height: u64 = conn
-        .query_row(
-            "SELECT height FROM record_heights WHERE url = ?1 AND publisher = ?2",
-            (url, publisher),
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?
-        .unwrap_or(0)
-        .max(0) as u64;
-    let extract: Option<String> = if tier1 {
-        conn.query_row(
-            "SELECT extract FROM extracts WHERE url = ?1 AND publisher = ?2",
-            (url, publisher),
-            |row| row.get(0),
-        )
-        .optional()?
-    } else {
-        None
-    };
-    let links_json: Option<String> = if tier1 {
-        let mut stmt =
-            conn.prepare("SELECT target_url FROM links WHERE source_url = ?1 ORDER BY position")?;
-        let targets: Vec<String> = stmt
-            .query_map([url], |row| row.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        Some(serde_json::to_string(&targets)?)
-    } else {
-        None
-    };
-    conn.execute(
-        "INSERT INTO excluded_records(url, publisher, delta_id, observed_at, title, abstract, lang, extract, links, height)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-         ON CONFLICT(url, publisher) DO UPDATE SET
-            delta_id = excluded.delta_id, observed_at = excluded.observed_at, title = excluded.title,
-            abstract = excluded.abstract, lang = excluded.lang, extract = excluded.extract,
-            links = excluded.links, height = excluded.height",
-        (
-            url, publisher, &delta_id, &observed_at, &title, &abstract_text, &lang, &extract,
-            &links_json, height as i64,
-        ),
-    )?;
-    remove_by_url(conn, url, publisher, at_height)
-}
-
-fn restore_excluded_row(
-    conn: &Connection,
-    url: &str,
-    publisher: &str,
-    row: &ExcludedRow,
-    tier1: bool,
-) -> Result<()> {
-    conn.execute(
-        "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(url, publisher) DO UPDATE SET
-            delta_id = excluded.delta_id, observed_at = excluded.observed_at,
-            title = excluded.title, abstract = excluded.abstract, lang = excluded.lang",
-        (
-            url,
-            publisher,
-            &row.delta_id,
-            &row.observed_at,
-            &row.title,
-            &row.abstract_text,
-            &row.lang,
-        ),
-    )?;
-    super::persist::record_height(conn, url, publisher, row.height)?;
-    if tier1 {
-        if let Some(extract) = &row.extract {
-            conn.execute(
-                "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(url, publisher) DO UPDATE SET delta_id = excluded.delta_id, extract = excluded.extract",
-                (url, publisher, &row.delta_id, extract),
-            )?;
-        }
-        let links: Vec<String> = row
-            .links
-            .as_deref()
-            .map(|s| serde_json::from_str(s).unwrap_or_default())
-            .unwrap_or_default();
-        conn.execute("DELETE FROM links WHERE source_url = ?1", [url])?;
-        for (position, target_url) in links.iter().enumerate() {
-            conn.execute(
-                "INSERT INTO links(source_url, target_url, position) VALUES (?1, ?2, ?3)",
-                (url, target_url, position as i64),
-            )?;
-        }
-        super::persist::replace_inlinks(conn, url, publisher, &links, row.height)?;
-    }
-    conn.execute(
-        "DELETE FROM excluded_records WHERE url = ?1 AND publisher = ?2",
-        (url, publisher),
-    )?;
-    Ok(())
-}
-
-/// WIST-3 §7.
-fn recompute_and_restore(
-    conn: &Connection,
-    history: &KeyHistory,
-    url: &str,
-    tier1: bool,
-) -> Result<()> {
-    let host = wist_core::declaration::url_host(url);
-    let self_declared = history.declared(host);
-    let candidates = candidates_for(conn, url)?;
-    let Some(winner) = wist_core::materialization::preferred(
-        host,
-        self_declared,
-        candidates.iter().map(String::as_str),
-    ) else {
-        return Ok(());
-    };
-    let winner = winner.to_string();
-    let already_live: bool = conn
-        .query_row(
-            "SELECT 1 FROM records WHERE url = ?1 AND publisher = ?2",
-            (url, &winner),
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false);
-    if already_live {
-        return Ok(());
-    }
-    let Some(row) = fetch_excluded(conn, url, &winner)? else {
-        return Ok(());
-    };
-    restore_excluded_row(conn, url, &winner, &row, tier1)
-}
-
-/// WIST-3 §7: at a domain's `seq`-0 Declaration height, other Publishers' records for its URLs are
-/// excluded as by `delete`. Idempotent.
-fn sweep_declared_domain(
-    conn: &Connection,
-    history: &KeyHistory,
-    domain: &str,
-    tier1: bool,
-    height: u64,
-) -> Result<()> {
-    let prefix = format!("https://{domain}%");
-
-    let mut estmt =
-        conn.prepare("SELECT url, publisher FROM excluded_records WHERE url LIKE ?1")?;
-    let excluded_rows: Vec<(String, String)> = estmt
-        .query_map([&prefix], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    drop(estmt);
-    for (url, publisher) in excluded_rows {
-        if publisher != domain && wist_core::declaration::url_host(&url) == domain {
-            conn.execute(
-                "DELETE FROM excluded_records WHERE url = ?1 AND publisher = ?2",
-                (&url, &publisher),
-            )?;
-        }
-    }
-
-    let mut stmt = conn.prepare("SELECT url, publisher FROM records WHERE url LIKE ?1")?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map([&prefix], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    drop(stmt);
-    for (url, publisher) in rows {
-        if publisher != domain && wist_core::declaration::url_host(&url) == domain {
-            remove_by_url(conn, &url, &publisher, height)?;
-            recompute_and_restore(conn, history, &url, tier1)?;
-        }
-    }
-    Ok(())
-}
-
-fn remove_excluded_by_delta_id(conn: &Connection, delta_id: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM excluded_records WHERE delta_id = ?1",
-        [delta_id],
-    )?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 pub fn apply_events(
     conn: &Connection,
-    client: &Client,
-    base: &Url,
     history: &mut KeyHistory,
     events: &[EpochEvent],
     tier1: bool,
     walk_floor: u64,
 ) -> Result<ApplyStats> {
     let mut stats = ApplyStats {
-        applied: 0,
         withdrawn: 0,
         labels: 0,
     };
@@ -1031,18 +682,14 @@ pub fn apply_events(
     if tier1 {
         conn.execute_batch(CREATE_TIER1)?;
     }
-    conn.execute_batch(crate::store::CREATE_CHAIN_TIPS)?;
-    conn.execute_batch(crate::store::CREATE_EXCLUDED_RECORDS)?;
-    let mut tips = load_chain_tips(conn)?;
-    let mut withdrawn = load_withdrawn(conn)?;
     for event in events {
-        let sealed_at_s = event.sealed_at_s;
         history.apply_epoch(
             event.height,
             &event.epoch_root,
             &event.sealed_at,
             event.recovery_window_days,
             event.declaration_activation_epochs,
+            &event.limits,
             &event.declarations,
         )?;
         for entry in &event.declarations {
@@ -1059,204 +706,14 @@ pub fn apply_events(
                 &entry["body"],
             )?;
         }
-        for entry in &event.declarations {
-            if let Some(domain) = entry["body"]["publisher"]["domain"].as_str() {
-                sweep_declared_domain(conn, history, domain, tier1, event.height)?;
-            }
-        }
-        for (delta_id, publisher, height) in &event.withdrawals {
-            record_withdrawal(conn, delta_id, publisher, *height)?;
-            withdrawn.adopt(delta_id, publisher, *height);
-            if let Some(url) = remove_by_delta_id(conn, delta_id, *height)? {
+        for (item_id, publisher, height) in &event.withdrawals {
+            record_withdrawal(conn, item_id, publisher, *height)?;
+            if remove_by_item_id(conn, item_id, *height)?.is_some() {
                 stats.withdrawn += 1;
-                recompute_and_restore(conn, history, &url, tier1)?;
-            }
-            // WIST-3 §7: withdrawn content never materializes, so its excluded record never
-            // returns.
-            remove_excluded_by_delta_id(conn, delta_id)?;
-        }
-
-        for body in &event.delta_bodies {
-            // WIST-3 §3.3: a Delta failing its Epoch's Key Set, fields, version, caps or clock is
-            // ignored like a fork, never ending the sync.
-            let verified =
-                match history.verify_delta(event.height, sealed_at_s, &event.profile, body) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("ignoring a Delta at height {}: {e}", event.height);
-                        continue;
-                    }
-                };
-            let env: DeltaEnvelope = serde_json::from_value(body.clone())?;
-            let id = verified.id;
-            let publisher = verified.publisher;
-            // WIST-1 §3.5: a `prev` other than the chain tip is a fork.
-            if !tips.apply(&publisher, &env.delta.url, &id, env.delta.prev.as_deref()) {
-                continue;
-            }
-            // WIST-3 §7: once a host self-declares, a parent's Deltas for its URLs move the chain
-            // tip but never materialize.
-            if verified.self_declared && publisher != verified.host {
-                continue;
-            }
-            // WIST-3 §6.2: even when the withdrawal sealed in the same Epoch.
-            if withdrawn.is_withdrawn(&id) {
-                continue;
-            }
-
-            match env.delta.change_type {
-                ChangeType::New | ChangeType::Update => {
-                    let hex = id.trim_start_matches("sha256:");
-                    let fields = match &env.delta.payload {
-                        Some(commitment) => fetch_payload(client, base, hex, commitment).ok(),
-                        None => None,
-                    };
-                    let title = fields.as_ref().map(|f| f.title.clone()).unwrap_or_default();
-                    let abstract_text = fields.as_ref().and_then(|f| f.abstract_text.clone());
-                    let extract = fields.as_ref().and_then(|f| f.extract.clone());
-                    let links = fields.as_ref().map(|f| f.links.clone()).unwrap_or_default();
-
-                    let mut candidates = candidates_for(conn, &env.delta.url)?;
-                    if !candidates.contains(&publisher) {
-                        candidates.push(publisher.clone());
-                    }
-                    let winner = wist_core::materialization::preferred(
-                        &verified.host,
-                        verified.self_declared,
-                        candidates.iter().map(String::as_str),
-                    )
-                    .map(str::to_string);
-
-                    if winner.as_deref() == Some(publisher.as_str()) {
-                        let holder: Option<String> = conn
-                            .query_row(
-                                "SELECT publisher FROM records WHERE url = ?1 LIMIT 1",
-                                [&env.delta.url],
-                                |row| row.get(0),
-                            )
-                            .optional()?;
-                        if let Some(holder) = &holder {
-                            if holder != &publisher {
-                                shadow_into_excluded(
-                                    conn,
-                                    &env.delta.url,
-                                    holder,
-                                    tier1,
-                                    event.height,
-                                )?;
-                            }
-                        }
-
-                        conn.execute(
-                            "INSERT INTO records(url, publisher, delta_id, observed_at, title, abstract, lang)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                             ON CONFLICT(url, publisher) DO UPDATE SET
-                                delta_id = excluded.delta_id, observed_at = excluded.observed_at,
-                                title = excluded.title, abstract = excluded.abstract,
-                                lang = excluded.lang",
-                            (
-                                &env.delta.url,
-                                &publisher,
-                                &id,
-                                &env.delta.observed_at,
-                                &title,
-                                &abstract_text,
-                                &env.delta.meta.lang,
-                            ),
-                        )?;
-                        super::persist::record_height(
-                            conn,
-                            &env.delta.url,
-                            &publisher,
-                            event.height,
-                        )?;
-                        conn.execute(
-                            "DELETE FROM excluded_records WHERE url = ?1 AND publisher = ?2",
-                            (&env.delta.url, &publisher),
-                        )?;
-                        stats.applied += 1;
-
-                        if tier1 {
-                            match &fields {
-                                Some(f) => {
-                                    if let Some(extract) = &f.extract {
-                                        conn.execute(
-                                            "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, ?2, ?3, ?4)
-                                             ON CONFLICT(url, publisher) DO UPDATE SET
-                                                delta_id = excluded.delta_id, extract = excluded.extract",
-                                            (&env.delta.url, &publisher, &id, extract),
-                                        )?;
-                                    }
-                                    conn.execute(
-                                        "DELETE FROM links WHERE source_url = ?1",
-                                        [&env.delta.url],
-                                    )?;
-                                    for (position, target_url) in f.links.iter().enumerate() {
-                                        conn.execute(
-                                            "INSERT INTO links(source_url, target_url, position) VALUES (?1, ?2, ?3)",
-                                            (&env.delta.url, target_url, position as i64),
-                                        )?;
-                                    }
-                                    super::persist::replace_inlinks(
-                                        conn,
-                                        &env.delta.url,
-                                        &publisher,
-                                        &f.links,
-                                        event.height,
-                                    )?;
-                                }
-                                None => {
-                                    conn.execute(
-                                        "DELETE FROM extracts WHERE url = ?1 AND publisher = ?2",
-                                        (&env.delta.url, &publisher),
-                                    )?;
-                                    conn.execute(
-                                        "DELETE FROM links WHERE source_url = ?1",
-                                        [&env.delta.url],
-                                    )?;
-                                }
-                            }
-                        }
-                    } else {
-                        write_excluded(
-                            conn,
-                            &env.delta.url,
-                            &publisher,
-                            &id,
-                            &env.delta.observed_at,
-                            &title,
-                            &abstract_text,
-                            &env.delta.meta.lang,
-                            extract.as_deref(),
-                            &links,
-                            event.height,
-                        )?;
-                    }
-                }
-                ChangeType::Delete => {
-                    remove_by_url(conn, &env.delta.url, &publisher, event.height)?;
-                    conn.execute(
-                        "DELETE FROM excluded_records WHERE url = ?1 AND publisher = ?2",
-                        (&env.delta.url, &publisher),
-                    )?;
-                    recompute_and_restore(conn, history, &env.delta.url, tier1)?;
-                }
-                ChangeType::Attest => {
-                    // WIST-3 §7: an attest refreshes `observed_at` and keeps its anchor Delta.
-                    conn.execute(
-                        "UPDATE records SET observed_at = ?3 WHERE url = ?1 AND publisher = ?2",
-                        (&env.delta.url, &publisher, &env.delta.observed_at),
-                    )?;
-                    conn.execute(
-                        "UPDATE excluded_records SET observed_at = ?3 WHERE url = ?1 AND publisher = ?2",
-                        (&env.delta.url, &publisher, &env.delta.observed_at),
-                    )?;
-                }
             }
         }
         apply_labels(conn, history, event, walk_floor, &mut stats)?;
     }
-    save_chain_tips(conn, &tips)?;
     record_identity_starts(conn, history)?;
     save_history(conn, history)?;
     Ok(stats)
@@ -1278,8 +735,8 @@ fn record_identity_starts(conn: &Connection, history: &KeyHistory) -> Result<()>
     Ok(())
 }
 
-/// WIST-2 §3.3 and WIST-3 §3.3: applied after the Epoch's Deltas; a failing Entry is ignored like a
-/// forked Delta. Every sealed Labeler Entry moves its last sealed height (WIST-4 §6).
+/// WIST-2 §3.3 and WIST-3 §3.3: a failing Entry is ignored. Every sealed Labeler Entry moves its
+/// last sealed height (WIST-4 §6).
 pub(super) fn apply_labels(
     conn: &Connection,
     history: &KeyHistory,
@@ -1287,10 +744,8 @@ pub(super) fn apply_labels(
     walk_floor: u64,
     stats: &mut ApplyStats,
 ) -> Result<()> {
-    for body in &event.delta_bodies {
-        if let Some(publisher) = body["delta"]["publisher"].as_str() {
-            super::persist::touch_labeler(conn, publisher, event.height)?;
-        }
+    for publisher in &event.publishers {
+        super::persist::touch_labeler(conn, publisher, event.height)?;
     }
     for (index, body) in &event.labels {
         let labeler = body["label"]["labeler"].as_str().unwrap_or_default();
@@ -1304,9 +759,9 @@ pub(super) fn apply_labels(
         match wist_core::label::validate_label(
             body,
             &declaration,
-            event.profile.url_cap_bytes,
+            event.url_cap_bytes,
             event.sealed_at_s,
-            event.profile.clock_skew_seconds,
+            event.clock_skew_seconds,
         ) {
             Ok(envelope) => {
                 let id = wist_core::label::label_id(&body["label"])
@@ -1346,7 +801,7 @@ pub(super) fn apply_labels(
             &declaration,
             sealed,
             event.sealed_at_s,
-            event.profile.clock_skew_seconds,
+            event.clock_skew_seconds,
         ) {
             Ok(envelope) => {
                 let id = wist_core::label::dispute_id(&body["dispute"])

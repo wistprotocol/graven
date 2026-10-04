@@ -31,7 +31,7 @@ fn sync(fx: &common::Fixture, target: &std::path::Path) -> graven::sync::SyncRep
 
 #[test]
 fn walked_labels_and_disputes_reach_the_index() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     sync(&fx, target.path());
     let labeler = common::Signer::new([1u8; 32]);
@@ -190,7 +190,7 @@ fn snapshot_label_and_dispute_tuples_are_adopted() {
 #[test]
 fn served_tool_list_includes_the_label_tools() {
     use std::io::{BufRead, BufReader, Write};
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     sync(&fx, target.path());
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_graven"))
@@ -259,7 +259,7 @@ fn count(conn: &rusqlite::Connection, table: &str, column: &str, id: &str) -> i6
 
 #[test]
 fn sealed_labels_and_disputes_beyond_the_clock_allowance_are_ignored() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     sync(&fx, target.path());
     let sealed_at = common::next_instant(&fx);

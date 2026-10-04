@@ -51,7 +51,7 @@ fn snapshot_path(fx: &common::Fixture, file: &str) -> String {
 /// WIST-3 §9's `WIST3-E04`.
 #[test]
 fn a_cold_start_asks_another_source_for_a_snapshot_file_whose_hash_fails() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let (_mirror_dir, mirror, mirror_requests) = mirror_of(&fx);
     flip_last_byte(
         &fx.dir
@@ -78,7 +78,7 @@ fn a_cold_start_asks_another_source_for_a_snapshot_file_whose_hash_fails() {
 /// WIST-3 §6.
 #[test]
 fn a_cold_start_asks_another_source_for_a_state_file_the_first_source_lacks() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let (_mirror_dir, mirror, mirror_requests) = mirror_of(&fx);
     std::fs::remove_file(
         fx.dir
@@ -106,7 +106,7 @@ fn a_cold_start_asks_another_source_for_a_state_file_the_first_source_lacks() {
 /// WIST-3 §8 step 2 and §9.
 #[test]
 fn a_cold_start_takes_the_manifest_of_the_source_that_agrees_with_the_chosen_index() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let (_mirror_dir, mirror, mirror_requests) = mirror_of(&fx);
     common::corrupt_manifest_content_digest(fx.dir.path(), &fx.log, &fx.snapshot_date);
 
@@ -123,7 +123,7 @@ fn a_cold_start_takes_the_manifest_of_the_source_that_agrees_with_the_chosen_ind
 /// WIST-3 §9's `WIST3-E04`.
 #[test]
 fn a_snapshot_no_source_serves_consistently_is_rejected_with_e04() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let (mirror_dir, mirror, _mirror_requests) = mirror_of(&fx);
     for served in [fx.dir.path(), mirror_dir.path()] {
         common::corrupt_manifest_content_digest(served, &fx.log, &fx.snapshot_date);
@@ -142,7 +142,7 @@ fn a_snapshot_no_source_serves_consistently_is_rejected_with_e04() {
 /// WIST-3 §8 step 8 and §9.
 #[test]
 fn a_cold_start_takes_the_snapshot_of_the_source_whose_documents_verify_at_the_adopted_head() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let second = common::Signer::new([41u8; 32]);
     common::seal_the_genesis_keys_removal(&fx, &second);
     let (mirror_dir, mirror, mirror_requests) = mirror_of(&fx);
@@ -167,7 +167,7 @@ fn a_cold_start_takes_the_snapshot_of_the_source_whose_documents_verify_at_the_a
 /// WIST-3 §9's `WIST3-E04`.
 #[test]
 fn a_snapshot_no_source_signs_for_the_adopted_head_is_rejected_by_every_source() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let second = common::Signer::new([42u8; 32]);
     common::seal_the_genesis_keys_removal(&fx, &second);
     let (_mirror_dir, mirror, mirror_requests) = mirror_of(&fx);
@@ -194,7 +194,7 @@ fn a_snapshot_no_source_signs_for_the_adopted_head_is_rejected_by_every_source()
 /// contradicts.
 #[test]
 fn a_cold_start_takes_the_snapshot_of_the_source_whose_manifest_agrees_with_its_state_file() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let (_mirror_dir, mirror, mirror_requests) = mirror_of(&fx);
     common::corrupt_state_digest(fx.dir.path(), &fx.other, &fx.snapshot_date);
 
@@ -217,7 +217,7 @@ fn a_cold_start_takes_the_snapshot_of_the_source_whose_manifest_agrees_with_its_
 /// WIST-3 §8 step 8 and §9.
 #[test]
 fn a_manifest_no_source_agrees_with_its_state_file_is_rejected_and_registers_nothing() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let (mirror_dir, mirror, _mirror_requests) = mirror_of(&fx);
     for served in [fx.dir.path(), mirror_dir.path()] {
         common::corrupt_state_digest(served, &fx.other, &fx.snapshot_date);

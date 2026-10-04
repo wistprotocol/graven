@@ -75,7 +75,7 @@ fn hit() -> RecordHit {
     RecordHit {
         url: SUBJECT.to_string(),
         publisher: "sub.example".to_string(),
-        delta_id: format!("sha256:{:064x}", 1),
+        item_id: format!("sha256:{:064x}", 1),
         observed_at: "2026-08-02T12:00:00Z".to_string(),
         title: "A".to_string(),
         r#abstract: None,

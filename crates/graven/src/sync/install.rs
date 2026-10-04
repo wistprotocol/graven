@@ -1,5 +1,5 @@
 use super::history::{default_recovery_window_days, persist_declaration, ChainState};
-use super::persist::{record_withdrawal, save_aggregator_keys, save_chain_tips};
+use super::persist::{record_withdrawal, save_aggregator_keys};
 use super::source::Sources;
 use crate::error::{Error, Result};
 use crate::fetch::Client;
@@ -14,9 +14,9 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::path::PathBuf;
 use wist_core::aggregator_keys::Registry;
-use wist_core::chain::ChainTips;
 use wist_core::crypto::{hex_encode, PublicKey};
 use wist_core::envelope::verify_envelope;
+use wist_core::materialization::ContentTuple;
 use wist_core::objects::Anchor;
 use wist_core::objects::LogAnchorEnvelope;
 use wist_core::objects::{
@@ -77,25 +77,24 @@ pub(super) fn load_anchor_bytes(spec: &str, client: &Client) -> Result<Vec<u8>> 
 }
 
 struct ShardRecord {
-    record: Value,
-    publisher: String,
+    tuple: ContentTuple,
     filed_in: usize,
 }
 
 fn read_records(sqlite_path: &Path, filed_in: usize) -> Result<Vec<ShardRecord>> {
     let conn = Connection::open(sqlite_path)?;
-    let mut stmt = conn.prepare("SELECT url, publisher, delta_id, observed_at FROM records")?;
+    let mut stmt =
+        conn.prepare("SELECT url, publisher, item_id, observed_at, attested_at FROM records")?;
     let records = stmt
         .query_map([], |row| {
-            let publisher = row.get::<_, String>(1)?;
             Ok(ShardRecord {
-                record: serde_json::json!({
-                    "url": row.get::<_, String>(0)?,
-                    "publisher": publisher,
-                    "delta_id": row.get::<_, String>(2)?,
-                    "observed_at": row.get::<_, String>(3)?,
-                }),
-                publisher,
+                tuple: ContentTuple {
+                    url: row.get(0)?,
+                    publisher: row.get(1)?,
+                    item_id: row.get(2)?,
+                    observed_at: row.get(3)?,
+                    attested_at: row.get(4)?,
+                },
                 filed_in,
             })
         })?
@@ -105,10 +104,21 @@ fn read_records(sqlite_path: &Path, filed_in: usize) -> Result<Vec<ShardRecord>>
 
 /// WIST-3 §7 "Sharding".
 fn shard_of(publisher: &str, count: usize) -> usize {
-    let digest = Sha256::digest(publisher.as_bytes());
-    let mut prefix = [0u8; 8];
-    prefix.copy_from_slice(&digest[..8]);
-    (u64::from_be_bytes(prefix) % count as u64) as usize
+    let count = std::num::NonZeroU64::new(count as u64).unwrap_or(std::num::NonZeroU64::MIN);
+    wist_core::snapshot::shard_of(publisher, count) as usize
+}
+
+/// WIST-3 §7: a Consumer MUST NOT require a tier-0 column the tier layout does not name.
+fn add_store_columns(conn: &Connection) -> Result<()> {
+    for column in ["collection", "generated_at"] {
+        let held: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('records') WHERE name = ?1")?
+            .exists([column])?;
+        if !held {
+            conn.execute(&format!("ALTER TABLE records ADD COLUMN {column} TEXT"), [])?;
+        }
+    }
+    Ok(())
 }
 
 const TIER0_PATH: &str = "tier0/index.sqlite";
@@ -250,14 +260,14 @@ fn install_tier0(
             "WIST3-E04 the {what} of the tier-0 index served under {snapshot_base} is not the one its manifest names"
         ))
     };
-    let whole: Vec<Value> = records.iter().map(|r| r.record.clone()).collect();
+    let whole: Vec<ContentTuple> = records.iter().map(|r| r.tuple.clone()).collect();
     if content_digest(&whole)? != manifest.content_digest {
         return Err(mismatch("content_digest".into()));
     }
     if let Some(digests) = shard_digests {
-        let mut grouped: Vec<Vec<Value>> = vec![Vec::new(); digests.len()];
+        let mut grouped: Vec<Vec<ContentTuple>> = vec![Vec::new(); digests.len()];
         for r in &records {
-            grouped[shard_of(&r.publisher, digests.len())].push(r.record.clone());
+            grouped[shard_of(&r.tuple.publisher, digests.len())].push(r.tuple.clone());
         }
         for (shard, (held, named)) in grouped.iter().zip(digests).enumerate() {
             if &content_digest(held)? != named {
@@ -266,13 +276,13 @@ fn install_tier0(
         }
         if let Some(misfiled) = records
             .iter()
-            .find(|r| shard_of(&r.publisher, digests.len()) != r.filed_in)
+            .find(|r| shard_of(&r.tuple.publisher, digests.len()) != r.filed_in)
         {
             return Err(Error::Verify(format!(
                 "WIST3-E04 shard {}'s tier-0 index served under {snapshot_base} carries a record of {}, which WIST-3 §7 assigns to shard {}",
                 misfiled.filed_in,
-                misfiled.publisher,
-                shard_of(&misfiled.publisher, digests.len())
+                misfiled.tuple.publisher,
+                shard_of(&misfiled.tuple.publisher, digests.len())
             )));
         }
     }
@@ -299,7 +309,7 @@ fn install_tier0(
             [path.to_string_lossy().as_ref()],
         )?;
         conn.execute(
-            "INSERT INTO main.records(url, publisher, delta_id, observed_at, title, abstract, lang) SELECT url, publisher, delta_id, observed_at, title, abstract, lang FROM shard.records",
+            "INSERT INTO main.records(url, publisher, item_id, observed_at, attested_at, title, abstract, lang) SELECT url, publisher, item_id, observed_at, attested_at, title, abstract, lang FROM shard.records",
             [],
         )?;
         conn.execute("DETACH DATABASE shard", [])?;
@@ -608,6 +618,7 @@ pub(super) fn snapshot(
     ) = snapshot_documents(sources, anchor, dir, from, tier1)?;
 
     let conn = Connection::open(&tmp_sqlite_path)?;
+    add_store_columns(&conn)?;
     conn.execute(CREATE_UNIQUE_INDEX, [])?;
     conn.execute(CREATE_DECLARATIONS, [])?;
 
@@ -621,12 +632,9 @@ pub(super) fn snapshot(
         }
     }
 
-    // WIST-3 §8 step 10: without the chain tips a continuing Delta reads as a fork; without the
-    // recovery windows an in-window rotation is invisible.
+    // WIST-3 §8 step 10: without the recovery windows an in-window rotation is invisible.
     let mut history = KeyHistory::new();
     let mut suffix_lists = super::suffix::SuffixLists::load(&conn)?;
-    conn.execute_batch(crate::store::CREATE_CHAIN_TIPS)?;
-    let mut tips = ChainTips::new();
     let mut adopted_windows: Vec<(String, String, Value, u64)> = Vec::new();
     let mut adopted_pending: Vec<(String, Value, u64, u64)> = Vec::new();
     let mut adopted_parameters: Vec<(String, String, i64)> = Vec::new();
@@ -670,15 +678,18 @@ pub(super) fn snapshot(
             // WIST-3 §6.2 and §7: a Consumer resuming above the withdrawal's Epoch never sees its
             // Entry.
             StateEntry::Withdrawal(w) => {
-                record_withdrawal(&conn, &w.delta_id, &w.publisher, w.sealing_height)?;
-                let _ = super::history::remove_by_delta_id(&conn, &w.delta_id, w.sealing_height)?;
+                record_withdrawal(&conn, &w.item_id, &w.publisher, w.sealing_height)?;
+                let _ = super::history::remove_by_item_id(&conn, &w.item_id, w.sealing_height)?;
             }
             StateEntry::Label(l) => super::persist::adopt_label_tuple(&conn, l)?,
             StateEntry::Dispute(d) => super::persist::adopt_dispute_tuple(&conn, d)?,
             StateEntry::SuffixList(s) => {
                 suffix_lists.adopt(client, base, &s.identifier, s.sealing_height)?;
             }
-            StateEntry::Record(r) => tips.adopt(&r.publisher, &r.url, &r.delta_id),
+            StateEntry::Collection(_)
+            | StateEntry::Record(_)
+            | StateEntry::Removal(_)
+            | StateEntry::RegistryUpdate(_) => {}
             // WIST-3 §7: authenticated from the Anchor before any of this state was read.
             StateEntry::AggregatorKey(_) => {}
         }
@@ -707,7 +718,6 @@ pub(super) fn snapshot(
             head,
         )?;
     }
-    save_chain_tips(&conn, &tips)?;
     super::persist::seed_ranking_index(&conn, manifest.epoch_number)?;
 
     save_aggregator_keys(&conn, &aggregator_keys)?;

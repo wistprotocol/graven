@@ -118,7 +118,8 @@ impl SuffixLists {
         let entries = epoch.iter().filter_map(|entry| {
             let kind = entry["type"].as_str()?;
             let host = match kind {
-                "publisher_delta" => entry["body"]["delta"]["publisher"].as_str(),
+                "publisher_catalog" => entry["body"]["catalog"]["publisher"].as_str(),
+                "publisher_item" => entry["body"]["item"]["publisher"].as_str(),
                 "label" => entry["body"]["label"]["labeler"].as_str(),
                 "dispute" => entry["body"]["dispute"]["disputant"].as_str(),
                 _ => None,

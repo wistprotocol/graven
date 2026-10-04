@@ -5,7 +5,7 @@ use rusqlite::Connection;
 
 #[test]
 fn cold_sync_verifies_chain_and_populates_store() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
 
     let report = graven::sync::run(
@@ -41,19 +41,19 @@ fn cold_sync_verifies_chain_and_populates_store() {
     assert_eq!(alpha.title, "Alpha Title");
     assert_eq!(alpha.publisher, fx.domain);
 
-    let beta = store.get("https://records.example/beta").unwrap().unwrap();
-    assert_eq!(beta.title, "Beta Title");
-    assert_eq!(beta.r#abstract.as_deref(), Some("Beta abstract"));
-    assert_eq!(beta.publisher, fx.domain);
+    assert!(common::holds_declaration(
+        &common::synced_log_dir(target.path()),
+        common::BETA_DOMAIN
+    ));
 
-    let hits = store.search("Beta", 10).unwrap();
+    let hits = store.search("Alpha", 10).unwrap();
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].url, "https://records.example/beta");
+    assert_eq!(hits[0].url, "https://records.example/alpha");
 }
 
 #[test]
 fn cold_sync_accepts_anchor_fetched_over_http() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     let anchor_url = format!("{}/log/anchor.json", fx.base_url);
 
@@ -62,31 +62,10 @@ fn cold_sync_accepts_anchor_fetched_over_http() {
     assert_eq!(report.head, 1);
 }
 
-#[test]
-fn cold_sync_records_post_snapshot_delta_with_unfetchable_payload_as_empty() {
-    let fx = common::build_fixture(false, false);
-    let target = tempfile::tempdir().unwrap();
-
-    let report = graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        false,
-    )
-    .unwrap();
-    assert_eq!(report.head, 1);
-
-    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
-    let beta = store.get("https://records.example/beta").unwrap().unwrap();
-    assert_eq!(beta.title, "");
-    assert!(beta.r#abstract.is_none());
-}
-
 /// WIST-3 §6 and §8 step 8.
 #[test]
 fn cold_sync_rejects_a_tampered_entry_bundle_and_keeps_the_snapshots_checkpoint() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let bundle = fx
         .dir
         .path()
@@ -121,14 +100,14 @@ fn cold_sync_rejects_a_tampered_entry_bundle_and_keeps_the_snapshots_checkpoint(
         .unwrap()
         .is_some());
     assert!(
-        store.get("https://records.example/beta").unwrap().is_none(),
+        !common::holds_declaration(&common::synced_log_dir(target.path()), common::BETA_DOMAIN),
         "no Entry above the adopted Checkpoint's tree size is applied"
     );
 }
 
 #[test]
 fn cold_sync_rejects_wrong_manifest_content_digest() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     common::corrupt_manifest_content_digest(fx.dir.path(), &fx.log, &fx.snapshot_date);
 
     let target = tempfile::tempdir().unwrap();
@@ -148,7 +127,7 @@ fn cold_sync_rejects_wrong_manifest_content_digest() {
 
 #[test]
 fn cold_sync_rejects_wrong_state_digest_in_manifest() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     common::corrupt_state_digest(fx.dir.path(), &fx.log, &fx.snapshot_date);
 
     let target = tempfile::tempdir().unwrap();
@@ -173,7 +152,7 @@ fn cold_sync_rejects_wrong_state_digest_in_manifest() {
 /// WIST-3 §8 step 8.
 #[test]
 fn cold_sync_rejects_state_signed_by_wrong_key() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     common::resign_state_with_wrong_key(fx.dir.path(), &fx.log, &fx.other, &fx.snapshot_date);
 
     let target = tempfile::tempdir().unwrap();
@@ -202,7 +181,7 @@ fn cold_sync_rejects_state_signed_by_wrong_key() {
 /// WIST-3 §5 and §8 step 8.
 #[test]
 fn cold_sync_rejects_checkpoint_signed_by_wrong_key_and_keeps_the_snapshots_checkpoint() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     common::resign_checkpoint_with_wrong_key(&fx, &fx.other);
 
     let target = tempfile::tempdir().unwrap();
@@ -224,16 +203,15 @@ fn cold_sync_rejects_checkpoint_signed_by_wrong_key_and_keeps_the_snapshots_chec
         0,
         "the Snapshot's Checkpoint is the head the run reached"
     );
-    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
     assert!(
-        store.get("https://records.example/beta").unwrap().is_none(),
+        !common::holds_declaration(&common::synced_log_dir(target.path()), common::BETA_DOMAIN),
         "the Epoch whose Checkpoint failed the signature rules is not applied"
     );
 }
 
 #[test]
 fn cold_sync_leaves_no_partial_state_when_tier0_mutation_fails() {
-    let fx = common::build_fixture(true, true);
+    let fx = common::build_fixture(true);
     let target = tempfile::tempdir().unwrap();
 
     let result = graven::sync::run(
@@ -257,8 +235,8 @@ fn cold_sync_leaves_no_partial_state_when_tier0_mutation_fails() {
 }
 
 #[test]
-fn continuous_sync_advances_head_and_applies_new_delta() {
-    let fx = common::build_fixture(true, false);
+fn continuous_sync_advances_head_and_applies_the_new_epoch() {
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
 
     let report1 = graven::sync::run(
@@ -290,10 +268,11 @@ fn continuous_sync_advances_head_and_applies_new_delta() {
     .unwrap();
     assert_eq!(sync_json["epoch_number"], 2);
 
+    assert!(common::holds_declaration(
+        &common::synced_log_dir(target.path()),
+        &new_url
+    ));
     let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
-    let extra = store.get(&new_url).unwrap().unwrap();
-    assert_eq!(extra.title, "Extra Title");
-    assert_eq!(extra.r#abstract.as_deref(), Some("Extra abstract"));
 
     let alpha = store.get("https://records.example/alpha").unwrap();
     assert!(alpha.is_some());
@@ -301,7 +280,7 @@ fn continuous_sync_advances_head_and_applies_new_delta() {
 
 #[test]
 fn continuous_sync_is_noop_when_checkpoint_unchanged() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
 
     graven::sync::run(
@@ -328,7 +307,7 @@ fn continuous_sync_is_noop_when_checkpoint_unchanged() {
 
 #[test]
 fn a_checkpoint_below_the_verified_head_does_not_regress_it_and_is_no_error() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
 
     graven::sync::run(
@@ -378,7 +357,7 @@ fn a_checkpoint_below_the_verified_head_does_not_regress_it_and_is_no_error() {
 
 #[test]
 fn a_differing_checkpoint_at_a_retained_epoch_number_is_equivocation_with_an_evidence_bundle() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
 
     graven::sync::run(
@@ -424,7 +403,7 @@ fn a_differing_checkpoint_at_a_retained_epoch_number_is_equivocation_with_an_evi
 
 #[test]
 fn cold_sync_refuses_when_sync_json_already_exists() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     let log_dir = common::synced_log_dir(target.path());
     std::fs::create_dir_all(&log_dir).unwrap();
@@ -441,157 +420,18 @@ fn cold_sync_refuses_when_sync_json_already_exists() {
     assert!(result.is_err());
 }
 
-#[test]
-fn continuous_sync_upserts_update_delta_preserving_signed_publisher() {
-    let dir = tempfile::tempdir().unwrap();
-    let log = common::Signer::new([9u8; 32]);
-    let publisher = common::Signer::new([1u8; 32]);
-    let domain = "records.example".to_string();
-    let snapshot_date = "2026-08-09".to_string();
-    let url = "https://records.example/alpha".to_string();
-
-    let mut state = common::Log::new(
-        dir.path(),
-        common::Signer::new([9u8; 32]),
-        "graven-test-log",
-    );
-
-    let declaration_env = common::build_declaration(&publisher, &domain);
-    let wrapped_declaration =
-        serde_json::json!({"type": "publisher_declaration", "body": declaration_env});
-
-    let (id1, delta1_env, payload1) = common::build_delta(
-        &publisher,
-        &url,
-        "Alpha Title",
-        Some("Alpha abstract"),
-        "alpha body",
-        None,
-    );
-    let hex1 = id1.strip_prefix("sha256:").unwrap();
-    common::write_payload(dir.path(), hex1, &payload1);
-    let wrapped_delta1 = serde_json::json!({"type": "publisher_delta", "body": delta1_env});
-
-    let epoch0 = state.seal(
-        "2026-08-09T12:00:00Z",
-        &[wrapped_declaration, wrapped_delta1],
-    );
-
-    let record1 = common::RecordFixture {
-        url: url.clone(),
-        publisher: domain.clone(),
-        delta_id: id1.clone(),
-        observed_at: "2026-08-09T12:00:00Z".into(),
-        title: "Alpha Title".into(),
-        abstract_text: Some("Alpha abstract".into()),
-        lang: "en".into(),
-    };
-
-    let snapdir = common::snapshot_dir(dir.path(), &snapshot_date, 0);
-    let sqlite_bytes = common::write_tier0(
-        &snapdir.join("tier0/index.sqlite"),
-        std::slice::from_ref(&record1),
-    );
-    let content_digest_value = wist_core::snapshot::content_digest(&[serde_json::json!({
-        "url": record1.url,
-        "publisher": record1.publisher,
-        "delta_id": record1.delta_id,
-        "observed_at": record1.observed_at,
-    })])
-    .unwrap();
-
-    let (state_bytes, state_digest_value) = common::write_state(
-        &snapdir.join("state.json"),
-        &log,
-        3600,
-        &[(domain.clone(), declaration_env.clone())],
-        std::slice::from_ref(&record1),
-        epoch0.tree_size(),
-    );
-
-    common::write_manifest(
-        &snapdir.join("manifest.json"),
-        &log,
-        &snapshot_date,
-        0,
-        epoch0.tree_size(),
-        &epoch0.root_token(),
-        &content_digest_value,
-        &state_bytes,
-        &state_digest_value,
-        &sqlite_bytes,
-    );
-
-    common::write_index(
-        &dir.path().join("snapshots/index.json"),
-        &log,
-        &snapshot_date,
-        epoch0.tree_size(),
-        &common::manifest_url(&snapshot_date, 0),
-        &content_digest_value,
-    );
-
-    let (id2, delta2_env, payload2) = common::build_delta(
-        &publisher,
-        &url,
-        "Alpha Title",
-        Some("Alpha abstract updated"),
-        "alpha body updated",
-        Some(&id1),
-    );
-    let hex2 = id2.strip_prefix("sha256:").unwrap();
-    common::write_payload(dir.path(), hex2, &payload2);
-    let wrapped_delta2 = serde_json::json!({"type": "publisher_delta", "body": delta2_env});
-
-    state.seal("2026-08-09T13:00:00Z", &[wrapped_delta2]);
-
-    let base_url = format!("http://{}", common::serve_static(dir.path().to_path_buf()));
-
-    let target = tempfile::tempdir().unwrap();
-    let report = graven::sync::run(
-        dir.path().join("log/anchor.json").to_str().unwrap(),
-        &base_url,
-        target.path(),
-        true,
-        false,
-    )
-    .unwrap();
-    assert_eq!(report.head, 1);
-
-    let conn =
-        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM records WHERE url = ?1", [&url], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(
-        count, 1,
-        "an update delta to an already-snapshotted URL must upsert in place, not duplicate the row"
-    );
-
-    let (publisher_col, delta_id_col, title_col): (String, String, String) = conn
-        .query_row(
-            "SELECT publisher, delta_id, title FROM records WHERE url = ?1",
-            [&url],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        publisher_col, domain,
-        "the materialized publisher must preserve the URL's port"
-    );
-    assert_eq!(
-        delta_id_col, id2,
-        "the materialized record must reflect the update delta, not the snapshot original"
-    );
-    assert_eq!(title_col, "Alpha Title");
-}
+const FORGED_SUBJECT: &str = "https://other.example/forged";
 
 #[test]
-fn delta_signed_by_undeclared_key_is_ignored_like_a_fork() {
-    let fx = common::build_fixture(true, false);
-    common::extend_fixture_with_forged_delta(&fx);
+fn a_label_signed_by_an_undeclared_key_is_ignored() {
+    let fx = common::build_fixture(false);
+    let attacker = common::Signer::new([7u8; 32]);
+    let at = common::next_instant(&fx);
+    common::seal_next(
+        &fx,
+        &at,
+        &[common::label_by(&attacker, &fx.domain, FORGED_SUBJECT)],
+    );
     let dir = tempfile::tempdir().unwrap();
     graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -601,11 +441,11 @@ fn delta_signed_by_undeclared_key_is_ignored_like_a_fork() {
         false,
     )
     .unwrap();
+    assert!(!common::labeled(
+        &common::synced_log_dir(dir.path()),
+        FORGED_SUBJECT
+    ));
     let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
-    assert!(store
-        .get("https://records.example/extra-2")
-        .unwrap()
-        .is_none());
     assert!(store
         .get("https://records.example/alpha")
         .unwrap()
@@ -613,8 +453,8 @@ fn delta_signed_by_undeclared_key_is_ignored_like_a_fork() {
 }
 
 #[test]
-fn delta_after_rotation_signed_by_old_key_is_ignored_like_a_fork() {
-    let fx = common::build_fixture(true, false);
+fn a_label_after_rotation_signed_by_the_old_key_is_ignored() {
+    let fx = common::build_fixture(false);
     let old = common::Signer::new([1u8; 32]);
     let new_key = common::Signer::new([2u8; 32]);
 
@@ -635,16 +475,9 @@ fn delta_after_rotation_signed_by_old_key_is_ignored_like_a_fork() {
         &[serde_json::json!({"type": "publisher_declaration", "body": rotation_decl})],
     );
 
-    let delta_number = fx.head_number() + 1;
-    let url = format!("https://records.example/extra-{delta_number}");
-    let (_id, delta_env, _payload) =
-        common::build_delta(&old, &url, "Stale Title", None, "stale body", None);
+    let subject = "https://other.example/stale";
     let at = common::next_instant(&fx);
-    common::seal_next(
-        &fx,
-        &at,
-        &[serde_json::json!({"type": "publisher_delta", "body": delta_env})],
-    );
+    common::seal_next(&fx, &at, &[common::label_by(&old, &fx.domain, subject)]);
 
     let dir = tempfile::tempdir().unwrap();
     graven::sync::run(
@@ -655,15 +488,20 @@ fn delta_after_rotation_signed_by_old_key_is_ignored_like_a_fork() {
         false,
     )
     .unwrap();
-    let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
-    assert!(store.get(&url).unwrap().is_none());
+    assert!(!common::labeled(
+        &common::synced_log_dir(dir.path()),
+        subject
+    ));
 }
 
 #[test]
-fn rotation_then_new_key_delta_syncs() {
-    let fx = common::build_fixture(true, false);
+fn a_label_signed_by_the_rotated_key_syncs() {
+    let fx = common::build_fixture(false);
     let new_key = common::Signer::new([2u8; 32]);
-    let new_url = common::extend_fixture_with_rotation(&fx, &new_key);
+    common::extend_fixture_with_rotation(&fx, &new_key);
+    let subject = "https://other.example/rotated";
+    let at = common::next_instant(&fx);
+    common::seal_next(&fx, &at, &[common::label_by(&new_key, &fx.domain, subject)]);
     let dir = tempfile::tempdir().unwrap();
 
     let report = graven::sync::run(
@@ -676,9 +514,10 @@ fn rotation_then_new_key_delta_syncs() {
     .unwrap();
     assert_eq!(report.head, 3);
 
-    let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
-    let record = store.get(&new_url).unwrap().unwrap();
-    assert_eq!(record.title, "Rotated Title");
+    assert!(common::labeled(
+        &common::synced_log_dir(dir.path()),
+        subject
+    ));
 }
 
 /// WIST-3 §7.
@@ -735,7 +574,7 @@ fn a_cold_start_adopts_one_declaration_named_by_several_tuples() {
 
 #[test]
 fn incremental_sync_reloads_declarations() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let dir = tempfile::tempdir().unwrap();
     graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -758,14 +597,15 @@ fn incremental_sync_reloads_declarations() {
     .unwrap();
     assert_eq!(report.head, 2);
 
-    let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
-    let record = store.get(&new_url).unwrap().unwrap();
-    assert_eq!(record.title, "Extra Title");
+    assert!(common::holds_declaration(
+        &common::synced_log_dir(dir.path()),
+        &new_url
+    ));
 }
 
 #[test]
 fn withdrawal_removes_record_from_local_index() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -776,15 +616,7 @@ fn withdrawal_removes_record_from_local_index() {
     )
     .unwrap();
 
-    let publisher = common::Signer::new([1u8; 32]);
-    let (alpha_id, _, _) = common::build_delta(
-        &publisher,
-        "https://records.example/alpha",
-        "Alpha Title",
-        Some("Alpha abstract"),
-        "alpha body",
-        None,
-    );
+    let alpha_id = common::item_id_of("https://records.example/alpha");
     common::extend_fixture_with_withdrawal(&fx, &alpha_id);
 
     let report = graven::sync::run(
@@ -802,12 +634,11 @@ fn withdrawal_removes_record_from_local_index() {
         .get("https://records.example/alpha")
         .unwrap()
         .is_none());
-    assert!(store.get("https://records.example/beta").unwrap().is_some());
 }
 
 #[test]
-fn withdrawal_for_unknown_delta_is_noop() {
-    let fx = common::build_fixture(true, false);
+fn withdrawal_for_unknown_item_is_noop() {
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -836,62 +667,12 @@ fn withdrawal_for_unknown_delta_is_noop() {
         .get("https://records.example/alpha")
         .unwrap()
         .is_some());
-    assert!(store.get("https://records.example/beta").unwrap().is_some());
-}
-
-#[test]
-fn delete_delta_removes_record() {
-    let fx = common::build_fixture(true, false);
-    let target = tempfile::tempdir().unwrap();
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        false,
-    )
-    .unwrap();
-
-    let publisher = common::Signer::new([1u8; 32]);
-    let (alpha_id, _, _) = common::build_delta(
-        &publisher,
-        "https://records.example/alpha",
-        "Alpha Title",
-        Some("Alpha abstract"),
-        "alpha body",
-        None,
-    );
-    common::extend_fixture_with_delete(&fx, "https://records.example/alpha", &alpha_id);
-
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        false,
-    )
-    .unwrap();
-
-    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
-    assert!(store
-        .get("https://records.example/alpha")
-        .unwrap()
-        .is_none());
-    assert!(store.get("https://records.example/beta").unwrap().is_some());
 }
 
 #[test]
 fn cold_start_applies_withdrawals_after_snapshot_position() {
-    let fx = common::build_fixture(true, false);
-    let publisher = common::Signer::new([1u8; 32]);
-    let (alpha_id, _, _) = common::build_delta(
-        &publisher,
-        "https://records.example/alpha",
-        "Alpha Title",
-        Some("Alpha abstract"),
-        "alpha body",
-        None,
-    );
+    let fx = common::build_fixture(false);
+    let alpha_id = common::item_id_of("https://records.example/alpha");
     common::extend_fixture_with_withdrawal(&fx, &alpha_id);
 
     let target = tempfile::tempdir().unwrap();
@@ -910,12 +691,11 @@ fn cold_start_applies_withdrawals_after_snapshot_position() {
         .get("https://records.example/alpha")
         .unwrap()
         .is_none());
-    assert!(store.get("https://records.example/beta").unwrap().is_some());
 }
 
 #[test]
 fn withdrawal_removes_tier1_and_embedding_rows_when_present() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -926,26 +706,18 @@ fn withdrawal_removes_tier1_and_embedding_rows_when_present() {
     )
     .unwrap();
 
-    let publisher = common::Signer::new([1u8; 32]);
-    let (alpha_id, _, _) = common::build_delta(
-        &publisher,
-        "https://records.example/alpha",
-        "Alpha Title",
-        Some("Alpha abstract"),
-        "alpha body",
-        None,
-    );
+    let alpha_id = common::item_id_of("https://records.example/alpha");
 
     let conn =
         Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
     conn.execute_batch(
-        "CREATE TABLE extracts(url TEXT, publisher TEXT, delta_id TEXT, extract TEXT);
+        "CREATE TABLE extracts(url TEXT, publisher TEXT, item_id TEXT, extract TEXT);
          CREATE TABLE links(source_url TEXT, target_url TEXT, position INTEGER);
-         CREATE TABLE embeddings(delta_id TEXT PRIMARY KEY, url TEXT, publisher TEXT, vector BLOB);",
+         CREATE TABLE embeddings(item_id TEXT PRIMARY KEY, url TEXT, publisher TEXT, vector BLOB);",
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO extracts(url, publisher, delta_id, extract) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO extracts(url, publisher, item_id, extract) VALUES (?1, ?2, ?3, ?4)",
         (
             "https://records.example/alpha",
             &fx.domain,
@@ -964,7 +736,7 @@ fn withdrawal_removes_tier1_and_embedding_rows_when_present() {
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO embeddings(delta_id, url, publisher, vector) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO embeddings(item_id, url, publisher, vector) VALUES (?1, ?2, ?3, ?4)",
         (
             &alpha_id,
             "https://records.example/alpha",
@@ -1002,58 +774,8 @@ fn withdrawal_removes_tier1_and_embedding_rows_when_present() {
 }
 
 #[test]
-fn an_ignored_delta_leaves_the_index_unchanged() {
-    let fx = common::build_fixture(true, false);
-    let dir = tempfile::tempdir().unwrap();
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        dir.path(),
-        true,
-        false,
-    )
-    .unwrap();
-
-    let sync_before = std::fs::read(common::synced_log_dir(dir.path()).join("sync.json")).unwrap();
-
-    common::extend_fixture_with_forged_delta(&fx);
-
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        dir.path(),
-        true,
-        false,
-    )
-    .unwrap();
-
-    let sync_after = std::fs::read(common::synced_log_dir(dir.path()).join("sync.json")).unwrap();
-    assert_ne!(
-        sync_before, sync_after,
-        "the sync advances past an Epoch whose only Delta is ignored"
-    );
-
-    let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
-    assert!(store
-        .get("https://records.example/alpha")
-        .unwrap()
-        .is_some());
-    assert!(store.get("https://records.example/beta").unwrap().is_some());
-    assert!(store
-        .get("https://records.example/extra-2")
-        .unwrap()
-        .is_none());
-
-    let conn = Connection::open(common::synced_log_dir(dir.path()).join("index.sqlite")).unwrap();
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(count, 2);
-}
-
-#[test]
 fn sync_creates_registry_and_per_log_layout() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
 
     let report = graven::sync::run(
@@ -1083,7 +805,7 @@ fn sync_creates_registry_and_per_log_layout() {
 
 #[test]
 fn legacy_layout_migrates_on_sync() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let synced = tempfile::tempdir().unwrap();
     graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -1131,14 +853,12 @@ fn legacy_layout_migrates_on_sync() {
     assert_eq!(registry.logs.len(), 1);
     assert_eq!(registry.logs[0].log_id, "graven-test-log");
 
-    let store = Store::open(&migrated_dir).unwrap();
-    let extra = store.get(&new_url).unwrap().unwrap();
-    assert_eq!(extra.title, "Extra Title");
+    assert!(common::holds_declaration(&migrated_dir, &new_url));
 }
 
 #[test]
 fn conflicting_base_for_same_log_id_errors() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
 
     graven::sync::run(
@@ -1211,7 +931,7 @@ fn distinct_log_ids_that_sanitize_identically_are_rejected() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        alpha_before.delta_id, alpha_after.delta_id,
+        alpha_before.item_id, alpha_after.item_id,
         "the surviving log's index must be untouched by the rejected collision"
     );
 }
@@ -1248,15 +968,19 @@ fn run_all_syncs_every_registered_log() {
         assert_eq!(report.head, 2);
     }
 
-    let store1 = Store::open(&graven::registry::log_dir(dir.path(), "log-one")).unwrap();
-    assert!(store1.get(&new_url1).unwrap().is_some());
-    let store2 = Store::open(&graven::registry::log_dir(dir.path(), "log-two")).unwrap();
-    assert!(store2.get(&new_url2).unwrap().is_some());
+    assert!(common::holds_declaration(
+        &graven::registry::log_dir(dir.path(), "log-one"),
+        &new_url1
+    ));
+    assert!(common::holds_declaration(
+        &graven::registry::log_dir(dir.path(), "log-two"),
+        &new_url2
+    ));
 }
 
 #[test]
 fn run_all_errors_clearly_on_unmigrated_legacy_dir() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let synced = tempfile::tempdir().unwrap();
     graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -1290,7 +1014,7 @@ fn run_all_errors_clearly_on_unmigrated_legacy_dir() {
 
 #[test]
 fn tier1_flag_is_sticky_once_enabled() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
 
     graven::sync::run(
@@ -1348,7 +1072,7 @@ fn log_id_that_escapes_logs_dir_is_rejected() {
 
 #[test]
 fn failed_migration_restores_legacy_layout_and_registers_nothing() {
-    let fx_a = common::build_fixture(true, false);
+    let fx_a = common::build_fixture(false);
     let fx_b = common::build_fixture_with_log_id("other-log", 21);
 
     let synced = tempfile::tempdir().unwrap();
@@ -1492,7 +1216,7 @@ fn cold_sync_without_tier1_flag_leaves_extracts_absent() {
 
 #[test]
 fn mid_migration_rename_failure_restores_first_file_via_public_api() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let dir = tempfile::tempdir().unwrap();
 
     std::fs::write(dir.path().join("index.sqlite"), b"legacy-index-bytes").unwrap();
@@ -1519,261 +1243,8 @@ fn mid_migration_rename_failure_restores_first_file_via_public_api() {
 }
 
 #[test]
-fn incremental_sync_with_tier1_populates_extract_for_new_url() {
-    let fx = common::build_fixture_with_tier1();
-    let target = tempfile::tempdir().unwrap();
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        true,
-    )
-    .unwrap();
-
-    let new_url = common::extend_fixture(&fx);
-
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        true,
-    )
-    .unwrap();
-
-    let conn =
-        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
-    let extract: String = conn
-        .query_row(
-            "SELECT extract FROM extracts WHERE url = ?1",
-            [&new_url],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(extract, "extra body");
-}
-
-#[test]
-fn incremental_sync_with_tier1_replaces_links_and_extract_on_update() {
-    let fx = common::build_fixture_with_tier1();
-    let target = tempfile::tempdir().unwrap();
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        true,
-    )
-    .unwrap();
-
-    let publisher = common::Signer::new([1u8; 32]);
-    let (alpha_id, _, _) = common::build_delta(
-        &publisher,
-        "https://records.example/alpha",
-        "Alpha Title",
-        Some("Alpha abstract"),
-        "alpha body",
-        None,
-    );
-
-    let (id2, delta2_env, payload2) = common::build_delta_with_links(
-        &publisher,
-        "https://records.example/alpha",
-        "Alpha Title",
-        Some("Alpha abstract"),
-        "alpha body v2",
-        &["https://records.example/second"],
-        Some(&alpha_id),
-    );
-    let hex2 = id2.strip_prefix("sha256:").unwrap();
-    common::write_payload(fx.dir.path(), hex2, &payload2);
-    let wrapped_delta2 = serde_json::json!({"type": "publisher_delta", "body": delta2_env});
-
-    let sealed_at = common::next_instant(&fx);
-    common::seal_next(&fx, &sealed_at, &[wrapped_delta2]);
-
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        true,
-    )
-    .unwrap();
-
-    let conn =
-        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
-    let extract: String = conn
-        .query_row(
-            "SELECT extract FROM extracts WHERE url = ?1",
-            ["https://records.example/alpha"],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(extract, "alpha body v2");
-
-    let mut stmt = conn
-        .prepare("SELECT target_url, position FROM links WHERE source_url = ?1 ORDER BY position")
-        .unwrap();
-    let rows: Vec<(String, i64)> = stmt
-        .query_map(["https://records.example/alpha"], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
-    assert_eq!(
-        rows,
-        vec![("https://records.example/second".to_string(), 0)]
-    );
-}
-
-#[test]
-fn incremental_sync_leaves_tier1_absent_when_payload_fetch_fails() {
-    let fx = common::build_fixture_with_tier1();
-    let target = tempfile::tempdir().unwrap();
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        true,
-    )
-    .unwrap();
-
-    let publisher = common::Signer::new([1u8; 32]);
-
-    let url = "https://records.example/no-payload".to_string();
-    let (_id, delta_env, _payload) = common::build_delta(
-        &publisher,
-        &url,
-        "No Payload Title",
-        None,
-        "unreachable extract",
-        None,
-    );
-    let wrapped_delta = serde_json::json!({"type": "publisher_delta", "body": delta_env});
-
-    let sealed_at = common::next_instant(&fx);
-    common::seal_next(&fx, &sealed_at, &[wrapped_delta]);
-
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        true,
-    )
-    .unwrap();
-
-    let conn =
-        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
-    let title: String = conn
-        .query_row("SELECT title FROM records WHERE url = ?1", [&url], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(title, "");
-
-    let extract_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM extracts WHERE url = ?1",
-            [&url],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(extract_count, 0);
-}
-
-#[test]
-fn incremental_sync_purges_stale_tier1_rows_when_update_payload_fetch_fails() {
-    let fx = common::build_fixture_with_tier1();
-    let target = tempfile::tempdir().unwrap();
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        true,
-    )
-    .unwrap();
-
-    let publisher = common::Signer::new([1u8; 32]);
-    let (alpha_id, _, _) = common::build_delta(
-        &publisher,
-        "https://records.example/alpha",
-        "Alpha Title",
-        Some("Alpha abstract"),
-        "alpha body",
-        None,
-    );
-
-    let (id2, delta2_env, _payload2) = common::build_delta(
-        &publisher,
-        "https://records.example/alpha",
-        "Alpha Title",
-        Some("Alpha abstract"),
-        "alpha body v2",
-        Some(&alpha_id),
-    );
-    let wrapped_delta2 = serde_json::json!({"type": "publisher_delta", "body": delta2_env});
-
-    let sealed_at = common::next_instant(&fx);
-    common::seal_next(&fx, &sealed_at, &[wrapped_delta2]);
-
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        true,
-    )
-    .unwrap();
-
-    let conn =
-        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
-    let (delta_id, title): (String, String) = conn
-        .query_row(
-            "SELECT delta_id, title FROM records WHERE url = ?1",
-            ["https://records.example/alpha"],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        delta_id, id2,
-        "record must reflect the failed-fetch update delta"
-    );
-    assert_eq!(title, "");
-
-    let extract_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM extracts WHERE url = ?1",
-            ["https://records.example/alpha"],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        extract_count, 0,
-        "stale extract from the prior successful sync must not survive a failed-fetch update"
-    );
-
-    let links_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM links WHERE source_url = ?1",
-            ["https://records.example/alpha"],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        links_count, 0,
-        "stale links from the prior successful sync must not survive a failed-fetch update"
-    );
-}
-
-#[test]
 fn a_manifest_disagreeing_with_its_index_entry_is_rejected() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let index_path = fx.dir.path().join("snapshots/index.json");
     let doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
@@ -1796,7 +1267,7 @@ fn a_manifest_disagreeing_with_its_index_entry_is_rejected() {
 
 #[test]
 fn a_log_that_rotates_its_aggregator_key_stays_syncable() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let next = common::Signer::new([21u8; 32]);
 
     let add = common::key_act(
@@ -1830,66 +1301,6 @@ fn a_log_that_rotates_its_aggregator_key_stays_syncable() {
 }
 
 #[test]
-fn malformed_signed_publisher_does_not_abort_sync_or_advance_a_chain() {
-    for field in [
-        None,
-        Some(serde_json::json!("RECORDS.EXAMPLE")),
-        Some(serde_json::Value::Null),
-    ] {
-        let fx = common::build_fixture(true, false);
-        let signer = common::Signer::new([1u8; 32]);
-        let (_, envelope, _) = common::build_delta(
-            &signer,
-            "https://records.example/malformed",
-            "Malformed",
-            None,
-            "body",
-            None,
-        );
-        let mut inner = envelope["delta"].clone();
-        match field {
-            Some(value) => inner["publisher"] = value,
-            None => {
-                inner.as_object_mut().unwrap().remove("publisher");
-            }
-        }
-        let signed =
-            wist_core::envelope::sign_envelope(&inner, "delta", &signer.kid(), &signer.sk).unwrap();
-        let wrapped = serde_json::json!({"type":"publisher_delta", "body":signed});
-        let at = common::next_instant(&fx);
-        common::seal_next(&fx, &at, &[wrapped]);
-        let target = tempfile::tempdir().unwrap();
-        graven::sync::run(
-            fx.anchor_path().to_str().unwrap(),
-            &fx.base_url,
-            target.path(),
-            true,
-            false,
-        )
-        .unwrap();
-        let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
-        assert!(store
-            .get("https://records.example/malformed")
-            .unwrap()
-            .is_none());
-        assert!(store
-            .get("https://records.example/alpha")
-            .unwrap()
-            .is_some());
-        let conn =
-            Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM chain_tips WHERE url = ?1",
-                ["https://records.example/malformed"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-}
-
-#[test]
 fn cold_start_enforces_the_adopted_sequence_floor() {
     let fx = common::build_fixture_with_state(Vec::new(), 5);
     let new_key = common::Signer::new([7u8; 32]);
@@ -1914,18 +1325,10 @@ fn cold_start_enforces_the_adopted_sequence_floor() {
 #[test]
 fn cold_start_adopts_withdrawal_and_label_tuples() {
     use wist_core::objects::{LabelEntry, StateEntry, WithdrawalEntry};
-    let publisher = common::Signer::new([1u8; 32]);
-    let (alpha_id, _, _) = common::build_delta(
-        &publisher,
-        "https://records.example/alpha",
-        "Alpha Title",
-        Some("Alpha abstract"),
-        "alpha body",
-        None,
-    );
+    let alpha_id = common::item_id_of("https://records.example/alpha");
     let extra = vec![
         StateEntry::Withdrawal(WithdrawalEntry {
-            delta_id: alpha_id.clone(),
+            item_id: alpha_id.clone(),
             publisher: "records.example".into(),
             sealing_height: 0,
         }),
@@ -1954,7 +1357,7 @@ fn cold_start_adopts_withdrawal_and_label_tuples() {
     let conn =
         Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
     let withdrawn: Vec<(String, String, i64)> = conn
-        .prepare("SELECT delta_id, publisher, height FROM withdrawals")
+        .prepare("SELECT item_id, publisher, height FROM withdrawals")
         .unwrap()
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .unwrap()
@@ -1971,70 +1374,8 @@ fn cold_start_adopts_withdrawal_and_label_tuples() {
             .get("https://records.example/alpha")
             .unwrap()
             .is_none(),
-        "a withdrawn Delta's content leaves the adopted index"
+        "a withdrawn Item's content leaves the adopted index"
     );
-    assert!(store.get("https://records.example/beta").unwrap().is_some());
-}
-
-#[test]
-fn a_withdrawal_sealed_beside_its_delta_keeps_the_delta_out_of_the_index() {
-    let fx = common::build_fixture(true, false);
-    let target = tempfile::tempdir().unwrap();
-    graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        false,
-    )
-    .unwrap();
-
-    let publisher = common::Signer::new([1u8; 32]);
-    let url = "https://records.example/gamma";
-    let (gamma_id, delta_env, payload) =
-        common::build_delta(&publisher, url, "Gamma Title", None, "gamma body", None);
-    common::write_payload(
-        fx.dir.path(),
-        gamma_id.trim_start_matches("sha256:"),
-        &payload,
-    );
-    let update = serde_json::json!({
-        "wist_version": "1.0.0",
-        "action": "payload_withdrawal",
-        "subject": fx.domain,
-        "details": {"delta_id": gamma_id, "legal_basis": "court order", "jurisdiction": "EU"},
-        "effective_at": "2026-08-09T14:00:00Z",
-    });
-    let withdrawal =
-        wist_core::envelope::sign_envelope(&update, "update", "log1", &fx.log.sk).unwrap();
-    seal_next(
-        &fx,
-        "2026-08-09T14:00:00Z",
-        &[
-            serde_json::json!({"type": "registry_update", "body": withdrawal}),
-            serde_json::json!({"type": "publisher_delta", "body": delta_env}),
-        ],
-    );
-
-    let report = graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        false,
-    )
-    .unwrap();
-    assert_eq!(report.head, 2);
-    let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
-    assert!(store.get(url).unwrap().is_none());
-    let conn =
-        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
-    let tip: String = conn
-        .query_row("SELECT tip FROM chain_tips WHERE url = ?1", [url], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(tip, gamma_id, "a withdrawn Delta still moves its chain tip");
 }
 
 fn parameter_change(
@@ -2051,23 +1392,14 @@ fn parameter_change(
     serde_json::json!({"type": "registry_update", "body": body})
 }
 
-/// Above WIST-4 §5's floor of 65 537 octets; low enough that a few hundred Deltas cross it.
+/// Above WIST-4 §5's floor of 65 537 octets; low enough that a few hundred Declarations cross it.
 const CAP: i64 = 70_000;
 
-fn bulk_deltas(fx: &common::Fixture, count: usize) -> Vec<serde_json::Value> {
+fn bulk_declarations(count: usize) -> Vec<serde_json::Value> {
     let publisher = common::Signer::new([1u8; 32]);
     (0..count)
         .map(|i| {
-            let (id, delta_env, payload) = common::build_delta(
-                &publisher,
-                &format!("https://records.example/bulk-{i}"),
-                &format!("Bulk title {i} {}", "x".repeat(120)),
-                Some(&"y".repeat(200)),
-                "bulk body",
-                None,
-            );
-            common::write_payload(fx.dir.path(), id.strip_prefix("sha256:").unwrap(), &payload);
-            serde_json::json!({"type": "publisher_delta", "body": delta_env})
+            common::declaration_entry(&publisher, &format!("bulk-{i}-{}.example", "x".repeat(50)))
         })
         .collect()
 }
@@ -2106,7 +1438,7 @@ fn cold_sync(fx: &common::Fixture) -> Result<(graven::sync::SyncReport, i64), St
 
 #[test]
 fn an_accepted_cap_reduction_rejects_a_later_epoch_above_it() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let (_, size) = seal_next(
         &fx,
         "2026-08-09T14:00:00Z",
@@ -2118,7 +1450,7 @@ fn an_accepted_cap_reduction_rejects_a_later_epoch_above_it() {
         )],
     );
     assert!(size <= CAP as u64);
-    let (_, size) = seal_next(&fx, "2026-08-16T14:00:00Z", &bulk_deltas(&fx, 200));
+    let (_, size) = seal_next(&fx, "2026-08-16T14:00:00Z", &bulk_declarations(200));
     assert!(size > CAP as u64);
     let error = cold_sync(&fx).unwrap_err();
     assert!(
@@ -2129,7 +1461,7 @@ fn an_accepted_cap_reduction_rejects_a_later_epoch_above_it() {
 
 #[test]
 fn a_cap_reduction_accepts_epochs_within_it() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let (_, _) = seal_next(
         &fx,
         "2026-08-09T14:00:00Z",
@@ -2140,7 +1472,7 @@ fn a_cap_reduction_accepts_epochs_within_it() {
             "2026-08-16T14:00:00Z",
         )],
     );
-    let (head, size) = seal_next(&fx, "2026-08-16T14:00:00Z", &bulk_deltas(&fx, 1));
+    let (head, size) = seal_next(&fx, "2026-08-16T14:00:00Z", &bulk_declarations(1));
     assert!(size <= CAP as u64);
     let (report, accepted) = cold_sync(&fx).unwrap();
     assert_eq!(report.head, head);
@@ -2149,8 +1481,8 @@ fn a_cap_reduction_accepts_epochs_within_it() {
 
 #[test]
 fn a_cap_below_a_sealed_epoch_is_not_accepted() {
-    let fx = common::build_fixture(true, false);
-    let mut entries = bulk_deltas(&fx, 200);
+    let fx = common::build_fixture(false);
+    let mut entries = bulk_declarations(200);
     entries.push(parameter_change(
         &fx,
         "epoch_cap_bytes",
@@ -2169,7 +1501,7 @@ fn a_cap_below_a_sealed_epoch_is_not_accepted() {
 
 #[test]
 fn a_fractional_epoch_timestamp_fails_the_sync() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     fx.log_state()
         .seal_off_profile("2026-08-09T14:00:00.5Z", &[]);
     let error = cold_sync(&fx).unwrap_err();
@@ -2181,146 +1513,10 @@ fn a_fractional_epoch_timestamp_fails_the_sync() {
 
 #[test]
 fn an_off_grid_epoch_timestamp_fails_the_sync() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     fx.log_state().seal_off_profile("2026-08-09T14:00:01Z", &[]);
     let error = cold_sync(&fx).unwrap_err();
     assert!(error.contains("off the cadence grid"), "{error}");
-}
-
-fn delta_observed(
-    publisher: &common::Signer,
-    url: &str,
-    observed_at: &str,
-    version: &str,
-) -> (String, serde_json::Value, serde_json::Value) {
-    let salt = wist_core::crypto::b64u_encode(&[7u8; 16]);
-    let content = serde_json::json!({
-        "extract": format!("body of {url}"),
-        "links": {"total": 0, "urls": []},
-        "summary": {"title": format!("Title of {url}")},
-    });
-    let payload = serde_json::json!({"wist_version": "1.0.0", "salt": salt, "content": content});
-    let delta = serde_json::json!({
-        "wist_version": version,
-        "publisher": "records.example",
-        "url": url,
-        "change_type": "new",
-        "observed_at": observed_at,
-        "payload": {
-            "commitment": wist_core::delta::make_commitment(&salt, &content).unwrap(),
-            "alg": "HMAC-SHA256",
-            "bytes": wist_core::delta::content_bytes(&content).unwrap(),
-        },
-        "meta": {"lang": "en"},
-    });
-    let envelope =
-        wist_core::envelope::sign_envelope(&delta, "delta", &publisher.kid(), &publisher.sk)
-            .unwrap();
-    (
-        wist_core::delta::delta_id(&delta).unwrap(),
-        envelope,
-        payload,
-    )
-}
-
-#[test]
-fn sealed_deltas_are_checked_against_their_epoch_clock_and_accepted_allowance() {
-    let fx = common::build_fixture(true, false);
-    let publisher = common::Signer::new([1u8; 32]);
-    let mut entries = vec![parameter_change(
-        &fx,
-        "clock_skew_seconds",
-        0,
-        "2026-08-16T14:00:00Z",
-    )];
-    let mut sealed = Vec::new();
-    for (url, observed_at, version) in [
-        (
-            "https://records.example/within-default",
-            "2026-08-09T14:10:00Z",
-            "1.0.0",
-        ),
-        (
-            "https://records.example/beyond-default",
-            "2026-08-09T14:10:00.000000000000000001Z",
-            "1.0.0",
-        ),
-        (
-            "https://records.example/patch-version",
-            "2026-08-09T13:00:00Z",
-            "1.7.3",
-        ),
-        (
-            "https://records.example/other-major",
-            "2026-08-09T13:00:00Z",
-            "2.0.0",
-        ),
-    ] {
-        let (id, envelope, payload) = delta_observed(&publisher, url, observed_at, version);
-        common::write_payload(fx.dir.path(), id.strip_prefix("sha256:").unwrap(), &payload);
-        sealed.push(url);
-        entries.push(serde_json::json!({"type": "publisher_delta", "body": envelope}));
-    }
-    seal_next(&fx, "2026-08-09T14:00:00Z", &entries);
-    let mut entries = Vec::new();
-    for (url, observed_at) in [
-        (
-            "https://records.example/at-zero-allowance",
-            "2026-08-16T14:00:00Z",
-        ),
-        (
-            "https://records.example/past-zero-allowance",
-            "2026-08-16T14:00:00.5Z",
-        ),
-    ] {
-        let (id, envelope, payload) = delta_observed(&publisher, url, observed_at, "1.0.0");
-        common::write_payload(fx.dir.path(), id.strip_prefix("sha256:").unwrap(), &payload);
-        sealed.push(url);
-        entries.push(serde_json::json!({"type": "publisher_delta", "body": envelope}));
-    }
-    let (head, _) = seal_next(&fx, "2026-08-16T14:00:00Z", &entries);
-    let target = tempfile::tempdir().unwrap();
-    let report = graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        false,
-    )
-    .unwrap();
-    assert_eq!(report.head, head);
-    let conn =
-        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
-    let mut stmt = conn
-        .prepare("SELECT url FROM records WHERE url LIKE 'https://records.example/%' ORDER BY url")
-        .unwrap();
-    let urls: Vec<String> = stmt
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    let materialized: Vec<&str> = sealed
-        .iter()
-        .copied()
-        .filter(|url| urls.iter().any(|u| u == url))
-        .collect();
-    assert_eq!(
-        materialized,
-        [
-            "https://records.example/within-default",
-            "https://records.example/patch-version",
-            "https://records.example/at-zero-allowance",
-        ],
-        "materialized {urls:?}"
-    );
-    let tips: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM chain_tips WHERE url IN ('https://records.example/beyond-default', 'https://records.example/other-major', 'https://records.example/past-zero-allowance')",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(tips, 0, "an ignored Delta moves no chain tip");
 }
 
 fn synced_state(target: &std::path::Path) -> graven::sync::SyncState {
@@ -2334,7 +1530,7 @@ fn count(conn: &Connection, table: &str) -> i64 {
 
 #[test]
 fn a_sync_that_cannot_commit_leaves_cursor_keys_and_index_unchanged() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let dir = tempfile::tempdir().unwrap();
     graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -2379,9 +1575,10 @@ fn a_sync_that_cannot_commit_leaves_cursor_keys_and_index_unchanged() {
     assert_eq!(after.root, before.root);
     let conn = Connection::open(&index).unwrap();
     assert_eq!(snapshot(&conn), counts_before);
-    let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
-    assert!(store.get(&new_url).unwrap().is_none());
-    drop(store);
+    assert!(!common::holds_declaration(
+        &common::synced_log_dir(dir.path()),
+        &new_url
+    ));
     drop(conn);
 
     let report = graven::sync::run(
@@ -2394,13 +1591,15 @@ fn a_sync_that_cannot_commit_leaves_cursor_keys_and_index_unchanged() {
     .unwrap();
     assert_eq!(report.head, 2);
     assert_eq!(synced_state(dir.path()).epoch_number, 2);
-    let store = Store::open(&common::synced_log_dir(dir.path())).unwrap();
-    assert!(store.get(&new_url).unwrap().is_some());
+    assert!(common::holds_declaration(
+        &common::synced_log_dir(dir.path()),
+        &new_url
+    ));
 }
 
 #[test]
 fn the_sync_cursor_lives_in_the_index_not_the_mirror_file() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let dir = tempfile::tempdir().unwrap();
     graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -2432,7 +1631,7 @@ fn the_sync_cursor_lives_in_the_index_not_the_mirror_file() {
 
 #[test]
 fn a_store_carrying_only_the_sync_file_is_read_and_imported() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let dir = tempfile::tempdir().unwrap();
     graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -2463,7 +1662,7 @@ fn a_store_carrying_only_the_sync_file_is_read_and_imported() {
 
 #[test]
 fn a_cold_start_replaces_the_verifying_index_a_crash_left_behind() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     let log_dir = common::synced_log_dir(target.path());
     std::fs::create_dir_all(&log_dir).unwrap();

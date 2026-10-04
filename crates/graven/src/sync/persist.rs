@@ -4,7 +4,6 @@ use crate::error::{Error, Result};
 use crate::keyset::KeyHistory;
 use rusqlite::{Connection, OptionalExtension};
 use wist_core::aggregator_keys::Registry;
-use wist_core::chain::ChainTips;
 use wist_core::objects::{AggregatorKeyEntry, Anchor};
 use wist_core::parameters::Amendment;
 use wist_core::withdrawal::WithdrawalReplay;
@@ -128,10 +127,10 @@ pub fn load_history(conn: &Connection) -> Result<KeyHistory> {
     }
 }
 
-/// WIST-3 §6.2: a later act of the same Delta keeps the first height.
+/// WIST-3 §6.2: a later act of the same Item keeps the first height.
 pub(super) fn load_withdrawn(conn: &Connection) -> Result<WithdrawalReplay> {
     conn.execute_batch(crate::store::CREATE_WITHDRAWALS)?;
-    let mut stmt = conn.prepare("SELECT delta_id, publisher, height FROM withdrawals")?;
+    let mut stmt = conn.prepare("SELECT item_id, publisher, height FROM withdrawals")?;
     let mut replay = WithdrawalReplay::new();
     for row in stmt.query_map([], |row| {
         Ok((
@@ -140,22 +139,22 @@ pub(super) fn load_withdrawn(conn: &Connection) -> Result<WithdrawalReplay> {
             row.get::<_, i64>(2)?,
         ))
     })? {
-        let (delta_id, publisher, height) = row?;
-        replay.adopt(&delta_id, &publisher, height.max(0) as u64);
+        let (item_id, publisher, height) = row?;
+        replay.adopt(&item_id, &publisher, height.max(0) as u64);
     }
     Ok(replay)
 }
 
 pub(super) fn record_withdrawal(
     conn: &Connection,
-    delta_id: &str,
+    item_id: &str,
     publisher: &str,
     height: u64,
 ) -> Result<()> {
     conn.execute_batch(crate::store::CREATE_WITHDRAWALS)?;
     conn.execute(
-        "INSERT OR IGNORE INTO withdrawals(delta_id, publisher, height) VALUES (?1, ?2, ?3)",
-        (delta_id, publisher, height as i64),
+        "INSERT OR IGNORE INTO withdrawals(item_id, publisher, height) VALUES (?1, ?2, ?3)",
+        (item_id, publisher, height as i64),
     )?;
     Ok(())
 }
@@ -171,35 +170,6 @@ pub(super) fn save_history(conn: &Connection, history: &KeyHistory) -> Result<()
     Ok(())
 }
 
-pub(super) fn load_chain_tips(conn: &Connection) -> Result<ChainTips> {
-    let mut tips = ChainTips::new();
-    let mut stmt = conn.prepare("SELECT publisher, url, tip FROM chain_tips")?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (publisher, url, tip) in rows {
-        tips.adopt(&publisher, &url, &tip);
-    }
-    Ok(tips)
-}
-
-pub(super) fn save_chain_tips(conn: &Connection, tips: &ChainTips) -> Result<()> {
-    for (publisher, url, tip) in tips.tips() {
-        conn.execute(
-            "INSERT INTO chain_tips(publisher, url, tip) VALUES (?1, ?2, ?3)
-             ON CONFLICT(publisher, url) DO UPDATE SET tip = excluded.tip",
-            (publisher, url, tip),
-        )?;
-    }
-    Ok(())
-}
-
 /// Committed in the same transaction as the index rows it describes.
 pub const CREATE_SYNC_STATE: &str = "CREATE TABLE IF NOT EXISTS sync_state(id INTEGER PRIMARY KEY CHECK(id = 1), state TEXT NOT NULL)";
 
@@ -210,7 +180,7 @@ pub fn read_sync_state(bytes: &[u8]) -> Result<SyncState> {
     let format = value.get("format").and_then(serde_json::Value::as_u64);
     if format != Some(u64::from(super::SYNC_STATE_FORMAT)) {
         return Err(Error::Verify(
-            "the stored sync state is in a superseded format, from before the Log became one growing tree, from before its fields were renamed to epoch_number/tree_size, or from before the Aggregator key registry carried each key's accepted acts; remove the log's directory and follow the Log again".into(),
+            "the stored sync state is in a superseded format, from before the Log became one growing tree, from before its fields were renamed to epoch_number/tree_size, from before the Aggregator key registry carried each key's accepted acts, or from before records were keyed by Item ID; remove the log's directory and follow the Log again".into(),
         ));
     }
     Ok(serde_json::from_value(value)?)
@@ -528,21 +498,6 @@ fn host_of(url: &str) -> String {
         .or_else(|| url.strip_prefix("http://"))
         .map_or(url, |rest| rest.split('/').next().unwrap_or(rest))
         .to_string()
-}
-
-pub(super) fn record_height(
-    conn: &Connection,
-    url: &str,
-    publisher: &str,
-    height: u64,
-) -> Result<()> {
-    conn.execute_batch(crate::store::CREATE_RANKING)?;
-    conn.execute(
-        "INSERT INTO record_heights(url, publisher, height) VALUES (?1, ?2, ?3)
-         ON CONFLICT(url, publisher) DO UPDATE SET height = excluded.height",
-        (url, publisher, height as i64),
-    )?;
-    Ok(())
 }
 
 pub(super) fn replace_inlinks(

@@ -20,28 +20,18 @@ fn embeddings_count(target: &std::path::Path) -> i64 {
 }
 
 fn alpha_beta_ids() -> (String, String) {
-    let publisher = common::Signer::new([1u8; 32]);
-    let (alpha_id, _, _) = common::build_delta(
-        &publisher,
-        "https://records.example/alpha",
-        "Alpha Title",
-        Some("Alpha abstract"),
-        "alpha body",
-        None,
-    );
-    let (beta_id, _, _) = common::build_delta(
-        &publisher,
-        "https://records.example/beta",
-        "Beta Title",
-        Some("Beta abstract"),
-        "beta body",
-        None,
-    );
-    (alpha_id, beta_id)
+    (
+        common::item_id_of("https://records.example/alpha"),
+        common::item_id_of("https://records.example/beta"),
+    )
 }
 
 fn sync_fixture() -> (common::Fixture, tempfile::TempDir) {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture_with_tier0(vec![common::RecordFixture::new(
+        "https://records.example/beta",
+        "records.example",
+        "Beta Title",
+    )]);
     let target = tempfile::tempdir().unwrap();
     graven::sync::run(
         fx.anchor_path().to_str().unwrap(),
@@ -235,7 +225,7 @@ fn dim_mismatch_row_rejects() {
 }
 
 #[test]
-fn unknown_delta_id_is_skipped_others_import() {
+fn unknown_item_id_is_skipped_others_import() {
     let (fx, target) = sync_fixture();
     let (alpha_id, _) = alpha_beta_ids();
     let (content_digest, tree_size) = read_sync_state(target.path());
@@ -278,7 +268,7 @@ fn unknown_delta_id_is_skipped_others_import() {
 }
 
 #[test]
-fn all_unknown_delta_ids_rejects() {
+fn all_unknown_item_ids_rejects() {
     let (fx, target) = sync_fixture();
     let (content_digest, tree_size) = read_sync_state(target.path());
     let unknown1 = format!("sha256:{}", "e".repeat(64));
@@ -438,7 +428,7 @@ fn withdrawal_purges_embedding_row() {
         Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
     let alpha_rows: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM embeddings WHERE delta_id = ?1",
+            "SELECT COUNT(*) FROM embeddings WHERE item_id = ?1",
             [&alpha_id],
             |r| r.get(0),
         )

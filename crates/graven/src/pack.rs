@@ -50,7 +50,7 @@ pub struct PackEnvelope {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VectorRow {
-    delta_id: String,
+    item_id: String,
     url: String,
     publisher: String,
     vector: Vec<f32>,
@@ -173,7 +173,7 @@ pub fn import(dir: &Path, log_id: &str, pack_path: &Path, key_b64u: &str) -> Res
         if row.vector.len() != pack.model.dim as usize {
             return Err(Error::Verify(format!(
                 "vector for {} has length {}, expected dim {}",
-                row.delta_id,
+                row.item_id,
                 row.vector.len(),
                 pack.model.dim
             )));
@@ -182,7 +182,7 @@ pub fn import(dir: &Path, log_id: &str, pack_path: &Path, key_b64u: &str) -> Res
 
     let index_path = log_dir.join("index.sqlite");
     let conn = Connection::open(&index_path)?;
-    let mut stmt = conn.prepare("SELECT delta_id FROM records")?;
+    let mut stmt = conn.prepare("SELECT item_id FROM records")?;
     let known: HashSet<String> = stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<HashSet<_>>>()?;
@@ -191,7 +191,7 @@ pub fn import(dir: &Path, log_id: &str, pack_path: &Path, key_b64u: &str) -> Res
     let mut imported_rows = Vec::new();
     let mut skipped = 0u64;
     for row in rows {
-        if known.contains(&row.delta_id) {
+        if known.contains(&row.item_id) {
             imported_rows.push(row);
         } else {
             skipped += 1;
@@ -207,9 +207,9 @@ pub fn import(dir: &Path, log_id: &str, pack_path: &Path, key_b64u: &str) -> Res
     tx.execute("DELETE FROM embeddings", [])?;
     for row in &imported_rows {
         tx.execute(
-            "INSERT OR REPLACE INTO embeddings(delta_id, url, publisher, vector) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO embeddings(item_id, url, publisher, vector) VALUES (?1, ?2, ?3, ?4)",
             (
-                &row.delta_id,
+                &row.item_id,
                 &row.url,
                 &row.publisher,
                 vector_to_blob(&row.vector),
@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn vector_row_rejects_unknown_fields() {
-        let json = r#"{"delta_id":"sha256:a","url":"https://x","publisher":"x.example","vector":[0.1],"extra":true}"#;
+        let json = r#"{"item_id":"sha256:a","url":"https://x","publisher":"x.example","vector":[0.1],"extra":true}"#;
         assert!(serde_json::from_str::<VectorRow>(json).is_err());
     }
 

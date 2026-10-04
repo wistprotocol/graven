@@ -754,7 +754,7 @@ fn sync_from(
 /// height.
 #[test]
 fn a_forged_note_at_the_verified_head_is_e03_against_its_source_and_leaves_no_evidence() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     let report = sync_with(&fx, target.path(), &[]).unwrap();
     assert_eq!(report.head, 1);
@@ -794,7 +794,7 @@ fn a_checkpoint_below_the_head_is_judged_under_the_keys_valid_at_its_own_height(
     for (offered_epoch, expected, evidence) in
         [(5u64, "WIST3-E02", true), (2u64, "WIST3-E03", false)]
     {
-        let fx = common::build_fixture(true, false);
+        let fx = common::build_fixture(false);
         let second = common::Signer::new([41u8; 32]);
         for epoch in 2..=10u64 {
             let at = common::next_instant(&fx);
@@ -851,7 +851,7 @@ fn a_checkpoint_below_the_head_is_judged_under_the_keys_valid_at_its_own_height(
 /// WIST-3 §5, the first Equivocation form.
 #[test]
 fn two_checkpoints_stating_one_tree_size_and_different_roots_are_divergence() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 1);
 
@@ -881,24 +881,14 @@ fn two_checkpoints_stating_one_tree_size_and_different_roots_are_divergence() {
 /// WIST-3 §5, the third Equivocation form.
 #[test]
 fn a_fork_below_the_verified_head_is_divergence_with_the_forks_tiles_preserved() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 1);
     let honest_size = fx.head_tree_size();
 
     let publisher = common::Signer::new([1u8; 32]);
     let fork_entries: Vec<Value> = (0..honest_size + 2)
-        .map(|i| {
-            let (_, env, _) = common::build_delta(
-                &publisher,
-                &format!("https://records.example/fork-{i}"),
-                "Fork",
-                None,
-                "fork body",
-                None,
-            );
-            serde_json::json!({"type": "publisher_delta", "body": env})
-        })
+        .map(|i| common::declaration_entry(&publisher, &format!("fork-{i}.example")))
         .collect();
     let mut forked = common::Log::new(
         fx.dir.path(),
@@ -973,7 +963,7 @@ fn a_size_zero_checkpoint_stating_another_root_is_divergence() {
 /// WIST-3 §3.1.
 #[test]
 fn an_archived_checkpoint_no_source_serves_below_an_offered_one_is_that_epochs_e01() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 1);
 
@@ -1003,18 +993,14 @@ fn recorded_head(target: &Path) -> u64 {
         .epoch_number
 }
 
-fn holds(target: &Path, url: &str) -> bool {
-    graven::store::Store::open(&common::synced_log_dir(target))
-        .unwrap()
-        .get(url)
-        .unwrap()
-        .is_some()
+fn holds(target: &Path, domain: &str) -> bool {
+    common::holds_declaration(&common::synced_log_dir(target), domain)
 }
 
 /// WIST-3 §8 step 8.
 #[test]
 fn a_corrupt_checkpoint_at_every_source_applies_the_epochs_below_it_and_reports_its_e03() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 1);
 
@@ -1042,7 +1028,7 @@ fn a_corrupt_checkpoint_at_every_source_applies_the_epochs_below_it_and_reports_
 /// WIST-3 §9 and §8 step 8.
 #[test]
 fn an_archived_checkpoint_no_source_holds_applies_the_epochs_below_it_and_reports_its_e01() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 1);
 
@@ -1066,7 +1052,7 @@ fn an_archived_checkpoint_no_source_holds_applies_the_epochs_below_it_and_report
 /// WIST-3 §8 step 8.
 #[test]
 fn a_cold_start_that_adopted_the_snapshots_epoch_stays_registered_when_the_walk_stops() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     common::extend_fixture(&fx);
     std::fs::remove_file(fx.dir.path().join("log/checkpoints/000000001")).unwrap();
 
@@ -1093,7 +1079,7 @@ fn a_cold_start_that_adopted_the_snapshots_epoch_stays_registered_when_the_walk_
 /// WIST-3 §5 and §9's `WIST3-E02`.
 #[test]
 fn a_divergent_checkpoint_applies_no_epoch_of_the_run_and_halts_the_log() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 1);
 
@@ -1135,7 +1121,7 @@ fn a_divergent_checkpoint_applies_no_epoch_of_the_run_and_halts_the_log() {
 /// WIST-3 §9's `WIST3-E03`.
 #[test]
 fn a_cold_start_asks_another_source_for_an_archived_checkpoint_whose_signature_fails() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let mirror_dir = tempfile::tempdir().unwrap();
     common::copy_dir(fx.dir.path(), mirror_dir.path());
     let (mirror_addr, mirror_requests) = common::serve_recording(mirror_dir.path().to_path_buf());
@@ -1179,7 +1165,7 @@ fn a_cold_start_asks_another_source_for_an_archived_checkpoint_whose_signature_f
 /// WIST-3 §5.
 #[test]
 fn a_verified_divergence_halts_every_later_sync_of_that_log() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 1);
 
@@ -1211,7 +1197,7 @@ fn a_verified_divergence_halts_every_later_sync_of_that_log() {
 /// WIST-3 §5.
 #[test]
 fn a_head_kept_short_of_the_quorum_is_reported_stale() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let witness = common::Witness::new("witness-a.example", [79u8; 32]);
     let roster = vec![witness.verifier_key()];
     let target = tempfile::tempdir().unwrap();
@@ -1240,7 +1226,7 @@ fn a_head_kept_short_of_the_quorum_is_reported_stale() {
 /// WIST-3 §5.
 #[test]
 fn a_recent_head_is_not_reported_stale() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     let now = jiff::Timestamp::now().as_second();
     let at = wist_core::timestamp::instant(now.div_euclid(3600) * 3600).unwrap();
@@ -1253,7 +1239,7 @@ fn a_recent_head_is_not_reported_stale() {
 /// WIST-3 §5.
 #[test]
 fn a_head_no_source_serves_reports_the_verified_heads_staleness() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     assert_eq!(sync_with(&fx, target.path(), &[]).unwrap().head, 1);
 
@@ -1272,7 +1258,7 @@ fn a_head_no_source_serves_reports_the_verified_heads_staleness() {
 /// WIST-3 §5.
 #[test]
 fn the_unwitnessed_record_stays_with_the_checkpoint_it_belongs_to() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let witness = common::Witness::new("witness-a.example", [78u8; 32]);
     let roster = vec![witness.verifier_key()];
     let target = tempfile::tempdir().unwrap();
@@ -1302,22 +1288,10 @@ fn the_unwitnessed_record_stays_with_the_checkpoint_it_belongs_to() {
 /// WIST-3 §6.
 #[test]
 fn an_epoch_whose_leaves_cross_a_tile_boundary_is_verified_and_applied() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let publisher = common::Signer::new([1u8; 32]);
     let entries: Vec<Value> = (0..300)
-        .map(|i| {
-            let url = format!("https://records.example/wide-{i}");
-            let (id, env, payload) = common::build_delta(
-                &publisher,
-                &url,
-                &format!("Wide {i}"),
-                None,
-                "wide body",
-                None,
-            );
-            common::write_payload(fx.dir.path(), id.strip_prefix("sha256:").unwrap(), &payload);
-            serde_json::json!({"type": "publisher_delta", "body": env})
-        })
+        .map(|i| common::declaration_entry(&publisher, &format!("wide-{i}.example")))
         .collect();
     common::seal_next(&fx, "2026-08-09T14:00:00Z", &entries);
     assert!(
@@ -1328,17 +1302,13 @@ fn an_epoch_whose_leaves_cross_a_tile_boundary_is_verified_and_applied() {
     let target = tempfile::tempdir().unwrap();
     let report = sync_with(&fx, target.path(), &[]).unwrap();
     assert_eq!(report.tree_size, fx.head_tree_size());
-    let store = graven::store::Store::open(&common::synced_log_dir(target.path())).unwrap();
-    assert!(store
-        .get("https://records.example/wide-299")
-        .unwrap()
-        .is_some());
+    assert!(holds(target.path(), "wide-299.example"));
 }
 
 /// WIST-3 §5.
 #[test]
 fn an_empty_roster_at_quorum_zero_adopts_the_head_and_records_it_unwitnessed() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     let report = sync_with(&fx, target.path(), &[]).unwrap();
     assert!(report.unwitnessed);
@@ -1349,7 +1319,7 @@ fn an_empty_roster_at_quorum_zero_adopts_the_head_and_records_it_unwitnessed() {
 
 #[test]
 fn a_sync_state_in_the_superseded_format_is_refused_with_an_instruction_to_resync() {
-    let fx = common::build_fixture(true, false);
+    let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     sync_with(&fx, target.path(), &[]).unwrap();
     let log_dir = common::synced_log_dir(target.path());
