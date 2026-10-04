@@ -87,7 +87,7 @@ fn rejected_at(error: &str, height: u64) -> bool {
 fn record_urls(target: &std::path::Path) -> Vec<String> {
     common::state_tuples(&common::synced_log_dir(target))
         .into_iter()
-        .filter(|tuple| tuple[0] == "record")
+        .filter(|tuple| tuple[0] == "record" && tuple[1] != common::RECORDS)
         .map(|tuple| tuple[2].as_str().unwrap().to_owned())
         .collect()
 }

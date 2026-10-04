@@ -9,7 +9,7 @@ fn sync_from(
     dir: &Path,
     mirrors: &[String],
 ) -> Result<graven::sync::SyncReport, graven::Error> {
-    graven::sync::follow(
+    let outcome = graven::sync::follow(
         &graven::sync::Follow {
             anchor: fx.anchor_path().to_str().unwrap(),
             log_base: &fx.base_url,
@@ -19,7 +19,11 @@ fn sync_from(
             allow_http: true,
         },
         dir,
-    )
+    );
+    if outcome.is_ok() {
+        common::assert_records_materialized(&common::synced_log_dir(dir));
+    }
+    outcome
 }
 
 fn mirror_of(fx: &common::Fixture) -> (tempfile::TempDir, String, Arc<Mutex<Vec<String>>>) {

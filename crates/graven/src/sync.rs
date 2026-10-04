@@ -731,6 +731,8 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
         walk_floor: Some(anchor.epoch_number()),
     };
     save_sync_state(&installed.conn, &anchor_state)?;
+    let resumed = load_replay(&installed.conn, &anchor, anchor_state.walk_floor)?;
+    install::materialize_tuples(&installed.conn, &resumed, anchor.epoch_number())?;
     let cadence = installed.chain.cadence();
     let offered = offered_above(
         context,
@@ -802,7 +804,7 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
             installed.chain = state.chain;
             state.replay
         }
-        None => load_replay(&installed.conn, &anchor, anchor_state.walk_floor)?,
+        None => resumed,
     };
     for entry in &verified {
         let adopted_here = entry.checkpoint.epoch_number() == adopted.epoch_number();

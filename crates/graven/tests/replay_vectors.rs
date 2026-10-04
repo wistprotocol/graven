@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use wist_core::crypto::{hex_decode, PublicKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::item::Kind;
-use wist_core::objects::{Anchor, GenesisKey, StateEntry};
+use wist_core::objects::{AggregatorKeyEntry, Anchor, GenesisKey, ParameterEntry, StateEntry};
 use wist_core::parameters::{Amendment, Schedule};
 use wist_core::sealing::{carried_label_ids, Epoch, Parameters, Replay};
 use wist_core::timestamp::log_seconds;
@@ -318,6 +318,43 @@ impl ServedLog {
         .map_err(|error| error.to_string());
         common::assert_records_materialized(&self.log_dir(target));
         outcome
+    }
+
+    fn snapshot(&self, height: u64, date: &str, mut tuples: Vec<StateEntry>, held: &Held) {
+        let at = |seconds: i64| wist_core::timestamp::instant(seconds).unwrap();
+        tuples.push(StateEntry::AggregatorKey(AggregatorKeyEntry {
+            key_id: self.log_key_id.clone(),
+            public_key: self.log.log.public_b64u(),
+            added_height: 0,
+            removed_height: None,
+            adding_act: None,
+            removing_act: None,
+        }));
+        for amendment in self.amendments() {
+            if amendment.epoch_number <= height {
+                tuples.push(StateEntry::Parameter(ParameterEntry {
+                    name: amendment.parameter,
+                    effective_at: at(amendment.effective_at_s),
+                    value: amendment.value,
+                }));
+            }
+        }
+        let signer = common::Signer::new(self.log.log.seed);
+        common::write_snapshot(
+            self.dir.path(),
+            &common::SnapshotParts {
+                signer: &signer,
+                key_id: &self.log_key_id,
+                snapshot_date: date,
+                checkpoint: &self.log.checkpoints[height as usize],
+                entries: tuples,
+                records: &held.records,
+                extracts: held.extracts.clone(),
+                links: held.links.clone(),
+                tier1: true,
+                shards: None,
+            },
+        );
     }
 
     fn head(&self, target: &Path) -> u64 {
@@ -1364,4 +1401,253 @@ fn materialization_preference_cases_walked_by_the_consumer_materialize_the_prefe
         cases += 1;
     }
     assert_eq!(cases, 10);
+}
+
+#[derive(Default)]
+struct Held {
+    records: Vec<common::RecordFixture>,
+    extracts: Vec<(String, String, String, String)>,
+    links: Vec<(String, String, i64)>,
+}
+
+fn held_from_payloads(vector: &Value, materialized: &Value) -> Held {
+    let mut held = Held::default();
+    for tuple in materialized.as_array().unwrap() {
+        let text = |member: &str| tuple[member].as_str().unwrap().to_owned();
+        let content = &vector["payloads"][text("item_id")]["content"];
+        held.records.push(common::RecordFixture {
+            url: text("url"),
+            publisher: text("publisher"),
+            item: Value::Null,
+            item_id: text("item_id"),
+            observed_at: text("observed_at"),
+            attested_at: text("attested_at"),
+            title: content["summary"]["title"].as_str().unwrap().to_owned(),
+            abstract_text: content["summary"]["abstract"].as_str().map(str::to_owned),
+            lang: "en".into(),
+        });
+        held.extracts.push((
+            text("url"),
+            text("publisher"),
+            text("item_id"),
+            content["extract"].as_str().unwrap().to_owned(),
+        ));
+        for (position, target) in content["links"]["urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            held.links.push((
+                text("url"),
+                target.as_str().unwrap().to_owned(),
+                position as i64,
+            ));
+        }
+    }
+    held
+}
+
+fn held_by_store(log_dir: &Path) -> Held {
+    let text = |row: &Value, member: &str| row[member].as_str().unwrap().to_owned();
+    let mut held = Held::default();
+    for row in rows(
+        log_dir,
+        "SELECT url, publisher, item_id, observed_at, attested_at, title, abstract, lang FROM records ORDER BY publisher, url",
+        &["url", "publisher", "item_id", "observed_at", "attested_at", "title", "abstract", "lang"],
+    ) {
+        held.records.push(common::RecordFixture {
+            url: text(&row, "url"),
+            publisher: text(&row, "publisher"),
+            item: Value::Null,
+            item_id: text(&row, "item_id"),
+            observed_at: text(&row, "observed_at"),
+            attested_at: text(&row, "attested_at"),
+            title: text(&row, "title"),
+            abstract_text: row["abstract"].as_str().map(str::to_owned),
+            lang: text(&row, "lang"),
+        });
+    }
+    for row in rows(
+        log_dir,
+        "SELECT url, publisher, item_id, extract FROM extracts",
+        &["url", "publisher", "item_id", "extract"],
+    ) {
+        held.extracts.push((
+            text(&row, "url"),
+            text(&row, "publisher"),
+            text(&row, "item_id"),
+            text(&row, "extract"),
+        ));
+    }
+    for row in rows(
+        log_dir,
+        "SELECT source_url, target_url, position FROM links",
+        &["source_url", "target_url", "position"],
+    ) {
+        held.links.push((
+            text(&row, "source_url"),
+            text(&row, "target_url"),
+            row["position"].as_i64().unwrap(),
+        ));
+    }
+    held
+}
+
+fn sorted_tuples(log_dir: &Path) -> Vec<String> {
+    let mut tuples: Vec<String> = common::state_tuples(log_dir)
+        .iter()
+        .map(|tuple| serde_json::to_string(tuple).unwrap())
+        .collect();
+    tuples.sort();
+    tuples
+}
+
+fn store_rows(log_dir: &Path) -> Vec<Value> {
+    let mut held = rows(
+        log_dir,
+        "SELECT url, publisher, item_id, observed_at, attested_at, title, abstract, lang, collection, generated_at FROM records ORDER BY publisher, url",
+        &["url", "publisher", "item_id", "observed_at", "attested_at", "title", "abstract", "lang", "collection", "generated_at"],
+    );
+    held.extend(rows(
+        log_dir,
+        "SELECT url, publisher, item_id, extract, collection FROM extracts ORDER BY publisher, url",
+        &["url", "publisher", "item_id", "extract", "collection"],
+    ));
+    held.extend(rows(
+        log_dir,
+        "SELECT source_url, target_url, position FROM links ORDER BY source_url, position",
+        &["source_url", "target_url", "position"],
+    ));
+    held
+}
+
+fn assert_same_store(resumed: &Path, walked: &Path, label: &str) {
+    assert_eq!(store_rows(resumed), store_rows(walked), "{label}: rows");
+    assert_eq!(
+        sorted_tuples(resumed),
+        sorted_tuples(walked),
+        "{label}: state tuples"
+    );
+}
+
+/// WIST-3 §7 and §8 catch-up decision: a Consumer resumed from a Snapshot's tuples reaches every
+/// later state, and resumed from the state a full walk holds at that Epoch holds that walk's rows
+/// and tuples at every later Epoch.
+#[test]
+fn record_materialization_snapshots_resume_to_the_records_and_state_of_a_full_walk() {
+    let vector = vector("wist3/record-materialization.json");
+    let log_key = &vector["keys"]["log"];
+    let log = signer_of(log_key);
+    let key_id = log_key["kid"].as_str().unwrap();
+    let mut resumed = 0;
+    for case in vector["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let snapshot_height = case["snapshot"]["height"].as_u64().unwrap();
+        let vector_tuples: Vec<Value> = case["snapshot"]["tuples"].as_array().unwrap().clone();
+        let mut materialization = Materialization::new(&vector, case);
+        for tuple in &vector_tuples {
+            let catalog = match tuple[0].as_str().unwrap() {
+                "record" => &tuple[5],
+                "removal" => &tuple[4],
+                _ => continue,
+            };
+            let catalog = catalog.as_str().unwrap().to_owned();
+            materialization
+                .catalogs
+                .entry(catalog.clone())
+                .or_insert(catalog);
+        }
+        let mut served = ServedLog::new(log_key, "materialization-snapshot-log");
+        for (item_id, payload) in vector["payloads"].as_object().unwrap() {
+            let path = served
+                .dir
+                .path()
+                .join(format!("payloads/{}.json", &item_id["sha256:".len()..]));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, serde_json::to_vec(payload).unwrap()).unwrap();
+        }
+        let walked = tempfile::tempdir().unwrap();
+        let from_vector = tempfile::tempdir().unwrap();
+        let from_walk = tempfile::tempdir().unwrap();
+        let walked_dir = served.log_dir(walked.path());
+        let expected = case["expected"].as_array().unwrap();
+        for (epoch, want) in case["epochs"].as_array().unwrap().iter().zip(expected) {
+            let height = epoch["height"].as_u64().unwrap();
+            let entries = materialization.entries(epoch, &log, key_id);
+            served.seal(VectorEpoch {
+                sealed_at: epoch["sealed_at"].as_str().unwrap().to_owned(),
+                parameters: BTreeMap::new(),
+                leaves: leaves(&entries),
+            });
+            let label = format!("{name} at {height}");
+            if height == 0 {
+                served.install(walked.path());
+            } else {
+                served.amend(walked.path());
+                assert_eq!(
+                    served.sync_tiers(walked.path(), true),
+                    Ok(height),
+                    "{label}"
+                );
+            }
+            if height < snapshot_height {
+                continue;
+            }
+            if height == snapshot_height {
+                let offered: Vec<StateEntry> = vector_tuples
+                    .iter()
+                    .map(|tuple| serde_json::from_value(tuple.clone()).unwrap())
+                    .collect();
+                served.snapshot(
+                    height,
+                    "2026-10-01",
+                    offered,
+                    &held_from_payloads(&vector, &want["materialized"]),
+                );
+                let declarations: Vec<StateEntry> = vector_tuples
+                    .iter()
+                    .filter(|tuple| tuple[0] == "declaration")
+                    .map(|tuple| serde_json::from_value(tuple.clone()).unwrap())
+                    .collect();
+                assert_eq!(
+                    served.sync_tiers(from_vector.path(), true),
+                    Ok(height),
+                    "{label}"
+                );
+                served.snapshot(
+                    height,
+                    "2026-10-02",
+                    tuples(&walked_dir)
+                        .into_iter()
+                        .chain(declarations)
+                        .collect(),
+                    &held_by_store(&walked_dir),
+                );
+            } else {
+                assert_eq!(
+                    served.sync_tiers(from_vector.path(), true),
+                    Ok(height),
+                    "{label}"
+                );
+            }
+            assert_eq!(
+                served.sync_tiers(from_walk.path(), true),
+                Ok(height),
+                "{label}"
+            );
+            let from_vector_dir = served.log_dir(from_vector.path());
+            assert_eq!(
+                materialization.state(&from_vector_dir),
+                without_height(want),
+                "{label}: resumed from the vector's tuples"
+            );
+            for (held, signed) in materialization.titles(&from_vector_dir) {
+                assert_eq!(held, signed, "{label}: content of the resumed store");
+            }
+            assert_same_store(&served.log_dir(from_walk.path()), &walked_dir, &label);
+            resumed += 1;
+        }
+    }
+    assert_eq!(resumed, 9);
 }

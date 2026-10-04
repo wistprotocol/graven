@@ -16,6 +16,7 @@ fn cold_sync_verifies_chain_and_populates_store() {
         false,
     )
     .unwrap();
+    common::assert_records_materialized(&common::synced_log_dir(target.path()));
 
     assert_eq!(report.epoch_number_before, None);
     assert_eq!(report.head, 1);
@@ -627,6 +628,7 @@ fn withdrawal_removes_record_from_local_index() {
         false,
     )
     .unwrap();
+    common::assert_records_materialized(&common::synced_log_dir(target.path()));
     assert_eq!(report.withdrawn, 1);
 
     let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
@@ -684,6 +686,7 @@ fn cold_start_applies_withdrawals_after_snapshot_position() {
         false,
     )
     .unwrap();
+    common::assert_records_materialized(&common::synced_log_dir(target.path()));
     assert_eq!(report.head, 2);
 
     let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
@@ -1155,6 +1158,7 @@ fn cold_sync_with_tier1_flag_imports_extracts_and_links() {
         true,
     )
     .unwrap();
+    common::assert_records_materialized(&common::synced_log_dir(target.path()));
 
     let conn =
         Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
@@ -1166,6 +1170,14 @@ fn cold_sync_with_tier1_flag_imports_extracts_and_links() {
     assert_eq!(url, "https://records.example/alpha");
     assert_eq!(publisher, fx.domain);
     assert_eq!(extract, "alpha body");
+    let collection: Option<String> = conn
+        .query_row("SELECT collection FROM extracts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        collection.as_deref(),
+        Some("default"),
+        "an extract carries the Collection of its record tuple"
+    );
 
     let (source_url, target_url, position): (String, String, i64) = conn
         .query_row(
@@ -1357,6 +1369,7 @@ fn cold_start_adopts_withdrawal_and_label_tuples() {
         false,
     )
     .unwrap();
+    common::assert_records_materialized(&common::synced_log_dir(target.path()));
     let conn =
         Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
     let withdrawn: Vec<(String, String, i64)> = conn

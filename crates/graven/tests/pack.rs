@@ -41,6 +41,7 @@ fn sync_fixture() -> (common::Fixture, tempfile::TempDir) {
         false,
     )
     .unwrap();
+    common::assert_records_materialized(&common::synced_log_dir(target.path()));
     (fx, target)
 }
 

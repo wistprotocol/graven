@@ -1,5 +1,5 @@
 use super::history::{default_recovery_window_days, persist_declaration, ChainState};
-use super::persist::{record_withdrawal, save_aggregator_keys};
+use super::persist::{record_sealed, record_withdrawal, save_aggregator_keys};
 use super::source::Sources;
 use crate::error::{Error, Result};
 use crate::fetch::Client;
@@ -11,6 +11,7 @@ use reqwest::Url;
 use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::path::PathBuf;
 use wist_core::aggregator_keys::Registry;
@@ -23,8 +24,9 @@ use wist_core::objects::{
     AggregatorKeyEntry, SnapshotIndexEntry, SnapshotIndexEnvelope, SnapshotManifest,
     SnapshotManifestEnvelope, SnapshotState, SnapshotStateEnvelope, StateEntry,
 };
-use wist_core::snapshot::content_digest;
+use wist_core::sealing::Replay;
 use wist_core::snapshot::state_digest;
+use wist_core::snapshot::{content_digest, shard_path};
 use wist_core::unsealed::{self, Document};
 
 pub(super) struct TempFileGuard {
@@ -108,18 +110,6 @@ fn shard_of(publisher: &str, count: usize) -> usize {
     wist_core::snapshot::shard_of(publisher, count) as usize
 }
 
-fn drop_withdrawn_rows(conn: &Connection, item_id: &str) -> Result<()> {
-    let urls: Vec<String> = conn
-        .prepare("SELECT url FROM records WHERE item_id = ?1")?
-        .query_map([item_id], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    conn.execute("DELETE FROM records WHERE item_id = ?1", [item_id])?;
-    for url in urls {
-        super::history::remove_derived(conn, item_id, &url)?;
-    }
-    Ok(())
-}
-
 const TIER0_PATH: &str = "tier0/index.sqlite";
 
 /// WIST-3 §6.
@@ -196,17 +186,15 @@ fn shard_layout<'m>(manifest: &'m SnapshotManifest, manifest_url: &Url) -> Resul
                 f.path, shards.count
             )));
         }
+        let prefix = shard_path(shard, "");
+        let relative = f.path.strip_prefix(&prefix).ok_or_else(|| {
+            refuse(format!(
+                "lists {} under shard {shard}, outside that shard's {prefix} directory",
+                f.path
+            ))
+        })?;
         let shard = shard as usize;
-        let relative = f
-            .path
-            .strip_prefix(&format!("shard-{shard}/"))
-            .ok_or_else(|| {
-                refuse(format!(
-                    "lists {} under shard {shard}, outside that shard's shard-{shard}/ directory",
-                    f.path
-                ))
-            })?;
-        if f.tier == 0 && relative == TIER0_PATH {
+        if f.tier == 0 && f.path == shard_path(shard as u64, TIER0_PATH) {
             has_tier0[shard] = true;
         }
         files.push((shard, relative));
@@ -230,7 +218,6 @@ fn install_tier0(
     manifest_url: &Url,
     snapshot_base: &str,
 ) -> Result<(TempFileGuard, PathBuf)> {
-    let sharded = shard_digests.is_some();
     let installed_path = dir.join("index.sqlite.verifying");
     let mut paths = Vec::with_capacity(tier0.len());
     let mut guards = Vec::with_capacity(tier0.len());
@@ -240,11 +227,7 @@ fn install_tier0(
                 "WIST3-E04 the manifest served at {manifest_url} lists no {TIER0_PATH} file"
             ))
         })?;
-        let path = if sharded {
-            dir.join(format!("index.sqlite.shard-{shard}.verifying"))
-        } else {
-            installed_path.clone()
-        };
+        let path = dir.join(format!("index.sqlite.shard-{shard}.verifying"));
         std::fs::write(&path, &bytes)?;
         guards.push(TempFileGuard::new(path.clone()));
         paths.push(path);
@@ -284,16 +267,6 @@ fn install_tier0(
                 shard_of(&misfiled.tuple.publisher, digests.len())
             )));
         }
-    }
-
-    if !sharded {
-        let mut guards = guards;
-        let guard = guards.pop().ok_or_else(|| {
-            Error::Verify(format!(
-                "WIST3-E04 the manifest served at {manifest_url} lists no {TIER0_PATH} file"
-            ))
-        })?;
-        return Ok((guard, installed_path));
     }
 
     if installed_path.exists() {
@@ -408,12 +381,7 @@ fn index_entry(sources: &Sources, at: usize) -> Result<(SnapshotIndexEntry, Unse
     let ((envelope, value), url) = sources.whole_at(SNAPSHOT_INDEX_PATH, at, |bytes| {
         parse_document::<SnapshotIndexEnvelope>(bytes, Document::Index)
     })?;
-    let entry = envelope
-        .index
-        .snapshots
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::Verify("snapshot index is empty".into()))?;
+    let entry = chosen_entry(envelope)?;
     Ok((
         entry,
         Unsealed {
@@ -422,6 +390,26 @@ fn index_entry(sources: &Sources, at: usize) -> Result<(SnapshotIndexEntry, Unse
             url: url.to_string(),
         },
     ))
+}
+
+/// WIST-3 §8 step 1.
+fn chosen_entry(envelope: SnapshotIndexEnvelope) -> Result<SnapshotIndexEntry> {
+    envelope
+        .index
+        .snapshots
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Verify("snapshot index is empty".into()))
+}
+
+/// WIST-3 §8 step 2.
+fn agreeing_manifest(
+    entry: &SnapshotIndexEntry,
+    bytes: &[u8],
+) -> Result<(SnapshotManifestEnvelope, Value)> {
+    let (envelope, value) = parse_document::<SnapshotManifestEnvelope>(bytes, Document::Manifest)?;
+    check_index_agreement(entry, &envelope.manifest)?;
+    Ok((envelope, value))
 }
 
 /// WIST-3 §8 step 2 (`WIST3-E04`).
@@ -465,10 +453,7 @@ fn documents(
     let (entry, index) = index_entry(sources, at)?;
     let ((manifest_envelope, manifest_value), manifest_url) =
         sources.whole_from(&entry.manifest_url, at, |bytes| {
-            let (envelope, value) =
-                parse_document::<SnapshotManifestEnvelope>(bytes, Document::Manifest)?;
-            check_index_agreement(&entry, &envelope.manifest)?;
-            Ok((envelope, value))
+            agreeing_manifest(&entry, bytes)
         })?;
     let manifest = manifest_envelope.manifest;
     let snapshot_base = manifest_directory(&entry.manifest_url);
@@ -539,15 +524,6 @@ fn documents(
             "WIST3-E04 the state_digest of the state file served at {state_url} is not the one its manifest names"
         )));
     }
-    let (guard, tmp_sqlite_path) = install_tier0(
-        dir,
-        tier0,
-        &manifest,
-        layout.shards,
-        &manifest_url,
-        snapshot_base,
-    )?;
-
     // WIST-3 §8 step 8's early rejection: a signature failing under the tuple key it names verifies
     // at no height.
     for unsealed in &unsealed {
@@ -558,6 +534,15 @@ fn documents(
             )));
         }
     }
+
+    let (guard, tmp_sqlite_path) = install_tier0(
+        dir,
+        tier0,
+        &manifest,
+        layout.shards,
+        &manifest_url,
+        snapshot_base,
+    )?;
 
     Ok(Documents {
         manifest,
@@ -678,9 +663,11 @@ pub(super) fn snapshot(
             // Entry.
             StateEntry::Withdrawal(w) => {
                 record_withdrawal(&conn, &w.item_id, &w.publisher, w.sealing_height)?;
-                drop_withdrawn_rows(&conn, &w.item_id)?;
             }
-            StateEntry::Label(l) => super::persist::adopt_label_tuple(&conn, l)?,
+            StateEntry::Label(l) => {
+                super::persist::adopt_label_tuple(&conn, l)?;
+                record_sealed(&conn, &[(l.label_id.clone(), Some(l.subject.clone()))], &[])?;
+            }
             StateEntry::Dispute(d) => super::persist::adopt_dispute_tuple(&conn, d)?,
             StateEntry::SuffixList(s) => {
                 suffix_lists.adopt(client, base, &s.identifier, s.sealing_height)?;
@@ -717,7 +704,6 @@ pub(super) fn snapshot(
             head,
         )?;
     }
-    super::persist::seed_ranking_index(&conn, manifest.epoch_number)?;
     let replay_tuples: Vec<StateEntry> = state
         .entries
         .iter()
@@ -751,6 +737,93 @@ pub(super) fn snapshot(
         unsealed,
         source,
     })
+}
+
+/// WIST-3 §8 cold start steps 4 and 9: the state tuples decide which records are materialized; a
+/// tier-0 row supplies only the content of the record whose Item it names.
+pub(super) fn materialize_tuples(
+    conn: &Connection,
+    replay: &Replay,
+    epoch_number: u64,
+) -> Result<()> {
+    let held: BTreeMap<(String, String), String> = conn
+        .prepare("SELECT url, publisher, item_id FROM records")?
+        .query_map([], |row| Ok(((row.get(0)?, row.get(1)?), row.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut kept = BTreeSet::new();
+    let mut stale_urls = BTreeSet::new();
+    for tuple in replay.materialized()? {
+        let record = replay
+            .records()
+            .record(&tuple.publisher, &tuple.url)
+            .ok_or_else(|| {
+                Error::Verify(format!(
+                    "the state tuples materialize {} of {} without a record",
+                    tuple.url, tuple.publisher
+                ))
+            })?;
+        let key = (tuple.url.clone(), tuple.publisher.clone());
+        let lang = record.item["meta"]["lang"].as_str();
+        match held.get(&key) {
+            Some(item_id) if *item_id == tuple.item_id => {
+                conn.execute(
+                    "UPDATE records SET observed_at = ?3, attested_at = ?4, lang = ?5, collection = ?6, generated_at = ?7 WHERE url = ?1 AND publisher = ?2",
+                    (&tuple.url, &tuple.publisher, &tuple.observed_at, &tuple.attested_at, lang, &record.collection, &record.generated_at),
+                )?;
+            }
+            Some(_) => {
+                stale_urls.insert(tuple.url.clone());
+                conn.execute(
+                    "UPDATE records SET item_id = ?3, observed_at = ?4, attested_at = ?5, title = NULL, abstract = NULL, lang = ?6, collection = ?7, generated_at = ?8 WHERE url = ?1 AND publisher = ?2",
+                    (&tuple.url, &tuple.publisher, &tuple.item_id, &tuple.observed_at, &tuple.attested_at, lang, &record.collection, &record.generated_at),
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO records(url, publisher, item_id, observed_at, attested_at, title, abstract, lang, collection, generated_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?8)",
+                    (&tuple.url, &tuple.publisher, &tuple.item_id, &tuple.observed_at, &tuple.attested_at, lang, &record.collection, &record.generated_at),
+                )?;
+            }
+        }
+        kept.insert(key);
+    }
+    for ((url, publisher), item_id) in &held {
+        if kept.contains(&(url.clone(), publisher.clone())) {
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM records WHERE url = ?1 AND publisher = ?2",
+            (url, publisher),
+        )?;
+        super::history::remove_derived(conn, item_id, url)?;
+        stale_urls.insert(url.clone());
+    }
+    let tier1 = crate::store::table_exists(conn, "extracts")?;
+    for url in &stale_urls {
+        conn.execute(
+            "UPDATE records SET title = NULL, abstract = NULL WHERE url = ?1",
+            [url],
+        )?;
+        if tier1 {
+            conn.execute("DELETE FROM extracts WHERE url = ?1", [url])?;
+            conn.execute("DELETE FROM links WHERE source_url = ?1", [url])?;
+        }
+    }
+    if tier1 {
+        conn.execute(
+            "DELETE FROM extracts WHERE NOT EXISTS (SELECT 1 FROM records r WHERE r.url = extracts.url AND r.publisher = extracts.publisher AND r.item_id = extracts.item_id)",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE extracts SET collection = (SELECT r.collection FROM records r WHERE r.url = extracts.url AND r.publisher = extracts.publisher)",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM links WHERE source_url NOT IN (SELECT url FROM records)",
+            [],
+        )?;
+    }
+    super::persist::seed_ranking_index(conn, epoch_number)
 }
 
 pub(super) fn migrate_legacy_layout(dir: &Path, log_id: &str) -> Result<bool> {
@@ -877,6 +950,54 @@ mod shard_tests {
             manifest_directory("https://mirror.example/any/where/manifest.json"),
             "https://mirror.example/any/where/"
         );
+    }
+}
+
+#[cfg(test)]
+mod index_vector_tests {
+    use super::*;
+
+    fn vector() -> Value {
+        let spec = std::env::var_os("WIST_SPEC_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../spec"));
+        serde_json::from_slice(
+            &std::fs::read(spec.join("vectors/wist3/snapshot-index.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn snapshot_index_cases_take_the_first_entry_and_refuse_a_manifest_disagreeing_with_it() {
+        let vector = vector();
+        let cases = vector["cases"].as_array().unwrap();
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let index = serde_json::to_vec(&case["index"]).unwrap();
+            let (envelope, _) =
+                parse_document::<SnapshotIndexEnvelope>(&index, Document::Index).unwrap();
+            let entry = chosen_entry(envelope).unwrap();
+            assert_eq!(
+                entry.manifest_url, case["index"]["index"]["snapshots"][0]["manifest_url"],
+                "{name}"
+            );
+            let manifest = serde_json::to_vec(&case["manifests"][&entry.manifest_url]).unwrap();
+            let outcome = agreeing_manifest(&entry, &manifest);
+            match case["expected"].as_str().unwrap() {
+                "accept" => {
+                    let (envelope, _) = outcome.unwrap_or_else(|e| panic!("{name}: {e}"));
+                    assert_eq!(
+                        envelope.manifest.content_digest, entry.content_digest,
+                        "{name}"
+                    );
+                }
+                code => {
+                    let error = outcome.err().unwrap_or_else(|| panic!("{name} is refused"));
+                    assert!(error.to_string().contains(code), "{name}: {error}");
+                }
+            }
+        }
+        assert_eq!(cases.len(), 7);
     }
 }
 

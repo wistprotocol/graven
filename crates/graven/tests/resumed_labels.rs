@@ -89,14 +89,16 @@ fn seal_after_snapshot(r: &Resumed, _epoch_number: u64, sealed_at: &str, entries
 }
 
 fn sync(r: &Resumed) -> graven::sync::SyncReport {
-    graven::sync::run(
+    let report = graven::sync::run(
         r.dir.path().join("log/anchor.json").to_str().unwrap(),
         &r.base_url,
         r.target.path(),
         true,
         false,
     )
-    .unwrap()
+    .unwrap();
+    common::assert_records_materialized(&graven::registry::log_dir(r.target.path(), &r.log_id));
+    report
 }
 
 fn opened(r: &Resumed) -> Store {
@@ -330,6 +332,10 @@ fn resumed_labeler_activity_matches_a_full_replay() {
         false,
     )
     .unwrap();
+    common::assert_records_materialized(&graven::registry::log_dir(
+        genesis_target.path(),
+        "resumed-labeler-genesis",
+    ));
     let genesis_store = Store::open(&graven::registry::log_dir(
         genesis_target.path(),
         "resumed-labeler-genesis",

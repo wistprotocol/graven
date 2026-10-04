@@ -1023,9 +1023,6 @@ impl Materializer<'_> {
                     decided.insert(url.clone(), (row.clone(), event.height));
                 }
             }
-            for url in withdrawn_rows(conn, event)? {
-                decided.insert(url.clone(), (materialized_row(replay, &url), event.height));
-            }
         }
         let mut written = BTreeSet::new();
         for (url, (row, height)) in &decided {
@@ -1101,25 +1098,6 @@ impl Materializer<'_> {
 }
 
 const PAYLOAD_FRAMING_BYTES: u64 = 4096;
-
-/// WIST-3 §6.2.
-fn withdrawn_rows(conn: &Connection, event: &EpochEvent) -> Result<Vec<String>> {
-    let mut urls = Vec::new();
-    for (item_id, _, _) in &event.withdrawals {
-        let mut stmt = conn.prepare("SELECT url FROM records WHERE item_id = ?1")?;
-        for url in stmt.query_map([item_id], |row| row.get::<_, String>(0))? {
-            let url = url?;
-            if !event
-                .materialized
-                .iter()
-                .any(|(affected, _)| *affected == url)
-            {
-                urls.push(url);
-            }
-        }
-    }
-    Ok(urls)
-}
 
 fn record_height(conn: &Connection, url: &str, publisher: &str, height: u64) -> Result<()> {
     conn.execute(

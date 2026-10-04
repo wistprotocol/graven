@@ -16,9 +16,9 @@ use wist_core::crypto::{b64u_encode, hex_encode, SigningKey};
 use wist_core::envelope::sign_envelope;
 use wist_core::materialization::ContentTuple;
 use wist_core::objects::{
-    AggregatorKeyEntry, Anchor, DeclarationEntry, GenesisKey, ParameterEntry, SnapshotFile,
-    SnapshotIndex, SnapshotIndexEntry, SnapshotManifest, SnapshotShards, SnapshotState,
-    SnapshotStateFile, StateEntry,
+    AggregatorKeyEntry, Anchor, CollectionEntry, DeclarationEntry, GenesisKey, ParameterEntry,
+    RecordEntry, SnapshotFile, SnapshotIndex, SnapshotIndexEntry, SnapshotManifest, SnapshotShards,
+    SnapshotState, SnapshotStateFile, StateEntry,
 };
 use wist_core::tiles::TileSet;
 use wist_core::{jcs, merkle};
@@ -66,6 +66,7 @@ pub fn key_entry(signer: &Signer, not_before: &str) -> Value {
 pub struct RecordFixture {
     pub url: String,
     pub publisher: String,
+    pub item: Value,
     pub item_id: String,
     pub observed_at: String,
     pub attested_at: String,
@@ -76,12 +77,14 @@ pub struct RecordFixture {
 
 impl RecordFixture {
     pub fn new(url: &str, publisher: &str, title: &str) -> Self {
+        let item = page_item(publisher, url, OBSERVED);
         RecordFixture {
             url: url.into(),
             publisher: publisher.into(),
-            item_id: item_id_of(url),
-            observed_at: "2026-08-09T12:00:00Z".into(),
-            attested_at: "2026-08-09T12:00:00Z".into(),
+            item_id: wist_core::item::item_id(&item).unwrap(),
+            item,
+            observed_at: OBSERVED.into(),
+            attested_at: OBSERVED.into(),
             title: title.into(),
             abstract_text: None,
             lang: "en".into(),
@@ -90,7 +93,54 @@ impl RecordFixture {
 }
 
 pub fn item_id_of(url: &str) -> String {
-    format!("sha256:{}", sha256_hex(url.as_bytes()))
+    let host = wist_core::declaration::url_host(url);
+    wist_core::item::item_id(&page_item(host, url, OBSERVED)).unwrap()
+}
+
+/// WIST-3 §7: one `collection` tuple per Publisher, whose Catalog lists that Publisher's records,
+/// and one `record` tuple per record.
+pub fn record_tuples(
+    records: &[RecordFixture],
+    signer_of: impl Fn(&str) -> Signer,
+) -> Vec<StateEntry> {
+    let mut by_publisher: std::collections::BTreeMap<&str, Vec<&RecordFixture>> =
+        std::collections::BTreeMap::new();
+    for record in records {
+        let held = by_publisher.entry(record.publisher.as_str()).or_default();
+        if !held.iter().any(|r| r.url == record.url) {
+            held.push(record);
+        }
+    }
+    let mut tuples = Vec::new();
+    for (publisher, held) in by_publisher {
+        let generated_at = held[0].attested_at.clone();
+        assert!(held.iter().all(|r| r.attested_at == generated_at));
+        let items: Vec<Value> = held.iter().map(|r| r.item.clone()).collect();
+        let published = publish(
+            &signer_of(publisher),
+            publisher,
+            "default",
+            &generated_at,
+            &items,
+        );
+        tuples.push(StateEntry::Collection(CollectionEntry {
+            publisher: publisher.into(),
+            collection: "default".into(),
+            envelope: published.catalog["body"].clone(),
+            sealing_height: 0,
+        }));
+        for record in held {
+            tuples.push(StateEntry::Record(RecordEntry {
+                publisher: publisher.into(),
+                url: record.url.clone(),
+                item: record.item.clone(),
+                collection: "default".into(),
+                catalog_id: published.catalog_id.clone(),
+                generated_at: generated_at.clone(),
+            }));
+        }
+    }
+    tuples
 }
 
 pub fn content_tuple(r: &RecordFixture) -> ContentTuple {
@@ -446,14 +496,16 @@ fn write_parquet(
     writer.into_inner().unwrap()
 }
 
+/// WIST-3 §7 tier layout, with the `collection` column an Aggregator may add.
 pub fn write_extracts_parquet(rows: &[(&str, &str, &str, &str)]) -> Vec<u8> {
     write_parquet(
-        "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary item_id (UTF8); required binary extract (UTF8); }",
+        "message extracts { required binary url (UTF8); required binary publisher (UTF8); required binary item_id (UTF8); required binary extract (UTF8); required binary collection (UTF8); }",
         &[
             rows.iter().map(|r| r.0.as_bytes().to_vec()).collect(),
             rows.iter().map(|r| r.1.as_bytes().to_vec()).collect(),
             rows.iter().map(|r| r.2.as_bytes().to_vec()).collect(),
             rows.iter().map(|r| r.3.as_bytes().to_vec()).collect(),
+            rows.iter().map(|_| b"default".to_vec()).collect(),
         ],
         None,
     )
@@ -1058,6 +1110,20 @@ pub fn holds_record_tuple(log_dir: &Path, publisher: &str, url: &str) -> bool {
 
 /// WIST-3 §7.
 pub fn assert_records_materialized(log_dir: &Path) {
+    assert_rows_are_the_replays(log_dir);
+    let state = graven::store::synced_state(log_dir).unwrap();
+    if state.walk_floor == Some(state.epoch_number) {
+        if let Some(manifest_digest) = &state.content_digest {
+            assert_eq!(
+                &records_content_digest(log_dir),
+                manifest_digest,
+                "WIST-3 §7: at the Snapshot's Epoch the records rows digest as its manifest names"
+            );
+        }
+    }
+}
+
+pub fn assert_rows_are_the_replays(log_dir: &Path) {
     let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
     let state = graven::store::synced_state(log_dir).unwrap();
     let head = graven::sync::checkpoints::retained(&conn, state.epoch_number)
@@ -1132,6 +1198,28 @@ pub fn assert_records_materialized(log_dir: &Path) {
         held, wanted,
         "the records rows are the materialized records"
     );
+}
+
+/// WIST-3 §7.
+pub fn records_content_digest(log_dir: &Path) -> String {
+    let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT url, publisher, item_id, observed_at, attested_at FROM records")
+        .unwrap();
+    let tuples: Vec<ContentTuple> = stmt
+        .query_map([], |row| {
+            Ok(ContentTuple {
+                url: row.get(0)?,
+                publisher: row.get(1)?,
+                item_id: row.get(2)?,
+                observed_at: row.get(3)?,
+                attested_at: row.get(4)?,
+            })
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    wist_core::snapshot::content_digest(&tuples).unwrap()
 }
 
 pub fn removed_item(publisher: &str, url: &str, observed_at: &str) -> Value {
@@ -1548,6 +1636,8 @@ fn build_fixture_state(
     };
     let sqlite_bytes = write_tier0(&snapdir.join("tier0/index.sqlite"), &tier0_records);
     let content_digest_value = content_digest(&tier0_records);
+    let mut state_entries = record_tuples(&tier0_records, |_| Signer::new([1u8; 32]));
+    state_entries.extend(extra_state);
 
     let (state_bytes, state_digest_value) = write_state_with(
         &snapdir.join("state.json"),
@@ -1555,7 +1645,7 @@ fn build_fixture_state(
         3600,
         &[(domain.clone(), declaration_env.clone())],
         epoch0_size,
-        extra_state,
+        state_entries,
         floor,
     );
 
@@ -1632,10 +1722,8 @@ fn build_fixture_state(
 pub const BETA_DOMAIN: &str = "beta.example";
 
 pub fn shard_of(publisher: &str, count: usize) -> usize {
-    let digest = Sha256::digest(publisher.as_bytes());
-    let mut prefix = [0u8; 8];
-    prefix.copy_from_slice(&digest[..8]);
-    (u64::from_be_bytes(prefix) % count as u64) as usize
+    let count = std::num::NonZeroU64::new(count as u64).unwrap();
+    wist_core::snapshot::shard_of(publisher, count) as usize
 }
 
 pub const SHARDED_DOMAINS: [&str; 6] = [
@@ -1715,7 +1803,7 @@ pub fn build_sharded_fixture(
     let mut files = Vec::new();
     let mut digests = Vec::new();
     for (shard, held) in filed.iter().enumerate() {
-        let shard_dir = snapdir.join(format!("shard-{shard}"));
+        let shard_dir = snapdir.join(wist_core::snapshot::shard_path(shard as u64, ""));
         let tier0 = write_tier0(&shard_dir.join("tier0/index.sqlite"), held);
         let extracts: Vec<String> = held
             .iter()
@@ -1755,7 +1843,7 @@ pub fn build_sharded_fixture(
             ("tier1/links.parquet", links_bytes, 1),
         ] {
             files.push(SnapshotFile {
-                path: format!("shard-{shard}/{path}"),
+                path: wist_core::snapshot::shard_path(shard as u64, path),
                 sha256: sha256_hex(&bytes),
                 bytes: bytes.len() as u64,
                 tier,
@@ -1772,7 +1860,13 @@ pub fn build_sharded_fixture(
         3600,
         &declarations,
         epoch0.tree_size(),
-        Vec::new(),
+        record_tuples(&records, |publisher| {
+            let i = SHARDED_DOMAINS
+                .iter()
+                .position(|d| *d == publisher)
+                .unwrap();
+            Signer::new([20 + i as u8; 32])
+        }),
         0,
     );
     let manifest = SnapshotManifest {
@@ -1826,6 +1920,162 @@ pub fn build_sharded_fixture(
         records,
         manifest_path,
     }
+}
+
+pub struct SnapshotParts<'a> {
+    pub signer: &'a Signer,
+    pub key_id: &'a str,
+    pub snapshot_date: &'a str,
+    pub checkpoint: &'a WistCheckpoint,
+    pub entries: Vec<StateEntry>,
+    pub records: &'a [RecordFixture],
+    pub extracts: Vec<(String, String, String, String)>,
+    pub links: Vec<(String, String, i64)>,
+    pub tier1: bool,
+    pub shards: Option<u64>,
+}
+
+/// WIST-3 §6 and §7: the index, manifest, state file and tier files of one Snapshot, signed under
+/// `key_id`; returns the manifest.
+pub fn write_snapshot(root: &Path, parts: &SnapshotParts) -> SnapshotManifest {
+    let epoch_number = parts.checkpoint.epoch_number();
+    let snapdir = snapshot_dir(root, parts.snapshot_date, epoch_number);
+    let state = SnapshotState {
+        wist_version: "1.0.0".into(),
+        tree_size: parts.checkpoint.tree_size(),
+        entries: parts.entries.clone(),
+    };
+    let entry_values: Vec<Value> = state
+        .entries
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap())
+        .collect();
+    let state_digest = wist_core::snapshot::state_digest(&entry_values).unwrap();
+    let state_envelope = sign_envelope(
+        &serde_json::to_value(&state).unwrap(),
+        "state",
+        parts.key_id,
+        &parts.signer.sk,
+    )
+    .unwrap();
+    let state_bytes = jcs::canonicalize(&state_envelope).unwrap();
+    std::fs::create_dir_all(&snapdir).unwrap();
+    std::fs::write(snapdir.join("state.json"), &state_bytes).unwrap();
+
+    let count = parts.shards.unwrap_or(1);
+    let shard_of_publisher = |publisher: &str| match parts.shards {
+        None => 0,
+        Some(count) => {
+            wist_core::snapshot::shard_of(publisher, std::num::NonZeroU64::new(count).unwrap())
+        }
+    };
+    let mut files = Vec::new();
+    let mut digests = Vec::new();
+    for shard in 0..count {
+        let path_of = |tier_file: &str| match parts.shards {
+            None => tier_file.to_owned(),
+            Some(_) => wist_core::snapshot::shard_path(shard, tier_file),
+        };
+        let held: Vec<RecordFixture> = parts
+            .records
+            .iter()
+            .filter(|r| shard_of_publisher(&r.publisher) == shard)
+            .cloned()
+            .collect();
+        let urls: std::collections::BTreeSet<&str> = held.iter().map(|r| r.url.as_str()).collect();
+        digests.push(content_digest(&held));
+        for (tier_file, tier) in wist_core::snapshot::TIER_FILES {
+            let path = path_of(tier_file);
+            let bytes = match tier_file {
+                "tier0/index.sqlite" => write_tier0(&snapdir.join(&path), &held),
+                "tier1/extracts.parquet" if parts.tier1 => {
+                    let rows: Vec<(&str, &str, &str, &str)> = parts
+                        .extracts
+                        .iter()
+                        .filter(|r| shard_of_publisher(&r.1) == shard)
+                        .map(|r| (r.0.as_str(), r.1.as_str(), r.2.as_str(), r.3.as_str()))
+                        .collect();
+                    write_extracts_parquet(&rows)
+                }
+                "tier1/links.parquet" if parts.tier1 => {
+                    let rows: Vec<(&str, &str, i64)> = parts
+                        .links
+                        .iter()
+                        .filter(|r| urls.contains(r.0.as_str()))
+                        .map(|r| (r.0.as_str(), r.1.as_str(), r.2))
+                        .collect();
+                    write_links_parquet(&rows)
+                }
+                _ if parts.tier1 && parts.shards.is_some() => write_parquet(
+                    "message unread { required binary labeler (UTF8); }",
+                    &[Vec::new()],
+                    None,
+                ),
+                _ => continue,
+            };
+            if tier_file != "tier0/index.sqlite" {
+                std::fs::create_dir_all(snapdir.join(&path).parent().unwrap()).unwrap();
+                std::fs::write(snapdir.join(&path), &bytes).unwrap();
+            }
+            files.push(SnapshotFile {
+                path,
+                sha256: sha256_hex(&bytes),
+                bytes: bytes.len() as u64,
+                tier,
+                shard: parts.shards.map(|_| shard),
+            });
+        }
+    }
+    let content_digest_value = content_digest(parts.records);
+    let manifest = SnapshotManifest {
+        wist_version: "1.0.0".into(),
+        snapshot_date: parts.snapshot_date.into(),
+        epoch_number,
+        tree_size: parts.checkpoint.tree_size(),
+        root_hash: parts.checkpoint.root_token(),
+        content_digest: content_digest_value.clone(),
+        state: SnapshotStateFile {
+            path: "state.json".into(),
+            sha256: sha256_hex(&state_bytes),
+            bytes: state_bytes.len() as u64,
+            state_digest,
+        },
+        shards: parts.shards.map(|count| SnapshotShards { count, digests }),
+        files,
+    };
+    let envelope = sign_envelope(
+        &serde_json::to_value(&manifest).unwrap(),
+        "manifest",
+        parts.key_id,
+        &parts.signer.sk,
+    )
+    .unwrap();
+    std::fs::write(
+        snapdir.join("manifest.json"),
+        serde_json::to_vec(&envelope).unwrap(),
+    )
+    .unwrap();
+    let index = SnapshotIndex {
+        wist_version: "1.0.0".into(),
+        updated_at: parts.checkpoint.sealed_at().into(),
+        snapshots: vec![SnapshotIndexEntry {
+            snapshot_date: parts.snapshot_date.into(),
+            tree_size: parts.checkpoint.tree_size(),
+            manifest_url: manifest_url(parts.snapshot_date, epoch_number),
+            content_digest: content_digest_value,
+        }],
+    };
+    let envelope = sign_envelope(
+        &serde_json::to_value(&index).unwrap(),
+        "index",
+        parts.key_id,
+        &parts.signer.sk,
+    )
+    .unwrap();
+    let index_path = root.join("snapshots/index.json");
+    std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+    std::fs::write(index_path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+    manifest
 }
 
 pub fn rewrite_manifest(path: &Path, log: &Signer, edit: impl FnOnce(&mut Value)) {

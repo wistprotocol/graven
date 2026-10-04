@@ -33,6 +33,7 @@ fn refused(sharded: &ShardedFixture) -> String {
 }
 
 fn assert_serves_every_record(sharded: &ShardedFixture, target: &std::path::Path) {
+    common::assert_records_materialized(&common::synced_log_dir(target));
     let store = Store::open(&common::synced_log_dir(target)).unwrap();
     for record in &sharded.records {
         let held = store
