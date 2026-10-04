@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use wist_core::crypto::{hex_encode, PublicKey};
+use wist_core::crypto::{hex_decode, hex_encode, PublicKey};
 use wist_core::envelope::{sign_envelope, verify_envelope};
 
 fn spec_dir() -> PathBuf {
@@ -20,9 +20,9 @@ fn vector() -> Value {
     .unwrap()
 }
 
-/// `tools/gen_vectors.py` `agg_key`.
 fn key_of(key_id: &str) -> common::Signer {
-    common::Signer::new(Sha256::digest(format!("wist aggregator snapshot {key_id}")).into())
+    let seed = hex_decode(vector()["keys"][key_id]["seed_hex"].as_str().unwrap()).unwrap();
+    common::Signer::new(seed.try_into().unwrap())
 }
 
 fn signed_by_its_named_key(envelope: &Value, inner: &str) -> bool {
