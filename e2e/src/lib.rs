@@ -799,3 +799,301 @@ impl McpClient {
         self.tool_call("get_extract", json!({"url": url}))
     }
 }
+
+pub fn marked_page(title: &str, body: &str, links: &[String]) -> String {
+    let anchors: String = links
+        .iter()
+        .map(|link| format!("<p><a href=\"{link}\">{link}</a></p>"))
+        .collect();
+    format!(
+        "<!doctype html><html lang=\"en\"><head><title>{title}</title><meta name=\"description\" content=\"{title}\"><meta name=\"wist\" content=\"publish\"></head><body><!--wist:content--><p>{body}</p>{anchors}<!--/wist:content--></body></html>"
+    )
+}
+
+pub struct Site {
+    pub host: String,
+    pub collection: String,
+    pub pages: PathBuf,
+    pub out: PathBuf,
+    pub state: PathBuf,
+    pub stream: PathBuf,
+}
+
+impl Site {
+    pub fn new(root: &Path, host: &str, collection: &str) -> Self {
+        let site = Site {
+            host: host.to_string(),
+            collection: collection.to_string(),
+            pages: root.join("pages").join(host),
+            out: root.join("sites").join(host),
+            state: root.join("state").join(host),
+            stream: root.join("streams").join(format!("{host}.jsonl")),
+        };
+        std::fs::create_dir_all(&site.pages).expect("create the pages directory");
+        std::fs::create_dir_all(root.join("streams")).expect("create the streams directory");
+        std::fs::create_dir_all(&site.out).expect("create the output directory");
+        site
+    }
+
+    pub fn url(&self, page: &str) -> String {
+        format!("https://{}/{page}", self.host)
+    }
+
+    pub fn write_page(&self, page: &str, html: &str) {
+        std::fs::write(self.pages.join(page), html).expect("write a page");
+    }
+
+    pub fn remove_page(&self, page: &str) {
+        std::fs::remove_file(self.pages.join(page)).expect("remove a page");
+    }
+
+    pub fn declaration(&self) -> Value {
+        read_json(&self.out.join(".well-known/wist/publisher.json"))
+    }
+
+    pub fn init(&self, spake: &Path) {
+        run(
+            spake,
+            &[
+                "init",
+                "--domain",
+                &self.host,
+                "--out",
+                s(&self.out),
+                "--state",
+                s(&self.state),
+            ],
+        );
+        self.sign_due(spake);
+    }
+
+    pub fn add_collection(&self, spake: &Path) {
+        run(
+            spake,
+            &[
+                "collection",
+                "add",
+                "--out",
+                s(&self.out),
+                "--state",
+                s(&self.state),
+                "--name",
+                &self.collection,
+                "--prefix",
+                &format!("https://{}/", self.host),
+                "--confirm",
+            ],
+        );
+    }
+
+    pub fn publish(&self, spake: &Path) -> std::process::Output {
+        self.publish_with(spake, run)
+    }
+
+    pub fn publish_in_fresh_env(&self, spake: &Path) -> std::process::Output {
+        self.publish_with(spake, |bin, args| run_in_fresh_env(bin, args, &[]))
+    }
+
+    fn publish_with(
+        &self,
+        spake: &Path,
+        runner: impl Fn(&Path, &[&str]) -> std::process::Output,
+    ) -> std::process::Output {
+        let base_url = format!("https://{}/", self.host);
+        runner(
+            spake,
+            &[
+                "emit",
+                "--out",
+                s(&self.out),
+                "--state",
+                s(&self.state),
+                "--collection",
+                &self.collection,
+                "--dir",
+                s(&self.pages),
+                "--base-url",
+                &base_url,
+                "--complete",
+                "--output",
+                s(&self.stream),
+            ],
+        );
+        runner(
+            spake,
+            &[
+                "publish",
+                "--out",
+                s(&self.out),
+                "--state",
+                s(&self.state),
+                "--collection",
+                &self.collection,
+                "--stream",
+                s(&self.stream),
+                "--allow-added",
+            ],
+        )
+    }
+
+    pub fn sign_due(&self, spake: &Path) -> std::process::Output {
+        run(
+            spake,
+            &["publish", "--out", s(&self.out), "--state", s(&self.state)],
+        )
+    }
+
+    pub fn catalog(&self) -> Value {
+        read_json(
+            &self
+                .out
+                .join(".well-known/wist/collections")
+                .join(&self.collection)
+                .join("catalog.json"),
+        )
+    }
+
+    pub fn served_item(&self, url: &str) -> Value {
+        let catalog = self.catalog();
+        let tree = catalog["catalog"]["tree"]
+            .as_str()
+            .and_then(|tree| tree.strip_prefix("sha256:"))
+            .unwrap_or_else(|| panic!("the served Catalog names no tree file: {catalog}"))
+            .to_string();
+        self.find_item(&tree, url).unwrap_or_else(|| {
+            panic!(
+                "the served tree of {} lists no Item for {url}",
+                self.collection
+            )
+        })
+    }
+
+    fn find_item(&self, tree: &str, url: &str) -> Option<Value> {
+        let file = read_json(
+            &self
+                .out
+                .join(".well-known/wist/collections")
+                .join(&self.collection)
+                .join("tree")
+                .join(tree),
+        );
+        if let Some(items) = file["items"].as_array() {
+            return items.iter().find(|item| item["url"] == url).cloned();
+        }
+        file["children"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|child| child["file"].as_str())
+            .filter_map(|file| file.strip_prefix("sha256:"))
+            .find_map(|child| self.find_item(child, url))
+    }
+
+    pub fn item_id(&self, url: &str) -> String {
+        wist_core::item::item_id(&self.served_item(url)).expect("compute the Item ID")
+    }
+
+    pub fn ping_and_wait(
+        &self,
+        spake: &Path,
+        http: &reqwest::blocking::Client,
+        aggregator: &Aggregator,
+    ) -> Value {
+        self.ping_and_wait_allowing(spake, http, aggregator, &[])
+    }
+
+    pub fn ping_and_wait_allowing(
+        &self,
+        spake: &Path,
+        http: &reqwest::blocking::Client,
+        aggregator: &Aggregator,
+        allowed: &[(&str, &str)],
+    ) -> Value {
+        let previous = fetch_status(http, &aggregator.base_url, &self.host)
+            .and_then(|status| status["last_pull_at"].as_str().map(str::to_string));
+        let since = poll_until(Duration::from_secs(5), Duration::from_millis(50), || {
+            let now = now_rfc3339();
+            previous
+                .as_ref()
+                .is_none_or(|previous| now > *previous)
+                .then_some(now)
+        });
+        self.ping(spake, &aggregator.base_url);
+        let status = wait_until_pull_recorded(http, &aggregator.base_url, &self.host, &since);
+        let unexpected: Vec<&Value> = status["rejections"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|rejection| {
+                !allowed
+                    .iter()
+                    .any(|(code, id)| rejection["code"] == *code && rejection["id"] == *id)
+            })
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "the pull of {} at {} since {since} left rejections {unexpected:?}\nstatus={status}\nclave serve stderr={}",
+            self.host,
+            aggregator.base_url,
+            aggregator.stderr.lock().unwrap_or_else(|e| e.into_inner())
+        );
+        status
+    }
+
+    pub fn ping(&self, spake: &Path, log_base: &str) {
+        run(
+            spake,
+            &[
+                "ping",
+                "--log",
+                log_base,
+                "--domain",
+                &self.host,
+                "--allow-http",
+                "--no-retry",
+            ],
+        );
+    }
+}
+
+pub fn read_json(path: &Path) -> Value {
+    serde_json::from_slice(
+        &std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
+    )
+    .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_served_item_is_found_through_inner_tree_nodes() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let site = Site::new(root.path(), "example.localhost", "docs");
+        let tree = site.out.join(".well-known/wist/collections/docs/tree");
+        std::fs::create_dir_all(&tree).expect("tree directory");
+        let wanted = json!({"url": "https://example.localhost/b.html", "observed_at": "2026-01-01T00:00:00Z"});
+        let bucket = json!({"items": [{"url": "https://example.localhost/a.html"}, wanted]});
+        let other = json!({"items": [{"url": "https://example.localhost/c.html"}]});
+        std::fs::write(tree.join("bb"), bucket.to_string()).expect("bucket");
+        std::fs::write(tree.join("cc"), other.to_string()).expect("bucket");
+        let node = json!({"children": [
+            {"prefix": "0", "count": 1, "file": "sha256:cc"},
+            {"prefix": "1", "count": 2, "file": "sha256:bb"},
+        ]});
+        std::fs::write(tree.join("aa"), node.to_string()).expect("node");
+        std::fs::write(
+            tree.parent()
+                .expect("collection directory")
+                .join("catalog.json"),
+            json!({"catalog": {"tree": "sha256:aa"}}).to_string(),
+        )
+        .expect("catalog");
+        assert_eq!(site.served_item("https://example.localhost/b.html"), wanted);
+        assert_eq!(
+            site.item_id("https://example.localhost/b.html"),
+            wist_core::item::item_id(&wanted).expect("Item ID")
+        );
+    }
+}

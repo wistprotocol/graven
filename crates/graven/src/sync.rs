@@ -152,6 +152,78 @@ pub fn follow(config: &Follow, dir: &Path) -> Result<SyncReport> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordRow {
+    pub url: String,
+    pub publisher: String,
+    pub item_id: String,
+    pub observed_at: String,
+    pub attested_at: String,
+    pub collection: Option<String>,
+    pub generated_at: Option<String>,
+    pub lang: Option<String>,
+}
+
+pub fn record_rows(log_dir: &Path) -> Result<Vec<RecordRow>> {
+    let conn = Connection::open(log_dir.join("index.sqlite"))?;
+    let mut stmt = conn.prepare(
+        "SELECT url, publisher, item_id, observed_at, attested_at, collection, generated_at, lang
+         FROM records ORDER BY publisher, url",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(RecordRow {
+                url: row.get(0)?,
+                publisher: row.get(1)?,
+                item_id: row.get(2)?,
+                observed_at: row.get(3)?,
+                attested_at: row.get(4)?,
+                collection: row.get(5)?,
+                generated_at: row.get(6)?,
+                lang: row.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn replayed_records(log_dir: &Path) -> Result<Vec<RecordRow>> {
+    let conn = Connection::open(log_dir.join("index.sqlite"))?;
+    let state = load_sync_state(&conn)?.ok_or_else(|| Error::NotSynced(log_dir.to_path_buf()))?;
+    let head = checkpoints::retained(&conn, state.epoch_number)?.ok_or_else(|| {
+        Error::Verify(format!(
+            "the store retains no Checkpoint at its head epoch {}",
+            state.epoch_number
+        ))
+    })?;
+    let replay = load_replay(&conn, &head, state.walk_floor)?;
+    replay
+        .materialized()?
+        .into_iter()
+        .map(|tuple| {
+            let record = replay
+                .records()
+                .record(&tuple.publisher, &tuple.url)
+                .ok_or_else(|| {
+                    Error::Verify(format!(
+                        "the replay materializes {} of {} without its record",
+                        tuple.url, tuple.publisher
+                    ))
+                })?;
+            Ok(RecordRow {
+                collection: Some(record.collection.clone()),
+                generated_at: Some(record.generated_at.clone()),
+                lang: record.item["meta"]["lang"].as_str().map(str::to_owned),
+                url: tuple.url,
+                publisher: tuple.publisher,
+                item_id: tuple.item_id,
+                observed_at: tuple.observed_at,
+                attested_at: tuple.attested_at,
+            })
+        })
+        .collect()
+}
+
 pub fn run_all(dir: &Path, allow_http: bool) -> Result<Vec<SyncReport>> {
     registry::check_not_legacy(dir)?;
     let reg = registry::load(dir)?;

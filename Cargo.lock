@@ -498,6 +498,7 @@ name = "e2e"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "graven",
  "jiff",
  "libc",
  "reqwest",
@@ -505,7 +506,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "wist-core",
- "zerovec",
 ]
 
 [[package]]

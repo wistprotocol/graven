@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Validate every artifact the e2e run produced against $WIST_SPEC_DIR/schemas/.
 
-Crypto is never reimplemented here: delta_id/root_hash/state_digest use the
-same rfc8785+hashlib primitives $WIST_SPEC_DIR/tools/validate_examples.py uses
-inline for the same computations, and every signature/commitment/merkle-root
-recompute calls that module's own functions directly (imported below). That
+Crypto is never reimplemented here: Catalogs, tree files, Items and Payloads
+are judged by the conformance reference's own modules under
+$WIST_SPEC_DIR/tools (catalogs, tree_files, items, materialization), and every
+signature recompute calls validate_examples.py's functions directly. That
 module runs its whole example-suite as top-level code and calls sys.exit() at
 the end, so it is loaded via importlib with SystemExit caught around
 exec_module rather than a plain `import` (which CPython would otherwise evict
@@ -74,10 +74,20 @@ def main() -> int:
 
     schemas_dir = spec_dir / "schemas"
 
+    from referencing import Registry, Resource
+
+    schemas = {
+        path.name.removesuffix(".schema.json"): json.loads(path.read_text())
+        for path in sorted(schemas_dir.glob("*.schema.json"))
+    }
+    schema_registry = Registry().with_resources(
+        (schema["$id"], Resource.from_contents(schema)) for schema in schemas.values()
+    )
+
     def schema_validate(name, doc):
-        schema = json.loads((schemas_dir / f"{name}.schema.json").read_text())
+        schema = schemas[name]
         Draft202012Validator.check_schema(schema)
-        Draft202012Validator(schema).validate(doc)
+        Draft202012Validator(schema, registry=schema_registry).validate(doc)
 
     def no_duplicate_members(pairs):
         """WIST-1 §4, applied to every file this reads from its octets:
@@ -99,9 +109,6 @@ def main() -> int:
     def sha256_hex(data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
 
-    def delta_id_of(delta) -> str:
-        return "sha256:" + sha256_hex(rfc8785.dumps(delta))
-
     def state_digest_of(entries) -> str:
         return "sha256:" + sha256_hex(b"".join(sorted(rfc8785.dumps(e) for e in entries)))
 
@@ -119,52 +126,77 @@ def main() -> int:
 
     check("publisher.json", _publisher)
 
-    def spake_key(doc):
-        return ve.b64u_decode(next(
-            key["x"] for key in publisher_doc["publisher"]["keys"]
-            if key["kid"] == doc["sig"]["key_id"]
-        ))
+    import catalogs
+    import items as item_rules
+    import materialization
+    import tree_files
 
-    def _feed():
-        doc = read_json(wk / "feed.json")
-        schema_validate("feed", doc)
-        ve.verify_envelope(doc, "feed", spake_key(doc))
+    def tree_octets(collection_dir):
+        return {
+            path.name: path.read_bytes()
+            for path in sorted((collection_dir / "tree").glob("*"))
+        }
 
-    check("feed.json", _feed)
+    named = [
+        collection["name"]
+        for collection in publisher_doc["publisher"].get("collections", [{"name": "default"}])
+    ]
+    collection_dirs = [wk / "collections" / name for name in named]
+    if not collection_dirs:
+        failures.append("collections:none-found")
+        print("FAIL collections:none-found")
 
-    delta_files = sorted((wk / "deltas").glob("*.json"))
-    if not delta_files:
-        failures.append("deltas:none-found")
-        print("FAIL deltas:none-found")
-
-    for delta_path in delta_files:
-
-        def _delta(delta_path=delta_path):
-            doc = read_json(delta_path)
-            schema_validate("delta", doc)
-            ve.verify_envelope(doc, "delta", spake_key(doc))
-            expected_id = delta_id_of(doc["delta"])
-            assert delta_path.stem == expected_id.removeprefix("sha256:"), (
-                f"filename {delta_path.name} does not match recomputed "
-                f"delta_id {expected_id}"
-            )
-
-        check(f"delta:{delta_path.name}", _delta)
-
-        commitment = read_json(delta_path)["delta"].get("payload")
-        if commitment is None:
+    for collection_dir in collection_dirs:
+        name = collection_dir.name
+        catalog_path = collection_dir / "catalog.json"
+        if not catalog_path.exists():
             continue
-        payload_path = wk / "payloads" / delta_path.name
+        envelope = read_json(catalog_path)
+        catalog = envelope["catalog"]
 
-        def _payload(payload_path=payload_path, commitment=commitment):
-            payload_doc = read_json(payload_path)
-            schema_validate("payload", payload_doc)
-            expected = ve._commit(payload_doc["salt"], payload_doc["content"])
-            assert expected == commitment["commitment"], (
-                "payload does not reproduce the delta's commitment"
+        def _catalog(envelope=envelope, catalog=catalog):
+            schema_validate("catalog", envelope)
+            disposition = catalogs.catalog_disposition(
+                envelope, publisher_doc["publisher"], catalog["generated_at"]
             )
+            assert disposition == "accepted", f"the served Catalog is {disposition}"
 
-        check(f"payload:{delta_path.name}", _payload)
+        check(f"catalog:{name}", _catalog)
+
+        listed = []
+
+        def _tree(collection_dir=collection_dir, catalog=catalog, listed=listed):
+            files = tree_octets(collection_dir)
+            for octets in files.values():
+                schema_validate("tree-file", parse_octets(octets))
+            listed.extend(tree_files.walk(catalog, files))
+
+        check(f"tree:{name}", _tree)
+
+        for item in listed:
+            item_id = item_rules.item_id(item)
+
+            def _item(item=item, catalog=catalog):
+                schema_validate("item", item)
+                disposition = item_rules.item_disposition(
+                    item, catalog, publisher_doc["publisher"]
+                )
+                assert disposition == "accepted", f"the listed Item is {disposition}"
+
+            check(f"item:{name}:{item_id}", _item)
+            if item_rules.kind(item) != "page":
+                continue
+            payload_path = collection_dir / "payloads" / f"{item_rules.payload_name(item)}.json"
+            if not payload_path.exists():
+                continue
+
+            def _payload(item=item, payload_path=payload_path):
+                payload_doc = read_json(payload_path)
+                schema_validate("payload", payload_doc)
+                disposition = item_rules.payload_disposition(item, payload_doc)
+                assert disposition == "accepted", f"the served Payload is {disposition}"
+
+            check(f"payload:{name}:{item_id}", _payload)
 
     anchor_doc = read_json(clave_dir / "anchor.json")
 
@@ -246,7 +278,8 @@ def main() -> int:
     check("tile/entries", _entry_bundles)
 
     ENTRY_SCHEMAS = {
-        "publisher_delta": "delta",
+        "publisher_catalog": "catalog",
+        "publisher_item": "publisher-item",
         "publisher_declaration": "publisher",
         "registry_update": "registry-update",
         "label": "label",
@@ -548,7 +581,7 @@ def main() -> int:
             conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
             try:
                 rows = conn.execute(
-                    "SELECT url, publisher, delta_id, observed_at FROM records"
+                    "SELECT url, publisher, item_id, observed_at, attested_at FROM records"
                 ).fetchall()
             finally:
                 conn.close()
@@ -556,12 +589,13 @@ def main() -> int:
                 {
                     "url": r[0],
                     "publisher": r[1],
-                    "delta_id": r[2],
+                    "item_id": r[2],
                     "observed_at": r[3],
+                    "attested_at": r[4],
                 }
                 for r in rows
             ]
-            digest = ve._content_digest(records)
+            digest = materialization.content_digest(records)
             assert digest == manifest_doc["manifest"]["content_digest"], (
                 "recomputed content_digest does not match the manifest"
             )

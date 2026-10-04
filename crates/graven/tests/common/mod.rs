@@ -1126,78 +1126,9 @@ pub fn assert_records_materialized(log_dir: &Path) {
 }
 
 pub fn assert_rows_are_the_replays(log_dir: &Path) {
-    let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
-    let state = graven::store::synced_state(log_dir).unwrap();
-    let head = graven::sync::checkpoints::retained(&conn, state.epoch_number)
-        .unwrap()
-        .unwrap();
-    let declarations: String = conn
-        .query_row(
-            "SELECT state FROM declaration_state WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let declarations = graven::keyset::KeyHistory::from_state(&declarations)
-        .unwrap()
-        .declarations()
-        .clone();
-    let tuples: Vec<StateEntry> = state_tuples(log_dir)
-        .into_iter()
-        .map(|tuple| serde_json::from_value(tuple).unwrap())
-        .collect();
-    let replay = wist_core::sealing::Replay::resumed(
-        head.epoch_number(),
-        head.sealed_at(),
-        declarations,
-        &tuples,
-    )
-    .unwrap();
-    let wanted: Vec<Value> = replay
-        .materialized()
-        .unwrap()
-        .into_iter()
-        .map(|tuple| {
-            let record = replay
-                .records()
-                .record(&tuple.publisher, &tuple.url)
-                .unwrap();
-            serde_json::json!([
-                tuple.url,
-                tuple.publisher,
-                tuple.item_id,
-                tuple.observed_at,
-                tuple.attested_at,
-                record.collection,
-                record.generated_at,
-                record.item["meta"]["lang"],
-            ])
-        })
-        .collect();
-    let mut stmt = conn
-        .prepare(
-            "SELECT url, publisher, item_id, observed_at, attested_at, collection, generated_at, lang
-             FROM records ORDER BY publisher, url",
-        )
-        .unwrap();
-    let held: Vec<Value> = stmt
-        .query_map([], |row| {
-            Ok(serde_json::json!([
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-            ]))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
     assert_eq!(
-        held, wanted,
+        graven::sync::record_rows(log_dir).unwrap(),
+        graven::sync::replayed_records(log_dir).unwrap(),
         "the records rows are the materialized records"
     );
 }

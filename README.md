@@ -420,17 +420,90 @@ cargo test
 
 Conformance tests read the spec repo's schemas/vectors from `../spec`
 (sibling checkout) by default, or from `WIST_SPEC_DIR` if set. Building also
-resolves `wist-core` from `../core`. The `e2e` workspace member drives the
-Consumer against a real `clave` binary, so `../clave` must also be a
-sibling checkout, rebuilt from its current sources on every run
-(`CLAVE_BIN` overrides the binary path and skips that build; set
-`WIST_BUILD_PROFILE=release` to build release executables), sealing on the
-default hourly cadence grid at explicit instants (`clave seal --at`): a
-cold start at a Snapshot's Epoch followed by continuous sync, a source
-serving an old head leaving the verified head where it is, and a
-Checkpoint adopted only once a Witness in the roster has cosigned it —
-with a minimal in-process Witness answering [tlog-witness]
+resolves `wist-core` from `../core`. The `e2e` workspace member drives
+real `spake` and `clave` binaries, so `../spake` and `../clave` must also be
+sibling checkouts, rebuilt from their current sources on every run
+(`SPAKE_BIN`/`CLAVE_BIN` override the binary paths and skip that build; set
+`WIST_BUILD_PROFILE=release` to build release executables). Sites are
+served from a loopback proxy and Logs seal on the default hourly cadence
+grid at explicit instants (`clave seal --at`), advancing Log time by whole
+hours while Catalogs keep wall-clock `generated_at` values.
+
+`e2e/tests/e2e.rs` runs the publication pipeline end to end. Each Publisher
+runs `spake init`, signs its due Catalogs (`spake publish`) and pings;
+Collections other than the implicit `default` are added with `spake
+collection add` once the first Declaration is sealed, and pages are
+published with `spake emit --complete` over marked pages and `spake publish
+--stream`. Each Aggregator pulls on the Ping, and the test waits for a pull
+after it whose status lists no rejection beyond the expected ones. The
+Consumer cold-starts from a Snapshot (`graven follow`) and continues with
+`graven sync`; after every sync the `records` rows of each Log equal the
+records the Replay resumed from the store materializes. The tests cover:
+
+- a page published through two Logs, read over MCP with its `item_id`,
+  `collection`, `attested_at` and `generated_at` and with one provenance
+  entry per Log; its update, the removal of a page, an Aggregator's
+  `payload_withdrawal` leaving the record seen in the other Log alone, a
+  Publisher's withdrawal with `--unpublish`, an Aggregator restart, and a
+  publication from a fresh environment;
+- a Labeler's Labels and definition, a dispute, subscription, link
+  ranking under the `default` and `text-only` profiles, a Label counting
+  only once live through two consecutive Epochs, and the selected profile
+  persisting;
+- a Publisher key rotation and a hijacked Declaration sealed as pending,
+  then reversed with `spake rotate --restore`, keeping the records;
+- an Aggregator key added and the genesis key removed, the Checkpoints'
+  signers at each step, a Consumer cold-started after the removal holding
+  the same records as the one that followed, and a Snapshot signed by the
+  removed key refused with `WIST3-E04`.
+
+Each test validates the served artifacts against the spec's schemas and
+conformance reference with `e2e/validate_artifacts.py` through
+`WIST_SPEC_DIR`, requiring `jsonschema`, `rfc8785` and `cryptography` on
+`PATH`'s python3 or in the spec's `tools/.venv`. The publication and
+Aggregator-key tests also read the served Log with an independent client,
+`e2e/tlog-client`, the latter under the verifier key of the key that
+remains after the removal, built on Go's
+`golang.org/x/mod/sumdb/note` and `tlog`: the head Checkpoint's signature,
+the root recomputed from the tiles, an Inclusion Proof for every leaf and a
+Consistency Proof from every smaller size. Either is skipped when its
+toolchain is missing, or fails under `CI=1`. Each test writes a run record
+under Cargo's `CARGO_TARGET_TMPDIR`, naming the scenarios it exercised and
+the revision of every repository it ran.
+
+`e2e/tests/consumer_sync.rs` drives the Consumer against an Aggregator with
+no Publisher: a cold start at a Snapshot's Epoch followed by continuous
+sync, a source serving an old head leaving the verified head where it is,
+and a Checkpoint adopted only once a Witness in the roster has cosigned it
+— with a minimal in-process Witness answering [tlog-witness]
 `add-checkpoint` with a cosignature/v1 line.
+
+The crate's `baseline` binary drives the pipeline at scale for capacity
+measurements: `cargo run -p e2e --bin baseline -- --domains N --pages M
+[--changed-percent P] [--body-words W] [--extra-empty-seals K]
+[--snapshot-shards S] [--compare-rebuild] [--withdraw] [--work-dir DIR]
+[--keep] [--no-tier1] [--skip-consumer] [--out report.json]` writes N
+loopback sites of M marked pages, publishes each into its `default`
+Collection, ingests them through one Aggregator behind a request-counting
+proxy, seals, cold-starts a Consumer, changes P percent of the pages,
+publishes and seals again, seals K further empty Epochs, verifies the
+history and catches the Consumer up, reporting wall seconds, bytes and
+request counts per stage together with the revision of every repository it
+ran. Each seal stage runs `clave seal --no-snapshot` and then `clave
+snapshot` as separate processes, reporting each one's wall seconds and peak
+resident set size in kB (`null` off Unix), the seconds, shard, byte and
+Payload-read counters parsed from their output (`null` for a line the
+executable did not print), and the sizes of the Aggregator's SQLite
+database, its write-ahead log and its Snapshot directories.
+`--snapshot-shards` sets the store's `snapshot_shard_count` before
+ingestion (one shard otherwise). `--skip-consumer` omits the three Consumer
+stages. `--compare-rebuild` adds a full Snapshot rebuild at the same head
+(`clave snapshot --rebuild`) per seal stage, reported under
+`snapshot_rebuild`. `--withdraw` then withdraws the Item of the first
+site's first page and reports one more seal stage under `withdrawal`, with
+the storage sizes before it under `before`. `--work-dir` places the
+temporary directory inside DIR, and `--keep` leaves it in place and prints
+its path on standard error; the report names no host, path or hardware.
 
 ## Verification
 
