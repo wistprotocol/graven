@@ -531,3 +531,169 @@ fn a_checkpoint_below_the_head_is_evidence_only_under_the_keys_valid_at_its_own_
             .collect()
     );
 }
+
+fn seed_epoch_0_registry_state(served: &ServedHistory, target: &Path, history: &Value) {
+    let epoch = &history["epochs"][0];
+    let sealed_at_s =
+        wist_core::timestamp::log_seconds(epoch["sealed_at"].as_str().unwrap()).unwrap();
+    let conn =
+        Connection::open(graven::registry::log_dir(target, &served.log_id).join("index.sqlite"))
+            .unwrap();
+    conn.execute("DELETE FROM state_tuples", []).unwrap();
+    conn.execute_batch(graven::store::CREATE_PARAMETERS)
+        .unwrap();
+    let tuples = epoch["expected_registry_state"].as_array().unwrap();
+    for (index, tuple) in tuples.iter().enumerate() {
+        match tuple[0].as_str().unwrap() {
+            "registry_update" => {
+                conn.execute(
+                    "INSERT INTO state_tuples(seq, tuple) VALUES (?1, ?2)",
+                    (index as i64, serde_json::to_string(tuple).unwrap()),
+                )
+                .unwrap();
+            }
+            "parameter" => {
+                conn.execute(
+                    "INSERT INTO parameters(parameter, value, epoch_number, entry_index, sealed_at_s, effective_at_s) VALUES (?1, ?2, 0, ?3, ?4, ?5)",
+                    (
+                        tuple[1].as_str().unwrap(),
+                        tuple[3].as_i64().unwrap(),
+                        index as i64,
+                        sealed_at_s,
+                        wist_core::timestamp::log_seconds(tuple[2].as_str().unwrap()).unwrap(),
+                    ),
+                )
+                .unwrap();
+            }
+            other => panic!("Epoch 0 carries a {other} tuple"),
+        }
+    }
+    let mut state = graven::sync::load_sync_state(&conn).unwrap().unwrap();
+    state.schedule_first_s = Some(sealed_at_s);
+    graven::sync::save_sync_state(&conn, &state).unwrap();
+    let files = served.dir.path().join("log/suffix-lists");
+    std::fs::create_dir_all(&files).unwrap();
+    for file in history["suffix_lists"].as_array().into_iter().flatten() {
+        let identifier = file["sha256"].as_str().unwrap();
+        std::fs::write(
+            files.join(format!(
+                "{}.dat",
+                identifier.strip_prefix("sha256:").unwrap()
+            )),
+            file["text"].as_str().unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+fn stored_registry_state(target: &Path, log_id: &str, height: u64) -> Vec<String> {
+    let log_dir = graven::registry::log_dir(target, log_id);
+    let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+    let mut amendments = std::collections::BTreeMap::new();
+    let mut stmt = conn
+        .prepare("SELECT parameter, value, effective_at_s FROM parameters ORDER BY epoch_number, entry_index")
+        .unwrap();
+    for row in stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .unwrap()
+    {
+        let (parameter, value, effective_at_s) = row.unwrap();
+        amendments.insert((parameter, effective_at_s), value);
+    }
+    let mut state: Vec<String> = amendments
+        .into_iter()
+        .map(|((parameter, effective_at_s), value)| {
+            serde_json::json!([
+                "parameter",
+                parameter,
+                wist_core::timestamp::instant(effective_at_s).unwrap(),
+                value
+            ])
+            .to_string()
+        })
+        .collect();
+    let suffix_list: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT height, sha256 FROM suffix_list_acts WHERE height <= ?1 ORDER BY seq DESC LIMIT 1",
+            [height as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+    if let Some((sealed, identifier)) = suffix_list {
+        state.push(serde_json::json!(["suffix_list", identifier, sealed]).to_string());
+    }
+    state.extend(
+        common::state_tuples(&log_dir)
+            .into_iter()
+            .filter(|tuple| tuple[0] == "registry_update")
+            .map(|tuple| tuple.to_string()),
+    );
+    state.sort();
+    state
+}
+
+#[test]
+fn each_epoch_walked_leaves_the_registry_state_the_vector_records_a_rejected_ones_included() {
+    let mut rejected = 0;
+    for history in histories() {
+        let name = history["name"].as_str().unwrap();
+        let epochs = history["epochs"].as_array().unwrap();
+        for through in 2..=applied_epochs(&history) {
+            let epoch = &epochs[through - 1];
+            let height = epoch["epoch_number"].as_u64().unwrap();
+            let served = serve(&history, through, None);
+            let target = tempfile::tempdir().unwrap();
+            install_at_epoch_0(&served, target.path(), &history);
+            seed_epoch_0_registry_state(&served, target.path(), &history);
+            let report = sync(&served, target.path())
+                .unwrap_or_else(|e| panic!("{name} Epoch {height}: {e}"));
+            assert_eq!(report.head, height, "{name}");
+            let reported: Vec<(u64, Vec<String>)> = report
+                .rejected
+                .iter()
+                .map(|epoch| (epoch.epoch_number, epoch.codes.clone()))
+                .collect();
+            let stated: Vec<(u64, Vec<String>)> = epochs[1..through]
+                .iter()
+                .filter_map(|epoch| {
+                    epoch["rejection"].as_str().map(|code| {
+                        (
+                            epoch["epoch_number"].as_u64().unwrap(),
+                            vec![code.to_owned()],
+                        )
+                    })
+                })
+                .collect();
+            assert_eq!(reported, stated, "{name} Epoch {height}");
+            if epoch["rejection"].is_string() {
+                rejected += 1;
+            }
+            let mut expected: Vec<String> = epoch["expected_registry_state"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(Value::to_string)
+                .collect();
+            expected.sort();
+            assert_eq!(
+                stored_registry_state(target.path(), &served.log_id, height),
+                expected,
+                "{name} Epoch {height}: {}",
+                epoch["why"]
+            );
+            assert_eq!(
+                stored_rows(target.path(), &served.log_id),
+                rows(&key_entries(&epoch["expected_state"])),
+                "{name} Epoch {height}: the aggregator_key records"
+            );
+            drop(served.dir);
+        }
+    }
+    assert!(rejected >= 1, "no rejected Epoch was walked");
+}

@@ -1487,12 +1487,21 @@ fn an_accepted_cap_reduction_rejects_a_later_epoch_above_it() {
         )],
     );
     assert!(size <= CAP as u64);
-    let (_, size) = seal_next(&fx, "2026-08-16T14:00:00Z", &bulk_declarations(200));
+    let (over, size) = seal_next(&fx, "2026-08-16T14:00:00Z", &bulk_declarations(200));
     assert!(size > CAP as u64);
-    let error = cold_sync(&fx).unwrap_err();
-    assert!(
-        error.contains("exceeds the accepted size schedule"),
-        "the reduced cap applies at its effective instant: {error}"
+    let (report, _) = cold_sync(&fx).unwrap();
+    assert_eq!(
+        report.head, over,
+        "the walk goes on past the rejected Epoch"
+    );
+    assert_eq!(
+        report
+            .rejected
+            .iter()
+            .map(|epoch| (epoch.epoch_number, epoch.codes.clone()))
+            .collect::<Vec<_>>(),
+        [(over, vec!["WIST3-E03".to_owned()])],
+        "the reduced cap applies at its effective instant"
     );
 }
 
@@ -1976,10 +1985,10 @@ fn incremental_sync_with_tier1_purges_the_previous_items_content_when_the_new_pa
     );
 }
 
-/// WIST-1 §5.2 and WIST-3 §3.3: a rejected Epoch applies none of its Registry Updates, the key,
-/// parameter and suffix-list acts included, and the walk goes on to the Epochs after it.
+/// WIST-3 §3.3, Rejected Epochs: a rejected Epoch applies its key acts alone and accepts their
+/// IDs alone, and the walk goes on to the Epochs after it.
 #[test]
-fn a_rejected_epoch_applies_none_of_its_registry_updates_and_the_walk_goes_on() {
+fn a_rejected_epoch_applies_its_key_acts_alone_and_the_walk_goes_on() {
     let fx = common::build_fixture(false);
     let target = tempfile::tempdir().unwrap();
     common::sync(&fx, target.path(), false);
@@ -2061,10 +2070,23 @@ fn a_rejected_epoch_applies_none_of_its_registry_updates_and_the_walk_goes_on() 
         )
     };
     let (keys, parameters, suffix_lists, updates) = held();
-    assert_eq!(keys, ["log1"]);
+    assert_eq!(keys, ["log1", "log2"]);
     assert!(!parameters.contains(&"catalog_refresh_seconds".to_owned()));
     assert!(suffix_lists.is_empty());
-    assert_eq!(updates, 0);
+    assert_eq!(updates, 1);
+    let key_act_id = wist_core::registry_updates::update_id(
+        &acts
+            .iter()
+            .find(|act| act["body"]["update"]["action"] == "aggregator_key_add")
+            .unwrap()["body"],
+    )
+    .unwrap();
+    let key_act_tuple = || {
+        common::state_tuples(&log_dir)
+            .into_iter()
+            .find(|tuple| tuple[0] == "registry_update" && tuple[1] == key_act_id.as_str())
+    };
+    assert_eq!(key_act_tuple().unwrap()[2], rejected);
 
     let at = common::next_instant(&fx);
     let accepted = common::seal_next(&fx, &at, &acts);
@@ -2076,6 +2098,11 @@ fn a_rejected_epoch_applies_none_of_its_registry_updates_and_the_walk_goes_on() 
     assert!(parameters.contains(&"catalog_refresh_seconds".to_owned()));
     assert_eq!(suffix_lists, [identifier]);
     assert_eq!(updates, 3);
+    assert_eq!(
+        key_act_tuple().unwrap()[2],
+        rejected,
+        "the key act sealed again is idempotent and its tuple keeps the rejected Epoch's height"
+    );
     assert_eq!(
         graven::store::synced_state(&log_dir)
             .unwrap()

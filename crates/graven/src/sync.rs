@@ -436,11 +436,19 @@ fn restore(
     local: &SyncState,
     head: &Checkpoint,
 ) -> Result<Restored> {
+    let replay = load_replay(conn, head, local.walk_floor)?;
+    let accepted = replay.registry_updates().clone();
+    let mut keys = load_aggregator_keys(conn, context.anchor, local.epoch_number)?;
+    keys.hold_accepted_updates(accepted.clone());
+    let mut chain = ChainState::restore(local, load_parameters(conn)?);
+    chain.hold_accepted_updates(accepted.clone());
+    let mut suffix_lists = SuffixLists::load(conn)?;
+    suffix_lists.hold_accepted_updates(accepted);
     Ok(Restored {
-        keys: load_aggregator_keys(conn, context.anchor, local.epoch_number)?,
-        chain: ChainState::restore(local, load_parameters(conn)?),
-        replay: load_replay(conn, head, local.walk_floor)?,
-        suffix_lists: SuffixLists::load(conn)?,
+        keys,
+        chain,
+        replay,
+        suffix_lists,
         tree: Tree::load(conn)?,
     })
 }

@@ -337,3 +337,118 @@ fn a_cold_start_installs_the_records_its_tuples_materialize_and_takes_only_their
     );
     assert!(common::record_row(&log_dir, &stray.url).is_none());
 }
+
+/// WIST-4 §5.1: a Consumer resumed from a Snapshot holds the IDs of its `registry_update` tuples
+/// as accepted, so a `parameter_change` sealed again above it is idempotent.
+#[test]
+fn a_consumer_resumed_from_a_snapshot_reads_a_parameter_change_sealed_again_as_idempotent() {
+    let vector = read_json("vectors/wist4/parameter-in-force.json");
+    let cases = vector["resume_cases"].as_array().unwrap();
+    assert!(!cases.is_empty());
+    for case in cases {
+        let label = case["label"].as_str().unwrap();
+        let parameter = case["parameter"].as_str().unwrap();
+        let snapshot_epoch = case["snapshot_epoch"].as_u64().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let log_id = "parameter-resume-log";
+        let log_signer = Signer::new([72u8; 32]);
+        let mut log = Log::new(dir.path(), Signer::new([72u8; 32]), log_id);
+        let act_key = &case["log_key"];
+        let addition = wist_core::envelope::sign_envelope(
+            &json!({
+                "wist_version": "1.0.0",
+                "action": "aggregator_key_add",
+                "subject": act_key["key_id"],
+                "details": {"alg": "Ed25519", "key_id": act_key["key_id"], "public_key": act_key["public_key"]},
+                "effective_at": "2026-08-01T00:00:00Z"
+            }),
+            "update",
+            "log1",
+            &log_signer.sk,
+        )
+        .unwrap();
+        let mut snapshot = None;
+        for epoch in case["epochs"].as_array().unwrap() {
+            let height = epoch["epoch_number"].as_u64().unwrap();
+            let mut entries: Vec<Value> = epoch["acts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|act| json!({"type": "registry_update", "body": act}))
+                .collect();
+            if height == 0 {
+                entries.push(json!({"type": "registry_update", "body": addition}));
+            }
+            let checkpoint = log.seal(epoch["sealed_at"].as_str().unwrap(), &entries);
+            if height == snapshot_epoch {
+                snapshot = Some(checkpoint);
+            }
+        }
+        let snapshot = snapshot.unwrap();
+        let mut entries: Vec<StateEntry> =
+            serde_json::from_value(case["snapshot_tuples"].clone()).unwrap();
+        entries.push(log_key_tuple(&log_signer));
+        entries.push(StateEntry::AggregatorKey(AggregatorKeyEntry {
+            key_id: act_key["key_id"].as_str().unwrap().into(),
+            public_key: act_key["public_key"].as_str().unwrap().into(),
+            added_height: 0,
+            removed_height: None,
+            adding_act: Some(addition.clone()),
+            removing_act: None,
+        }));
+        entries.push(StateEntry::RegistryUpdate(
+            wist_core::objects::RegistryUpdateEntry {
+                update_id: wist_core::registry_updates::update_id(&addition).unwrap(),
+                sealing_height: 0,
+            },
+        ));
+        common::write_snapshot(
+            dir.path(),
+            &SnapshotParts {
+                signer: &log_signer,
+                key_id: "log1",
+                snapshot_date: "2026-08-04",
+                checkpoint: &snapshot,
+                entries,
+                records: &[],
+                extracts: Vec::new(),
+                links: Vec::new(),
+                tier1: false,
+                shards: None,
+            },
+        );
+        let served = Served {
+            base_url: format!("http://{}", common::serve_static(dir.path().to_path_buf())),
+            dir,
+            log_id: log_id.into(),
+        };
+        let (_target, log_dir) = served.cold_start_unchecked(false);
+
+        let accepted = rows(
+            &log_dir,
+            &format!(
+                "SELECT value, epoch_number FROM parameters WHERE parameter = '{parameter}' ORDER BY epoch_number, entry_index"
+            ),
+        );
+        assert_eq!(
+            accepted.last().map(|row| row["value"].clone()),
+            Some(case["resumed_value"].clone()),
+            "{label}"
+        );
+        assert!(
+            accepted
+                .iter()
+                .all(|row| row["epoch_number"].as_u64().unwrap() <= snapshot_epoch),
+            "{label}: the act sealed again above the Snapshot applies nothing: {accepted:?}"
+        );
+        let held: Vec<Value> = common::state_tuples(&log_dir)
+            .into_iter()
+            .filter(|tuple| tuple[0] == "registry_update")
+            .collect();
+        for tuple in case["snapshot_tuples"].as_array().unwrap() {
+            if tuple[0] == "registry_update" {
+                assert!(held.contains(tuple), "{label}: {tuple} keeps its height");
+            }
+        }
+    }
+}

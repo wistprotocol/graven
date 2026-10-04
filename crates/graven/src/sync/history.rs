@@ -14,10 +14,9 @@ use wist_core::declaration::url_host;
 use wist_core::item::{judge_payload_octets, Kind, SizeCaps};
 use wist_core::label::{SealedDispute, SealedLabel};
 use wist_core::merkle::consistency_proof_from;
-use wist_core::objects::{
-    PageItem, Payload, PublisherEnvelope, RegistryDetails, RegistryUpdateEnvelope,
-};
-use wist_core::parameters::{Amendment, Schedule};
+use wist_core::objects::{PageItem, Payload, PublisherEnvelope};
+use wist_core::parameters::{ActPosition, Amendment, Disposition as ScheduleDisposition, Schedule};
+use wist_core::registry_updates::AcceptedUpdates;
 use wist_core::sealing::{
     carried_label_ids, Epoch, Judgment, Outcome, Parameters, Removed, Replay,
 };
@@ -29,6 +28,7 @@ pub struct ChainState {
     adopted: Vec<Amendment>,
     largest: u64,
     prior_at: Option<i64>,
+    updates: AcceptedUpdates,
 }
 
 impl ChainState {
@@ -38,6 +38,7 @@ impl ChainState {
             adopted: Vec::new(),
             largest: 0,
             prior_at: None,
+            updates: AcceptedUpdates::new(),
         }
     }
 
@@ -65,6 +66,7 @@ impl ChainState {
             adopted,
             largest: 0,
             prior_at: None,
+            updates: AcceptedUpdates::new(),
         })
     }
 
@@ -81,7 +83,16 @@ impl ChainState {
             adopted: Vec::new(),
             largest: state.largest_epoch_bytes,
             prior_at: state.prior_sealed_at_s,
+            updates: AcceptedUpdates::new(),
         }
+    }
+
+    /// WIST-4 §5.1: the Registry Update IDs accepted below the first Epoch this state walks.
+    pub fn hold_accepted_updates(&mut self, updates: AcceptedUpdates) {
+        if let Some(schedule) = &mut self.schedule {
+            schedule.hold_accepted_updates(updates.clone());
+        }
+        self.updates = updates;
     }
 
     fn schedule_at(&mut self, at: i64) -> &mut Schedule {
@@ -90,6 +101,7 @@ impl ChainState {
             for amendment in self.adopted.drain(..) {
                 schedule.adopt(amendment);
             }
+            schedule.hold_accepted_updates(self.updates.clone());
             self.schedule = Some(schedule);
         }
         self.schedule.as_mut().unwrap()
@@ -382,27 +394,6 @@ fn registry_update_id(body: &Value) -> Option<String> {
     wist_core::registry_updates::update_id(body).ok()
 }
 
-struct Accepting<'a> {
-    replay: &'a Replay,
-    here: Vec<String>,
-}
-
-impl Accepting<'_> {
-    fn repeated(&self, id: Option<&String>) -> bool {
-        // WIST-4 §5.1: an occurrence of an accepted ID applies nothing, and one failing field
-        // validation changes no state either.
-        id.is_some_and(|id| {
-            self.replay.registry_updates().is_accepted(id) || self.here.contains(id)
-        })
-    }
-
-    fn accept(&mut self, id: Option<String>) {
-        if let Some(id) = id {
-            self.here.push(id);
-        }
-    }
-}
-
 fn act_of<'v>(entry: &'v Value, eligible: bool, actions: &[&str]) -> Option<&'v Value> {
     let body = &entry["body"];
     (eligible
@@ -522,14 +513,10 @@ fn verify_checkpoint(
     // the Entry form, canonical order and the 65 535-octet bound are left to the Replay, which
     // rejects the Epoch for them.
     let octets = leaves.octets;
-    let keys_before = (**keys).clone();
 
-    let mut accepting = Accepting {
-        replay,
-        here: Vec::new(),
-    };
-    // WIST-3 §3.3 and §3.4: key acts apply first, in canonical Entry index order, under the keys
-    // valid at N−1; a failing key act is ignored.
+    // WIST-3 §§3.3, 3.4: key acts apply first, in ascending leaf index, under the keys valid at
+    // N−1, in every Epoch a rejected one included; a failing key act is ignored.
+    let mut key_acts: Vec<String> = Vec::new();
     for (entry, eligible) in entries.iter().zip(&leaves.body_eligible) {
         let Some(body) = act_of(
             entry,
@@ -538,23 +525,17 @@ fn verify_checkpoint(
         ) else {
             continue;
         };
-        let id = registry_update_id(body);
-        if accepting.repeated(id.as_ref()) {
-            continue;
-        }
         for outcome in keys.apply_epoch(n, [body]) {
             if let Some(code) = outcome.code() {
                 eprintln!("ignoring an Aggregator key act at height {n}: {code}");
             }
             if outcome.is_accepted() {
-                accepting.accept(id.clone());
+                key_acts.extend(registry_update_id(body));
             }
         }
     }
     // Authenticated under the keys valid at N, after this Epoch's key acts.
     let authenticators = keys.valid_at(n);
-    let authentic =
-        |body: &Value| wist_core::aggregator_keys::authenticate(body, &authenticators).is_ok();
     let log_key = |key_id: &str| {
         authenticators
             .iter()
@@ -568,52 +549,29 @@ fn verify_checkpoint(
         .map_err(|e| Error::Verify(format!("epoch {n}: WIST3-E03 {e}")))?;
     // WIST-4 §5: every Epoch's size counts toward the largest, a rejected one's included.
     let largest = chain.largest.max(octets);
-    let schedule_before = chain.schedule_at(at).clone();
-    let schedule = chain.schedule_at(at);
+    let mut candidate = chain.schedule_at(at).clone();
+    let mut parameter_acts: Vec<String> = Vec::new();
     for (index, (entry, eligible)) in entries.iter().zip(&leaves.body_eligible).enumerate() {
         let Some(body) = act_of(entry, *eligible, &["parameter_change"]) else {
             continue;
         };
-        let id = registry_update_id(body);
-        if accepting.repeated(id.as_ref()) {
-            continue;
-        }
-        let (parameter, value, effective_at_s) = match parameter_change(body) {
-            Ok(change) => change,
-            Err(code) => {
-                eprintln!("ignoring a parameter_change at height {n}: {code}");
-                continue;
-            }
-        };
-        if !authentic(body) {
-            eprintln!("ignoring a parameter_change at height {n}: WIST4-E11");
-            continue;
-        }
-        let amendment = Amendment {
-            parameter,
-            value,
+        let position = ActPosition {
             epoch_number: n,
             entry_index: index as u64,
             sealed_at_s: at,
-            effective_at_s,
         };
-        if schedule
-            .try_accept_with_epoch_size(amendment, largest)
-            .is_ok()
-        {
-            accepting.accept(id);
+        match candidate.apply_act(body, position, largest, log_key) {
+            ScheduleDisposition::Accepted(_) => parameter_acts.extend(registry_update_id(body)),
+            ScheduleDisposition::Rejected { code, .. } => {
+                eprintln!("ignoring a parameter_change at height {n}: {code}");
+            }
+            ScheduleDisposition::Repeated { .. } | ScheduleDisposition::NotParameterChange => {}
         }
     }
-    if largest > schedule.epoch_size_bounds(at).0 {
-        return Err(Error::Verify(format!(
-            "epoch {n}: WIST3-E03 Epoch exceeds the accepted size schedule"
-        )));
-    }
-    let parameters = Parameters::from_schedule(schedule, at)
+    let parameters = Parameters::from_schedule(chain.schedule_at(at), at)
         .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
     let recovery_window_days = parameters.get("recovery_window_days");
     let suffix_list = suffix_lists.in_force_at_epoch(n)?;
-    let accepted_here = accepting.here;
     chain.largest = largest;
     chain.prior_at = Some(at);
 
@@ -623,34 +581,38 @@ fn verify_checkpoint(
         .iter()
         .map(|(index, octets)| (*index, octets.as_slice()))
         .collect();
-    let outcome = replay
-        .epoch_stored(
-            &Epoch {
-                height: n,
-                root: &root,
-                sealed_at: &sealed_at,
-                parameters: &parameters,
-                suffix_list: suffix_list.as_deref(),
-                log_key: &log_key,
-                entries,
-            },
-            &stored,
-        )
-        .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
+    let epoch = Epoch {
+        height: n,
+        root: &root,
+        sealed_at: &sealed_at,
+        parameters: &parameters,
+        suffix_list: suffix_list.as_deref(),
+        log_key: &log_key,
+        entries,
+    };
+    // WIST-4 §5 and WIST-3 §6: an Epoch over the smallest cap at its `sealed_at` and at every
+    // accepted later `effective_at` is rejected whole.
+    let outcome = if octets > candidate.epoch_size_bounds(at).0 {
+        replay.reject_epoch(&epoch, vec!["WIST3-E03".to_owned()])
+    } else {
+        replay.epoch_stored(&epoch, &stored)
+    }
+    .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
     let (judged, records_removed) = match outcome {
-        // WIST-1 §5.2: no Entry of a rejected Epoch takes effect, the acts this walk applies itself
-        // included; its Checkpoint is judged under the keys valid before it.
+        // WIST-3 §3.3, Rejected Epochs: of a rejected Epoch only the key acts apply, and their IDs
+        // alone are accepted; its Checkpoint is judged under the keys they leave valid.
         Outcome::Rejected { codes } => {
             eprintln!(
-                "rejecting the Epoch at height {n}, which applies nothing: {}",
+                "rejecting the Epoch at height {n}, which applies its key acts alone: {}",
                 codes.join(", ")
             );
-            **keys = keys_before;
-            *chain.schedule_at(at) = schedule_before;
+            for id in &key_acts {
+                replay.accept_registry_update(id, n);
+            }
             let adoption = super::checkpoints::decide(
                 checkpoint,
                 inputs.log_id,
-                &keys.valid_at(n),
+                &authenticators,
                 inputs.witnesses,
                 chain.quorum_at(at),
             )
@@ -662,18 +624,13 @@ fn verify_checkpoint(
             records_removed,
         } => (entries, records_removed),
     };
-    let mut accepting = Accepting {
-        replay,
-        here: accepted_here,
-    };
+    *chain.schedule_at(at) = candidate;
+    let mut accepted_here = key_acts;
+    accepted_here.extend(parameter_acts);
     for (entry, eligible) in entries.iter().zip(&leaves.body_eligible) {
         let Some(body) = act_of(entry, *eligible, &["suffix_list_update"]) else {
             continue;
         };
-        let id = registry_update_id(body);
-        if accepting.repeated(id.as_ref()) {
-            continue;
-        }
         if suffix_lists.apply_act(
             inputs.sources.client(),
             inputs.sources.primary(),
@@ -681,10 +638,9 @@ fn verify_checkpoint(
             body,
             log_key,
         )? {
-            accepting.accept(id);
+            accepted_here.extend(registry_update_id(body));
         }
     }
-    let accepted_here = accepting.here;
     for id in &accepted_here {
         replay.accept_registry_update(id, n);
     }
@@ -787,21 +743,6 @@ fn sightings(
         ));
     }
     Ok(sightings)
-}
-
-/// WIST-4 §5.1: the envelope checks outside any contract (`WIST4-E11`), then the `details` and
-/// `subject` contract (`WIST4-E04`); a value or identifier outside §5's table is left to the
-/// schedule (`WIST4-E03`).
-fn parameter_change(body: &Value) -> std::result::Result<(String, i64, i64), &'static str> {
-    let envelope: RegistryUpdateEnvelope =
-        serde_json::from_value(body.clone()).map_err(|_| "WIST4-E11")?;
-    wist_core::withdrawal::envelope_fields(&envelope)?;
-    let details = match envelope.update.typed_details() {
-        Ok(RegistryDetails::ParameterChange(details)) => details,
-        _ => return Err("WIST4-E04"),
-    };
-    let effective_at_s = log_seconds(&envelope.update.effective_at).map_err(|_| "WIST4-E11")?;
-    Ok((details.parameter, details.value, effective_at_s))
 }
 
 pub(super) fn default_recovery_window_days() -> i64 {

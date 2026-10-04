@@ -76,6 +76,10 @@ impl SuffixLists {
         Ok(())
     }
 
+    pub fn hold_accepted_updates(&mut self, updates: wist_core::registry_updates::AcceptedUpdates) {
+        self.replay.hold_accepted_updates(updates);
+    }
+
     /// WIST-3 §8 step 10: the file is obtained before any Epoch's capacity is checked under it.
     pub fn adopt(
         &mut self,
@@ -156,7 +160,7 @@ impl SuffixLists {
                 eprintln!("ignoring a suffix_list_update at height {height}: {code}");
                 Ok(false)
             }
-            Disposition::NotSuffixList => Ok(false),
+            Disposition::Repeated { .. } | Disposition::NotSuffixList => Ok(false),
         }
     }
 }
