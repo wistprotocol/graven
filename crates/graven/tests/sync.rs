@@ -1316,8 +1316,11 @@ fn cold_start_enforces_the_adopted_sequence_floor() {
     .err()
     .map(|e| e.to_string())
     .unwrap_or_default();
+    let rotated = fx.log_state().head_number();
     assert!(
-        error.contains("WIST1-E08") && error.contains("does not exceed accepted floor"),
+        error.contains("WIST1-E08")
+            && error.contains("the Epoch is rejected")
+            && error.contains(&format!("stopped at epoch {rotated}")),
         "a rotation to seq 1 must not pass a floor of 5: {error}"
     );
 }

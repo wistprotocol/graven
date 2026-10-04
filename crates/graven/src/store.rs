@@ -42,6 +42,14 @@ CREATE INDEX IF NOT EXISTS inlinks_target ON inlinks(target_host); \
 CREATE TABLE IF NOT EXISTS link_changes(target_host TEXT NOT NULL, height INTEGER NOT NULL, added INTEGER NOT NULL, removed INTEGER NOT NULL, PRIMARY KEY(target_host, height)); \
 CREATE TABLE IF NOT EXISTS identity_starts(domain TEXT PRIMARY KEY, height INTEGER NOT NULL)";
 
+pub const CREATE_SEALED_LABEL_IDS: &str =
+    "CREATE TABLE IF NOT EXISTS sealed_label_ids(label_id TEXT PRIMARY KEY, subject TEXT)";
+
+pub const CREATE_SEALED_ITEMS: &str = "CREATE TABLE IF NOT EXISTS sealed_items(item_id TEXT NOT NULL, publisher TEXT NOT NULL, kind TEXT NOT NULL, height INTEGER NOT NULL, PRIMARY KEY(item_id, publisher, kind))";
+
+pub const CREATE_STATE_TUPLES: &str =
+    "CREATE TABLE IF NOT EXISTS state_tuples(seq INTEGER PRIMARY KEY, tuple TEXT NOT NULL)";
+
 /// WIST-4 §9.
 pub const CREATE_PARAMETERS: &str = "CREATE TABLE IF NOT EXISTS parameters(parameter TEXT NOT NULL, value INTEGER NOT NULL, epoch_number INTEGER NOT NULL, entry_index INTEGER NOT NULL, sealed_at_s INTEGER NOT NULL, effective_at_s INTEGER NOT NULL, PRIMARY KEY(parameter, epoch_number, entry_index))";
 
@@ -1325,6 +1333,7 @@ mod tests {
                 schedule_first_s: None,
                 prior_sealed_at_s: None,
                 largest_epoch_bytes: 0,
+                walk_floor: None,
             })
             .unwrap(),
         )
@@ -1443,6 +1452,7 @@ mod tests {
                 schedule_first_s: None,
                 prior_sealed_at_s: None,
                 largest_epoch_bytes: 0,
+                walk_floor: None,
             })
             .unwrap(),
         )

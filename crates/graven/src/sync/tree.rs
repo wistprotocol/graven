@@ -232,15 +232,13 @@ fn bundle_bytes(sources: &Sources, tree: &Tree, bundle: &EntryBundle) -> Result<
     }
 }
 
-/// WIST-3 §3.1 and §6: held to leaves `size(N-1)` through `size(N) - 1` and stopped at the prefix's
-/// transport bound.
-pub fn epoch_entries(
+fn leaf_data(
     sources: &Sources,
     tree: &Tree,
     from: u64,
     to: u64,
     transport_bound: u64,
-) -> Result<Vec<Value>> {
+) -> Result<Vec<Vec<u8>>> {
     if from >= to {
         return Ok(Vec::new());
     }
@@ -272,5 +270,67 @@ pub fn epoch_entries(
         }
     }
     wist_core::epoch::check_leaf_range(from, to, &leaf_indexes)?;
-    Ok(parse_entries(&leaf_data)?)
+    Ok(leaf_data)
+}
+
+/// WIST-3 §3.1 and §6: held to leaves `size(N-1)` through `size(N) - 1` and stopped at the prefix's
+/// transport bound.
+pub fn epoch_entries(
+    sources: &Sources,
+    tree: &Tree,
+    from: u64,
+    to: u64,
+    transport_bound: u64,
+) -> Result<Vec<Value>> {
+    Ok(parse_entries(&leaf_data(
+        sources,
+        tree,
+        from,
+        to,
+        transport_bound,
+    )?)?)
+}
+
+pub struct EpochLeaves {
+    pub entries: Vec<Value>,
+    pub stored: Vec<(usize, Vec<u8>)>,
+    pub body_eligible: Vec<bool>,
+    pub octets: u64,
+}
+
+/// WIST-1 §4: a leaf whose text is not JCS input is read as `serde_json` reads it, the last of a
+/// repeated member winning, and kept as stored octets; any other leaf must be its Entry's JCS.
+pub fn epoch_leaves(
+    sources: &Sources,
+    tree: &Tree,
+    from: u64,
+    to: u64,
+    transport_bound: u64,
+) -> Result<EpochLeaves> {
+    let leaves = leaf_data(sources, tree, from, to, transport_bound)?;
+    let mut read = EpochLeaves {
+        entries: Vec::with_capacity(leaves.len()),
+        stored: Vec::new(),
+        body_eligible: Vec::with_capacity(leaves.len()),
+        octets: leaves.iter().map(|leaf| leaf.len() as u64 + 2).sum(),
+    };
+    for (index, leaf) in leaves.into_iter().enumerate() {
+        match wist_core::json::member_eligible(&leaf, &[]) {
+            Some(true) => {
+                let mut entry = parse_entries(std::slice::from_ref(&leaf))?;
+                read.entries.push(entry.remove(0));
+                read.body_eligible.push(true);
+            }
+            Some(false) => {
+                let entry: Value = serde_json::from_slice(&leaf)
+                    .map_err(|e| invalid(&format!("an Entry does not parse: {e}")))?;
+                read.entries.push(entry);
+                read.body_eligible
+                    .push(wist_core::json::member_eligible(&leaf, &["body"]) == Some(true));
+                read.stored.push((index, leaf));
+            }
+            None => return Err(invalid("an Entry's leaf data is not JSON text")),
+        }
+    }
+    Ok(read)
 }

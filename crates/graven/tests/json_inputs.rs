@@ -33,9 +33,10 @@ fn cold_sync(
     .map_err(|e| e.to_string())
 }
 
-/// WIST-3 §4: an Entry's leaf data is its JCS serialization.
+/// WIST-3 §3.3 and WIST-1 §4: a `publisher_declaration` body that is not JCS input rejects its
+/// Epoch.
 #[test]
-fn an_entry_whose_leaf_data_repeats_a_member_fails_the_sync() {
+fn a_declaration_whose_leaf_data_repeats_a_member_rejects_its_epoch() {
     for (name, escaped) in [("domain", "domai\\u006e"), ("seq", "se\\u0071")] {
         let fx = common::build_fixture(false);
         let publisher = common::Signer::new([1u8; 32]);
@@ -44,9 +45,14 @@ fn an_entry_whose_leaf_data_repeats_a_member_fails_the_sync() {
         let sealed_at = common::next_instant(&fx);
         fx.log_state()
             .seal_leaf_bytes(&sealed_at, &[duplicate(&original, name, escaped)]);
+        let rejected = fx.log_state().head_number();
         let error = cold_sync(&fx).unwrap_err();
         assert!(
-            error.contains("duplicate JSON member name"),
+            error.contains("WIST1-E05")
+                && error.contains(&format!(
+                    "stopped at epoch {rejected} and its verified head is epoch {}",
+                    rejected - 1
+                )),
             "{name}: {error}"
         );
     }

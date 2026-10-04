@@ -1,4 +1,4 @@
-use super::persist::{record_withdrawal, save_history};
+use super::persist::{record_sealed, record_withdrawal, save_history, save_state_tuples};
 use super::source::Sources;
 use super::tree::Tree;
 use super::SyncState;
@@ -9,14 +9,14 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use wist_core::aggregator_keys::Registry;
 use wist_core::checkpoint::{self, check_consistency, Adoption, Checkpoint, WitnessKey};
-use wist_core::collection::Limits;
 use wist_core::epoch::verify_epoch;
+use wist_core::item::Kind;
+use wist_core::label::{SealedDispute, SealedLabel};
 use wist_core::merkle::consistency_proof_from;
-use wist_core::objects::PublisherEnvelope;
+use wist_core::objects::{PublisherEnvelope, RegistryUpdateEnvelope};
 use wist_core::parameters::{Amendment, Schedule};
-use wist_core::suffix_list::EpochCaps;
+use wist_core::sealing::{carried_label_ids, Epoch, Judgment, Outcome, Parameters, Replay};
 use wist_core::timestamp::log_seconds;
-use wist_core::withdrawal::{Disposition, SealedItems, WithdrawalReplay};
 
 /// WIST-4 §9 and ADR-0020.
 pub struct ChainState {
@@ -153,27 +153,19 @@ fn default_of(parameter: &str) -> u64 {
 
 pub struct EpochEvent {
     pub height: u64,
-    /// The `sha256:` form of WIST-3 §3.1.
-    pub epoch_root: String,
     pub sealed_at: String,
-    pub sealed_at_s: i64,
-    pub url_cap_bytes: i64,
-    pub clock_skew_seconds: i64,
-    /// WIST-1 §5.1: in force at `sealed_at`.
-    pub limits: Limits,
     /// WIST-1 §5.2: in force at `sealed_at`; freezes the end of a recovery window opened in this
     /// Epoch.
     pub recovery_window_days: i64,
-    /// WIST-1 §5.2: in force at `sealed_at`.
-    pub declaration_activation_epochs: i64,
     /// In canonical Epoch order.
     pub declarations: Vec<Value>,
     /// WIST-3 §6.2: (withdrawn Item ID, Publisher, earliest withdrawing Epoch).
     pub withdrawals: Vec<(String, String, u64)>,
     pub publishers: Vec<String>,
-    /// WIST-2 §3.3: paired with the canonical Entry index.
-    pub labels: Vec<(u64, Value)>,
-    pub disputes: Vec<(u64, Value)>,
+    pub labels: Vec<SealedLabel>,
+    pub disputes: Vec<SealedDispute>,
+    /// WIST-3 §3.2: valid or ignored.
+    pub label_ids: Vec<String>,
 }
 
 pub struct ApplyStats {
@@ -219,7 +211,7 @@ pub struct WalkInputs<'a> {
 pub struct WalkState<'a> {
     pub keys: &'a mut Registry,
     pub chain: &'a mut ChainState,
-    pub withdrawals_replay: &'a mut WithdrawalReplay,
+    pub replay: &'a mut Replay,
     pub suffix_lists: &'a mut super::suffix::SuffixLists,
     pub tree: &'a mut Tree,
 }
@@ -267,6 +259,41 @@ pub fn walk_checkpoints(
     })
 }
 
+fn registry_update_id(body: &Value) -> Option<String> {
+    wist_core::registry_updates::update_id(body).ok()
+}
+
+struct Accepting<'a> {
+    replay: &'a Replay,
+    here: Vec<String>,
+}
+
+impl Accepting<'_> {
+    fn repeated(&self, id: Option<&String>) -> bool {
+        // WIST-4 §5.1: an occurrence of an accepted ID applies nothing, and one failing field
+        // validation changes no state either.
+        id.is_some_and(|id| {
+            self.replay.registry_updates().is_accepted(id) || self.here.contains(id)
+        })
+    }
+
+    fn accept(&mut self, id: Option<String>) {
+        if let Some(id) = id {
+            self.here.push(id);
+        }
+    }
+}
+
+fn act_of<'v>(entry: &'v Value, eligible: bool, actions: &[&str]) -> Option<&'v Value> {
+    let body = &entry["body"];
+    (eligible
+        && entry["type"] == "registry_update"
+        && body["update"]["action"]
+            .as_str()
+            .is_some_and(|action| actions.contains(&action)))
+    .then_some(body)
+}
+
 /// WIST-3 §5 order: sequence rules, Entries, Consistency Proof, Registry Updates, then the
 /// signature.
 fn verify_checkpoint(
@@ -279,7 +306,7 @@ fn verify_checkpoint(
     let WalkState {
         keys,
         chain,
-        withdrawals_replay,
+        replay,
         suffix_lists,
         tree,
     } = state;
@@ -363,7 +390,7 @@ fn verify_checkpoint(
     if let Err(error) = check_consistency(previous, checkpoint, &proof) {
         return Err(diverged(&error.to_string(), Some(tree)));
     }
-    let entries = super::tree::epoch_entries(
+    let leaves = super::tree::epoch_leaves(
         inputs.sources,
         tree,
         previous_size,
@@ -371,50 +398,82 @@ fn verify_checkpoint(
         chain.transport_bound(),
     )
     .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
-    // WIST-3 §3.1 and §6: a failure of the Epoch's own Entries is an invalid object.
-    let summary = verify_epoch(
-        previous_size,
-        checkpoint,
-        &entries,
-        tree.reader(),
-        chain.transport_bound(),
-    )
-    .map_err(|error| Error::Verify(format!("epoch {n}: {error}")))?;
+    let entries = &leaves.entries;
+    // WIST-3 §3.1 and §6: a failure of the Epoch's own Entries is an invalid object. A leaf that is
+    // not its Entry's JCS is authenticated by its entry bundle against the verified tiles.
+    let octets = if leaves.stored.is_empty() {
+        verify_epoch(
+            previous_size,
+            checkpoint,
+            entries,
+            tree.reader(),
+            chain.transport_bound(),
+        )
+        .map_err(|error| Error::Verify(format!("epoch {n}: {error}")))?
+        .octets
+    } else if leaves.octets > chain.transport_bound() {
+        return Err(Error::Verify(format!(
+            "epoch {n}: WIST3-E03 an Epoch over the size cap in force"
+        )));
+    } else {
+        leaves.octets
+    };
 
+    let mut accepting = Accepting {
+        replay,
+        here: Vec::new(),
+    };
     // WIST-3 §3.3 and §3.4: key acts apply first, in canonical Entry index order, under the keys
     // valid at N−1; a failing key act is ignored.
-    let key_acts: Vec<&Value> = entries
-        .iter()
-        .filter(|entry| entry["type"] == "registry_update")
-        .map(|entry| &entry["body"])
-        .filter(|body| {
-            matches!(
-                body["update"]["action"].as_str(),
-                Some("aggregator_key_add" | "aggregator_key_remove")
-            )
-        })
-        .collect();
-    for outcome in keys.apply_epoch(n, key_acts) {
-        if let Some(code) = outcome.code() {
-            eprintln!("ignoring an Aggregator key act at height {n}: {code}");
+    for (entry, eligible) in entries.iter().zip(&leaves.body_eligible) {
+        let Some(body) = act_of(
+            entry,
+            *eligible,
+            &["aggregator_key_add", "aggregator_key_remove"],
+        ) else {
+            continue;
+        };
+        let id = registry_update_id(body);
+        if accepting.repeated(id.as_ref()) {
+            continue;
+        }
+        for outcome in keys.apply_epoch(n, [body]) {
+            if let Some(code) = outcome.code() {
+                eprintln!("ignoring an Aggregator key act at height {n}: {code}");
+            }
+            if outcome.is_accepted() {
+                accepting.accept(id.clone());
+            }
         }
     }
     // Authenticated under the keys valid at N, after this Epoch's key acts.
     let authenticators = keys.valid_at(n);
     let authentic =
         |body: &Value| wist_core::aggregator_keys::authenticate(body, &authenticators).is_ok();
+    let log_key = |key_id: &str| {
+        authenticators
+            .iter()
+            .find(|key| key.key_id == key_id)
+            .map(|key| key.public_key.clone())
+    };
 
     let sealed_at = checkpoint.sealed_at().to_string();
     let at = checkpoint
         .sealed_at_s()
         .map_err(|e| Error::Verify(format!("epoch {n}: WIST3-E03 {e}")))?;
-    let largest = chain.largest.max(summary.octets);
+    let largest = chain.largest.max(octets);
     let schedule = chain.schedule_at(at);
-    for (index, entry) in entries.iter().enumerate() {
-        let update = &entry["body"]["update"];
-        if entry["type"] != "registry_update" || update["action"] != "parameter_change" {
+    for (index, (entry, eligible)) in entries.iter().zip(&leaves.body_eligible).enumerate() {
+        let Some(body) = act_of(entry, *eligible, &["parameter_change"]) else {
+            continue;
+        };
+        let id = registry_update_id(body);
+        if accepting.repeated(id.as_ref())
+            || serde_json::from_value::<RegistryUpdateEnvelope>(body.clone()).is_err()
+        {
             continue;
         }
+        let update = &body["update"];
         let (Some(parameter), Some(value), Some(effective_at)) = (
             update["details"]["parameter"].as_str(),
             update["details"]["value"].as_i64(),
@@ -426,135 +485,98 @@ fn verify_checkpoint(
             continue;
         };
         // WIST-4 §5.1: `WIST4-E11`, changing nothing.
-        if !authentic(&entry["body"]) {
+        if !authentic(body) {
             eprintln!("ignoring a parameter_change at height {n}: WIST4-E11");
             continue;
         }
-        let _ = schedule.try_accept_with_epoch_size(
-            Amendment {
-                parameter: parameter.to_owned(),
-                value,
-                epoch_number: n,
-                entry_index: index as u64,
-                sealed_at_s: at,
-                effective_at_s,
-            },
-            largest,
-        );
+        let amendment = Amendment {
+            parameter: parameter.to_owned(),
+            value,
+            epoch_number: n,
+            entry_index: index as u64,
+            sealed_at_s: at,
+            effective_at_s,
+        };
+        if schedule
+            .try_accept_with_epoch_size(amendment, largest)
+            .is_ok()
+        {
+            accepting.accept(id);
+        }
     }
     if largest > schedule.epoch_size_bounds(at).0 {
         return Err(Error::Verify(format!(
             "epoch {n}: WIST3-E03 Epoch exceeds the accepted size schedule"
         )));
     }
-    let in_force = |name: &str| {
-        schedule
-            .value_at(name, at)
-            .ok_or_else(|| Error::Verify(format!("epoch {n}: no value of {name} is in force")))
-    };
-    let url_cap_bytes = in_force("url_cap_bytes")?;
-    let clock_skew_seconds = in_force("clock_skew_seconds")?;
-    let limits = Limits::new(
-        in_force("collections_max")?,
-        in_force("scope_entries_max")?,
-        url_cap_bytes,
-    )
-    .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
-    let recovery_window_days = schedule.value_at("recovery_window_days", at).unwrap();
-    let declaration_activation_epochs = schedule
-        .value_at("declaration_activation_epochs", at)
-        .unwrap();
-    let caps = EpochCaps {
-        domain_epoch_entries_max: schedule
-            .value_at("domain_epoch_entries_max", at)
-            .unwrap()
-            .max(0) as u64,
-        labeler_epoch_entries_max: schedule
-            .value_at("labeler_epoch_entries_max", at)
-            .unwrap()
-            .max(0) as u64,
-    };
-    suffix_lists.check_capacity(n, &entries, caps)?;
-    for entry in entries.iter().filter(|e| e["type"] == "registry_update") {
-        let body = &entry["body"];
-        if body["update"]["action"] == "suffix_list_update" {
-            suffix_lists.apply_act(
-                inputs.sources.client(),
-                inputs.sources.primary(),
-                n,
-                body,
-                |key_id| {
-                    authenticators
-                        .iter()
-                        .find(|key| key.key_id == key_id)
-                        .map(|key| key.public_key.clone())
-                },
-            )?;
+    let parameters = Parameters::from_schedule(schedule, at)
+        .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
+    let recovery_window_days = parameters.get("recovery_window_days");
+    let suffix_list = suffix_lists.in_force_at_epoch(n)?;
+    for (entry, eligible) in entries.iter().zip(&leaves.body_eligible) {
+        let Some(body) = act_of(entry, *eligible, &["suffix_list_update"]) else {
+            continue;
+        };
+        let id = registry_update_id(body);
+        if accepting.repeated(id.as_ref()) {
+            continue;
+        }
+        if suffix_lists.apply_act(
+            inputs.sources.client(),
+            inputs.sources.primary(),
+            n,
+            body,
+            log_key,
+        )? {
+            accepting.accept(id);
         }
     }
+    let accepted_here = accepting.here;
     chain.largest = largest;
     chain.prior_at = Some(at);
 
-    let mut declarations = Vec::new();
-    let mut withdrawal_acts = Vec::new();
-    let mut publishers = Vec::new();
-    let mut labels = Vec::new();
-    let mut disputes = Vec::new();
-
-    for (index, entry) in entries.iter().enumerate() {
-        match entry.get("type").and_then(Value::as_str) {
-            Some("label") => labels.push((index as u64, entry["body"].clone())),
-            Some("dispute") => disputes.push((index as u64, entry["body"].clone())),
-            Some("publisher_declaration") => {
-                if entry.get("body").is_none() {
-                    return Err(Error::Verify(format!(
-                        "epoch {n}: publisher_declaration entry missing body"
-                    )));
-                }
-                declarations.push(entry.clone());
-            }
-            Some("registry_update") => {
-                let body = entry.get("body").ok_or_else(|| {
-                    Error::Verify(format!("epoch {n}: registry_update entry missing body"))
-                })?;
-                if body["update"]["action"] == "payload_withdrawal" {
-                    withdrawal_acts.push(body.clone());
-                }
-            }
-            Some(kind @ ("publisher_catalog" | "publisher_item")) => {
-                let outer = kind.trim_start_matches("publisher_");
-                if let Some(publisher) = entry["body"][outer]["publisher"].as_str() {
-                    publishers.push(publisher.to_owned());
-                }
-            }
-            _ => {}
-        }
-    }
-    let sealed_items = SealedItems::resumed();
-    let mut withdrawals = Vec::new();
-    for body in &withdrawal_acts {
-        let disposition = withdrawals_replay.apply(
-            n,
-            body,
-            |key_id| {
-                authenticators
-                    .iter()
-                    .find(|key| key.key_id == key_id)
-                    .map(|key| key.public_key.clone())
+    let root = checkpoint.root_token();
+    let stored: Vec<(usize, &[u8])> = leaves
+        .stored
+        .iter()
+        .map(|(index, octets)| (*index, octets.as_slice()))
+        .collect();
+    let outcome = replay
+        .epoch_stored(
+            &Epoch {
+                height: n,
+                root: &root,
+                sealed_at: &sealed_at,
+                parameters: &parameters,
+                suffix_list: suffix_list.as_deref(),
+                log_key: &log_key,
+                entries,
             },
-            &sealed_items,
-        );
-        match disposition {
-            Disposition::Accepted {
-                item_id,
-                publisher,
-                withdrawn_height,
-                ..
-            } => withdrawals.push((item_id, publisher, withdrawn_height)),
-            Disposition::Rejected(code) => {
-                eprintln!("ignoring a payload_withdrawal at height {n}: {code}");
-            }
-            Disposition::Repeated { .. } | Disposition::NotWithdrawal => {}
+            &stored,
+        )
+        .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
+    let judged = match outcome {
+        Outcome::Rejected { codes } => {
+            return Err(Error::Verify(format!(
+                "epoch {n}: the Epoch is rejected ({})",
+                codes.join(", ")
+            )))
+        }
+        Outcome::Accepted { entries, .. } => entries,
+    };
+    for id in &accepted_here {
+        replay.accept_registry_update(id, n);
+    }
+    let label_ids = carried_label_ids(entries, &stored)
+        .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
+    for (entry, judgment) in entries.iter().zip(&judged) {
+        if let Some(Judgment::Ignored(failures)) = judgment {
+            let codes: Vec<&str> = failures.iter().map(|failure| failure.code).collect();
+            eprintln!(
+                "ignoring a {} Entry at height {n}: {}",
+                entry["type"].as_str().unwrap_or("malformed"),
+                codes.join(", ")
+            );
         }
     }
 
@@ -570,19 +592,40 @@ fn verify_checkpoint(
 
     let event = EpochEvent {
         height: n,
-        epoch_root: checkpoint.root_token(),
         sealed_at,
-        sealed_at_s: at,
-        url_cap_bytes,
-        clock_skew_seconds,
-        limits,
         recovery_window_days,
-        declaration_activation_epochs,
-        declarations,
-        withdrawals,
-        publishers,
-        labels,
-        disputes,
+        declarations: entries
+            .iter()
+            .filter(|entry| entry["type"] == "publisher_declaration")
+            .cloned()
+            .collect(),
+        withdrawals: replay
+            .withdrawals()
+            .entries()
+            .into_iter()
+            .filter(|withdrawal| withdrawal.sealing_height == n)
+            .map(|withdrawal| (withdrawal.item_id, withdrawal.publisher, n))
+            .collect(),
+        publishers: entries
+            .iter()
+            .filter_map(|entry| match entry["type"].as_str() {
+                Some("publisher_catalog") => entry["body"]["catalog"]["publisher"].as_str(),
+                Some("publisher_item") => entry["body"]["item"]["publisher"].as_str(),
+                _ => None,
+            })
+            .map(str::to_owned)
+            .collect(),
+        labels: replay
+            .labels()
+            .filter(|label| label.height == n)
+            .cloned()
+            .collect(),
+        disputes: replay
+            .disputes()
+            .filter(|dispute| dispute.height == n)
+            .cloned()
+            .collect(),
+        label_ids,
     };
     Ok((event, adoption))
 }
@@ -669,10 +712,10 @@ pub(super) fn remove_by_item_id(
 
 pub fn apply_events(
     conn: &Connection,
-    history: &mut KeyHistory,
+    replay: &Replay,
     events: &[EpochEvent],
     tier1: bool,
-    walk_floor: u64,
+    walked_from: u64,
 ) -> Result<ApplyStats> {
     let mut stats = ApplyStats {
         withdrawn: 0,
@@ -683,15 +726,6 @@ pub fn apply_events(
         conn.execute_batch(CREATE_TIER1)?;
     }
     for event in events {
-        history.apply_epoch(
-            event.height,
-            &event.epoch_root,
-            &event.sealed_at,
-            event.recovery_window_days,
-            event.declaration_activation_epochs,
-            &event.limits,
-            &event.declarations,
-        )?;
         for entry in &event.declarations {
             // WIST-4 §6: a Declaration counts as a Labeler's sealed Entry.
             if let Some(domain) = entry["body"]["publisher"]["domain"].as_str() {
@@ -712,10 +746,39 @@ pub fn apply_events(
                 stats.withdrawn += 1;
             }
         }
-        apply_labels(conn, history, event, walk_floor, &mut stats)?;
+        apply_labels(conn, event, &mut stats)?;
+        let label_ids: Vec<(String, Option<String>)> = event
+            .label_ids
+            .iter()
+            .map(|label_id| {
+                let subject = event
+                    .labels
+                    .iter()
+                    .find(|sealed| &sealed.label_id == label_id)
+                    .map(|sealed| sealed.label.subject.clone());
+                (label_id.clone(), subject)
+            })
+            .collect();
+        record_sealed(conn, &label_ids, &[])?;
     }
-    record_identity_starts(conn, history)?;
-    save_history(conn, history)?;
+    let items: Vec<(String, String, Kind, u64)> = replay
+        .sealed_items()
+        .sealed()
+        .filter(|item| item.height > walked_from)
+        .map(|item| {
+            (
+                item.item_id.to_owned(),
+                item.publisher.to_owned(),
+                item.kind,
+                item.height,
+            )
+        })
+        .collect();
+    record_sealed(conn, &[], &items)?;
+    let history = KeyHistory::from_declarations(replay.declarations().clone());
+    record_identity_starts(conn, &history)?;
+    save_history(conn, &history)?;
+    save_state_tuples(conn, &replay.state_entries())?;
     Ok(stats)
 }
 
@@ -735,86 +798,30 @@ fn record_identity_starts(conn: &Connection, history: &KeyHistory) -> Result<()>
     Ok(())
 }
 
-/// WIST-2 §3.3 and WIST-3 §3.3: a failing Entry is ignored. Every sealed Labeler Entry moves its
-/// last sealed height (WIST-4 §6).
-pub(super) fn apply_labels(
-    conn: &Connection,
-    history: &KeyHistory,
-    event: &EpochEvent,
-    walk_floor: u64,
-    stats: &mut ApplyStats,
-) -> Result<()> {
+/// WIST-4 §6: every sealed Labeler Entry moves its last sealed height.
+fn apply_labels(conn: &Connection, event: &EpochEvent, stats: &mut ApplyStats) -> Result<()> {
     for publisher in &event.publishers {
         super::persist::touch_labeler(conn, publisher, event.height)?;
     }
-    for (index, body) in &event.labels {
-        let labeler = body["label"]["labeler"].as_str().unwrap_or_default();
-        let Some(declaration) = history.declaration_for(labeler) else {
-            eprintln!(
-                "ignoring a Label at height {}: no Declaration for {labeler}",
-                event.height
-            );
-            continue;
-        };
-        match wist_core::label::validate_label(
-            body,
-            &declaration,
-            event.url_cap_bytes,
-            event.sealed_at_s,
-            event.clock_skew_seconds,
-        ) {
-            Ok(envelope) => {
-                let id = wist_core::label::label_id(&body["label"])
-                    .map_err(|r| Error::Verify(format!("label id: {r:?}")))?;
-                super::persist::record_label(conn, &envelope.label, &id, event.height, *index)?;
-                stats.labels += 1;
-            }
-            Err(rejection) => eprintln!(
-                "ignoring a Label at height {}: {}",
-                event.height,
-                rejection.code()
-            ),
-        }
+    for sealed in &event.labels {
+        super::persist::record_label(
+            conn,
+            &sealed.label,
+            &sealed.label_id,
+            sealed.height,
+            sealed.entry_index,
+        )?;
+        stats.labels += 1;
     }
-    for (index, body) in &event.disputes {
-        let disputant = body["dispute"]["disputant"].as_str().unwrap_or_default();
-        let Some(declaration) = history.declaration_for(disputant) else {
-            eprintln!(
-                "ignoring a dispute at height {}: no Declaration for {disputant}",
-                event.height
-            );
-            continue;
-        };
-        // WIST-3 §7: a Snapshot carries only the current Label, so only a miss above the walk floor
-        // is genuinely absent.
-        let dispute_height = body["dispute"]["height"].as_u64().unwrap_or(u64::MAX);
-        let sealed = |label_id: &str| match super::persist::sealed_label_subject(conn, label_id)
-            .ok()
-            .flatten()
-        {
-            Some(subject) => wist_core::label::LabelLookup::Known { subject },
-            None if dispute_height <= walk_floor => wist_core::label::LabelLookup::Unverifiable,
-            None => wist_core::label::LabelLookup::Absent,
-        };
-        match wist_core::label::validate_dispute(
-            body,
-            &declaration,
-            sealed,
-            event.sealed_at_s,
-            event.clock_skew_seconds,
-        ) {
-            Ok(envelope) => {
-                let id = wist_core::label::dispute_id(&body["dispute"])
-                    .map_err(|r| Error::Verify(format!("dispute id: {r:?}")))?;
-                super::persist::record_dispute(conn, &envelope.dispute, &id, event.height, *index)?;
-                stats.labels += 1;
-            }
-            Err(rejection) => eprintln!(
-                "ignoring a dispute at height {}: {}",
-                event.height,
-                rejection.code()
-            ),
-        }
+    for sealed in &event.disputes {
+        super::persist::record_dispute(
+            conn,
+            &sealed.dispute,
+            &sealed.dispute_id,
+            sealed.height,
+            sealed.entry_index,
+        )?;
+        stats.labels += 1;
     }
     Ok(())
 }

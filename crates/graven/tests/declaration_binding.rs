@@ -1,8 +1,8 @@
 mod common;
 
-use graven::keyset::KeyHistory;
 use serde_json::{json, Value};
 use wist_core::declaration::Decision;
+use wist_core::declarations::Declarations;
 
 fn spec_dir() -> std::path::PathBuf {
     std::env::var_os("WIST_SPEC_DIR")
@@ -38,7 +38,7 @@ fn code(text: &str) -> String {
 }
 
 fn outcome(stored: &Value, fetched: &Value) -> String {
-    let mut history = KeyHistory::new();
+    let mut history = Declarations::default();
     if !stored.is_null() {
         let effects = history
             .apply_epoch(
@@ -111,7 +111,7 @@ fn an_ordinary_rotation_keeps_the_identity_and_a_fresh_one_waits_for_activation(
             .iter()
             .find(|c| c["expected"] == expected)
             .unwrap();
-        let mut history = KeyHistory::new();
+        let mut history = Declarations::default();
         history
             .apply_epoch(
                 0,
@@ -137,8 +137,7 @@ fn an_ordinary_rotation_keeps_the_identity_and_a_fresh_one_waits_for_activation(
         assert_eq!(effects.installations[0].decision, Some(decision));
         assert!(!effects.installations[0].resets_identity);
         assert_eq!(effects.installations[0].pending, pending);
-        assert!(history.declared("example.com"));
-        let domain = &history.declarations().domains()["example.com"];
+        let domain = &history.domains()["example.com"];
         assert_eq!(domain.pending().is_some(), pending);
         assert_eq!(
             domain.pending().map(|p| p.activation_height()),

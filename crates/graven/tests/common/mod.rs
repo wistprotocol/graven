@@ -879,6 +879,86 @@ pub fn declaration_entry(publisher: &Signer, domain: &str) -> Value {
     serde_json::json!({"type": "publisher_declaration", "body": build_declaration(publisher, domain)})
 }
 
+pub fn page_item(publisher: &str, url: &str, observed_at: &str) -> Value {
+    let salt = b64u_encode(&[5u8; 16]);
+    let content = serde_json::json!({
+        "extract": url,
+        "links": {"total": 0, "urls": []},
+        "summary": {"title": url},
+    });
+    serde_json::json!({
+        "publisher": publisher,
+        "url": url,
+        "observed_at": observed_at,
+        "payload": {
+            "commitment": wist_core::item::commitment(&salt, &content).unwrap(),
+            "alg": "HMAC-SHA256",
+            "bytes": jcs::canonicalize(&content).unwrap().len(),
+        },
+        "meta": {"lang": "en"},
+    })
+}
+
+pub fn removed_item(publisher: &str, url: &str, observed_at: &str) -> Value {
+    serde_json::json!({
+        "publisher": publisher,
+        "url": url,
+        "observed_at": observed_at,
+        "removed": true,
+    })
+}
+
+pub struct Published {
+    pub catalog: Value,
+    pub catalog_id: String,
+    pub items: Vec<Value>,
+}
+
+pub fn publish(
+    signer: &Signer,
+    publisher: &str,
+    collection: &str,
+    generated_at: &str,
+    items: &[Value],
+) -> Published {
+    let mut list = items.to_vec();
+    list.sort_by_key(|item| wist_core::item::key(item["url"].as_str().unwrap()));
+    let built = wist_core::tree::build(&list, &wist_core::tree::TreeBounds::suite()).unwrap();
+    let inner = serde_json::json!({
+        "wist_version": "1.0.0",
+        "publisher": publisher,
+        "collection": collection,
+        "generated_at": generated_at,
+        "size": list.len(),
+        "root": format!("sha256:{}", hex_encode(&wist_core::item::root(&list).unwrap())),
+        "tree": built.tree,
+    });
+    let envelope = sign_envelope(&inner, "catalog", &signer.kid(), &signer.sk).unwrap();
+    let catalog: wist_core::objects::Catalog = serde_json::from_value(inner.clone()).unwrap();
+    let items = (0..list.len())
+        .map(|index| {
+            let body = wist_core::publisher_item::build(&list, index as u64, &catalog).unwrap();
+            serde_json::json!({"type": "publisher_item", "body": body})
+        })
+        .collect();
+    Published {
+        catalog: serde_json::json!({"type": "publisher_catalog", "body": envelope}),
+        catalog_id: wist_core::catalog::catalog_id(&inner).unwrap(),
+        items,
+    }
+}
+
+pub fn state_tuples(log_dir: &Path) -> Vec<Value> {
+    let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT tuple FROM state_tuples ORDER BY seq")
+        .unwrap();
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|text| serde_json::from_str(&text.unwrap()).unwrap())
+        .collect()
+}
+
 pub fn extend_fixture(fx: &Fixture) -> String {
     let publisher = Signer::new([1u8; 32]);
     let next_number = fx.log_state().head_number() + 1;

@@ -8,9 +8,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use wist_core::crypto::PublicKey;
-use wist_core::suffix_list::{
-    self, Disposition, EpochCaps, HeldFile, SuffixList, SuffixListReplay,
-};
+use wist_core::suffix_list::{self, Disposition, HeldFile, SuffixList, SuffixListReplay};
 
 pub struct SuffixLists {
     replay: SuffixListReplay,
@@ -112,24 +110,6 @@ impl SuffixLists {
         Ok(Some(list))
     }
 
-    /// WIST-3 §3.2.
-    pub fn check_capacity(&mut self, height: u64, epoch: &[Value], caps: EpochCaps) -> Result<()> {
-        let list = self.in_force_at_epoch(height)?;
-        let entries = epoch.iter().filter_map(|entry| {
-            let kind = entry["type"].as_str()?;
-            let host = match kind {
-                "publisher_catalog" => entry["body"]["catalog"]["publisher"].as_str(),
-                "publisher_item" => entry["body"]["item"]["publisher"].as_str(),
-                "label" => entry["body"]["label"]["labeler"].as_str(),
-                "dispute" => entry["body"]["dispute"]["disputant"].as_str(),
-                _ => None,
-            }?;
-            Some((kind, host))
-        });
-        suffix_list::check_epoch_capacity(entries, list.as_deref(), caps)
-            .map_err(|e| Error::Verify(format!("epoch {height}: {e}")))
-    }
-
     /// WIST-4 §3.1: an unauthenticated or failing act is ignored with its code; an unobtainable or
     /// mismatched file fails the walk.
     pub fn apply_act(
@@ -139,7 +119,7 @@ impl SuffixLists {
         height: u64,
         body: &Value,
         log_key: impl Fn(&str) -> Option<PublicKey>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let fetched: RefCell<BTreeMap<String, Result<Vec<u8>>>> = RefCell::new(BTreeMap::new());
         let octets = &self.octets;
         let held = |identifier: &str| -> HeldFile {
@@ -162,7 +142,7 @@ impl SuffixLists {
                 for (identifier, file) in fetched {
                     self.octets.insert(identifier, file?);
                 }
-                Ok(())
+                Ok(true)
             }
             Disposition::Rejected("WIST3-E01") => {
                 let failure = fetched
@@ -174,9 +154,9 @@ impl SuffixLists {
             }
             Disposition::Rejected(code) => {
                 eprintln!("ignoring a suffix_list_update at height {height}: {code}");
-                Ok(())
+                Ok(false)
             }
-            Disposition::NotSuffixList => Ok(()),
+            Disposition::NotSuffixList => Ok(false),
         }
     }
 }

@@ -177,6 +177,19 @@ fn install_at_epoch_0(served: &ServedHistory, target: &Path, history: &Value) {
         )
         .unwrap();
     }
+    conn.execute_batch(graven::store::CREATE_STATE_TUPLES)
+        .unwrap();
+    for (seq, tuple) in registry_update_tuples(history)
+        .into_iter()
+        .filter(|tuple| tuple[2] == 0)
+        .enumerate()
+    {
+        conn.execute(
+            "INSERT INTO state_tuples(seq, tuple) VALUES (?1, ?2)",
+            (seq as i64, serde_json::to_string(&tuple).unwrap()),
+        )
+        .unwrap();
+    }
     let mut keys = graven::keyset::KeyHistory::new();
     keys.seed_head(
         checkpoint.epoch_number(),
@@ -201,6 +214,7 @@ fn install_at_epoch_0(served: &ServedHistory, target: &Path, history: &Value) {
             schedule_first_s: None,
             prior_sealed_at_s: Some(checkpoint.sealed_at_s().unwrap()),
             largest_epoch_bytes: 0,
+            walk_floor: Some(0),
         },
     )
     .unwrap();
@@ -219,6 +233,25 @@ fn install_at_epoch_0(served: &ServedHistory, target: &Path, history: &Value) {
     )
     .unwrap();
     tree.save(&conn).unwrap();
+}
+
+fn registry_update_tuples(history: &Value) -> Vec<Value> {
+    history["snapshot_state"]["cases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|case| case["verifies"] == true)
+        .flat_map(|case| case["entries"].as_array().unwrap())
+        .filter(|tuple| tuple[0] == "registry_update")
+        .cloned()
+        .collect()
+}
+
+fn stored_registry_update_tuples(target: &Path, log_id: &str) -> Vec<Value> {
+    common::state_tuples(&graven::registry::log_dir(target, log_id))
+        .into_iter()
+        .filter(|tuple| tuple[0] == "registry_update")
+        .collect()
 }
 
 fn stored_amendments(target: &Path, log_id: &str) -> Vec<(String, i64, u64)> {
@@ -287,6 +320,7 @@ fn head_state(history: &Value) -> Value {
 
 #[test]
 fn each_history_walks_to_its_verified_head_and_persists_the_tuples_the_vector_records() {
+    let mut checked = 0;
     for history in histories() {
         let name = history["name"].as_str().unwrap();
         let served = serve(&history, applied_epochs(&history), None);
@@ -308,8 +342,21 @@ fn each_history_walks_to_its_verified_head_and_persists_the_tuples_the_vector_re
             accepted_amendments(&history, applied_epochs(&history)),
             "{name}: the amendments the walked Epochs leave accepted"
         );
+        if history["snapshot_state"]["epoch_number"] == history["verified_head"] {
+            let mut stored = stored_registry_update_tuples(target.path(), &served.log_id);
+            let mut expected = registry_update_tuples(&history);
+            stored.sort_by_key(|tuple| tuple[1].as_str().unwrap().to_owned());
+            expected.sort_by_key(|tuple| tuple[1].as_str().unwrap().to_owned());
+            assert!(!expected.is_empty(), "{name}");
+            assert_eq!(
+                stored, expected,
+                "{name}: the accepted Registry Update IDs the walked Epochs leave"
+            );
+            checked += 1;
+        }
         drop(served.dir);
     }
+    assert_eq!(checked, 1);
 }
 
 #[test]

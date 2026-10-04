@@ -1,8 +1,7 @@
 //! WIST-1 §5.2 and WIST-3 §7.
 use crate::error::{Error, Result};
 use serde_json::Value;
-use wist_core::collection::Limits;
-use wist_core::declarations::{Declarations, Effects, Position};
+use wist_core::declarations::{Declarations, Position};
 use wist_core::objects::PublisherEnvelope;
 
 #[derive(Debug, Default)]
@@ -17,6 +16,10 @@ fn history_error(e: wist_core::Error) -> Error {
 impl KeyHistory {
     pub fn new() -> KeyHistory {
         KeyHistory::default()
+    }
+
+    pub fn from_declarations(declarations: Declarations) -> KeyHistory {
+        KeyHistory { declarations }
     }
 
     pub fn from_state(state: &str) -> Result<KeyHistory> {
@@ -156,37 +159,6 @@ impl KeyHistory {
             .map_err(history_error)
     }
 
-    /// WIST-1 §5.2 under the parameters in force at the Epoch's `sealed_at`; a rejected Declaration
-    /// fails the sync.
-    #[allow(clippy::too_many_arguments)]
-    pub fn apply_epoch(
-        &mut self,
-        epoch_number: u64,
-        epoch_root: &str,
-        sealed_at: &str,
-        recovery_window_days: i64,
-        declaration_activation_epochs: i64,
-        limits: &Limits,
-        entries: &[Value],
-    ) -> Result<Effects> {
-        self.declarations
-            .apply_epoch(
-                epoch_number,
-                epoch_root,
-                sealed_at,
-                recovery_window_days,
-                declaration_activation_epochs,
-                limits,
-                entries,
-            )
-            .map_err(history_error)
-    }
-
-    /// WIST-3 §7.
-    pub fn declared(&self, host: &str) -> bool {
-        self.declarations.domains().contains_key(host)
-    }
-
     /// WIST-2 §3.3: none inside an open recovery window.
     pub fn declaration_for(&self, domain: &str) -> Option<PublisherEnvelope> {
         let state = self.declarations.domains().get(domain)?;
@@ -198,7 +170,9 @@ impl KeyHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wist_core::collection::Limits;
     use wist_core::crypto::{b64u_encode, SigningKey};
+    use wist_core::declarations::Effects;
     use wist_core::envelope::sign_envelope;
 
     struct Signer {
@@ -269,7 +243,7 @@ mod tests {
     }
 
     struct Chain {
-        history: KeyHistory,
+        declarations: Declarations,
         height: Option<u64>,
         activation_epochs: i64,
     }
@@ -281,19 +255,23 @@ mod tests {
 
         fn with_activation(activation_epochs: i64) -> Self {
             Chain {
-                history: KeyHistory::new(),
+                declarations: Declarations::default(),
                 height: None,
                 activation_epochs,
             }
         }
 
-        fn seal(&mut self, sealed_at: &str, declarations: &[&Value]) -> Result<Effects> {
+        fn seal(
+            &mut self,
+            sealed_at: &str,
+            declarations: &[&Value],
+        ) -> std::result::Result<Effects, wist_core::Error> {
             let height = self.height.map_or(0, |h| h + 1);
             let entries: Vec<Value> = declarations
                 .iter()
                 .map(|d| serde_json::json!({"type": "publisher_declaration", "body": d}))
                 .collect();
-            let effects = self.history.apply_epoch(
+            let effects = self.declarations.apply_epoch(
                 height,
                 &format!("sha256:{height:064}"),
                 sealed_at,
@@ -307,7 +285,7 @@ mod tests {
         }
 
         fn sealing_key(&self, domain: &str, signer: &Signer) -> bool {
-            self.history
+            KeyHistory::from_declarations(self.declarations.clone())
                 .declaration_for(domain)
                 .is_some_and(|envelope| {
                     envelope
@@ -514,7 +492,10 @@ mod tests {
             .adopt_domain("records.example", &decl0, 4, 0)
             .unwrap();
         history.seed_head(4, "sha256:anchor", None);
-        let mut history = KeyHistory::from_state(&history.state().unwrap()).unwrap();
+        let mut declarations = KeyHistory::from_state(&history.state().unwrap())
+            .unwrap()
+            .declarations()
+            .clone();
         let decl1 = decl(
             "records.example",
             1,
@@ -525,7 +506,7 @@ mod tests {
             &pk1,
         );
         let entry = serde_json::json!({"type": "publisher_declaration", "body": decl1});
-        assert!(history
+        assert!(declarations
             .apply_epoch(
                 6,
                 "sha256:h6",
@@ -536,7 +517,7 @@ mod tests {
                 std::slice::from_ref(&entry)
             )
             .is_err());
-        history
+        declarations
             .apply_epoch(
                 5,
                 "sha256:h5",
@@ -547,7 +528,7 @@ mod tests {
                 &[entry],
             )
             .unwrap();
-        assert!(history
+        assert!(KeyHistory::from_declarations(declarations)
             .declaration_for("records.example")
             .is_some_and(|envelope| envelope.publisher.keys[0].kid == pk2.kid()));
     }

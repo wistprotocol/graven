@@ -498,6 +498,7 @@ mod tests {
                 schedule_first_s: None,
                 prior_sealed_at_s: None,
                 largest_epoch_bytes: 0,
+                walk_floor: None,
             })
             .unwrap(),
         )

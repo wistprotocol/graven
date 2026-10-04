@@ -719,6 +719,22 @@ pub(super) fn snapshot(
         )?;
     }
     super::persist::seed_ranking_index(&conn, manifest.epoch_number)?;
+    let replay_tuples: Vec<StateEntry> = state
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                StateEntry::RegistryUpdate(_)
+                    | StateEntry::Collection(_)
+                    | StateEntry::Record(_)
+                    | StateEntry::Removal(_)
+                    | StateEntry::Withdrawal(_)
+            )
+        })
+        .cloned()
+        .collect();
+    super::persist::save_state_tuples(&conn, &replay_tuples)?;
 
     save_aggregator_keys(&conn, &aggregator_keys)?;
     let chain = ChainState::from_tuples(&adopted_parameters)?;

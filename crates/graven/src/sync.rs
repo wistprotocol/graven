@@ -21,6 +21,8 @@ use crate::error::{Error, Result};
 
 use crate::fetch::Client;
 
+use crate::keyset::KeyHistory;
+
 use crate::registry::{self, LogEntry};
 
 use crate::store::{CREATE_DECLARATIONS, CREATE_UNIQUE_INDEX};
@@ -36,6 +38,8 @@ use wist_core::checkpoint::{Adoption, Checkpoint, WitnessKey};
 use wist_core::aggregator_keys::Registry;
 
 use wist_core::objects::Anchor;
+
+use wist_core::sealing::Replay;
 
 #[derive(Debug, Clone)]
 pub struct SyncReport {
@@ -89,6 +93,8 @@ pub struct SyncState {
     pub prior_sealed_at_s: Option<i64>,
     #[serde(default)]
     pub largest_epoch_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walk_floor: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -311,16 +317,21 @@ struct SyncContext<'a> {
 struct Restored {
     keys: Registry,
     chain: ChainState,
-    withdrawals: wist_core::withdrawal::WithdrawalReplay,
+    replay: Replay,
     suffix_lists: SuffixLists,
     tree: Tree,
 }
 
-fn restore(conn: &Connection, context: &SyncContext, local: &SyncState) -> Result<Restored> {
+fn restore(
+    conn: &Connection,
+    context: &SyncContext,
+    local: &SyncState,
+    head: &Checkpoint,
+) -> Result<Restored> {
     Ok(Restored {
         keys: load_aggregator_keys(conn, context.anchor, local.epoch_number)?,
         chain: ChainState::restore(local, load_parameters(conn)?),
-        withdrawals: load_withdrawn(conn)?,
+        replay: load_replay(conn, head, local.walk_floor)?,
         suffix_lists: SuffixLists::load(conn)?,
         tree: Tree::load(conn)?,
     })
@@ -415,11 +426,11 @@ fn walk_to_adoption(
     let mut end = offered.len();
     let mut stopped: Option<Stop> = None;
     while end > 0 {
-        let mut restored = restore(conn, context, local)?;
+        let mut restored = restore(conn, context, local, head)?;
         let mut state = WalkState {
             keys: &mut restored.keys,
             chain: &mut restored.chain,
-            withdrawals_replay: &mut restored.withdrawals,
+            replay: &mut restored.replay,
             suffix_lists: &mut restored.suffix_lists,
             tree: &mut restored.tree,
         };
@@ -539,11 +550,10 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
     let Restored {
         keys,
         chain,
+        replay,
         suffix_lists,
         tree,
-        ..
     } = restored;
-    let mut history = load_history(&conn)?;
     let tx = conn.unchecked_transaction()?;
     save_parameters(&tx, &chain)?;
     suffix_lists.save(&tx)?;
@@ -561,7 +571,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
     tx.execute(CREATE_DECLARATIONS, [])?;
     let stats = apply_events(
         &tx,
-        &mut history,
+        &replay,
         &walk.events,
         context.tier1,
         local.epoch_number,
@@ -569,7 +579,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
     fetch_definitions(
         &tx,
         context.sources.client(),
-        &history,
+        &KeyHistory::from_declarations(replay.declarations().clone()),
         context.subscriptions,
     )?;
     tx.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])?;
@@ -589,6 +599,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
         schedule_first_s: chain.schedule_first_s(),
         prior_sealed_at_s: chain.prior_at(),
         largest_epoch_bytes: chain.largest(),
+        walk_floor: local.walk_floor,
     };
     save_sync_state(&tx, &sync_state)?;
     tx.commit()?;
@@ -683,6 +694,7 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
         &anchor.root_token(),
         Some(sealed_at_s),
     );
+    save_history(&installed.conn, &installed.history)?;
     let mut tree = Tree::new();
     tree::seed(
         context.sources,
@@ -712,6 +724,7 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
         schedule_first_s: installed.chain.schedule_first_s(),
         prior_sealed_at_s: installed.chain.prior_at(),
         largest_epoch_bytes: installed.chain.largest(),
+        walk_floor: Some(anchor.epoch_number()),
     };
     save_sync_state(&installed.conn, &anchor_state)?;
     let cadence = installed.chain.cadence();
@@ -776,13 +789,17 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
         });
     }
 
-    if let Some(state) = state {
-        save_parameters(&installed.conn, &state.chain)?;
-        state.suffix_lists.save(&installed.conn)?;
-        save_aggregator_keys(&installed.conn, &state.keys)?;
-        state.tree.save(&installed.conn)?;
-        installed.chain = state.chain;
-    }
+    let replay = match state {
+        Some(state) => {
+            save_parameters(&installed.conn, &state.chain)?;
+            state.suffix_lists.save(&installed.conn)?;
+            save_aggregator_keys(&installed.conn, &state.keys)?;
+            state.tree.save(&installed.conn)?;
+            installed.chain = state.chain;
+            state.replay
+        }
+        None => load_replay(&installed.conn, &anchor, anchor_state.walk_floor)?,
+    };
     for entry in &verified {
         let adopted_here = entry.checkpoint.epoch_number() == adopted.epoch_number();
         checkpoints::save_checkpoint(
@@ -794,7 +811,7 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
 
     let stats = apply_events(
         &installed.conn,
-        &mut installed.history,
+        &replay,
         &events,
         context.tier1,
         anchor.epoch_number(),
@@ -802,7 +819,7 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
     fetch_definitions(
         &installed.conn,
         context.sources.client(),
-        &installed.history,
+        &KeyHistory::from_declarations(replay.declarations().clone()),
         context.subscriptions,
     )?;
     installed
@@ -824,6 +841,7 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
         schedule_first_s: installed.chain.schedule_first_s(),
         prior_sealed_at_s: installed.chain.prior_at(),
         largest_epoch_bytes: installed.chain.largest(),
+        walk_floor: anchor_state.walk_floor,
     };
     save_sync_state(&installed.conn, &sync_state)?;
     installed.commit(context.log_dir)?;

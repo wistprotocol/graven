@@ -4,9 +4,11 @@ use crate::error::{Error, Result};
 use crate::keyset::KeyHistory;
 use rusqlite::{Connection, OptionalExtension};
 use wist_core::aggregator_keys::Registry;
-use wist_core::objects::{AggregatorKeyEntry, Anchor};
+use wist_core::checkpoint::Checkpoint;
+use wist_core::item::Kind;
+use wist_core::objects::{AggregatorKeyEntry, Anchor, StateEntry};
 use wist_core::parameters::Amendment;
-use wist_core::withdrawal::WithdrawalReplay;
+use wist_core::sealing::Replay;
 
 /// WIST-3 §3.4 and §7: re-authenticated from the Anchor at `at` as a state file's tuples are, so a
 /// reload never restores a retired key.
@@ -127,24 +129,6 @@ pub fn load_history(conn: &Connection) -> Result<KeyHistory> {
     }
 }
 
-/// WIST-3 §6.2: a later act of the same Item keeps the first height.
-pub(super) fn load_withdrawn(conn: &Connection) -> Result<WithdrawalReplay> {
-    conn.execute_batch(crate::store::CREATE_WITHDRAWALS)?;
-    let mut stmt = conn.prepare("SELECT item_id, publisher, height FROM withdrawals")?;
-    let mut replay = WithdrawalReplay::new();
-    for row in stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    })? {
-        let (item_id, publisher, height) = row?;
-        replay.adopt(&item_id, &publisher, height.max(0) as u64);
-    }
-    Ok(replay)
-}
-
 pub(super) fn record_withdrawal(
     conn: &Connection,
     item_id: &str,
@@ -157,6 +141,134 @@ pub(super) fn record_withdrawal(
         (item_id, publisher, height as i64),
     )?;
     Ok(())
+}
+
+pub(super) fn save_state_tuples(conn: &Connection, tuples: &[StateEntry]) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_STATE_TUPLES)?;
+    conn.execute("DELETE FROM state_tuples", [])?;
+    for (seq, tuple) in tuples.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO state_tuples(seq, tuple) VALUES (?1, ?2)",
+            (seq as i64, serde_json::to_string(tuple)?),
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn load_state_tuples(conn: &Connection) -> Result<Vec<StateEntry>> {
+    conn.execute_batch(crate::store::CREATE_STATE_TUPLES)?;
+    let mut stmt = conn.prepare("SELECT tuple FROM state_tuples ORDER BY seq")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.iter()
+        .map(|text| {
+            wist_core::json::validate(text.as_bytes())?;
+            Ok(serde_json::from_str(text)?)
+        })
+        .collect()
+}
+
+fn held_labels(conn: &Connection) -> Result<Vec<(String, Option<String>)>> {
+    conn.execute_batch(crate::store::CREATE_LABELS)?;
+    conn.execute_batch(crate::store::CREATE_SEALED_LABEL_IDS)?;
+    let mut stmt = conn.prepare(
+        "SELECT label_id, subject FROM sealed_label_ids
+         UNION SELECT label_id, subject FROM labels
+         UNION SELECT label_id, subject FROM label_current WHERE label_id IS NOT NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn kind_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Page => "page",
+        Kind::Removed => "removed",
+    }
+}
+
+fn held_items(conn: &Connection) -> Result<Vec<(String, String, Kind, u64)>> {
+    conn.execute_batch(crate::store::CREATE_SEALED_ITEMS)?;
+    let mut stmt = conn.prepare("SELECT item_id, publisher, kind, height FROM sealed_items")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(item_id, publisher, kind, height)| {
+            let kind = match kind.as_str() {
+                "page" => Kind::Page,
+                "removed" => Kind::Removed,
+                other => {
+                    return Err(Error::Verify(format!(
+                        "the store records a sealed Item of kind {other:?}"
+                    )))
+                }
+            };
+            Ok((item_id, publisher, kind, height.max(0) as u64))
+        })
+        .collect()
+}
+
+pub(super) fn record_sealed(
+    conn: &Connection,
+    label_ids: &[(String, Option<String>)],
+    items: &[(String, String, Kind, u64)],
+) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_SEALED_LABEL_IDS)?;
+    conn.execute_batch(crate::store::CREATE_SEALED_ITEMS)?;
+    for (label_id, subject) in label_ids {
+        conn.execute(
+            "INSERT OR IGNORE INTO sealed_label_ids(label_id, subject) VALUES (?1, ?2)",
+            (label_id, subject),
+        )?;
+    }
+    for (item_id, publisher, kind, height) in items {
+        conn.execute(
+            "INSERT OR IGNORE INTO sealed_items(item_id, publisher, kind, height) VALUES (?1, ?2, ?3, ?4)",
+            (item_id, publisher, kind_name(*kind), *height as i64),
+        )?;
+    }
+    Ok(())
+}
+
+/// WIST-3 §7: the index's Label and Item rows stand in for what no state tuple carries.
+pub(super) fn load_replay(
+    conn: &Connection,
+    head: &Checkpoint,
+    walk_floor: Option<u64>,
+) -> Result<Replay> {
+    let history = load_history(conn)?;
+    let tuples = load_state_tuples(conn)?;
+    let mut replay = Replay::resumed(
+        head.epoch_number(),
+        head.sealed_at(),
+        history.declarations().clone(),
+        &tuples,
+    )
+    .map_err(|error| {
+        Error::Verify(format!(
+            "the store's publication state does not resume at epoch {}: {error}",
+            head.epoch_number()
+        ))
+    })?;
+    replay.hold_walk_floor(walk_floor);
+    for (label_id, subject) in held_labels(conn)? {
+        replay.hold_sealed_label(&label_id, subject.as_deref());
+    }
+    for (item_id, publisher, kind, height) in held_items(conn)? {
+        replay.hold_sealed_item(&item_id, &publisher, kind, height);
+    }
+    Ok(replay)
 }
 
 pub const CREATE_DECLARATION_STATE: &str = "CREATE TABLE IF NOT EXISTS declaration_state(id INTEGER PRIMARY KEY CHECK(id = 1), state TEXT NOT NULL)";
@@ -339,21 +451,6 @@ pub(super) fn record_dispute(
         )?;
     }
     touch_labeler(conn, &dispute.disputant, height)
-}
-
-/// WIST-2 §3.3.
-pub(super) fn sealed_label_subject(conn: &Connection, label_id: &str) -> Result<Option<String>> {
-    if !crate::store::table_exists(conn, "labels")? {
-        return Ok(None);
-    }
-    conn.query_row(
-        "SELECT subject FROM labels WHERE label_id = ?1
-         UNION ALL SELECT subject FROM label_current WHERE label_id = ?1 LIMIT 1",
-        [label_id],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
 }
 
 /// WIST-4 §6.
