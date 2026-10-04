@@ -720,6 +720,7 @@ pub(super) fn snapshot(
         .cloned()
         .collect();
     super::persist::save_state_tuples(&conn, &replay_tuples)?;
+    super::persist::record_snapshot_sightings(&conn, manifest.epoch_number, &replay_tuples)?;
 
     save_aggregator_keys(&conn, &aggregator_keys)?;
     let chain = ChainState::from_tuples(&adopted_parameters)?;

@@ -11,11 +11,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use wist_core::aggregator_keys::Registry;
 use wist_core::checkpoint::{self, check_consistency, Adoption, Checkpoint, WitnessKey};
 use wist_core::declaration::url_host;
-use wist_core::epoch::verify_epoch;
 use wist_core::item::{judge_payload_octets, Kind, SizeCaps};
 use wist_core::label::{SealedDispute, SealedLabel};
 use wist_core::merkle::consistency_proof_from;
-use wist_core::objects::{PageItem, Payload, PublisherEnvelope, RegistryUpdateEnvelope};
+use wist_core::objects::{
+    PageItem, Payload, PublisherEnvelope, RegistryDetails, RegistryUpdateEnvelope,
+};
 use wist_core::parameters::{Amendment, Schedule};
 use wist_core::sealing::{
     carried_label_ids, Epoch, Judgment, Outcome, Parameters, Removed, Replay,
@@ -184,6 +185,29 @@ pub struct EpochEvent {
     pub label_ids: Vec<String>,
     /// WIST-3 §7.
     pub materialized: Vec<(String, Option<MaterializedRow>)>,
+    /// WIST-4 §5.1: (Item ID, Publisher of its named Catalog, kind) of each valid `publisher_item`
+    /// Entry.
+    pub sightings: Vec<(String, String, Kind)>,
+    pub rejected: Option<Vec<String>>,
+}
+
+impl EpochEvent {
+    fn rejected(height: u64, sealed_at: String, codes: Vec<String>) -> Self {
+        EpochEvent {
+            height,
+            sealed_at,
+            recovery_window_days: default_recovery_window_days(),
+            declarations: Vec::new(),
+            withdrawals: Vec::new(),
+            publishers: Vec::new(),
+            labels: Vec::new(),
+            disputes: Vec::new(),
+            label_ids: Vec::new(),
+            materialized: Vec::new(),
+            sightings: Vec::new(),
+            rejected: Some(codes),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -494,25 +518,11 @@ fn verify_checkpoint(
     )
     .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
     let entries = &leaves.entries;
-    // WIST-3 §3.1 and §6: a failure of the Epoch's own Entries is an invalid object. A leaf that is
-    // not its Entry's JCS is authenticated by its entry bundle against the verified tiles.
-    let octets = if leaves.stored.is_empty() {
-        verify_epoch(
-            previous_size,
-            checkpoint,
-            entries,
-            tree.reader(),
-            chain.transport_bound(),
-        )
-        .map_err(|error| Error::Verify(format!("epoch {n}: {error}")))?
-        .octets
-    } else if leaves.octets > chain.transport_bound() {
-        return Err(Error::Verify(format!(
-            "epoch {n}: WIST3-E03 an Epoch over the size cap in force"
-        )));
-    } else {
-        leaves.octets
-    };
+    // WIST-3 §3.3: every leaf is authenticated by its entry bundle against the verified tiles, so
+    // the Entry form, canonical order and the 65 535-octet bound are left to the Replay, which
+    // rejects the Epoch for them.
+    let octets = leaves.octets;
+    let keys_before = (**keys).clone();
 
     let mut accepting = Accepting {
         replay,
@@ -556,36 +566,31 @@ fn verify_checkpoint(
     let at = checkpoint
         .sealed_at_s()
         .map_err(|e| Error::Verify(format!("epoch {n}: WIST3-E03 {e}")))?;
+    // WIST-4 §5: every Epoch's size counts toward the largest, a rejected one's included.
     let largest = chain.largest.max(octets);
+    let schedule_before = chain.schedule_at(at).clone();
     let schedule = chain.schedule_at(at);
     for (index, (entry, eligible)) in entries.iter().zip(&leaves.body_eligible).enumerate() {
         let Some(body) = act_of(entry, *eligible, &["parameter_change"]) else {
             continue;
         };
         let id = registry_update_id(body);
-        if accepting.repeated(id.as_ref())
-            || serde_json::from_value::<RegistryUpdateEnvelope>(body.clone()).is_err()
-        {
+        if accepting.repeated(id.as_ref()) {
             continue;
         }
-        let update = &body["update"];
-        let (Some(parameter), Some(value), Some(effective_at)) = (
-            update["details"]["parameter"].as_str(),
-            update["details"]["value"].as_i64(),
-            update["effective_at"].as_str(),
-        ) else {
-            continue;
+        let (parameter, value, effective_at_s) = match parameter_change(body) {
+            Ok(change) => change,
+            Err(code) => {
+                eprintln!("ignoring a parameter_change at height {n}: {code}");
+                continue;
+            }
         };
-        let Ok(effective_at_s) = log_seconds(effective_at) else {
-            continue;
-        };
-        // WIST-4 §5.1: `WIST4-E11`, changing nothing.
         if !authentic(body) {
             eprintln!("ignoring a parameter_change at height {n}: WIST4-E11");
             continue;
         }
         let amendment = Amendment {
-            parameter: parameter.to_owned(),
+            parameter,
             value,
             epoch_number: n,
             entry_index: index as u64,
@@ -608,24 +613,6 @@ fn verify_checkpoint(
         .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
     let recovery_window_days = parameters.get("recovery_window_days");
     let suffix_list = suffix_lists.in_force_at_epoch(n)?;
-    for (entry, eligible) in entries.iter().zip(&leaves.body_eligible) {
-        let Some(body) = act_of(entry, *eligible, &["suffix_list_update"]) else {
-            continue;
-        };
-        let id = registry_update_id(body);
-        if accepting.repeated(id.as_ref()) {
-            continue;
-        }
-        if suffix_lists.apply_act(
-            inputs.sources.client(),
-            inputs.sources.primary(),
-            n,
-            body,
-            log_key,
-        )? {
-            accepting.accept(id);
-        }
-    }
     let accepted_here = accepting.here;
     chain.largest = largest;
     chain.prior_at = Some(at);
@@ -651,17 +638,53 @@ fn verify_checkpoint(
         )
         .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
     let (judged, records_removed) = match outcome {
+        // WIST-1 §5.2: no Entry of a rejected Epoch takes effect, the acts this walk applies itself
+        // included; its Checkpoint is judged under the keys valid before it.
         Outcome::Rejected { codes } => {
-            return Err(Error::Verify(format!(
-                "epoch {n}: the Epoch is rejected ({})",
+            eprintln!(
+                "rejecting the Epoch at height {n}, which applies nothing: {}",
                 codes.join(", ")
-            )))
+            );
+            **keys = keys_before;
+            *chain.schedule_at(at) = schedule_before;
+            let adoption = super::checkpoints::decide(
+                checkpoint,
+                inputs.log_id,
+                &keys.valid_at(n),
+                inputs.witnesses,
+                chain.quorum_at(at),
+            )
+            .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
+            return Ok((EpochEvent::rejected(n, sealed_at, codes), adoption));
         }
         Outcome::Accepted {
             entries,
             records_removed,
         } => (entries, records_removed),
     };
+    let mut accepting = Accepting {
+        replay,
+        here: accepted_here,
+    };
+    for (entry, eligible) in entries.iter().zip(&leaves.body_eligible) {
+        let Some(body) = act_of(entry, *eligible, &["suffix_list_update"]) else {
+            continue;
+        };
+        let id = registry_update_id(body);
+        if accepting.repeated(id.as_ref()) {
+            continue;
+        }
+        if suffix_lists.apply_act(
+            inputs.sources.client(),
+            inputs.sources.primary(),
+            n,
+            body,
+            log_key,
+        )? {
+            accepting.accept(id);
+        }
+    }
+    let accepted_here = accepting.here;
     for id in &accepted_here {
         replay.accept_registry_update(id, n);
     }
@@ -733,8 +756,52 @@ fn verify_checkpoint(
             .collect(),
         label_ids,
         materialized,
+        sightings: sightings(replay, entries, &judged)?,
+        rejected: None,
     };
     Ok((event, adoption))
+}
+
+fn sightings(
+    replay: &Replay,
+    entries: &[Value],
+    judged: &[Option<Judgment>],
+) -> Result<Vec<(String, String, Kind)>> {
+    let mut sightings = Vec::new();
+    for (entry, judgment) in entries.iter().zip(judged) {
+        if entry["type"] != "publisher_item" || !matches!(judgment, Some(Judgment::Valid)) {
+            continue;
+        }
+        let item = &entry["body"]["item"];
+        let named = entry["body"]["catalog"].as_str();
+        let Some((publisher, _, _)) = replay
+            .latest_catalogs()
+            .find(|(_, _, latest)| Some(latest.catalog_id.as_str()) == named)
+        else {
+            continue;
+        };
+        sightings.push((
+            wist_core::item::item_id(item)?,
+            publisher.to_owned(),
+            wist_core::item::kind(item),
+        ));
+    }
+    Ok(sightings)
+}
+
+/// WIST-4 §5.1: the envelope checks outside any contract (`WIST4-E11`), then the `details` and
+/// `subject` contract (`WIST4-E04`); a value or identifier outside §5's table is left to the
+/// schedule (`WIST4-E03`).
+fn parameter_change(body: &Value) -> std::result::Result<(String, i64, i64), &'static str> {
+    let envelope: RegistryUpdateEnvelope =
+        serde_json::from_value(body.clone()).map_err(|_| "WIST4-E11")?;
+    wist_core::withdrawal::envelope_fields(&envelope)?;
+    let details = match envelope.update.typed_details() {
+        Ok(RegistryDetails::ParameterChange(details)) => details,
+        _ => return Err("WIST4-E04"),
+    };
+    let effective_at_s = log_seconds(&envelope.update.effective_at).map_err(|_| "WIST4-E11")?;
+    Ok((details.parameter, details.value, effective_at_s))
 }
 
 pub(super) fn default_recovery_window_days() -> i64 {
@@ -793,7 +860,7 @@ fn remove_ranking_bookkeeping(
         "DELETE FROM record_heights WHERE url = ?1 AND publisher = ?2",
         (url, publisher),
     )?;
-    super::persist::replace_inlinks(conn, url, publisher, &[], height)
+    super::persist::replace_inlinks(conn, url, publisher, None, &[], height)
 }
 
 struct StoredRow {
@@ -844,18 +911,11 @@ pub struct Materializer<'a> {
 
 impl Materializer<'_> {
     /// WIST-1 §3.6: a Payload read for a sealed Item keeps the parameter profile of the Epoch
-    /// that first sealed the Item.
-    fn caps(&self, conn: &Connection, replay: &Replay, row: &MaterializedRow) -> SizeCaps {
-        let height = replay
-            .sealed_items()
-            .sealed()
-            .filter(|sealed| {
-                sealed.item_id == row.item_id
-                    && sealed.publisher == row.publisher
-                    && sealed.kind == Kind::Page
-            })
-            .map(|sealed| sealed.height)
-            .min();
+    /// that first sealed the Item, dated by the earliest sighting the store holds.
+    fn caps(&self, conn: &Connection, row: &MaterializedRow) -> SizeCaps {
+        let height = super::persist::earliest_sighting(conn, &row.item_id, &row.publisher)
+            .ok()
+            .flatten();
         let sealed_at = height
             .and_then(|height| super::checkpoints::retained(conn, height).ok().flatten())
             .and_then(|checkpoint| checkpoint.sealed_at_s().ok())
@@ -866,14 +926,8 @@ impl Materializer<'_> {
     }
 
     /// WIST-3 §6.1 and §8.
-    fn content(
-        &self,
-        conn: &Connection,
-        replay: &Replay,
-        url: &str,
-        row: &MaterializedRow,
-    ) -> Option<Content> {
-        let caps = self.caps(conn, replay, row);
+    fn content(&self, conn: &Connection, url: &str, row: &MaterializedRow) -> Option<Content> {
+        let caps = self.caps(conn, row);
         let page: PageItem = serde_json::from_value(row.item.clone()).ok()?;
         let hex = row.item_id.strip_prefix("sha256:")?;
         let bound = caps.extract_cap_bytes()
@@ -935,12 +989,20 @@ impl Materializer<'_> {
                 )?;
             }
         }
-        super::persist::replace_inlinks(conn, url, &row.publisher, links, height)
+        super::persist::replace_inlinks(
+            conn,
+            url,
+            &row.publisher,
+            Some(&row.item_id),
+            links,
+            height,
+        )
     }
 
     fn remove(
         &self,
         conn: &Connection,
+        replay: &Replay,
         url: &str,
         stored: &StoredRow,
         replaced_by: Option<&MaterializedRow>,
@@ -951,6 +1013,14 @@ impl Materializer<'_> {
             (url, &stored.key.publisher),
         )?;
         remove_derived(conn, &stored.key.item_id, url)?;
+        if replay.withdrawals().is_withdrawn(&stored.key.item_id) {
+            conn.execute_batch(crate::store::CREATE_RANKING)?;
+            conn.execute(
+                "DELETE FROM record_heights WHERE url = ?1 AND publisher = ?2",
+                (url, &stored.key.publisher),
+            )?;
+            return super::persist::retract_links(conn, &stored.key.item_id);
+        }
         if replaced_by.is_none_or(|row| row.publisher != stored.key.publisher) {
             remove_ranking_bookkeeping(conn, url, &stored.key.publisher, height)?;
         }
@@ -960,7 +1030,6 @@ impl Materializer<'_> {
     fn insert(
         &self,
         conn: &Connection,
-        replay: &Replay,
         url: &str,
         row: &MaterializedRow,
         height: u64,
@@ -979,7 +1048,7 @@ impl Materializer<'_> {
             ),
         )?;
         record_height(conn, url, &row.publisher, height)?;
-        let content = self.content(conn, replay, url, row);
+        let content = self.content(conn, url, row);
         self.write_content(conn, url, row, content.as_ref(), height)
     }
 
@@ -1040,7 +1109,7 @@ impl Materializer<'_> {
             };
             for held in &stored {
                 if !(same_item(held) && stored.len() == 1) {
-                    self.remove(conn, url, held, row, height)?;
+                    self.remove(conn, replay, url, held, row, height)?;
                     if replay.withdrawals().is_withdrawn(&held.key.item_id) {
                         stats.withdrawn += 1;
                     }
@@ -1056,7 +1125,7 @@ impl Materializer<'_> {
                         written.remove(url);
                     }
                 }
-                _ => self.insert(conn, replay, url, row, height)?,
+                _ => self.insert(conn, url, row, height)?,
             }
         }
         Ok(written)
@@ -1088,7 +1157,7 @@ impl Materializer<'_> {
             else {
                 continue;
             };
-            if let Some(content) = self.content(conn, replay, &url, &row) {
+            if let Some(content) = self.content(conn, &url, &row) {
                 let height = height.map_or(0, |height| height.max(0) as u64);
                 self.write_content(conn, &url, &row, Some(&content), height)?;
             }
@@ -1113,7 +1182,6 @@ pub fn apply_events(
     replay: &Replay,
     events: &[EpochEvent],
     materializer: &Materializer,
-    walked_from: u64,
 ) -> Result<ApplyStats> {
     let mut stats = ApplyStats {
         withdrawn: 0,
@@ -1125,7 +1193,19 @@ pub fn apply_events(
     if materializer.tier1 {
         conn.execute_batch(CREATE_TIER1)?;
     }
+    let items: Vec<(String, String, Kind, u64)> = events
+        .iter()
+        .flat_map(|event| {
+            event.sightings.iter().map(|(item_id, publisher, kind)| {
+                (item_id.clone(), publisher.clone(), *kind, event.height)
+            })
+        })
+        .collect();
+    record_sealed(conn, &[], &items)?;
     for event in events {
+        if event.rejected.is_some() {
+            continue;
+        }
         for entry in &event.declarations {
             // WIST-4 §6: a Declaration counts as a Labeler's sealed Entry.
             if let Some(domain) = entry["body"]["publisher"]["domain"].as_str() {
@@ -1159,21 +1239,13 @@ pub fn apply_events(
         record_sealed(conn, &label_ids, &[])?;
     }
     let written = materializer.apply(conn, replay, events, &mut stats)?;
+    // WIST-3 §6.2: an Item withdrawn while no record materializes it leaves no link history either.
+    for event in events {
+        for (item_id, _, _) in &event.withdrawals {
+            super::persist::retract_links(conn, item_id)?;
+        }
+    }
     materializer.retry(conn, replay, &written)?;
-    let items: Vec<(String, String, Kind, u64)> = replay
-        .sealed_items()
-        .sealed()
-        .filter(|item| item.height > walked_from)
-        .map(|item| {
-            (
-                item.item_id.to_owned(),
-                item.publisher.to_owned(),
-                item.kind,
-                item.height,
-            )
-        })
-        .collect();
-    record_sealed(conn, &[], &items)?;
     let history = KeyHistory::from_declarations(replay.declarations().clone());
     record_identity_starts(conn, &history)?;
     save_history(conn, &history)?;

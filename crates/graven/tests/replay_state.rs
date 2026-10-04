@@ -69,7 +69,11 @@ fn withdrawal_of(fx: &common::Fixture, item: &Value) -> Value {
 
 fn rows(log_dir: &Path, query: &str) -> Vec<Vec<String>> {
     let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
-    let mut stmt = conn.prepare(query).unwrap();
+    let mut stmt = match conn.prepare(query) {
+        Ok(stmt) => stmt,
+        Err(error) if error.to_string().contains("no such table") => return Vec::new(),
+        Err(error) => panic!("{query}: {error}"),
+    };
     let width = stmt.column_count();
     stmt.query_map([], |row| {
         (0..width)
@@ -101,6 +105,7 @@ fn held_state(target: &Path) -> Vec<(String, Vec<Vec<String>>)> {
         "SELECT item_id, publisher, height FROM withdrawals ORDER BY item_id",
         "SELECT parameter, value, epoch_number FROM parameters ORDER BY parameter, epoch_number",
         "SELECT labeler, label_count, first_seen_height, last_sealed_height FROM labelers ORDER BY labeler",
+        "SELECT item_id, publisher, kind, height FROM sealed_items ORDER BY item_id, publisher, kind",
     ]
     .into_iter()
     .map(|query| (query.to_owned(), rows(&log_dir, query)))
@@ -249,4 +254,89 @@ fn entries_above_the_adopted_checkpoint_are_not_applied() {
     assert_eq!(sync(&fx, target.path(), &roster).head, above);
     assert_eq!(kinds(&log_dir), ["registry_update", "collection", "record"]);
     assert_eq!(rows(&log_dir, "SELECT label_id FROM labels").len(), 1);
+}
+
+/// WIST-4 §5.1: the Snapshot's record tuple shows its Item sealed by its Publisher after a walked
+/// Entry replaces the tuple, so an act of another Publisher naming it fails the contract in a later
+/// run as in one uninterrupted run.
+#[test]
+fn a_withdrawal_naming_a_replaced_snapshot_item_of_another_publisher_fails_in_every_run_split() {
+    let fx = common::build_fixture(false);
+    let publisher = common::Signer::new([1u8; 32]);
+    let stepwise = tempfile::tempdir().unwrap();
+    sync(&fx, stepwise.path(), &[]);
+
+    let alpha = "https://records.example/alpha";
+    let snapshot_item = common::page_item(RECORDS, alpha, common::OBSERVED);
+    let replacing = common::page_item(RECORDS, alpha, "2026-08-09T13:30:00Z");
+    common::seal_catalog(
+        &fx,
+        &publisher,
+        RECORDS,
+        std::slice::from_ref(&replacing),
+        &[],
+    );
+    sync(&fx, stepwise.path(), &[]);
+    assert!(
+        !common::state_tuples(&common::synced_log_dir(stepwise.path()))
+            .iter()
+            .any(|tuple| tuple[0] == "record"
+                && tuple[3] == serde_json::to_value(&snapshot_item).unwrap())
+    );
+
+    let mut act = common::withdrawal_entry(&fx.log, "log1", &snapshot_item, "2026-08-09T15:00:00Z");
+    let mut update = act["body"]["update"].clone();
+    update["subject"] = json!(common::BETA_DOMAIN);
+    act["body"] = sign_envelope(&update, "update", "log1", &fx.log.sk).unwrap();
+    let at = common::next_instant(&fx);
+    common::seal_next(&fx, &at, &[act]);
+    sync(&fx, stepwise.path(), &[]);
+
+    let once = tempfile::tempdir().unwrap();
+    sync(&fx, once.path(), &[]);
+    let withdrawals = |target: &Path| -> Vec<Value> {
+        common::state_tuples(&common::synced_log_dir(target))
+            .into_iter()
+            .filter(|tuple| tuple[0] == "withdrawal")
+            .collect()
+    };
+    assert!(withdrawals(once.path()).is_empty());
+    assert!(withdrawals(stepwise.path()).is_empty());
+    assert_eq!(held_state(stepwise.path()), held_state(once.path()));
+}
+
+/// WIST-4 §5.1: an Item found nowhere stays found nowhere for a later act of another Publisher,
+/// whether the walk resumes between the two acts or not.
+#[test]
+fn two_publishers_withdrawing_an_item_found_nowhere_get_the_same_verdicts_in_every_run_split() {
+    let fx = common::build_fixture(false);
+    let stepwise = tempfile::tempdir().unwrap();
+    sync(&fx, stepwise.path(), &[]);
+    let never = common::page_item(RECORDS, "https://records.example/never", common::OBSERVED);
+    let first = common::withdrawal_entry(&fx.log, "log1", &never, "2026-08-09T15:00:00Z");
+    let at = common::next_instant(&fx);
+    common::seal_next(&fx, &at, std::slice::from_ref(&first));
+    sync(&fx, stepwise.path(), &[]);
+
+    let mut update = first["body"]["update"].clone();
+    update["subject"] = json!(common::BETA_DOMAIN);
+    let second = json!({
+        "type": "registry_update",
+        "body": sign_envelope(&update, "update", "log1", &fx.log.sk).unwrap(),
+    });
+    let at = common::next_instant(&fx);
+    common::seal_next(&fx, &at, &[second]);
+    sync(&fx, stepwise.path(), &[]);
+
+    let once = tempfile::tempdir().unwrap();
+    sync(&fx, once.path(), &[]);
+    let accepted = |target: &Path| -> usize {
+        common::state_tuples(&common::synced_log_dir(target))
+            .iter()
+            .filter(|tuple| tuple[0] == "registry_update")
+            .count()
+    };
+    assert_eq!(accepted(once.path()), 2, "both acts find the Item nowhere");
+    assert_eq!(accepted(stepwise.path()), 2);
+    assert_eq!(held_state(stepwise.path()), held_state(once.path()));
 }

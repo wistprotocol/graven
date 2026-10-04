@@ -127,11 +127,12 @@ pub fn import(dir: &Path, log_id: &str, pack_path: &Path, key_b64u: &str) -> Res
     let log_dir = resolve_log_dir(dir, log_id)?;
     let sync_state = crate::store::synced_state(&log_dir)?;
 
-    if pack.tree_size != sync_state.tree_size
+    // WIST-3 §7: a pack is verified against the Snapshot the store installed.
+    if Some(pack.tree_size) != sync_state.snapshot_tree_size
         || Some(pack.content_digest.clone()) != sync_state.content_digest
     {
         return Err(Error::Verify(
-            "pack tree_size/content_digest does not match local sync state".into(),
+            "pack tree_size/content_digest does not name the Snapshot this store installed".into(),
         ));
     }
 
@@ -182,16 +183,16 @@ pub fn import(dir: &Path, log_id: &str, pack_path: &Path, key_b64u: &str) -> Res
 
     let index_path = log_dir.join("index.sqlite");
     let conn = Connection::open(&index_path)?;
-    let mut stmt = conn.prepare("SELECT item_id FROM records")?;
-    let known: HashSet<String> = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
+    let mut stmt = conn.prepare("SELECT item_id, url, publisher FROM records")?;
+    let known: HashSet<(String, String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<rusqlite::Result<HashSet<_>>>()?;
     drop(stmt);
 
     let mut imported_rows = Vec::new();
     let mut skipped = 0u64;
     for row in rows {
-        if known.contains(&row.item_id) {
+        if known.contains(&(row.item_id.clone(), row.url.clone(), row.publisher.clone())) {
             imported_rows.push(row);
         } else {
             skipped += 1;

@@ -79,9 +79,12 @@ fn publishers() -> [Publisher; 2] {
     ]
 }
 
-fn rejected_at(error: &str, height: u64) -> bool {
-    error.contains("the Epoch is rejected (WIST3-E03)")
-        && error.contains(&format!("stopped at epoch {height} "))
+fn rejected_at(report: &graven::sync::SyncReport, height: u64) -> bool {
+    report.head == height
+        && report
+            .rejected
+            .iter()
+            .any(|epoch| epoch.epoch_number == height && epoch.codes == ["WIST3-E03"])
 }
 
 fn record_urls(target: &std::path::Path) -> Vec<String> {
@@ -204,16 +207,17 @@ fn capacity_is_counted_per_registrable_domain_under_the_adopted_tuple() {
     append_epoch(&fx, std::slice::from_ref(&b_list.catalog));
     let catalogs = sync(&fx, target.path()).unwrap().head;
     let height = append_epoch(&fx, &[a_list.items[0].clone(), b_list.items[0].clone()]);
-    let err = sync(&fx, target.path()).unwrap_err().to_string();
-    assert!(rejected_at(&err, height), "{err}");
-    assert_eq!(
-        graven::store::synced_state(&common::synced_log_dir(target.path()))
-            .unwrap()
-            .epoch_number,
-        catalogs,
-        "the rejected Epoch leaves the verified head"
+    assert!(height > catalogs);
+    let report = sync(&fx, target.path()).unwrap();
+    assert!(rejected_at(&report, height), "{report}");
+    assert!(
+        record_urls(target.path()).is_empty(),
+        "the rejected Epoch applies none of its Items"
     );
-    assert!(record_urls(target.path()).is_empty());
+    append_epoch(&fx, &[b_list.items[0].clone()]);
+    let report = sync(&fx, target.path()).unwrap();
+    assert!(report.rejected.is_empty(), "{report}");
+    assert_eq!(record_urls(target.path()), ["https://b.example.com/x"]);
 
     let mut without_tuple = Vec::new();
     caps(&mut without_tuple);
@@ -240,6 +244,22 @@ fn capacity_is_counted_per_registrable_domain_under_the_adopted_tuple() {
         ["https://a.example.com/x", "https://b.example.com/x"]
     );
     let height = append_epoch(&fx, &a_list.items);
-    let err = sync(&fx, target.path()).unwrap_err().to_string();
-    assert!(rejected_at(&err, height), "{err}");
+    let report = sync(&fx, target.path()).unwrap();
+    assert!(rejected_at(&report, height), "{report}");
+    let a_y = a_list
+        .items
+        .iter()
+        .find(|entry| entry["body"]["item"]["url"] == "https://a.example.com/y")
+        .unwrap()
+        .clone();
+    append_epoch(&fx, &[a_y]);
+    sync(&fx, target.path()).unwrap();
+    assert_eq!(
+        record_urls(target.path()),
+        [
+            "https://a.example.com/x",
+            "https://a.example.com/y",
+            "https://b.example.com/x"
+        ]
+    );
 }

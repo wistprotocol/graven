@@ -1318,23 +1318,44 @@ fn cold_start_enforces_the_adopted_sequence_floor() {
     let new_key = common::Signer::new([7u8; 32]);
     common::extend_fixture_with_rotation(&fx, &new_key);
     let target = tempfile::tempdir().unwrap();
-    let error = graven::sync::run(
-        fx.anchor_path().to_str().unwrap(),
-        &fx.base_url,
-        target.path(),
-        true,
-        false,
-    )
-    .err()
-    .map(|e| e.to_string())
-    .unwrap_or_default();
+    let run = || {
+        graven::sync::run(
+            fx.anchor_path().to_str().unwrap(),
+            &fx.base_url,
+            target.path(),
+            true,
+            false,
+        )
+        .unwrap()
+    };
+    let report = run();
     let rotated = fx.log_state().head_number();
-    assert!(
-        error.contains("WIST1-E08")
-            && error.contains("the Epoch is rejected")
-            && error.contains(&format!("stopped at epoch {rotated}")),
-        "a rotation to seq 1 must not pass a floor of 5: {error}"
+    assert_eq!(report.head, rotated);
+    assert_eq!(
+        report
+            .rejected
+            .iter()
+            .map(|epoch| (epoch.epoch_number, epoch.codes.clone()))
+            .collect::<Vec<_>>(),
+        [(rotated, vec!["WIST1-E08".to_owned()])],
+        "a rotation to seq 1 must not pass a floor of 5"
     );
+    let log_dir = common::synced_log_dir(target.path());
+    let sequences = || -> Vec<i64> {
+        let conn = rusqlite::Connection::open(log_dir.join("index.sqlite")).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT seq FROM declarations WHERE domain = ?1 ORDER BY seq")
+            .unwrap();
+        stmt.query_map([&fx.domain], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert_eq!(sequences(), [0], "the rejected rotation installs nothing");
+    let later = common::extend_fixture(&fx);
+    assert!(run().rejected.is_empty());
+    assert!(common::holds_declaration(&log_dir, &later));
+    assert_eq!(sequences(), [0]);
 }
 
 #[test]
@@ -1952,5 +1973,114 @@ fn incremental_sync_with_tier1_purges_the_previous_items_content_when_the_new_pa
     assert!(
         links_of(&log_dir, url).is_empty(),
         "the previous Item's links do not survive"
+    );
+}
+
+/// WIST-1 §5.2 and WIST-3 §3.3: a rejected Epoch applies none of its Registry Updates, the key,
+/// parameter and suffix-list acts included, and the walk goes on to the Epochs after it.
+#[test]
+fn a_rejected_epoch_applies_none_of_its_registry_updates_and_the_walk_goes_on() {
+    let fx = common::build_fixture(false);
+    let target = tempfile::tempdir().unwrap();
+    common::sync(&fx, target.path(), false);
+    let list: &[u8] = b"// ===BEGIN ICANN DOMAINS===\ncom\n// ===END ICANN DOMAINS===\n";
+    let identifier = wist_core::suffix_list::identifier(list);
+    let lists = fx.dir.path().join("log/suffix-lists");
+    std::fs::create_dir_all(&lists).unwrap();
+    std::fs::write(
+        lists.join(format!(
+            "{}.dat",
+            identifier.strip_prefix("sha256:").unwrap()
+        )),
+        list,
+    )
+    .unwrap();
+    let suffix_update = serde_json::json!({
+        "wist_version": "1.0.0",
+        "action": "suffix_list_update",
+        "subject": identifier,
+        "details": {"sha256": identifier, "bytes": list.len()},
+        "effective_at": "2026-08-09T15:00:00Z",
+    });
+    let acts = common::canonical_order(&[
+        common::key_act(
+            &fx,
+            "aggregator_key_add",
+            "log1",
+            &fx.log,
+            "log2",
+            Some(&common::Signer::new([23u8; 32])),
+            "2026-08-09T15:00:00Z",
+        ),
+        common::parameter_act(
+            "log1",
+            &fx.log,
+            "catalog_refresh_seconds",
+            86_400,
+            "2026-08-30T00:00:00Z",
+        ),
+        serde_json::json!({"type": "registry_update", "body": wist_core::envelope::sign_envelope(&suffix_update, "update", "log1", &fx.log.sk).unwrap()}),
+    ]);
+    let mut leaves: Vec<Vec<u8>> = acts
+        .iter()
+        .map(|entry| wist_core::jcs::canonicalize(entry).unwrap())
+        .collect();
+    leaves.push(br#"{"body":{},"type":"bogus"}"#.to_vec());
+    let at = common::next_instant(&fx);
+    let rejected = fx.log_state().seal_leaf_bytes(&at, &leaves).epoch_number();
+
+    let report = common::sync(&fx, target.path(), false);
+    assert_eq!(report.head, rejected);
+    assert_eq!(
+        report
+            .rejected
+            .iter()
+            .map(|epoch| (epoch.epoch_number, epoch.codes.clone()))
+            .collect::<Vec<_>>(),
+        [(rejected, vec!["WIST3-E03".to_owned()])]
+    );
+    let log_dir = common::synced_log_dir(target.path());
+    let held = || {
+        let conn = rusqlite::Connection::open(log_dir.join("index.sqlite")).unwrap();
+        let read = |query: &str| -> Vec<String> {
+            conn.prepare(query)
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        (
+            read("SELECT key_id FROM aggregator_keys ORDER BY key_id"),
+            read("SELECT parameter FROM parameters ORDER BY parameter"),
+            read("SELECT sha256 FROM suffix_list_acts ORDER BY seq"),
+            common::state_tuples(&log_dir)
+                .iter()
+                .filter(|tuple| tuple[0] == "registry_update")
+                .count(),
+        )
+    };
+    let (keys, parameters, suffix_lists, updates) = held();
+    assert_eq!(keys, ["log1"]);
+    assert!(!parameters.contains(&"catalog_refresh_seconds".to_owned()));
+    assert!(suffix_lists.is_empty());
+    assert_eq!(updates, 0);
+
+    let at = common::next_instant(&fx);
+    let accepted = common::seal_next(&fx, &at, &acts);
+    let report = common::sync(&fx, target.path(), false);
+    assert_eq!(report.head, accepted);
+    assert!(report.rejected.is_empty(), "{report}");
+    let (keys, parameters, suffix_lists, updates) = held();
+    assert_eq!(keys, ["log1", "log2"]);
+    assert!(parameters.contains(&"catalog_refresh_seconds".to_owned()));
+    assert_eq!(suffix_lists, [identifier]);
+    assert_eq!(updates, 3);
+    assert_eq!(
+        graven::store::synced_state(&log_dir)
+            .unwrap()
+            .rejected_epochs
+            .len(),
+        1
     );
 }

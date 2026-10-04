@@ -46,14 +46,36 @@ fn a_declaration_whose_leaf_data_repeats_a_member_rejects_its_epoch() {
         fx.log_state()
             .seal_leaf_bytes(&sealed_at, &[duplicate(&original, name, escaped)]);
         let rejected = fx.log_state().head_number();
-        let error = cold_sync(&fx).unwrap_err();
+        let (report, target) = cold_sync(&fx).unwrap();
+        assert_eq!(report.head, rejected, "{name}");
+        assert_eq!(
+            report
+                .rejected
+                .iter()
+                .map(|epoch| (epoch.epoch_number, epoch.codes.clone()))
+                .collect::<Vec<_>>(),
+            [(rejected, vec!["WIST1-E05".to_owned()])],
+            "{name}"
+        );
+        let log_dir = common::synced_log_dir(target.path());
         assert!(
-            error.contains("WIST1-E05")
-                && error.contains(&format!(
-                    "stopped at epoch {rejected} and its verified head is epoch {}",
-                    rejected - 1
-                )),
-            "{name}: {error}"
+            !common::holds_declaration(&log_dir, "repeated.example"),
+            "{name}"
+        );
+        let later = common::extend_fixture(&fx);
+        let report = graven::sync::run(
+            fx.anchor_path().to_str().unwrap(),
+            &fx.base_url,
+            target.path(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(report.rejected.is_empty(), "{name}: {report}");
+        assert!(common::holds_declaration(&log_dir, &later), "{name}");
+        assert!(
+            !common::holds_declaration(&log_dir, "repeated.example"),
+            "{name}"
         );
     }
 }

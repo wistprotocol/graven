@@ -9,7 +9,7 @@ fn read_sync_state(target: &std::path::Path) -> (String, u64) {
     .unwrap();
     (
         value["content_digest"].as_str().unwrap().to_string(),
-        value["tree_size"].as_u64().unwrap(),
+        value["snapshot_tree_size"].as_u64().unwrap(),
     )
 }
 
@@ -531,4 +531,64 @@ fn an_item_a_removed_item_ends_has_its_embedding_row_purged() {
 
     assert!(common::record_row(&log_dir, "https://records.example/alpha").is_none());
     assert_eq!(embedded_items(target.path()), [beta_id]);
+}
+
+/// WIST-3 §7: a pack names the Snapshot the store installed, whatever the store walked since, and
+/// supplies vectors only for records still materialized with the Item it names.
+#[test]
+fn a_pack_over_the_installed_snapshot_imports_after_the_store_walked_further() {
+    let (fx, target) = sync_fixture();
+    let (alpha_id, beta_id) = alpha_beta_ids();
+    let snapshot_tree_size = fx.log_state().checkpoints[0].tree_size();
+    let at = common::next_instant(&fx);
+    let newer = common::page_item(&fx.domain, "https://records.example/beta", &at);
+    common::seal_catalog(
+        &fx,
+        &common::Signer::new([1u8; 32]),
+        &fx.domain,
+        std::slice::from_ref(&newer),
+        &[],
+    );
+    let report = common::sync(&fx, target.path(), false);
+    assert_ne!(report.tree_size, snapshot_tree_size);
+    let content_digest: String = serde_json::from_slice::<serde_json::Value>(
+        &std::fs::read(common::synced_log_dir(target.path()).join("sync.json")).unwrap(),
+    )
+    .unwrap()["content_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let pack_dir = tempfile::tempdir().unwrap();
+    let pack_path = common::build_pack(
+        pack_dir.path(),
+        &fx.log,
+        &content_digest,
+        snapshot_tree_size,
+        &[
+            (
+                alpha_id.as_str(),
+                "https://records.example/alpha",
+                fx.domain.as_str(),
+                vec![0.1, 0.2, 0.3],
+            ),
+            (
+                beta_id.as_str(),
+                "https://records.example/beta",
+                fx.domain.as_str(),
+                vec![0.4, 0.5, 0.6],
+            ),
+        ],
+        3,
+        "cosine",
+    );
+    let report = graven::pack::import(
+        target.path(),
+        "graven-test-log",
+        &pack_path,
+        &fx.log.public_b64u(),
+    )
+    .unwrap();
+    assert_eq!((report.imported, report.skipped), (1, 1));
+    assert_eq!(embedded_items(target.path()), [alpha_id]);
 }

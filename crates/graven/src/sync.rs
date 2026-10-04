@@ -53,6 +53,20 @@ pub struct SyncReport {
     /// WIST-3 §5.
     pub stale: bool,
     pub withdrawn: u64,
+    /// WIST-1 §5.2: walked by this run and applying nothing.
+    pub rejected: Vec<RejectedEpoch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedEpoch {
+    pub epoch_number: u64,
+    pub codes: Vec<String>,
+}
+
+impl std::fmt::Display for RejectedEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.epoch_number, self.codes.join(", "))
+    }
 }
 
 impl std::fmt::Display for SyncReport {
@@ -70,11 +84,16 @@ impl std::fmt::Display for SyncReport {
             f,
             "[{}] synced from {from} to head epoch {} (tree size {}, root {}, {witnessing}{staleness}), withdrawn {}",
             self.log_id, self.head, self.tree_size, self.root, self.withdrawn
-        )
+        )?;
+        if !self.rejected.is_empty() {
+            let rejected: Vec<String> = self.rejected.iter().map(ToString::to_string).collect();
+            write!(f, ", rejected epochs {}", rejected.join("; "))?;
+        }
+        Ok(())
     }
 }
 
-pub const SYNC_STATE_FORMAT: u32 = 6;
+pub const SYNC_STATE_FORMAT: u32 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncState {
@@ -85,8 +104,11 @@ pub struct SyncState {
     pub root: String,
     #[serde(default)]
     pub unwitnessed: bool,
+    /// The installed Snapshot's, which a pack names (WIST-3 §7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_tree_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule_first_s: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +117,20 @@ pub struct SyncState {
     pub largest_epoch_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walk_floor: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_epochs: Vec<RejectedEpoch>,
+}
+
+fn rejected_in(events: &[EpochEvent]) -> Vec<RejectedEpoch> {
+    events
+        .iter()
+        .filter_map(|event| {
+            event.rejected.as_ref().map(|codes| RejectedEpoch {
+                epoch_number: event.height,
+                codes: codes.clone(),
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -576,6 +612,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
         unwitnessed: local.unwitnessed,
         stale,
         withdrawn: 0,
+        rejected: Vec::new(),
     };
 
     let keys = load_aggregator_keys(&conn, context.anchor, local.epoch_number)?;
@@ -650,7 +687,6 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
             chain: &chain,
             tier1: context.tier1,
         },
-        local.epoch_number,
     )?;
     fetch_definitions(
         &tx,
@@ -665,6 +701,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
             [],
         )?;
     }
+    let rejected = rejected_in(&walk.events);
     let sync_state = SyncState {
         format: SYNC_STATE_FORMAT,
         tree_size: adopted.tree_size(),
@@ -672,10 +709,12 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
         root: adopted.root_token(),
         unwitnessed,
         content_digest: local.content_digest.clone(),
+        snapshot_tree_size: local.snapshot_tree_size,
         schedule_first_s: chain.schedule_first_s(),
         prior_sealed_at_s: chain.prior_at(),
         largest_epoch_bytes: chain.largest(),
         walk_floor: local.walk_floor,
+        rejected_epochs: [local.rejected_epochs.clone(), rejected.clone()].concat(),
     };
     save_sync_state(&tx, &sync_state)?;
     tx.commit()?;
@@ -691,6 +730,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
         unwitnessed,
         stale,
         withdrawn: stats.withdrawn,
+        rejected,
     };
     match stopped {
         None => Ok(report),
@@ -797,10 +837,12 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
         root: anchor.root_token(),
         unwitnessed: matches!(anchor_adoption, Adoption::Adopted { unwitnessed: true }),
         content_digest: Some(installed.content_digest.clone()),
+        snapshot_tree_size: Some(anchor.tree_size()),
         schedule_first_s: installed.chain.schedule_first_s(),
         prior_sealed_at_s: installed.chain.prior_at(),
         largest_epoch_bytes: installed.chain.largest(),
         walk_floor: Some(anchor.epoch_number()),
+        rejected_epochs: Vec::new(),
     };
     save_sync_state(&installed.conn, &anchor_state)?;
     let resumed = load_replay(&installed.conn, &anchor, anchor_state.walk_floor)?;
@@ -896,7 +938,6 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
             chain: &installed.chain,
             tier1: context.tier1,
         },
-        anchor.epoch_number(),
     )?;
     fetch_definitions(
         &installed.conn,
@@ -913,6 +954,7 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
             [],
         )?;
     }
+    let rejected = rejected_in(&events);
     let sync_state = SyncState {
         format: SYNC_STATE_FORMAT,
         tree_size: adopted.tree_size(),
@@ -920,10 +962,12 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
         root: adopted.root_token(),
         unwitnessed,
         content_digest: Some(installed.content_digest.clone()),
+        snapshot_tree_size: anchor_state.snapshot_tree_size,
         schedule_first_s: installed.chain.schedule_first_s(),
         prior_sealed_at_s: installed.chain.prior_at(),
         largest_epoch_bytes: installed.chain.largest(),
         walk_floor: anchor_state.walk_floor,
+        rejected_epochs: rejected.clone(),
     };
     save_sync_state(&installed.conn, &sync_state)?;
     installed.commit(context.log_dir)?;
@@ -939,6 +983,7 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
         unwitnessed,
         stale,
         withdrawn: stats.withdrawn,
+        rejected,
     };
     match stopped {
         None => Ok(ColdStart::Done(report)),

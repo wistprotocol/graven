@@ -292,6 +292,136 @@ fn a_withdrawal_removes_the_row_and_leaves_the_record() {
     assert!(h.holds_record(RECORDS, url));
 }
 
+/// WIST-3 §6.2: nothing derived from a withdrawn Payload's links stays, and its earlier
+/// contribution to the in-link history is taken back.
+#[test]
+fn a_withdrawal_leaves_no_row_derived_from_the_withdrawn_payload() {
+    let h = Harness::new();
+    let url = "https://records.example/withdrawn";
+    let item = h.page(
+        RECORDS,
+        url,
+        "Withdrawn",
+        &["https://first.example/a", "https://second.example/b"],
+    );
+    let kept_url = "https://records.example/kept";
+    let kept = h.page(
+        RECORDS,
+        kept_url,
+        "Kept",
+        &["https://kept-target.example/c"],
+    );
+    h.publish(&owner(), RECORDS, &[item.clone(), kept], &[]);
+    h.sync();
+    let item_id = wist_core::item::item_id(&item).unwrap();
+    let conn = rusqlite::Connection::open(h.log_dir().join("index.sqlite")).unwrap();
+    conn.execute_batch(graven::store::CREATE_EMBEDDINGS)
+        .unwrap();
+    conn.execute(
+        "INSERT INTO embeddings(item_id, url, publisher, vector) VALUES (?1, ?2, ?3, x'00000000')",
+        (&item_id, url, RECORDS),
+    )
+    .unwrap();
+    let count = |query: &str| -> i64 { conn.query_row(query, [], |row| row.get(0)).unwrap() };
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM inlinks WHERE source_url = 'https://records.example/withdrawn'"
+        ),
+        2
+    );
+    assert_eq!(count("SELECT SUM(added) FROM link_changes"), 3);
+
+    let withdrawal = common::withdrawal_entry(&h.fx.log, "log1", &item, "2026-08-09T15:00:00Z");
+    h.declare(&[withdrawal]);
+    h.sync();
+
+    assert!(h.row(url).is_none());
+    assert_eq!(h.extracts(url), 0);
+    assert_eq!(h.links(url), 0);
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM inlinks WHERE source_url = 'https://records.example/withdrawn'"
+        ),
+        0
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM link_changes WHERE target_host IN ('first.example', 'second.example')"),
+        0
+    );
+    let embedded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM embeddings WHERE item_id = ?1",
+            [&item_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(embedded, 0);
+    assert_eq!(count("SELECT SUM(added) FROM link_changes"), 1);
+    assert_eq!(count("SELECT SUM(removed) FROM link_changes"), 0);
+    assert_eq!(h.links(kept_url), 1);
+}
+
+/// WIST-3 §6.2: the in-link history reads as if the withdrawn Item's links were never read; a link
+/// it continued from the Item before it dies where it replaced that Item.
+#[test]
+fn a_withdrawn_replacement_leaves_the_link_history_of_a_record_whose_links_were_never_read() {
+    let h = Harness::new();
+    let url = "https://records.example/page";
+    let first = h.page(
+        RECORDS,
+        url,
+        "First",
+        &["https://dropped.example/a", "https://continued.example/b"],
+    );
+    h.publish(&owner(), RECORDS, std::slice::from_ref(&first), &[]);
+    h.sync();
+    let first_height = h.fx.head_number();
+    let (second, payload) = common::page(
+        RECORDS,
+        url,
+        "2026-08-09T13:30:00Z",
+        &Content {
+            title: "Second",
+            r#abstract: None,
+            extract: "Second body",
+            links: &["https://continued.example/b", "https://added.example/c"],
+        },
+    );
+    common::serve_payload(h.fx.dir.path(), &second, &payload);
+    h.publish(&owner(), RECORDS, std::slice::from_ref(&second), &[]);
+    h.sync();
+    let second_height = h.fx.head_number();
+
+    let withdrawal = common::withdrawal_entry(&h.fx.log, "log1", &second, "2026-08-09T15:00:00Z");
+    h.declare(&[withdrawal]);
+    h.sync();
+
+    let conn = rusqlite::Connection::open(h.log_dir().join("index.sqlite")).unwrap();
+    let history: Vec<(String, i64, i64, i64)> = conn
+        .prepare(
+            "SELECT target_host, height, SUM(added), SUM(removed) FROM link_changes
+             GROUP BY target_host, height ORDER BY target_host, height",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let (first_height, second_height) = (first_height as i64, second_height as i64);
+    assert_eq!(
+        history,
+        [
+            ("continued.example".to_owned(), first_height, 1, 0),
+            ("continued.example".to_owned(), second_height, 0, 1),
+            ("dropped.example".to_owned(), first_height, 1, 0),
+            ("dropped.example".to_owned(), second_height, 0, 1),
+        ]
+    );
+    assert_eq!(h.links(url), 0);
+}
+
 #[test]
 fn narrowing_removes_the_rows_outside_the_new_scope() {
     let h = Harness::new();

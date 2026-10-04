@@ -39,9 +39,12 @@ CREATE TABLE IF NOT EXISTS labeler_subjects(labeler TEXT NOT NULL, subject TEXT 
 CREATE TABLE IF NOT EXISTS label_definitions(labeler TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, treatment TEXT NOT NULL, asserted_at TEXT NOT NULL, PRIMARY KEY(labeler, name))";
 
 pub const CREATE_RANKING: &str = "CREATE TABLE IF NOT EXISTS record_heights(url TEXT NOT NULL, publisher TEXT NOT NULL, height INTEGER NOT NULL, PRIMARY KEY(url, publisher)); \
-CREATE TABLE IF NOT EXISTS inlinks(source_url TEXT NOT NULL, source_host TEXT NOT NULL, target_url TEXT NOT NULL, target_host TEXT NOT NULL, height INTEGER NOT NULL, PRIMARY KEY(source_url, target_url)); \
+CREATE TABLE IF NOT EXISTS inlinks(source_url TEXT NOT NULL, source_host TEXT NOT NULL, target_url TEXT NOT NULL, target_host TEXT NOT NULL, height INTEGER NOT NULL, item_id TEXT NOT NULL, added_by TEXT NOT NULL, PRIMARY KEY(source_url, target_url)); \
 CREATE INDEX IF NOT EXISTS inlinks_target ON inlinks(target_host); \
-CREATE TABLE IF NOT EXISTS link_changes(target_host TEXT NOT NULL, height INTEGER NOT NULL, added INTEGER NOT NULL, removed INTEGER NOT NULL, PRIMARY KEY(target_host, height)); \
+CREATE INDEX IF NOT EXISTS inlinks_item ON inlinks(item_id); \
+CREATE INDEX IF NOT EXISTS inlinks_added_by ON inlinks(added_by); \
+CREATE TABLE IF NOT EXISTS link_changes(target_host TEXT NOT NULL, height INTEGER NOT NULL, added INTEGER NOT NULL, removed INTEGER NOT NULL, source_url TEXT NOT NULL, target_url TEXT NOT NULL, item_id TEXT NOT NULL); \
+CREATE INDEX IF NOT EXISTS link_changes_item ON link_changes(item_id); \
 CREATE TABLE IF NOT EXISTS identity_starts(domain TEXT PRIMARY KEY, height INTEGER NOT NULL)";
 
 pub const CREATE_SEALED_LABEL_IDS: &str =
@@ -307,6 +310,31 @@ fn row_to_similar_candidate(row: &rusqlite::Row) -> rusqlite::Result<SimilarCand
         hit: row_to_hit(row)?,
         vector: row.get(9)?,
     })
+}
+
+/// WIST-2 §3.3: `records` holds the subject URL's materialized record alone, so it is the one the
+/// rule selects.
+pub(crate) fn label_binding_applies(
+    conn: &Connection,
+    subject: &str,
+    delta: Option<&str>,
+) -> Result<bool> {
+    if delta.is_none() {
+        return Ok(true);
+    }
+    let mut stmt = conn.prepare("SELECT publisher, item_id FROM records WHERE url = ?1")?;
+    let held = stmt
+        .query_map([subject], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(wist_core::label::materialized_binding_applies(
+        delta,
+        subject,
+        false,
+        held.iter()
+            .map(|(publisher, item_id)| (publisher.as_str(), item_id.as_str(), false)),
+    ))
 }
 
 pub fn synced_state(dir: &Path) -> Result<SyncState> {
@@ -1056,27 +1084,8 @@ impl Store {
             .collect())
     }
 
-    /// WIST-2 §3.3: `records` holds the subject URL's materialized record alone, so it is the one
-    /// the rule selects.
     fn binding_applies(&self, row: &LabelRow) -> Result<bool> {
-        if row.delta.is_none() {
-            return Ok(true);
-        }
-        let mut stmt = self
-            .conn
-            .prepare("SELECT publisher, item_id FROM records WHERE url = ?1")?;
-        let held = stmt
-            .query_map([&row.subject], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(wist_core::label::materialized_binding_applies(
-            row.delta.as_deref(),
-            &row.subject,
-            false,
-            held.iter()
-                .map(|(publisher, item_id)| (publisher.as_str(), item_id.as_str(), false)),
-        ))
+        label_binding_applies(&self.conn, &row.subject, row.delta.as_deref())
     }
 
     pub fn label_id_of(&self, row: &LabelRow) -> Result<Option<String>> {
@@ -1581,10 +1590,12 @@ mod tests {
                 root: "sha256:deadbeef".into(),
                 unwitnessed: false,
                 content_digest: None,
+                snapshot_tree_size: None,
                 schedule_first_s: None,
                 prior_sealed_at_s: None,
                 largest_epoch_bytes: 0,
                 walk_floor: None,
+                rejected_epochs: Vec::new(),
             })
             .unwrap(),
         )
@@ -1919,10 +1930,12 @@ mod tests {
                 root: "sha256:deadbeef".into(),
                 unwitnessed: false,
                 content_digest: None,
+                snapshot_tree_size: None,
                 schedule_first_s: None,
                 prior_sealed_at_s: None,
                 largest_epoch_bytes: 0,
                 walk_floor: None,
+                rejected_epochs: Vec::new(),
             })
             .unwrap(),
         )

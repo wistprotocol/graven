@@ -265,7 +265,7 @@ fn agreed_subjects(
         return Ok(BTreeSet::new());
     }
     let mut stmt = conn.prepare(
-        "SELECT labeler, subject, expires_at FROM label_current WHERE name = ?1 AND retracted = 0",
+        "SELECT labeler, subject, expires_at, delta FROM label_current WHERE name = ?1 AND retracted = 0",
     )?;
     let mut votes: HashMap<String, BTreeSet<String>> = HashMap::new();
     for row in stmt.query_map([name], |row| {
@@ -273,10 +273,13 @@ fn agreed_subjects(
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
         ))
     })? {
-        let (labeler, subject, expires_at) = row?;
-        if !labelers.contains(&labeler) {
+        let (labeler, subject, expires_at, delta) = row?;
+        if !labelers.contains(&labeler)
+            || !crate::store::label_binding_applies(conn, &subject, delta.as_deref())?
+        {
             continue;
         }
         if let (Some(expiry), Some(head)) = (expires_at.as_deref(), head_sealed_at) {
@@ -371,9 +374,10 @@ fn counted_subjects(
     // An expiry later than the head's instant is later than every earlier Epoch's. An index resumed
     // from a Snapshot holds the current Label without its history.
     let mut expired: BTreeSet<Triple> = BTreeSet::new();
+    let mut unbound: BTreeSet<Triple> = BTreeSet::new();
     if table_exists(conn, "label_current")? {
         let mut stmt = conn.prepare(
-            "SELECT labeler, subject, name, height, asserted_at, retracted, expires_at, entry_index FROM label_current",
+            "SELECT labeler, subject, name, height, asserted_at, retracted, expires_at, entry_index, delta FROM label_current",
         )?;
         for row in stmt.query_map([], |row| {
             Ok((
@@ -385,14 +389,27 @@ fn counted_subjects(
                 row.get::<_, i64>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         })? {
-            let (labeler, subject, name, height, asserted_at, retracted, expires_at, entry_index) =
-                row?;
+            let (
+                labeler,
+                subject,
+                name,
+                height,
+                asserted_at,
+                retracted,
+                expires_at,
+                entry_index,
+                delta,
+            ) = row?;
             if !names.contains(&name.as_str()) || !labelers.contains(&labeler) {
                 continue;
             }
             let triple = (labeler, subject, name);
+            if !crate::store::label_binding_applies(conn, &triple.1, delta.as_deref())? {
+                unbound.insert(triple.clone());
+            }
             if expires_at.as_deref().is_some_and(|expiry| {
                 head_sealed_at.is_some_and(|head| {
                     wist_core::publisher_time::compare(expiry, head)
@@ -415,6 +432,9 @@ fn counted_subjects(
     }
     let mut votes: HashMap<String, BTreeSet<String>> = HashMap::new();
     for (triple, mut rows) in events {
+        if unbound.contains(&triple) {
+            continue;
+        }
         rows.sort_by_key(|(height, entry_index, _, _)| (*height, *entry_index));
         let events: Vec<wist_core::label::LabelEvent> = rows
             .iter()

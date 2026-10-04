@@ -234,11 +234,48 @@ pub(super) fn record_sealed(
     }
     for (item_id, publisher, kind, height) in items {
         conn.execute(
-            "INSERT OR IGNORE INTO sealed_items(item_id, publisher, kind, height) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO sealed_items(item_id, publisher, kind, height) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(item_id, publisher, kind) DO UPDATE SET height = MIN(height, excluded.height)",
             (item_id, publisher, kind_name(*kind), *height as i64),
         )?;
     }
     Ok(())
+}
+
+/// WIST-4 §5.1: the `record`, `removal` and `withdrawal` tuples of the installed Snapshot show their
+/// Items sealed at or below its Epoch.
+pub(super) fn record_snapshot_sightings(
+    conn: &Connection,
+    epoch_number: u64,
+    tuples: &[StateEntry],
+) -> Result<()> {
+    let sealed = wist_core::withdrawal::SealedItems::from_state(epoch_number, tuples)?;
+    let items: Vec<(String, String, Kind, u64)> = sealed
+        .sealed()
+        .map(|item| {
+            (
+                item.item_id.to_owned(),
+                item.publisher.to_owned(),
+                item.kind,
+                item.height,
+            )
+        })
+        .collect();
+    record_sealed(conn, &[], &items)
+}
+
+pub(super) fn earliest_sighting(
+    conn: &Connection,
+    item_id: &str,
+    publisher: &str,
+) -> Result<Option<u64>> {
+    conn.execute_batch(crate::store::CREATE_SEALED_ITEMS)?;
+    let height: Option<i64> = conn.query_row(
+        "SELECT MIN(height) FROM sealed_items WHERE item_id = ?1 AND publisher = ?2 AND kind = 'page'",
+        (item_id, publisher),
+        |row| row.get(0),
+    )?;
+    Ok(height.map(|height| height.max(0) as u64))
 }
 
 /// WIST-3 §7: the index's Label and Item rows stand in for what no state tuple carries.
@@ -292,7 +329,7 @@ pub fn read_sync_state(bytes: &[u8]) -> Result<SyncState> {
     let format = value.get("format").and_then(serde_json::Value::as_u64);
     if format != Some(u64::from(super::SYNC_STATE_FORMAT)) {
         return Err(Error::Verify(
-            "the stored sync state is in a superseded format, from before the Log became one growing tree, from before its fields were renamed to epoch_number/tree_size, from before the Aggregator key registry carried each key's accepted acts, or from before records were keyed by Item ID; remove the log's directory and follow the Log again".into(),
+            "the stored sync state is in a superseded format, from before the Log became one growing tree, from before its fields were renamed to epoch_number/tree_size, from before the Aggregator key registry carried each key's accepted acts, from before records were keyed by Item ID, or from before link rows and Item sightings were kept per Item; remove the log's directory and follow the Log again".into(),
         ));
     }
     Ok(serde_json::from_value(value)?)
@@ -597,40 +634,124 @@ fn host_of(url: &str) -> String {
         .to_string()
 }
 
+fn link_change(
+    conn: &Connection,
+    source_url: &str,
+    target_url: &str,
+    item_id: &str,
+    height: u64,
+    added: bool,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO link_changes(target_host, height, added, removed, source_url, target_url, item_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            host_of(target_url),
+            height as i64,
+            i64::from(added),
+            i64::from(!added),
+            source_url,
+            target_url,
+            item_id
+        ],
+    )?;
+    Ok(())
+}
+
 pub(super) fn replace_inlinks(
     conn: &Connection,
     source_url: &str,
     source_host: &str,
+    item_id: Option<&str>,
     targets: &[String],
     height: u64,
 ) -> Result<()> {
     conn.execute_batch(crate::store::CREATE_RANKING)?;
-    let mut stmt = conn.prepare("SELECT target_url FROM inlinks WHERE source_url = ?1")?;
-    let previous: std::collections::BTreeSet<String> = stmt
-        .query_map([source_url], |row| row.get::<_, String>(0))?
+    let mut stmt =
+        conn.prepare("SELECT target_url, added_by FROM inlinks WHERE source_url = ?1")?;
+    let previous: std::collections::BTreeMap<String, String> = stmt
+        .query_map([source_url], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let current: std::collections::BTreeSet<String> = targets.iter().cloned().collect();
-    let mut changes: std::collections::BTreeMap<String, (i64, i64)> = Default::default();
-    for target in previous.difference(&current) {
-        changes.entry(host_of(target)).or_default().1 += 1;
-    }
-    for target in current.difference(&previous) {
-        changes.entry(host_of(target)).or_default().0 += 1;
+    let current: std::collections::BTreeSet<&String> = match item_id {
+        Some(_) => targets.iter().collect(),
+        None => Default::default(),
+    };
+    for (target, added_by) in &previous {
+        if !current.contains(target) {
+            link_change(conn, source_url, target, added_by, height, false)?;
+        }
     }
     conn.execute("DELETE FROM inlinks WHERE source_url = ?1", [source_url])?;
-    for target in &current {
+    let Some(item_id) = item_id else {
+        return Ok(());
+    };
+    for target in current {
+        let added_by = match previous.get(target) {
+            Some(added_by) => added_by.as_str(),
+            None => {
+                link_change(conn, source_url, target, item_id, height, true)?;
+                item_id
+            }
+        };
         conn.execute(
-            "INSERT OR REPLACE INTO inlinks(source_url, source_host, target_url, target_host, height) VALUES (?1, ?2, ?3, ?4, ?5)",
-            (source_url, source_host, target, host_of(target), height as i64),
+            "INSERT OR REPLACE INTO inlinks(source_url, source_host, target_url, target_host, height, item_id, added_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                source_url,
+                source_host,
+                target,
+                host_of(target),
+                height as i64,
+                item_id,
+                added_by
+            ],
         )?;
     }
-    for (target_host, (added, removed)) in changes {
-        conn.execute(
-            "INSERT INTO link_changes(target_host, height, added, removed) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(target_host, height) DO UPDATE SET added = added + excluded.added, removed = removed + excluded.removed",
-            (target_host, height as i64, added, removed),
+    Ok(())
+}
+
+/// WIST-3 §6.2: a withdrawn Payload's declared links are content; the link rows are left as if its
+/// links had never been read.
+pub(super) fn retract_links(conn: &Connection, item_id: &str) -> Result<()> {
+    conn.execute_batch(crate::store::CREATE_RANKING)?;
+    let carried: Vec<(String, String, String, i64)> = conn
+        .prepare("SELECT source_url, target_url, added_by, height FROM inlinks WHERE item_id = ?1")?
+        .query_map([item_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (source_url, target_url, added_by, height) in &carried {
+        if added_by != item_id {
+            link_change(
+                conn,
+                source_url,
+                target_url,
+                added_by,
+                (*height).max(0) as u64,
+                false,
+            )?;
+        }
+    }
+    conn.execute("DELETE FROM inlinks WHERE item_id = ?1", [item_id])?;
+    let continued: Vec<(String, String, String, i64)> = conn
+        .prepare("SELECT source_url, target_url, item_id, height FROM inlinks WHERE added_by = ?1")?
+        .query_map([item_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (source_url, target_url, carrier, height) in &continued {
+        link_change(
+            conn,
+            source_url,
+            target_url,
+            carrier,
+            (*height).max(0) as u64,
+            true,
         )?;
     }
+    conn.execute(
+        "UPDATE inlinks SET added_by = item_id WHERE added_by = ?1",
+        [item_id],
+    )?;
+    conn.execute("DELETE FROM link_changes WHERE item_id = ?1", [item_id])?;
     Ok(())
 }
 
@@ -646,17 +767,19 @@ pub(super) fn seed_ranking_index(conn: &Connection, height: u64) -> Result<()> {
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         for (source_url, target_url) in rows {
-            let source_host = conn
+            let Some((source_host, item_id)) = conn
                 .query_row(
-                    "SELECT publisher FROM records WHERE url = ?1 LIMIT 1",
+                    "SELECT publisher, item_id FROM records WHERE url = ?1 LIMIT 1",
                     [&source_url],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()?
-                .unwrap_or_else(|| host_of(&source_url));
+            else {
+                continue;
+            };
             conn.execute(
-                "INSERT OR IGNORE INTO inlinks(source_url, source_host, target_url, target_host, height) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (&source_url, source_host, &target_url, host_of(&target_url), height as i64),
+                "INSERT OR IGNORE INTO inlinks(source_url, source_host, target_url, target_host, height, item_id, added_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                rusqlite::params![source_url, source_host, target_url, host_of(&target_url), height as i64, item_id],
             )?;
         }
     }

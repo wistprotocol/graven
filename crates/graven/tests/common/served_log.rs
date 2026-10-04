@@ -263,10 +263,12 @@ impl ServedLog {
                 root: checkpoint.root_token(),
                 unwitnessed: true,
                 content_digest: None,
+                snapshot_tree_size: None,
                 schedule_first_s: Some(at),
                 prior_sealed_at_s: Some(at),
                 largest_epoch_bytes: 0,
                 walk_floor: None,
+                rejected_epochs: Vec::new(),
             },
         )
         .unwrap();
@@ -316,6 +318,12 @@ impl ServedLog {
         .map_err(|error| error.to_string());
         super::assert_records_materialized(&self.log_dir(target));
         outcome
+    }
+
+    pub fn rejected(&self, target: &Path) -> Vec<graven::sync::RejectedEpoch> {
+        graven::store::synced_state(&self.log_dir(target))
+            .unwrap()
+            .rejected_epochs
     }
 
     pub fn head(&self, target: &Path) -> u64 {

@@ -268,3 +268,73 @@ fn ranking_costs_are_measured() {
         default_query, personal_query
     );
 }
+
+/// WIST-2 §3.3: a bound Label applies nothing while the URL's materialized record carries another
+/// Item, so a `wist:spam` Label bound to a replaced Item stops penalizing the URL.
+#[test]
+fn a_spam_label_bound_to_an_item_stops_penalizing_once_another_item_is_the_record() {
+    let fx = common::build_fixture_without_records();
+    let target = tempfile::tempdir().unwrap();
+    sync(&fx, target.path());
+    let labeler = site(31, "spam-labels.example");
+    let pages = site(32, "pages.example");
+    let url = "https://pages.example/orchard";
+    let mut entries = vec![declaration(&labeler), declaration(&pages)];
+    let first = page(
+        &fx,
+        &pages,
+        "orchard",
+        "Orchard notes",
+        "orchard apples",
+        &[],
+    );
+    let item_id = wist_core::item::item_id(&first[1]["body"]["item"]).unwrap();
+    entries.extend(first);
+    let label = json!({
+        "wist_version": "1.0.0",
+        "labeler": labeler.domain,
+        "subject": url,
+        "name": "wist:spam",
+        "asserted_at": "2026-08-09T12:30:00Z",
+        "delta": item_id,
+    });
+    entries.push(json!({"type": "label", "body": sign_envelope(&label, "label", &labeler.signer.kid(), &labeler.signer.sk).unwrap()}));
+    append_epoch(&fx, &entries);
+    sync(&fx, target.path());
+    let mut subscriptions = std::collections::BTreeSet::new();
+    subscriptions.insert(labeler.domain.to_string());
+    save_subscriptions(target.path(), &subscriptions).unwrap();
+    let spam = || {
+        let store = MultiStore::open_read_only(target.path()).unwrap();
+        let profile = load_profile(target.path(), "text-only").unwrap();
+        let ranked = store.search_ranked("orchard", 10, &profile).unwrap();
+        assert_eq!(ranked.len(), 1, "{ranked:?}");
+        assert_eq!(ranked[0].url, url);
+        ranked[0].signals.spam
+    };
+    assert!(spam(), "the Label binds the materialized Item");
+
+    let (item, payload) = common::page(
+        pages.domain,
+        url,
+        "2026-08-09T13:30:00Z",
+        &common::Content {
+            title: "Orchard notes",
+            r#abstract: None,
+            extract: "orchard pears",
+            links: &[],
+        },
+    );
+    common::serve_payload(fx.dir.path(), &item, &payload);
+    append_epoch(
+        &fx,
+        &common::catalog_entries(
+            &pages.signer,
+            pages.domain,
+            &common::next_instant(&fx),
+            &[item],
+        ),
+    );
+    sync(&fx, target.path());
+    assert!(!spam(), "the materialized record carries another Item");
+}

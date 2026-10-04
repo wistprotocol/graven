@@ -211,10 +211,12 @@ fn install_at_epoch_0(served: &ServedHistory, target: &Path, history: &Value) {
             root: checkpoint.root_token(),
             unwitnessed: true,
             content_digest: None,
+            snapshot_tree_size: None,
             schedule_first_s: None,
             prior_sealed_at_s: Some(checkpoint.sealed_at_s().unwrap()),
             largest_epoch_bytes: 0,
             walk_floor: Some(0),
+            rejected_epochs: Vec::new(),
         },
     )
     .unwrap();

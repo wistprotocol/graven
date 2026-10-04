@@ -520,10 +520,12 @@ mod tests {
                 root: "sha256:deadbeef".into(),
                 unwitnessed: false,
                 content_digest: None,
+                snapshot_tree_size: None,
                 schedule_first_s: None,
                 prior_sealed_at_s: None,
                 largest_epoch_bytes: 0,
                 walk_floor: None,
+                rejected_epochs: Vec::new(),
             })
             .unwrap(),
         )

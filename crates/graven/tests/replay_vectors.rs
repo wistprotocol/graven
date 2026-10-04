@@ -223,15 +223,16 @@ fn catalog_sealing_histories_walked_by_the_consumer_hold_each_epochs_state() {
                     walked += 1;
                 }
                 "rejected" => {
-                    let error = outcome.unwrap_err();
+                    assert_eq!(outcome, Ok(height), "{label}");
                     let codes = want["codes"].as_array().unwrap();
+                    let reported = served.rejected(target.path());
                     assert!(
-                        codes
-                            .iter()
-                            .any(|code| error.contains(code.as_str().unwrap())),
-                        "{label}: {error} reports none of {codes:?}"
+                        reported.iter().any(|epoch| epoch.epoch_number == height
+                            && codes
+                                .iter()
+                                .any(|code| epoch.codes.iter().any(|held| held == code))),
+                        "{label}: {reported:?} reports none of {codes:?}"
                     );
-                    assert_eq!(served.head(target.path()), height - 1, "{label}");
                     rejected += 1;
                 }
                 other => panic!("{label}: {other}"),
@@ -241,9 +242,6 @@ fn catalog_sealing_histories_walked_by_the_consumer_hold_each_epochs_state() {
                 without_base(&want["state"]),
                 "{label}"
             );
-            if want["status"] == "rejected" {
-                break;
-            }
         }
         if served.epochs.len() < 2 {
             continue;
@@ -475,16 +473,38 @@ fn collection_narrowing_histories_walked_by_the_consumer_keep_the_records_each_d
                     continue;
                 }
                 served.amend(target.path());
+                let before = narrowing.stored(&log_dir, publisher);
                 let outcome = served.sync(target.path());
+                assert_eq!(outcome, Ok(height), "{label}");
                 if rejected_at == Some(height) {
                     let code = history["expected"]["rejected"]["code"].as_str().unwrap();
-                    let error = outcome.unwrap_err();
-                    assert!(error.contains(code), "{label}: {error}");
-                    assert_eq!(served.head(target.path()), height - 1, "{label}");
+                    let reported: Vec<(u64, Vec<String>)> = served
+                        .rejected(target.path())
+                        .into_iter()
+                        .map(|epoch| (epoch.epoch_number, epoch.codes))
+                        .collect();
+                    assert_eq!(reported, [(height, vec![code.to_owned()])], "{label}");
+                    assert_eq!(narrowing.stored(&log_dir, publisher), before, "{label}");
+                    let later = common::Signer::new([0x65; 32]);
+                    let sealed_at = wist_core::timestamp::instant(
+                        log_seconds(epoch["sealed_at"].as_str().unwrap()).unwrap() + 3600,
+                    )
+                    .unwrap();
+                    served.seal(VectorEpoch {
+                        sealed_at,
+                        parameters: parameter_map(parameters),
+                        leaves: leaves(&[common::declaration_entry(&later, "later.example")]),
+                    });
+                    served.amend(target.path());
+                    assert_eq!(served.sync(target.path()), Ok(height + 1), "{label}");
+                    assert!(
+                        common::holds_declaration(&log_dir, "later.example"),
+                        "{label}"
+                    );
+                    assert_eq!(narrowing.stored(&log_dir, publisher), before, "{label}");
                     refused += 1;
                     break;
                 }
-                assert_eq!(outcome, Ok(height), "{label}");
                 let want = want.unwrap();
                 let live_now: Vec<Value> = live
                     .iter()
@@ -584,16 +604,32 @@ fn the_per_labeler_and_per_domain_caps_reject_an_epoch_the_consumer_walks() {
         }
         let target = tempfile::tempdir().unwrap();
         served.install(target.path());
-        let outcome = served.sync(target.path());
+        let log_dir = served.log_dir(target.path());
+        let before = common::state_tuples(&log_dir);
+        assert_eq!(served.sync(target.path()), Ok(1), "{label}");
+        let rejected: Vec<(u64, Vec<String>)> = served
+            .rejected(target.path())
+            .into_iter()
+            .map(|epoch| (epoch.epoch_number, epoch.codes))
+            .collect();
         match case["expected"].as_str() {
-            None => assert_eq!(outcome, Ok(1), "{label}"),
+            None => assert!(rejected.is_empty(), "{label}: {rejected:?}"),
             Some(code) => {
-                let error = outcome.unwrap_err();
+                assert_eq!(rejected, [(1, vec![code.to_owned()])], "{label}");
+                assert_eq!(common::state_tuples(&log_dir), before, "{label}");
+                let later = common::Signer::new([0x64; 32]);
+                served.seal(VectorEpoch {
+                    sealed_at: hourly(2),
+                    parameters: parameters.clone(),
+                    leaves: leaves(&[common::declaration_entry(&later, "later.example")]),
+                });
+                served.amend(target.path());
+                assert_eq!(served.sync(target.path()), Ok(2), "{label}");
                 assert!(
-                    error.contains(&format!("the Epoch is rejected ({code})")),
-                    "{label}: {error}"
+                    common::holds_declaration(&log_dir, "later.example"),
+                    "{label}"
                 );
-                assert_eq!(served.head(target.path()), 0, "{label}");
+                assert_eq!(served.rejected(target.path()).len(), 1, "{label}");
             }
         }
         cases += 1;
@@ -1321,4 +1357,332 @@ fn record_materialization_snapshots_resume_to_the_records_and_state_of_a_full_wa
         }
     }
     assert_eq!(resumed, 9);
+}
+
+fn test_agg_k1() -> Value {
+    let keypair = vector("wist1/keypair.json");
+    json!({
+        "seed_hex": keypair["seed_hex"],
+        "x": keypair["public_key"],
+        "kid": "test-agg-k1",
+    })
+}
+
+fn tuple_entries(tuples: &Value) -> Vec<StateEntry> {
+    tuples
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tuple| serde_json::from_value(tuple.clone()).unwrap())
+        .collect()
+}
+
+fn sorted_values(values: &[Value]) -> Vec<String> {
+    let mut values: Vec<String> = values
+        .iter()
+        .map(|value| serde_json::to_string(value).unwrap())
+        .collect();
+    values.sort();
+    values
+}
+
+struct Resume<'v> {
+    vector: &'v Value,
+    served: ServedLog,
+    signers: BTreeMap<String, common::Signer>,
+}
+
+impl<'v> Resume<'v> {
+    fn new(vector: &'v Value) -> Self {
+        let resume = &vector["resume"];
+        let mut domains: Vec<String> = vector["sealed_items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|sealed| sealed["publisher"].as_str().unwrap().to_owned())
+            .chain(
+                ["record_tuples", "removal_tuples"]
+                    .iter()
+                    .flat_map(|name| resume[*name].as_array().unwrap())
+                    .map(|tuple| tuple[1].as_str().unwrap().to_owned()),
+            )
+            .collect();
+        domains.sort();
+        domains.dedup();
+        let signers = domains
+            .into_iter()
+            .enumerate()
+            .map(|(n, domain)| (domain, common::Signer::new([0x70 + n as u8; 32])))
+            .collect();
+        Resume {
+            vector,
+            served: ServedLog::new(&test_agg_k1(), "withdrawal-resume-log"),
+            signers,
+        }
+    }
+
+    fn declaration(&self, domain: &str) -> Value {
+        let signer = &self.signers[domain];
+        common::build_declaration_full(signer, domain, 0, None, &[(signer, "2026-08-01T00:00:00Z")])
+    }
+
+    fn entries(&self, height: u64) -> Vec<Value> {
+        let resume = &self.vector["resume"];
+        let mut entries = Vec::new();
+        if height == 0 {
+            entries.extend(self.signers.keys().map(
+                |domain| json!({"type": "publisher_declaration", "body": self.declaration(domain)}),
+            ));
+        }
+        let mut listed: BTreeMap<&str, (&str, Vec<Value>)> = BTreeMap::new();
+        for sealed in self.vector["sealed_items"].as_array().unwrap() {
+            if sealed["height"] != height || height <= resume["snapshot_height"].as_u64().unwrap() {
+                continue;
+            }
+            listed
+                .entry(sealed["publisher"].as_str().unwrap())
+                .or_insert_with(|| (sealed["generated_at"].as_str().unwrap(), Vec::new()))
+                .1
+                .push(sealed["item"].clone());
+        }
+        for (publisher, (generated_at, items)) in listed {
+            entries.extend(common::catalog_entries(
+                &self.signers[publisher],
+                publisher,
+                generated_at,
+                &items,
+            ));
+        }
+        for act in resume["act_cases"].as_array().unwrap() {
+            if act["height"] == height {
+                let body: Value =
+                    serde_json::from_str(act["envelope_json"].as_str().unwrap()).unwrap();
+                entries.push(json!({"type": "registry_update", "body": body}));
+            }
+        }
+        entries
+    }
+
+    fn seal_through(&mut self, height: u64) {
+        while (self.served.epochs.len() as u64) <= height {
+            let next = self.served.epochs.len() as u64;
+            let entries = self.entries(next);
+            self.served.seal(VectorEpoch {
+                sealed_at: format!("2026-08-02T{next:02}:30:00Z"),
+                parameters: BTreeMap::new(),
+                leaves: leaves(&entries),
+            });
+        }
+    }
+
+    fn snapshot(&self) {
+        let resume = &self.vector["resume"];
+        let height = resume["snapshot_height"].as_u64().unwrap();
+        let mut tuples: Vec<StateEntry> = [
+            "registry_update_tuples",
+            "record_tuples",
+            "removal_tuples",
+            "adopted",
+        ]
+        .iter()
+        .flat_map(|name| tuple_entries(&resume[*name]))
+        .collect();
+        let records = wist_core::sealing::Records::from_state(&tuples).unwrap();
+        let withdrawn: Vec<&str> = resume["adopted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tuple| tuple[1].as_str().unwrap())
+            .collect();
+        let materialized = wist_core::materialization::materialized(
+            records.records(),
+            |host| self.signers.contains_key(host),
+            |item_id| withdrawn.contains(&item_id),
+        )
+        .unwrap();
+        let held = Held {
+            records: materialized
+                .into_iter()
+                .map(|tuple| common::RecordFixture {
+                    item: records
+                        .record(&tuple.publisher, &tuple.url)
+                        .unwrap()
+                        .item
+                        .clone(),
+                    title: tuple.url.clone(),
+                    url: tuple.url,
+                    publisher: tuple.publisher,
+                    item_id: tuple.item_id,
+                    observed_at: tuple.observed_at,
+                    attested_at: tuple.attested_at,
+                    abstract_text: None,
+                    lang: "en".into(),
+                })
+                .collect(),
+            ..Held::default()
+        };
+        tuples.extend(self.signers.keys().map(|domain| {
+            StateEntry::Declaration(wist_core::objects::DeclarationEntry {
+                domain: domain.clone(),
+                declaration: self.declaration(domain),
+                sealing_height: 0,
+                highest_accepted_seq: 0,
+            })
+        }));
+        self.served.snapshot(height, "2026-08-02", tuples, &held);
+    }
+
+    fn assert_verdicts(&self, target: &Path, label: &str) {
+        let resume = &self.vector["resume"];
+        let tuples = common::state_tuples(&self.served.log_dir(target));
+        let withdrawals: Vec<Value> = tuples
+            .iter()
+            .filter(|tuple| tuple[0] == "withdrawal")
+            .cloned()
+            .collect();
+        assert_eq!(
+            sorted_values(&withdrawals),
+            sorted_values(resume["state_tuples"].as_array().unwrap()),
+            "{label}: withdrawal tuples"
+        );
+        let accepted: Vec<&str> = tuples
+            .iter()
+            .filter(|tuple| tuple[0] == "registry_update")
+            .map(|tuple| tuple[1].as_str().unwrap())
+            .collect();
+        for act in resume["act_cases"].as_array().unwrap() {
+            let case = act["label"].as_str().unwrap();
+            let body: Value = serde_json::from_str(act["envelope_json"].as_str().unwrap()).unwrap();
+            let update_id = wist_core::registry_updates::update_id(&body).unwrap();
+            assert_eq!(
+                accepted.contains(&update_id.as_str()),
+                act["code"].is_null(),
+                "{label}: {case} at {}",
+                act["height"]
+            );
+        }
+    }
+}
+
+/// WIST-4 §5.1: a resumed Consumer judges an act against every Item it applied through the act's
+/// Epoch and the tuples of the Snapshot it resumed from, however its walk is split into runs.
+#[test]
+fn withdrawal_resume_verdicts_hold_in_every_split_of_the_walk_into_runs() {
+    let vector = vector("wist4/withdrawal.json");
+    let snapshot_height = vector["resume"]["snapshot_height"].as_u64().unwrap();
+    let top = vector["resume"]["act_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|act| act["height"].as_u64().unwrap())
+        .max()
+        .unwrap();
+    let inner: Vec<u64> = (snapshot_height + 1..top).collect();
+    for split in 0..1u32 << inner.len() {
+        let stops: Vec<u64> = inner
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| split & (1 << bit) != 0)
+            .map(|(_, height)| *height)
+            .chain(std::iter::once(top))
+            .collect();
+        let mut resume = Resume::new(&vector);
+        resume.seal_through(snapshot_height);
+        resume.snapshot();
+        let target = tempfile::tempdir().unwrap();
+        assert_eq!(resume.served.sync(target.path()), Ok(snapshot_height));
+        for height in &stops {
+            resume.seal_through(*height);
+            assert_eq!(resume.served.sync(target.path()), Ok(*height), "{stops:?}");
+        }
+        resume.assert_verdicts(target.path(), &format!("runs ending at {stops:?}"));
+        if split == 0 {
+            let once = tempfile::tempdir().unwrap();
+            assert_eq!(resume.served.sync(once.path()), Ok(top));
+            resume.assert_verdicts(once.path(), "one run from the Snapshot");
+        }
+    }
+}
+
+fn amendments_sealed_at(log_dir: &Path, height: u64) -> Vec<Value> {
+    rows(
+        log_dir,
+        &format!(
+            "SELECT parameter, value FROM parameters WHERE epoch_number = {height} ORDER BY entry_index"
+        ),
+        &["parameter", "value"],
+    )
+}
+
+fn walk_one_act(body: &Value) -> Vec<Value> {
+    let entry = json!({"type": "registry_update", "body": body});
+    let leaf = wist_core::jcs::canonicalize(&entry)
+        .unwrap_or_else(|_| serde_json::to_vec(&entry).unwrap());
+    let mut served = ServedLog::new(&test_agg_k1(), "parameter-wire-log");
+    served.seal(VectorEpoch {
+        sealed_at: "2026-08-01T00:00:00Z".into(),
+        parameters: BTreeMap::new(),
+        leaves: Vec::new(),
+    });
+    let target = tempfile::tempdir().unwrap();
+    served.install(target.path());
+    served.seal(VectorEpoch {
+        sealed_at: "2026-08-01T01:00:00Z".into(),
+        parameters: BTreeMap::new(),
+        leaves: vec![leaf],
+    });
+    served.amend(target.path());
+    assert_eq!(served.sync(target.path()), Ok(1));
+    amendments_sealed_at(&served.log_dir(target.path()), 1)
+}
+
+/// WIST-4 §5.1: a `parameter_change` changes the schedule only when it passes JSON/JCS eligibility,
+/// the envelope checks, its `details` and `subject` contract, authentication and §5's bounds and
+/// combinations.
+#[test]
+fn parameter_change_wire_cases_walked_by_the_consumer_change_the_schedule_as_the_vector_disposes() {
+    let vector = vector("wist4/parameter-combinations.json");
+    let mut cases = 0;
+    for case in vector["wire_cases"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        let adopted = case["code"].is_null() && case["combinations_hold_at_defaults"] == true;
+        let held = walk_one_act(&case["envelope"]);
+        assert_eq!(held.len(), usize::from(adopted), "{label}: {held:?}");
+        if adopted {
+            assert_eq!(
+                held[0]["parameter"], case["envelope"]["update"]["details"]["parameter"],
+                "{label}"
+            );
+        }
+        cases += 1;
+    }
+    assert_eq!(cases, 45);
+}
+
+#[test]
+fn a_parameter_change_breaking_its_contract_or_major_version_changes_no_schedule() {
+    let log = signer_of(&test_agg_k1());
+    let signed = |update: Value| sign_envelope(&update, "update", "test-agg-k1", &log.sk).unwrap();
+    let update = json!({
+        "wist_version": "1.0.0",
+        "action": "parameter_change",
+        "subject": "quota_base",
+        "effective_at": "2026-08-12T00:00:00Z",
+        "details": {"parameter": "quota_base", "value": 2},
+    });
+    assert_eq!(walk_one_act(&signed(update.clone())).len(), 1);
+
+    let mut other_subject = update.clone();
+    other_subject["subject"] = json!("catalog_refresh_seconds");
+    let mut extra_member = update.clone();
+    extra_member["details"]["note"] = json!("raised");
+    let mut next_major = update.clone();
+    next_major["wist_version"] = json!("2.0.0");
+    for (label, changed) in [
+        ("a subject other than details.parameter", other_subject),
+        ("a details member the contract does not name", extra_member),
+        ("wist_version 2.0.0", next_major),
+    ] {
+        assert!(walk_one_act(&signed(changed)).is_empty(), "{label}");
+    }
 }
