@@ -424,6 +424,7 @@ fn withdrawal_purges_embedding_row() {
         false,
     )
     .unwrap();
+    common::assert_records_materialized(&common::synced_log_dir(target.path()));
 
     let conn =
         Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
@@ -436,4 +437,98 @@ fn withdrawal_purges_embedding_row() {
         .unwrap();
     assert_eq!(alpha_rows, 0);
     assert_eq!(embeddings_count(target.path()), 1);
+}
+
+fn import_alpha_and_beta(fx: &common::Fixture, target: &std::path::Path) -> (String, String) {
+    let (alpha_id, beta_id) = alpha_beta_ids();
+    let (content_digest, tree_size) = read_sync_state(target);
+    let pack_dir = tempfile::tempdir().unwrap();
+    let pack_path = common::build_pack(
+        pack_dir.path(),
+        &fx.log,
+        &content_digest,
+        tree_size,
+        &[
+            (
+                alpha_id.as_str(),
+                "https://records.example/alpha",
+                fx.domain.as_str(),
+                vec![0.1, 0.2, 0.3],
+            ),
+            (
+                beta_id.as_str(),
+                "https://records.example/beta",
+                fx.domain.as_str(),
+                vec![0.4, 0.5, 0.6],
+            ),
+        ],
+        3,
+        "cosine",
+    );
+    graven::pack::import(target, "graven-test-log", &pack_path, &fx.log.public_b64u()).unwrap();
+    assert_eq!(embeddings_count(target), 2);
+    (alpha_id, beta_id)
+}
+
+fn embedded_items(target: &std::path::Path) -> Vec<String> {
+    let conn = Connection::open(common::synced_log_dir(target).join("index.sqlite")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT item_id FROM embeddings ORDER BY item_id")
+        .unwrap();
+    stmt.query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn an_item_superseded_by_a_later_catalogs_item_has_its_embedding_row_purged() {
+    let (fx, target) = sync_fixture();
+    let (alpha_id, beta_id) = import_alpha_and_beta(&fx, target.path());
+
+    let at = common::next_instant(&fx);
+    let newer = common::page_item(&fx.domain, "https://records.example/alpha", &at);
+    common::seal_catalog(
+        &fx,
+        &common::Signer::new([1u8; 32]),
+        &fx.domain,
+        std::slice::from_ref(&newer),
+        &[],
+    );
+    common::sync(&fx, target.path(), false);
+    let log_dir = common::synced_log_dir(target.path());
+    common::assert_records_materialized(&log_dir);
+
+    let newer_id = wist_core::item::item_id(&newer).unwrap();
+    assert_ne!(newer_id, alpha_id);
+    assert_eq!(
+        common::record_row(&log_dir, "https://records.example/alpha").map(|row| row.1),
+        Some(newer_id)
+    );
+    assert_eq!(embedded_items(target.path()), [beta_id]);
+}
+
+#[test]
+fn an_item_a_removed_item_ends_has_its_embedding_row_purged() {
+    let (fx, target) = sync_fixture();
+    let (_, beta_id) = import_alpha_and_beta(&fx, target.path());
+
+    let at = common::next_instant(&fx);
+    common::seal_catalog(
+        &fx,
+        &common::Signer::new([1u8; 32]),
+        &fx.domain,
+        &[common::removed_item(
+            &fx.domain,
+            "https://records.example/alpha",
+            &at,
+        )],
+        &[],
+    );
+    common::sync(&fx, target.path(), false);
+    let log_dir = common::synced_log_dir(target.path());
+    common::assert_records_materialized(&log_dir);
+
+    assert!(common::record_row(&log_dir, "https://records.example/alpha").is_none());
+    assert_eq!(embedded_items(target.path()), [beta_id]);
 }

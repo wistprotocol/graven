@@ -3,8 +3,10 @@ use crate::sync::SyncState;
 use rmcp::schemars;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use wist_core::objects::StateEntry;
+use wist_core::sealing::{Record, Removal, UrlState};
 
 pub const CREATE_RECORDS: &str = "CREATE TABLE records(url TEXT, publisher TEXT, item_id TEXT, observed_at TEXT, attested_at TEXT, title TEXT, abstract TEXT, lang TEXT, collection TEXT, generated_at TEXT); \
 CREATE VIRTUAL TABLE records_fts USING fts5(title, abstract, content=records, content_rowid=rowid)";
@@ -47,8 +49,8 @@ pub const CREATE_SEALED_LABEL_IDS: &str =
 
 pub const CREATE_SEALED_ITEMS: &str = "CREATE TABLE IF NOT EXISTS sealed_items(item_id TEXT NOT NULL, publisher TEXT NOT NULL, kind TEXT NOT NULL, height INTEGER NOT NULL, PRIMARY KEY(item_id, publisher, kind))";
 
-pub const CREATE_STATE_TUPLES: &str =
-    "CREATE TABLE IF NOT EXISTS state_tuples(seq INTEGER PRIMARY KEY, tuple TEXT NOT NULL)";
+pub const CREATE_STATE_TUPLES: &str = "CREATE TABLE IF NOT EXISTS state_tuples(seq INTEGER PRIMARY KEY, tuple TEXT NOT NULL); \
+CREATE INDEX IF NOT EXISTS state_tuples_key ON state_tuples(json_extract(tuple, '$[1]'), json_extract(tuple, '$[2]'))";
 
 /// WIST-4 §9.
 pub const CREATE_PARAMETERS: &str = "CREATE TABLE IF NOT EXISTS parameters(parameter TEXT NOT NULL, value INTEGER NOT NULL, epoch_number INTEGER NOT NULL, entry_index INTEGER NOT NULL, sealed_at_s INTEGER NOT NULL, effective_at_s INTEGER NOT NULL, PRIMARY KEY(parameter, epoch_number, entry_index))";
@@ -176,41 +178,38 @@ pub struct SimilarHit {
     pub score: f64,
 }
 
-#[derive(Debug, Clone)]
 struct ExtractRow {
     extract: String,
     item_id: String,
-    observed_at: String,
 }
 
-fn merge_extract(rows: Vec<(ProvEntry, ExtractRow)>) -> Option<(String, Vec<ProvEntry>)> {
-    let mut by_item: BTreeMap<String, (ExtractRow, Vec<ProvEntry>)> = BTreeMap::new();
-    for (provenance, row) in rows {
-        let entry = by_item
-            .entry(row.item_id.clone())
-            .or_insert_with(|| (row, Vec::new()));
-        entry.1.push(provenance);
-    }
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeldState {
+    Record(Record),
+    Removed(Removal),
+}
 
-    let mut winner: Option<(String, String, String, Vec<ProvEntry>)> = None;
-    for (item_id, (row, mut provenance)) in by_item {
-        provenance.sort_by(|a, b| a.log_id.cmp(&b.log_id));
-        let is_better = match &winner {
-            Some((obs, did, _, _)) => {
-                (row.observed_at.as_str(), item_id.as_str()) > (obs.as_str(), did.as_str())
-            }
-            None => true,
-        };
-        if is_better {
-            winner = Some((
-                row.observed_at.clone(),
-                item_id,
-                row.extract.clone(),
-                provenance,
-            ));
+impl HeldState {
+    pub fn as_url_state(&self) -> UrlState<'_> {
+        match self {
+            HeldState::Record(record) => UrlState::Record(record),
+            HeldState::Removed(removal) => UrlState::Removed(removal),
         }
     }
-    winner.map(|(_, _, extract, provenance)| (extract, provenance))
+}
+
+struct Resolved {
+    publisher: String,
+    item_id: String,
+    holders: Vec<usize>,
+}
+
+impl Resolved {
+    fn holds(&self, log: usize, hit: &RecordHit) -> bool {
+        self.holders.contains(&log)
+            && hit.publisher == self.publisher
+            && hit.item_id == self.item_id
+    }
 }
 
 fn quote_phrase(q: &str) -> String {
@@ -308,32 +307,6 @@ fn row_to_similar_candidate(row: &rusqlite::Row) -> rusqlite::Result<SimilarCand
         hit: row_to_hit(row)?,
         vector: row.get(9)?,
     })
-}
-
-fn merge(rows: Vec<(ProvEntry, RecordHit)>) -> Vec<MergedHit> {
-    let mut by_item: BTreeMap<String, (RecordHit, Vec<ProvEntry>)> = BTreeMap::new();
-    for (provenance, hit) in rows {
-        let entry = by_item
-            .entry(hit.item_id.clone())
-            .or_insert_with(|| (hit, Vec::new()));
-        entry.1.push(provenance);
-    }
-
-    let mut by_url_publisher: BTreeMap<(String, String), MergedHit> = BTreeMap::new();
-    for (_, (hit, mut provenance)) in by_item {
-        provenance.sort_by(|a, b| a.log_id.cmp(&b.log_id));
-        let candidate = MergedHit::of(hit, provenance);
-        let key = (candidate.url.clone(), candidate.publisher.clone());
-        match by_url_publisher.get(&key) {
-            Some(existing)
-                if (existing.observed_at.as_str(), existing.item_id.as_str())
-                    >= (candidate.observed_at.as_str(), candidate.item_id.as_str()) => {}
-            _ => {
-                by_url_publisher.insert(key, candidate);
-            }
-        }
-    }
-    by_url_publisher.into_values().collect()
 }
 
 pub fn synced_state(dir: &Path) -> Result<SyncState> {
@@ -519,8 +492,9 @@ impl MultiStore {
         limit: usize,
         profile: &crate::ranking::Profile,
     ) -> Result<Vec<RankedHit>> {
-        let mut merged: BTreeMap<(String, String), RankedHit> = BTreeMap::new();
-        for handle in &self.logs {
+        let mut resolved: HashMap<String, Option<Resolved>> = HashMap::new();
+        let mut merged: BTreeMap<String, RankedHit> = BTreeMap::new();
+        for (index, handle) in self.logs.iter().enumerate() {
             let scored = handle.store.search_scored(q, limit.max(1) * 4)?;
             if scored.is_empty() {
                 continue;
@@ -533,39 +507,40 @@ impl MultiStore {
                 handle.head_sealed_at.as_deref(),
             )?;
             for ranked in crate::ranking::rank(&handle.store.conn, profile, &state, scored)? {
-                let provenance = handle.provenance();
-                let key = (ranked.hit.url.clone(), ranked.hit.publisher.clone());
-                match merged.get_mut(&key) {
-                    Some(existing) if existing.score >= ranked.score => {
-                        existing.provenance.push(provenance);
-                    }
-                    _ => {
-                        let mut previous = merged
-                            .remove(&key)
-                            .map(|e| e.provenance)
-                            .unwrap_or_default();
-                        previous.push(provenance);
-                        previous.sort_by(|a, b| a.log_id.cmp(&b.log_id));
-                        merged.insert(
-                            key,
-                            RankedHit {
-                                url: ranked.hit.url,
-                                publisher: ranked.hit.publisher,
-                                item_id: ranked.hit.item_id,
-                                observed_at: ranked.hit.observed_at,
-                                title: ranked.hit.title,
-                                r#abstract: ranked.hit.r#abstract,
-                                collection: ranked.hit.collection,
-                                attested_at: ranked.hit.attested_at,
-                                generated_at: ranked.hit.generated_at,
-                                score: ranked.score,
-                                signals: ranked.signals,
-                                explanation: ranked.explanation,
-                                provenance: previous,
-                            },
-                        );
-                    }
+                let url = ranked.hit.url.clone();
+                if !resolved.contains_key(&url) {
+                    resolved.insert(url.clone(), self.resolve(&url)?);
                 }
+                let Some(chosen) = &resolved[&url] else {
+                    continue;
+                };
+                if !chosen.holds(index, &ranked.hit) {
+                    continue;
+                }
+                if merged
+                    .get(&url)
+                    .is_some_and(|existing| existing.score >= ranked.score)
+                {
+                    continue;
+                }
+                merged.insert(
+                    url,
+                    RankedHit {
+                        url: ranked.hit.url,
+                        publisher: ranked.hit.publisher,
+                        item_id: ranked.hit.item_id,
+                        observed_at: ranked.hit.observed_at,
+                        title: ranked.hit.title,
+                        r#abstract: ranked.hit.r#abstract,
+                        collection: ranked.hit.collection,
+                        attested_at: ranked.hit.attested_at,
+                        generated_at: ranked.hit.generated_at,
+                        score: ranked.score,
+                        signals: ranked.signals,
+                        explanation: ranked.explanation,
+                        provenance: self.provenance_of(&chosen.holders),
+                    },
+                );
             }
         }
         let mut rows: Vec<RankedHit> = merged.into_values().collect();
@@ -585,14 +560,24 @@ impl MultiStore {
 
     pub fn labels(&self, subject: &str, every_labeler: bool) -> Result<Vec<LabelView>> {
         let mut views: BTreeMap<(String, String), LabelView> = BTreeMap::new();
+        let mut bound: Option<Option<String>> = None;
         for handle in &self.logs {
             for row in handle
                 .store
-                .labels_for(subject, handle.head_sealed_at.as_deref())?
+                .current_labels(subject, handle.head_sealed_at.as_deref())?
             {
                 let subscribed = self.subscriptions.contains(&row.labeler);
                 if !subscribed && !every_labeler {
                     continue;
+                }
+                if row.delta.is_some() {
+                    if bound.is_none() {
+                        bound = Some(self.resolve(subject)?.map(|chosen| chosen.item_id));
+                    }
+                    let item_id = bound.as_ref().and_then(Option::as_deref);
+                    if !wist_core::label::binding_applies(row.delta.as_deref(), item_id) {
+                        continue;
+                    }
                 }
                 let label_id = handle.store.label_id_of(&row)?;
                 let disputes = match &label_id {
@@ -682,45 +667,81 @@ impl MultiStore {
     }
 
     pub fn search(&self, q: &str, limit: usize) -> Result<Vec<MergedHit>> {
-        let mut rows = Vec::new();
-        for handle in &self.logs {
+        let mut matched: BTreeMap<String, Vec<(usize, RecordHit)>> = BTreeMap::new();
+        for (index, handle) in self.logs.iter().enumerate() {
             for hit in handle.store.search(q, limit)? {
-                rows.push((handle.provenance(), hit));
+                matched
+                    .entry(hit.url.clone())
+                    .or_default()
+                    .push((index, hit));
             }
         }
-        let mut merged = merge(rows);
-        merged.truncate(limit);
+        let mut merged = Vec::new();
+        for (url, hits) in matched {
+            if merged.len() == limit {
+                break;
+            }
+            let Some(chosen) = self.resolve(&url)? else {
+                continue;
+            };
+            let shown = chosen.holders.iter().find_map(|log| {
+                hits.iter()
+                    .find(|(index, hit)| index == log && chosen.holds(*index, hit))
+            });
+            if let Some((_, hit)) = shown {
+                merged.push(MergedHit::of(
+                    hit.clone(),
+                    self.provenance_of(&chosen.holders),
+                ));
+            }
+        }
         Ok(merged)
     }
 
     pub fn get(&self, url: &str) -> Result<Option<MergedHit>> {
+        let Some(chosen) = self.resolve(url)? else {
+            return Ok(None);
+        };
         let mut rows = Vec::new();
-        for handle in &self.logs {
-            if let Some(hit) = handle.store.get(url)? {
-                rows.push((handle.provenance(), hit));
+        for &log in &chosen.holders {
+            if let Some(hit) = self.logs[log].store.record_of(url, &chosen.publisher)? {
+                rows.push(hit);
             }
         }
-        Ok(merge(rows).into_iter().next())
+        let shown = rows
+            .iter()
+            .position(|hit| hit.title.is_some() || hit.r#abstract.is_some())
+            .unwrap_or(0);
+        Ok((shown < rows.len())
+            .then(|| MergedHit::of(rows.swap_remove(shown), self.provenance_of(&chosen.holders))))
     }
 
     pub fn extract(&self, url: &str) -> Result<Option<(String, Vec<ProvEntry>)>> {
-        let mut rows = Vec::new();
-        for handle in &self.logs {
-            if let Some(row) = handle.store.extract_row(url)? {
-                rows.push((handle.provenance(), row));
+        let Some(chosen) = self.resolve(url)? else {
+            return Ok(None);
+        };
+        let mut extract = None;
+        let mut provenance = Vec::new();
+        for &log in &chosen.holders {
+            let handle = &self.logs[log];
+            if let Some(row) = handle.store.extract_of(url, &chosen.publisher)? {
+                if row.item_id == chosen.item_id {
+                    extract.get_or_insert(row.extract);
+                    provenance.push(handle.provenance());
+                }
             }
         }
-        Ok(merge_extract(rows))
+        Ok(extract.map(|extract| (extract, provenance)))
     }
 
     pub fn links(&self, url: &str) -> Result<Vec<(String, i64)>> {
         let Some((_, provenance)) = self.extract(url)? else {
             return Ok(Vec::new());
         };
-        let Some(winning_log_id) = provenance.first().map(|p| p.log_id.clone()) else {
+        let Some(first) = provenance.first() else {
             return Ok(Vec::new());
         };
-        match self.logs.iter().find(|h| h.log_id == winning_log_id) {
+        match self.logs.iter().find(|h| h.log_id == first.log_id) {
             Some(handle) => handle.store.links_rows(url),
             None => Ok(Vec::new()),
         }
@@ -745,12 +766,141 @@ impl MultiStore {
     }
 
     pub fn similar(&self, url: &str, k: usize) -> Result<Vec<SimilarHit>> {
-        for handle in &self.logs {
-            if let Some(hits) = handle.store.similar_within(url, k, &handle.provenance())? {
-                return Ok(hits);
+        let target = self.resolve(url)?;
+        for (index, handle) in self.logs.iter().enumerate() {
+            let Some(target) = target
+                .as_ref()
+                .filter(|chosen| chosen.holders.contains(&index))
+            else {
+                continue;
+            };
+            let Some(scored) = handle.store.similar_within(url, &target.item_id)? else {
+                continue;
+            };
+            let mut resolved: HashMap<String, Option<Resolved>> = HashMap::new();
+            let mut hits = Vec::new();
+            for (score, hit) in scored {
+                if hits.len() == k {
+                    break;
+                }
+                if !resolved.contains_key(&hit.url) {
+                    resolved.insert(hit.url.clone(), self.resolve(&hit.url)?);
+                }
+                if let Some(chosen) = &resolved[&hit.url] {
+                    if chosen.holds(index, &hit) {
+                        hits.push(SimilarHit {
+                            hit: MergedHit::of(hit, self.provenance_of(&chosen.holders)),
+                            score,
+                        });
+                    }
+                }
             }
+            return Ok(hits);
         }
         Err(Error::Verify(format!("no embedding for url {url}")))
+    }
+
+    fn provenance_of(&self, holders: &[usize]) -> Vec<ProvEntry> {
+        holders
+            .iter()
+            .map(|&log| self.logs[log].provenance())
+            .collect()
+    }
+
+    pub fn url_states(
+        &self,
+        publisher: &str,
+        url: &str,
+    ) -> Result<Vec<(String, Option<HeldState>)>> {
+        self.logs
+            .iter()
+            .map(|handle| {
+                Ok((
+                    handle.log_id.clone(),
+                    handle.store.url_state(publisher, url)?,
+                ))
+            })
+            .collect()
+    }
+
+    /// WIST-3 §7, Several Logs.
+    pub fn combined_state(
+        &self,
+        publisher: &str,
+        url: &str,
+    ) -> Result<Option<(HeldState, Vec<String>)>> {
+        let held = self.url_states(publisher, url)?;
+        let combined = wist_core::several_logs::combine(held.iter().map(|(log_id, state)| {
+            (log_id.as_str(), state.as_ref().map(HeldState::as_url_state))
+        }))?;
+        Ok(combined.map(|combined| {
+            let state = match combined.state {
+                UrlState::Record(record) => HeldState::Record(record.clone()),
+                UrlState::Removed(removal) => HeldState::Removed(removal.clone()),
+            };
+            (
+                state,
+                combined.logs.into_iter().map(str::to_owned).collect(),
+            )
+        }))
+    }
+
+    fn holders(&self, url: &str, publisher: &str) -> Result<Option<(String, Vec<usize>)>> {
+        if let [only] = self.logs.as_slice() {
+            return Ok(only
+                .store
+                .record_of(url, publisher)?
+                .map(|hit| (hit.item_id, vec![0])));
+        }
+        let Some((HeldState::Record(record), log_ids)) = self.combined_state(publisher, url)?
+        else {
+            return Ok(None);
+        };
+        let mut holders = Vec::new();
+        for log_id in log_ids {
+            let Some(log) = self.logs.iter().position(|h| h.log_id == log_id) else {
+                continue;
+            };
+            if self.logs[log]
+                .store
+                .record_of(url, publisher)?
+                .is_some_and(|hit| hit.item_id == record.item_id)
+            {
+                holders.push(log);
+            }
+        }
+        Ok((!holders.is_empty()).then_some((record.item_id, holders)))
+    }
+
+    /// WIST-3 §7: Several Logs per Publisher, then One URL, one Publisher.
+    fn resolve(&self, url: &str) -> Result<Option<Resolved>> {
+        let mut publishers = BTreeSet::new();
+        for handle in &self.logs {
+            publishers.extend(handle.store.publishers_of(url)?);
+        }
+        let mut held = Vec::new();
+        for publisher in publishers {
+            if let Some((item_id, holders)) = self.holders(url, &publisher)? {
+                held.push(Resolved {
+                    publisher,
+                    item_id,
+                    holders,
+                });
+            }
+        }
+        let host = wist_core::declaration::url_host(url);
+        let self_declared = held.iter().any(|chosen| chosen.publisher == host);
+        let Some(preferred) = wist_core::materialization::preferred(
+            host,
+            self_declared,
+            held.iter().map(|chosen| (chosen.publisher.as_str(), false)),
+        )
+        .map(str::to_owned) else {
+            return Ok(None);
+        };
+        Ok(held
+            .into_iter()
+            .find(|chosen| chosen.publisher == preferred))
     }
 }
 
@@ -859,6 +1009,21 @@ impl Store {
 
     /// WIST-2 §3.3.
     pub fn labels_for(&self, subject: &str, head_sealed_at: Option<&str>) -> Result<Vec<LabelRow>> {
+        let mut applying = Vec::new();
+        for row in self.current_labels(subject, head_sealed_at)? {
+            if self.binding_applies(&row)? {
+                applying.push(row);
+            }
+        }
+        Ok(applying)
+    }
+
+    /// WIST-2 §3.3, the `delta` binding left to the caller.
+    pub fn current_labels(
+        &self,
+        subject: &str,
+        head_sealed_at: Option<&str>,
+    ) -> Result<Vec<LabelRow>> {
         if !table_exists(&self.conn, "label_current")? {
             return Ok(Vec::new());
         }
@@ -880,18 +1045,15 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut applying = Vec::new();
-        for row in rows {
-            let expired =
-                (row.expires_at.as_deref().zip(head_sealed_at)).is_some_and(|(expiry, head)| {
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                !(row.expires_at.as_deref().zip(head_sealed_at)).is_some_and(|(expiry, head)| {
                     wist_core::publisher_time::compare(expiry, head)
                         != Some(std::cmp::Ordering::Greater)
-                });
-            if !expired && self.binding_applies(&row)? {
-                applying.push(row);
-            }
-        }
-        Ok(applying)
+                })
+            })
+            .collect())
     }
 
     /// WIST-2 §3.3: `records` holds the subject URL's materialized record alone, so it is the one
@@ -1027,21 +1189,79 @@ impl Store {
             .map_err(Into::into)
     }
 
-    fn extract_row(&self, url: &str) -> Result<Option<ExtractRow>> {
+    fn record_of(&self, url: &str, publisher: &str) -> Result<Option<RecordHit>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {HIT_COLUMNS} FROM records r WHERE r.url = ?1 AND r.publisher = ?2 LIMIT 1"
+                ),
+                (url, publisher),
+                row_to_hit,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn publishers_of(&self, url: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT publisher FROM records WHERE url = ?1")?;
+        let rows = stmt
+            .query_map([url], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// WIST-3 §7.
+    pub fn url_state(&self, publisher: &str, url: &str) -> Result<Option<HeldState>> {
+        if !table_exists(&self.conn, "state_tuples")? {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT tuple FROM state_tuples
+             WHERE json_extract(tuple, '$[1]') = ?1 AND json_extract(tuple, '$[2]') = ?2
+               AND json_extract(tuple, '$[0]') IN ('record', 'removal')",
+        )?;
+        let tuples = stmt
+            .query_map((publisher, url), |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut removal = None;
+        for text in tuples {
+            match serde_json::from_str::<StateEntry>(&text)? {
+                StateEntry::Record(entry) => {
+                    return Ok(Some(HeldState::Record(Record {
+                        item_id: wist_core::item::item_id(&entry.item)?,
+                        item: entry.item,
+                        collection: entry.collection,
+                        catalog: entry.catalog_id,
+                        generated_at: entry.generated_at,
+                    })));
+                }
+                StateEntry::Removal(entry) => {
+                    removal = Some(HeldState::Removed(Removal {
+                        item_id: entry.item_id,
+                        catalog: entry.catalog_id,
+                        generated_at: entry.generated_at,
+                    }));
+                }
+                _ => {}
+            }
+        }
+        Ok(removal)
+    }
+
+    fn extract_of(&self, url: &str, publisher: &str) -> Result<Option<ExtractRow>> {
         if !table_exists(&self.conn, "extracts")? {
             return Ok(None);
         }
         self.conn
             .query_row(
-                "SELECT e.extract, e.item_id, r.observed_at
-                 FROM extracts e JOIN records r ON r.url = e.url AND r.publisher = e.publisher
-                 WHERE e.url = ?1 LIMIT 1",
-                [url],
+                "SELECT extract, item_id FROM extracts WHERE url = ?1 AND publisher = ?2",
+                (url, publisher),
                 |row| {
                     Ok(ExtractRow {
                         extract: row.get(0)?,
                         item_id: row.get(1)?,
-                        observed_at: row.get(2)?,
                     })
                 },
             )
@@ -1062,12 +1282,7 @@ impl Store {
         Ok(rows)
     }
 
-    fn similar_within(
-        &self,
-        url: &str,
-        k: usize,
-        provenance: &ProvEntry,
-    ) -> Result<Option<Vec<SimilarHit>>> {
+    fn similar_within(&self, url: &str, item_id: &str) -> Result<Option<Vec<(f64, RecordHit)>>> {
         if !table_exists(&self.conn, "embeddings")? {
             return Ok(None);
         }
@@ -1081,15 +1296,15 @@ impl Store {
             return Ok(None);
         };
 
-        let target: Option<(String, Vec<u8>)> = self
+        let target: Option<Vec<u8>> = self
             .conn
             .query_row(
-                "SELECT item_id, vector FROM embeddings WHERE url = ?1 LIMIT 1",
-                [url],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT vector FROM embeddings WHERE url = ?1 AND item_id = ?2",
+                (url, item_id),
+                |row| row.get(0),
             )
             .optional()?;
-        let Some((self_item_id, target_blob)) = target else {
+        let Some(target_blob) = target else {
             return Ok(None);
         };
         let target_vec = blob_to_vec(&target_blob)?;
@@ -1102,32 +1317,22 @@ impl Store {
             .query_map([], row_to_similar_candidate)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        let mut scored: Vec<(f64, SimilarCandidate)> = Vec::new();
+        let mut scored: Vec<(f64, RecordHit)> = Vec::new();
         for candidate in candidates {
-            if candidate.hit.item_id == self_item_id {
+            if candidate.hit.item_id == item_id {
                 continue;
             }
             let vector = blob_to_vec(&candidate.vector)?;
             let score = score_for(&metric, &target_vec, &vector)?;
-            scored.push((score, candidate));
+            scored.push((score, candidate.hit));
         }
 
         scored.sort_by(|a, b| {
             b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.hit.item_id.cmp(&b.1.hit.item_id))
+                .then_with(|| a.1.item_id.cmp(&b.1.item_id))
         });
-        scored.truncate(k);
-
-        Ok(Some(
-            scored
-                .into_iter()
-                .map(|(score, candidate)| SimilarHit {
-                    hit: MergedHit::of(candidate.hit, vec![provenance.clone()]),
-                    score,
-                })
-                .collect(),
-        ))
+        Ok(Some(scored))
     }
 }
 
@@ -1221,111 +1426,104 @@ mod tests {
         assert!(store.get("https://example.com/alpha").unwrap().is_some());
     }
 
-    fn hit(url: &str, item_id: &str, observed_at: &str) -> RecordHit {
-        RecordHit {
-            url: url.into(),
-            publisher: "example.com".into(),
-            item_id: item_id.into(),
-            observed_at: observed_at.into(),
-            title: Some("T".into()),
-            collection: None,
-            attested_at: observed_at.into(),
-            generated_at: None,
-            r#abstract: None,
-        }
+    fn seed_record_tuple(
+        log_dir: &Path,
+        publisher: &str,
+        url: &str,
+        observed_at: &str,
+        (generated_at, catalog): (&str, &str),
+    ) -> String {
+        let item =
+            serde_json::json!({"publisher": publisher, "url": url, "observed_at": observed_at});
+        let item_id = wist_core::item::item_id(&item).unwrap();
+        seed_tuple(
+            log_dir,
+            StateEntry::Record(wist_core::objects::RecordEntry {
+                publisher: publisher.into(),
+                url: url.into(),
+                item,
+                collection: "default".into(),
+                catalog_id: catalog.into(),
+                generated_at: generated_at.into(),
+            }),
+        );
+        item_id
     }
 
-    fn prov(log_id: &str, synced_height: u64) -> ProvEntry {
-        ProvEntry {
-            log_id: log_id.to_string(),
-            synced_height,
-            unwitnessed: false,
-            halted: false,
-        }
+    fn seed_removal_tuple(
+        log_dir: &Path,
+        publisher: &str,
+        url: &str,
+        item_id: &str,
+        (generated_at, catalog): (&str, &str),
+    ) {
+        seed_tuple(
+            log_dir,
+            StateEntry::Removal(wist_core::objects::RemovalEntry {
+                publisher: publisher.into(),
+                url: url.into(),
+                item_id: item_id.into(),
+                catalog_id: catalog.into(),
+                generated_at: generated_at.into(),
+            }),
+        );
     }
 
-    #[test]
-    fn same_item_in_two_logs_merges_to_one_hit() {
-        let rows = vec![
-            (
-                prov("log-b", 5),
-                hit(
-                    "https://example.com/a",
-                    "sha256:same",
-                    "2026-08-09T12:00:00Z",
-                ),
-            ),
-            (
-                prov("log-a", 3),
-                hit(
-                    "https://example.com/a",
-                    "sha256:same",
-                    "2026-08-09T12:00:00Z",
-                ),
-            ),
-        ];
-        let merged = merge(rows);
-        assert_eq!(merged.len(), 1);
-        let m = &merged[0];
-        assert_eq!(m.provenance.len(), 2);
-        assert_eq!(m.provenance[0].log_id, "log-a");
-        assert_eq!(m.provenance[0].synced_height, 3);
-        assert_eq!(m.provenance[1].log_id, "log-b");
-        assert_eq!(m.provenance[1].synced_height, 5);
+    fn seed_tuple(log_dir: &Path, tuple: StateEntry) {
+        std::fs::create_dir_all(log_dir).unwrap();
+        let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+        conn.execute_batch(CREATE_STATE_TUPLES).unwrap();
+        conn.execute(
+            "INSERT INTO state_tuples(seq, tuple) VALUES ((SELECT COUNT(*) FROM state_tuples), ?1)",
+            [serde_json::to_string(&tuple).unwrap()],
+        )
+        .unwrap();
     }
 
-    #[test]
-    fn same_url_different_item_ids_prefers_latest_observed_at() {
-        let rows = vec![
-            (
-                prov("log-a", 3),
-                hit(
-                    "https://example.com/a",
-                    "sha256:stale",
-                    "2026-08-09T12:00:00Z",
-                ),
-            ),
-            (
-                prov("log-b", 5),
-                hit(
-                    "https://example.com/a",
-                    "sha256:fresh",
-                    "2026-08-09T13:00:00Z",
-                ),
-            ),
-        ];
-        let merged = merge(rows);
-        assert_eq!(merged.len(), 1);
-        let m = &merged[0];
-        assert_eq!(m.item_id, "sha256:fresh");
-        assert_eq!(m.provenance.len(), 1);
-        assert_eq!(m.provenance[0].log_id, "log-b");
+    fn create_records(log_dir: &Path) -> Connection {
+        std::fs::create_dir_all(log_dir).unwrap();
+        let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS records(url TEXT, publisher TEXT, item_id TEXT, observed_at TEXT, attested_at TEXT, title TEXT, abstract TEXT, lang TEXT, collection TEXT, generated_at TEXT);
+             CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(title, abstract, content=records, content_rowid=rowid);",
+        )
+        .unwrap();
+        conn
     }
 
-    #[test]
-    fn tie_on_observed_at_breaks_by_item_id() {
-        let rows = vec![
-            (
-                prov("log-a", 3),
-                hit(
-                    "https://example.com/a",
-                    "sha256:aaa",
-                    "2026-08-09T12:00:00Z",
-                ),
-            ),
-            (
-                prov("log-b", 5),
-                hit(
-                    "https://example.com/a",
-                    "sha256:bbb",
-                    "2026-08-09T12:00:00Z",
-                ),
-            ),
-        ];
-        let merged = merge(rows);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].item_id, "sha256:bbb");
+    fn seed_record_row(
+        log_dir: &Path,
+        publisher: &str,
+        url: &str,
+        item_id: &str,
+        observed_at: &str,
+        title: &str,
+    ) {
+        let conn = create_records(log_dir);
+        conn.execute(
+            "INSERT INTO records(url, publisher, item_id, observed_at, attested_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?4, ?5, NULL, 'en')",
+            (url, publisher, item_id, observed_at, title),
+        )
+        .unwrap();
+        conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])
+            .unwrap();
     }
+
+    fn seed_held(
+        log_dir: &Path,
+        publisher: &str,
+        url: &str,
+        observed_at: &str,
+        catalog: (&str, &str),
+        title: &str,
+    ) -> String {
+        let item_id = seed_record_tuple(log_dir, publisher, url, observed_at, catalog);
+        seed_record_row(log_dir, publisher, url, &item_id, observed_at, title);
+        item_id
+    }
+
+    const EARLY: (&str, &str) = ("2026-08-09T01:00:00Z", "sha256:catalog-early");
+    const LATE: (&str, &str) = ("2026-08-09T02:00:00Z", "sha256:catalog-late");
 
     fn seed_row(log_dir: &Path, url: &str, item_id: &str, observed_at: &str, title: &str) {
         std::fs::create_dir_all(log_dir).unwrap();
@@ -1408,38 +1606,257 @@ mod tests {
         crate::registry::save(dir, &crate::registry::Registry { logs }).unwrap();
     }
 
+    fn two_logs(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let log_a = crate::registry::log_dir(dir, "log-a");
+        let log_b = crate::registry::log_dir(dir, "log-b");
+        create_records(&log_a);
+        create_records(&log_b);
+        seed_sync(&log_a, 3);
+        seed_sync(&log_b, 5);
+        seed_registry(dir, &["log-a", "log-b"]);
+        (log_a, log_b)
+    }
+
     #[test]
     fn multi_store_search_merges_hits_across_logs() {
         let tmp = tempfile::tempdir().unwrap();
-        let log_a = crate::registry::log_dir(tmp.path(), "log-a");
-        let log_b = crate::registry::log_dir(tmp.path(), "log-b");
-        seed_row(
-            &log_a,
-            "https://example.com/alpha",
-            "sha256:same",
-            "2026-08-09T00:00:00Z",
-            "Alpha Title",
-        );
-        seed_sync(&log_a, 3);
-        seed_row(
-            &log_b,
-            "https://example.com/alpha",
-            "sha256:same",
-            "2026-08-09T00:00:00Z",
-            "Alpha Title",
-        );
-        seed_sync(&log_b, 5);
-        seed_registry(tmp.path(), &["log-a", "log-b"]);
+        let (log_a, log_b) = two_logs(tmp.path());
+        let url = "https://example.com/alpha";
+        let observed = "2026-08-09T00:00:00Z";
+        let item_a = seed_held(&log_a, "example.com", url, observed, EARLY, "Alpha Title");
+        let item_b = seed_held(&log_b, "example.com", url, observed, EARLY, "Alpha Title");
+        assert_eq!(item_a, item_b);
 
         let store = MultiStore::open_read_only(tmp.path()).unwrap();
         let hits = store.search("Alpha", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].provenance.len(), 2);
         assert_eq!(hits[0].provenance[0].log_id, "log-a");
+        assert_eq!(hits[0].provenance[0].synced_height, 3);
         assert_eq!(hits[0].provenance[1].log_id, "log-b");
+        assert_eq!(hits[0].provenance[1].synced_height, 5);
 
-        let record = store.get("https://example.com/alpha").unwrap().unwrap();
+        let record = store.get(url).unwrap().unwrap();
+        assert_eq!(record.item_id, item_a);
         assert_eq!(record.provenance.len(), 2);
+    }
+
+    #[test]
+    fn a_record_proved_against_a_later_catalog_is_taken_over_a_later_observed_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (log_a, log_b) = two_logs(tmp.path());
+        let url = "https://example.com/alpha";
+        seed_held(
+            &log_a,
+            "example.com",
+            url,
+            "2026-08-09T00:30:00Z",
+            EARLY,
+            "Alpha early",
+        );
+        let later = seed_held(
+            &log_b,
+            "example.com",
+            url,
+            "2026-08-09T00:10:00Z",
+            LATE,
+            "Alpha late",
+        );
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        let record = store.get(url).unwrap().unwrap();
+        assert_eq!(record.item_id, later);
+        assert_eq!(record.title.as_deref(), Some("Alpha late"));
+        assert_eq!(record.provenance.len(), 1);
+        assert_eq!(record.provenance[0].log_id, "log-b");
+
+        let hits = store.search("Alpha", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].item_id, later);
+        assert!(store.search("early", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn between_states_proved_against_one_catalog_the_greater_item_id_is_taken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (log_a, log_b) = two_logs(tmp.path());
+        let url = "https://example.com/alpha";
+        let one = seed_held(
+            &log_a,
+            "example.com",
+            url,
+            "2026-08-09T00:10:00Z",
+            EARLY,
+            "One",
+        );
+        let two = seed_held(
+            &log_b,
+            "example.com",
+            url,
+            "2026-08-09T00:20:00Z",
+            EARLY,
+            "Two",
+        );
+        let greater = std::cmp::max(one, two);
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        assert_eq!(store.get(url).unwrap().unwrap().item_id, greater);
+        let (state, logs) = store.combined_state("example.com", url).unwrap().unwrap();
+        let HeldState::Record(record) = state else {
+            panic!("a record is taken");
+        };
+        assert_eq!(record.item_id, greater);
+        assert_eq!(logs.len(), 1);
+    }
+
+    #[test]
+    fn a_removal_proved_against_a_later_catalog_hides_another_logs_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (log_a, log_b) = two_logs(tmp.path());
+        let url = "https://example.com/alpha";
+        let item = seed_held(
+            &log_a,
+            "example.com",
+            url,
+            "2026-08-09T00:10:00Z",
+            EARLY,
+            "Alpha",
+        );
+        seed_removal_tuple(&log_b, "example.com", url, "sha256:removed", LATE);
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        assert!(store.get(url).unwrap().is_none());
+        assert!(store.search("Alpha", 10).unwrap().is_empty());
+        let (state, logs) = store.combined_state("example.com", url).unwrap().unwrap();
+        assert!(matches!(state, HeldState::Removed(_)));
+        assert_eq!(logs, ["log-b"]);
+        assert!(matches!(
+            store.url_states("example.com", url).unwrap()[0].1,
+            Some(HeldState::Record(ref record)) if record.item_id == item
+        ));
+    }
+
+    #[test]
+    fn a_record_proved_against_an_earlier_catalog_than_a_removal_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (log_a, log_b) = two_logs(tmp.path());
+        let url = "https://example.com/alpha";
+        let item = seed_held(
+            &log_a,
+            "example.com",
+            url,
+            "2026-08-09T00:10:00Z",
+            LATE,
+            "Alpha",
+        );
+        seed_removal_tuple(&log_b, "example.com", url, "sha256:removed", EARLY);
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        let record = store.get(url).unwrap().unwrap();
+        assert_eq!(record.item_id, item);
+        assert_eq!(record.provenance.len(), 1);
+        assert_eq!(record.provenance[0].log_id, "log-a");
+    }
+
+    #[test]
+    fn a_taken_record_no_log_materializes_shows_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (log_a, log_b) = two_logs(tmp.path());
+        let url = "https://example.com/alpha";
+        seed_held(
+            &log_a,
+            "example.com",
+            url,
+            "2026-08-09T00:10:00Z",
+            EARLY,
+            "Alpha",
+        );
+        seed_record_tuple(&log_b, "example.com", url, "2026-08-09T00:20:00Z", LATE);
+        seed_record_row(
+            &log_b,
+            "example.com",
+            "https://example.com/other",
+            "sha256:other",
+            "2026-08-09T00:20:00Z",
+            "Other",
+        );
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        assert!(store.get(url).unwrap().is_none());
+        assert!(store.search("Alpha", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_hosts_own_publisher_is_taken_when_any_log_materializes_its_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (log_a, log_b) = two_logs(tmp.path());
+        let url = "https://blog.example.com/post";
+        seed_held(
+            &log_a,
+            "example.com",
+            url,
+            "2026-08-09T00:10:00Z",
+            LATE,
+            "Post by the ancestor",
+        );
+        let own = seed_held(
+            &log_b,
+            "blog.example.com",
+            url,
+            "2026-08-09T00:10:00Z",
+            EARLY,
+            "Post by the host",
+        );
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        let record = store.get(url).unwrap().unwrap();
+        assert_eq!(record.publisher, "blog.example.com");
+        assert_eq!(record.item_id, own);
+        let hits = store.search("Post", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].publisher, "blog.example.com");
+    }
+
+    #[test]
+    fn a_label_bound_to_the_item_another_log_holds_applies_to_the_combined_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (log_a, log_b) = two_logs(tmp.path());
+        let url = "https://example.com/alpha";
+        let stale = seed_held(
+            &log_a,
+            "example.com",
+            url,
+            "2026-08-09T00:10:00Z",
+            EARLY,
+            "Alpha",
+        );
+        let fresh = seed_held(
+            &log_b,
+            "example.com",
+            url,
+            "2026-08-09T00:20:00Z",
+            LATE,
+            "Alpha",
+        );
+        let conn = Connection::open(log_a.join("index.sqlite")).unwrap();
+        conn.execute_batch(CREATE_LABELS).unwrap();
+        for (name, bound) in [("wist:fresh", &fresh), ("wist:stale", &stale)] {
+            conn.execute(
+                "INSERT INTO label_current(labeler, subject, name, label_id, value, asserted_at, retracted, expires_at, delta, height, entry_index) VALUES ('labeler.example', ?1, ?2, NULL, NULL, '2026-08-09T00:00:00Z', 0, NULL, ?3, 1, 0)",
+                (url, name, bound),
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        let names: Vec<String> = store
+            .labels(url, true)
+            .unwrap()
+            .into_iter()
+            .map(|label| label.name)
+            .collect();
+        assert_eq!(names, ["wist:fresh"]);
     }
 
     #[test]
@@ -1640,50 +2057,48 @@ mod tests {
     #[test]
     fn multi_store_extract_prefers_latest_item_across_logs() {
         let tmp = tempfile::tempdir().unwrap();
-        let log_a = crate::registry::log_dir(tmp.path(), "log-a");
-        let log_b = crate::registry::log_dir(tmp.path(), "log-b");
+        let (log_a, log_b) = two_logs(tmp.path());
+        let url = "https://example.com/alpha";
 
-        seed_row(
+        let stale = seed_held(
             &log_a,
-            "https://example.com/alpha",
-            "sha256:stale",
+            "example.com",
+            url,
             "2026-08-09T12:00:00Z",
+            EARLY,
             "Alpha Title",
         );
         seed_tier1_row(
             &log_a,
-            "https://example.com/alpha",
-            "sha256:stale",
+            url,
+            &stale,
             "stale extract",
             &[("https://example.com/stale-link", 0)],
         );
-        seed_sync(&log_a, 3);
 
-        seed_row(
+        let fresh = seed_held(
             &log_b,
-            "https://example.com/alpha",
-            "sha256:fresh",
-            "2026-08-09T13:00:00Z",
+            "example.com",
+            url,
+            "2026-08-09T11:00:00Z",
+            LATE,
             "Alpha Title",
         );
         seed_tier1_row(
             &log_b,
-            "https://example.com/alpha",
-            "sha256:fresh",
+            url,
+            &fresh,
             "fresh extract",
             &[("https://example.com/fresh-link", 0)],
         );
-        seed_sync(&log_b, 5);
-
-        seed_registry(tmp.path(), &["log-a", "log-b"]);
 
         let store = MultiStore::open_read_only(tmp.path()).unwrap();
-        let (extract, provenance) = store.extract("https://example.com/alpha").unwrap().unwrap();
+        let (extract, provenance) = store.extract(url).unwrap().unwrap();
         assert_eq!(extract, "fresh extract");
         assert_eq!(provenance.len(), 1);
         assert_eq!(provenance[0].log_id, "log-b");
 
-        let links = store.links("https://example.com/alpha").unwrap();
+        let links = store.links(url).unwrap();
         assert_eq!(
             links,
             vec![("https://example.com/fresh-link".to_string(), 0)]
@@ -1873,29 +2288,30 @@ mod tests {
     #[test]
     fn similar_picks_first_registry_log_with_embeddings_for_url() {
         let tmp = tempfile::tempdir().unwrap();
-        let log_a = crate::registry::log_dir(tmp.path(), "log-a");
-        let log_b = crate::registry::log_dir(tmp.path(), "log-b");
-        seed_row(
+        let (log_a, log_b) = two_logs(tmp.path());
+        let observed = "2026-08-09T00:00:00Z";
+        seed_held(
             &log_a,
+            "example.com",
             "https://example.com/other",
-            "sha256:other",
-            "2026-08-09T00:00:00Z",
+            observed,
+            EARLY,
             "Other",
         );
-        seed_sync(&log_a, 1);
-
-        seed_row(
+        let a = seed_held(
             &log_b,
+            "example.com",
             "https://example.com/a",
-            "sha256:a",
-            "2026-08-09T00:00:00Z",
+            observed,
+            EARLY,
             "A",
         );
-        seed_row(
+        let b = seed_held(
             &log_b,
+            "example.com",
             "https://example.com/b",
-            "sha256:b",
-            "2026-08-09T00:00:00Z",
+            observed,
+            EARLY,
             "B",
         );
         seed_embeddings(
@@ -1903,17 +2319,70 @@ mod tests {
             "cosine",
             2,
             &[
-                ("sha256:a", "https://example.com/a", &[1.0, 0.0]),
-                ("sha256:b", "https://example.com/b", &[1.0, 0.0]),
+                (&a, "https://example.com/a", &[1.0, 0.0]),
+                (&b, "https://example.com/b", &[1.0, 0.0]),
             ],
         );
-        seed_sync(&log_b, 2);
-        seed_registry(tmp.path(), &["log-a", "log-b"]);
 
         let store = MultiStore::open_read_only(tmp.path()).unwrap();
         let hits = store.similar("https://example.com/a", 5).unwrap();
         assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].hit.item_id, b);
         assert_eq!(hits[0].hit.provenance[0].log_id, "log-b");
+    }
+
+    #[test]
+    fn similar_leaves_out_a_record_another_log_supersedes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (log_a, log_b) = two_logs(tmp.path());
+        let observed = "2026-08-09T00:00:00Z";
+        let a = seed_held(
+            &log_a,
+            "example.com",
+            "https://example.com/a",
+            observed,
+            EARLY,
+            "A",
+        );
+        let b = seed_held(
+            &log_a,
+            "example.com",
+            "https://example.com/b",
+            observed,
+            EARLY,
+            "B",
+        );
+        let c = seed_held(
+            &log_a,
+            "example.com",
+            "https://example.com/c",
+            observed,
+            EARLY,
+            "C",
+        );
+        seed_held(
+            &log_b,
+            "example.com",
+            "https://example.com/b",
+            "2026-08-09T00:30:00Z",
+            LATE,
+            "B again",
+        );
+        seed_embeddings(
+            &log_a,
+            "cosine",
+            2,
+            &[
+                (&a, "https://example.com/a", &[1.0, 0.0]),
+                (&b, "https://example.com/b", &[1.0, 0.0]),
+                (&c, "https://example.com/c", &[0.0, 1.0]),
+            ],
+        );
+
+        let store = MultiStore::open_read_only(tmp.path()).unwrap();
+        let hits = store.similar("https://example.com/a", 5).unwrap();
+        let items: Vec<&str> = hits.iter().map(|hit| hit.hit.item_id.as_str()).collect();
+        assert_eq!(items, [c.as_str()]);
     }
 
     #[test]

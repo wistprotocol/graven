@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod served_log;
+
 use base64::Engine;
 use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::properties::WriterProperties;

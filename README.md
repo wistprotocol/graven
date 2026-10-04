@@ -1,11 +1,11 @@
 # graven
 
-The signed Delta format targets [WIST specification revision `0127b0f2e5420e167a15d3f7afae6ed81030e158`](https://github.com/wistprotocol/spec/tree/0127b0f2e5420e167a15d3f7afae6ed81030e158). Object version `1.0.0` alone does not identify a compatible draft.
+The publication format — Declarations, Collections, Catalogs, Items and Payloads — targets [WIST specification revision `0f7c054b1b870cf063c05776b888fb26f46c73a6`](https://github.com/wistprotocol/spec/tree/0f7c054b1b870cf063c05776b888fb26f46c73a6). Object version `1.0.0` alone does not identify a compatible draft.
 
 WIST Protocol consumer and MCP server. Graven cold-syncs a verified Snapshot,
 then applies incremental Epochs to a separate SQLite index per Log (WIST-3 §8).
-`serve` exposes the merged index with per-record provenance to an LLM agent
-over MCP. Verification checks and limits are listed
+`serve` exposes the index of every followed Log, combined per Publisher
+and URL, with per-record provenance to an LLM agent over MCP. Verification checks and limits are listed
 [below](#what-sync-verifies).
 
 Subcommands: `follow --anchor <url|path> --log <base-url> --dir <dir>`
@@ -20,7 +20,11 @@ given `--anchor`/`--log` it does exactly what `follow` does for that one
 log), `serve --dir <dir>` (MCP server over stdio against every synced log
 in the store), `pack import --dir <dir> --log-id <id> --pack <pack.json>
 --key <publisher-b64u-key>` (verify and import a signed embedding
-companion pack against one already-synced log).
+companion pack against one already-synced log), `subscribe --dir <dir>
+[--labeler <domain>]` and `unsubscribe --dir <dir> --labeler <domain>`
+(the Labelers the index applies; `subscribe` without `--labeler` lists
+them), and `profile list --dir <dir>` and `profile show|use --dir <dir>
+--name <profile>` (the ranking profiles below).
 
 ## Store layout
 
@@ -29,8 +33,9 @@ companion pack against one already-synced log).
 source does not hold a file, and the `witnesses` roster). Every Log path
 is resolved under its base's own path, so a Mirror serving the Log at
 `https://cdn.example/wist/` is read at `https://cdn.example/wist/tile/…`. Each log gets
-its own `<dir>/logs/<sanitized-log-id>/` holding `index.sqlite` (records,
-and, where `--tier1` is on, `extracts`/`links`/FTS tables) whose
+its own `<dir>/logs/<sanitized-log-id>/` holding `index.sqlite` (the
+`records` table, and, where `--tier1` is on, `extracts`/`links`/FTS tables)
+whose
 `sync_state` row is the sync cursor: the verified head's `epoch_number`,
 the tree size it states as `tree_size`, its `root` in the
 `sha256:`+hex form, whether the acceptance was `unwitnessed`, the
@@ -40,20 +45,29 @@ The `checkpoints` table holds every Checkpoint the Consumer acted on,
 note and signature lines verbatim, so the rollback comparison and an
 equivocation bundle survive a restart; `tree_tiles` holds the tree
 hashes it verified, so continuing needs no refetch of the Log's history.
-Publisher declarations, chain tips, the Aggregator key registry — every
+`records` holds one row per materialized record (WIST-3 §7): `url`,
+`publisher`, `item_id`, `observed_at`, `attested_at`, `title`, `abstract`,
+`lang`, `collection` and `generated_at`, the instant of the Catalog the
+record's Item was proved against. `state_tuples` holds the Log-derived
+publication state as WIST-3 §7's state tuples — Declarations, latest
+Catalogs, records, removal states, withdrawals and accepted Registry
+Update IDs — rewritten whole after each adopted Epoch; every run resumes
+the replay from them. `sealed_items` and `sealed_label_ids` hold the Items
+and Label IDs of the Epochs the Consumer walked, and the sync cursor's
+`walk_floor` the Epoch of the Snapshot it was installed from.
+Publisher Declarations, the Aggregator key registry — every
 key the Log admitted, the genesis key and retired ones included, with
 the heights that bound each one's validity and the accepted acts that
 set them, so a reload re-authenticates the registry from the Anchor's
 genesis key, restores no key a removal retired, and judges a Checkpoint
-at any height under the keys valid there — parameters and withdrawals
-are persisted in `index.sqlite` too, so an incremental sync
-reloads them without re-walking the Log from genesis. A `sync_state` row
-written before the Log became one growing tree — one naming a Block hash
-where a tree size and root now stand — before its fields were renamed
-to `epoch_number`/`tree_size`, or before the key registry kept those
-acts, which no store can supply after the fact — is refused with an
-instruction to remove the log's directory and follow the Log again,
-never reinterpreted.
+at any height under the keys valid there — parameters and withdrawals,
+keyed by Item ID, are persisted in `index.sqlite` too, so an incremental
+sync reloads them without re-walking the Log from genesis. A `sync_state`
+row written in a superseded format — before the Log became one growing
+tree, before its fields were renamed to `epoch_number`/`tree_size`,
+before the key registry kept each key's accepted acts, or before records
+were keyed by Item ID — is refused with an instruction to remove the
+log's directory and follow the Log again, never reinterpreted.
 A divergence leaves an evidence bundle under
 `<dir>/logs/<sanitized-log-id>/evidence/`: `equivocation-epoch-<N>/` with
 the retained and offered Checkpoint notes, or `divergence-epoch-<N>/`
@@ -185,32 +199,46 @@ rules (WIST-4 §3.1): an accepted act's file is fetched from
 (`WIST3-E03`) and held in the `suffix_lists` table, a file no source
 serves fails the sync (`WIST3-E01`), and an act the Log key does not
 authenticate or whose `bytes` disagrees with the file is ignored with
-its code. Every walked Epoch's `publisher_delta`, `label` and `dispute`
-Entries are counted per Registrable Domain under the snapshot in force
-at it against `domain_epoch_entries_max`, and its `label` and `dispute`
-Entries against `labeler_epoch_entries_max` (WIST-3 §3.2); an Epoch over
-either fails the sync (`WIST3-E03`). Before the first accepted act every
+its code. Every walked Epoch's `publisher_catalog`, `publisher_item`,
+`label` and `dispute` Entries are counted per Registrable Domain under
+the suffix-list snapshot in force at it against
+`domain_epoch_entries_max`, and its `label` and `dispute` Entries against
+`labeler_epoch_entries_max` (WIST-3 §3.2); an Epoch over either is
+rejected (`WIST3-E03`). Before the first accepted act every
 Canonical Host is its own unit. A cold start adopts the Snapshot's
 `suffix_list` tuple and obtains its file before the first walked Epoch.
 
-Per-delta, independently of the above, in WIST-1 §7's order: complete
-field validation under `delta.schema.json` (`WIST1-E14`), wire major `1`
-support with same-major minor and patch values accepted (`WIST1-E15`,
-ADR-0030), the presence rules and the URL and commitment caps the accepted
-schedule holds at the Epoch's `sealed_at` (`WIST1-E09`/`E07`/`E11`/`E04`),
-then the WIST-1 §5.2 binding: `sig.key_id` must resolve to a key in its
-publisher's key set as of the sealing height, and that key's `valid_from`
-must not be after the delta's `observed_at` under the Publisher timestamp
-profile's exact fraction and offset arithmetic (ADR-0026). Verification
-selects history by the canonical signed `publisher` and checks its literal
-URL scope; shared keys and reused identifiers in other domains cannot
-change authorship. Last, WIST-1 §3.4's clock check uses the committing
-Epoch's `sealed_at` and the `clock_skew_seconds` accepted at that instant
-(`WIST1-E06`); no wall clock takes part. Deltas failing any of these are
-ignored without advancing their chains.
+## Publication replay
 
-The chain of Publisher Declarations that produced that
-key set must itself be well-formed — `seq` and `prev_declaration` strictly
+Each walked Epoch is judged by core's replay of WIST-3 §8, the same
+judgment an Aggregator's history check runs: with the parameters, the
+suffix list and the Aggregator keys in force at the Epoch, after the
+Epoch's key acts, `parameter_change` and `suffix_list_update` acts apply,
+it judges Publisher Declarations, Catalogs (`publisher_catalog`) against
+their Collection's keys and scope, Items (`publisher_item`) against the
+Catalog their inclusion proof names, `payload_withdrawal` acts, Labels
+and disputes. An Entry that fails its checks is ignored, reported on
+stderr with its codes, and changes no state. An Epoch the replay rejects
+stops the sync with its codes and leaves the stored head and state
+unchanged. The store changes only once a Checkpoint is adopted, and
+Entries above the adopted tree size are not applied.
+
+`records` holds exactly the materialized records of the replayed state:
+a valid Item of kind `page` makes the record of its Publisher and URL; a
+`removed` Item, a Collection narrowed so the URL leaves its scope and a
+base Catalog remove it; a withdrawal hides the record of the Item it
+names; and of the records of one URL, self-declaration and then the
+nearest ancestor decide the one materialized (WIST-3 §7, One URL, one
+Publisher). A record's content — title, abstract and, with `--tier1`,
+extract and links — comes from `/payloads/<item-id-hex>.json`, verified
+against its Item's commitment under the size caps of the Epoch that first
+sealed the Item (WIST-1 §3.6). A Payload no source serves or that fails
+verification leaves the row without content and never fails the sync;
+every later sync retries it. A row that leaves or changes Item takes its
+extracts, links and embeddings with it.
+
+A Publisher's chain of Declarations, which supplies the keys its
+Collections and Labels are judged under, must be well-formed — `seq` and `prev_declaration` strictly
 monotonic and hash-linked, every key identifier occurring once across
 `keys` and `recovery_keys` with no public key in both sets (`WIST1-E08`,
 ADR-0023), an ordinary rotation carrying `recovery_keys` byte-identical to
@@ -224,34 +252,30 @@ names none, `WIST1-E01` verifies under none), and continuity follows the
 authenticated public bytes: a renamed signing key is an ordinary rotation,
 a renamed recovery key keeps recovery authority, and an unknown key is a
 fresh identity that cannot alter a protected recovery set and yields to a
-still-open recovery window. An invalid Declaration fails the sync. On cold start the Snapshot's `declaration` tuple supplies the
-accepted sequence floor every later Declaration must exceed, and a
-`recovery_window` tuple restores the recovery-chain head at its own height
-with the window end on it (WIST-3 §§7/8); a `withdrawal` tuple is recorded
-in the `withdrawals` table and removes the content it names from the
-adopted index, so a Consumer resuming above the withdrawal's Epoch excludes
-it exactly as a replaying one does (WIST-3 §6.2); a `label` tuple is parsed
-and carried no further.
+still-open recovery window.
+
+On cold start the Snapshot's state tuples seed the replay: `declaration`
+tuples supply the accepted sequence floor every later Declaration must
+exceed, a `recovery_window` tuple restores the recovery-chain head at its
+own height with the window end on it, `collection`, `record` and
+`removal` tuples restore the latest Catalogs, records and removal states,
+and `withdrawal` tuples the withdrawn Items (WIST-3 §§7/8). `records` is
+built from the records those tuples materialize: a tier-0 row supplies
+content only where its URL, Publisher and Item ID match one, other rows
+are dropped, and a record with no matching row fetches its Payload;
+`collection` and `generated_at` come from the `record` tuples.
 
 Registry Updates carry four acts (WIST-4 §3). Only `aggregator_key_add`
 and `aggregator_key_remove` must verify under an Aggregator key for the
 Epoch to stand; a `parameter_change` replays through the accepted schedule
-above and a `payload_withdrawal` replays through core's withdrawal
-engine under the Aggregator key valid at its Epoch — field, version and
-authenticity failures and a Delta of another Publisher or sealed above
-the act are ignored with their WIST-4 §5.1 code — then records the
-withdrawn Delta at the earliest Epoch that withdrew it and removes its
-record, extracts, links and embeddings; a withdrawal sealed in the same
-Epoch as the Delta it names keeps that Delta from materializing at all.
-A Delta sealed below the Epochs the sync walked cannot be checked
-against the act, since no Snapshot tuple names sealed Deltas, and such
-an act is read as consistent. A `label` or `dispute` Entry is validated under its signer's Declaration
-at the Epoch as the Aggregator validated it — fields, the registry name,
-self-labeling, the disputed Label's sealing and authority, the signature,
-and `asserted_at` within the Epoch's `sealed_at` plus the
-`clock_skew_seconds` in force then, the bound a sealed Delta's
-`observed_at` meets (WIST-1 §3.4) — and one that fails is ignored like a
-forked Delta (WIST-2 §3.3). The
+above, and a `payload_withdrawal`, naming an Item ID, is judged by the
+replay under the Aggregator key valid at its Epoch — field, version and
+authenticity failures and an Item of another Publisher are ignored with
+their code — and records the withdrawn Item at the earliest Epoch that
+withdrew it. A `label` or `dispute` Entry is judged by the replay under
+its signer's Declaration at the Epoch (WIST-2 §3.3); one that fails is
+ignored. A Label's `delta`, an Item ID, binds it to one publication: the
+Label applies only while the subject URL's record carries that Item. The
 index keeps every walked Label and dispute, the current Label per
 (labeler, subject, name) and the current dispute per (Label ID,
 disputant) by `asserted_at` and Log order, a cold start adopting the
@@ -263,15 +287,14 @@ statistics, recomputed locally). `subscribe --labeler` names the
 Labelers the index applies, kept in `labelers.json`; each sync fetches
 their label definitions from `labels/definitions/<hex>.json`, keeping
 the newest that verifies, so `get_labels` reports the treatment a
-Labeler declares and `inform` where none does (WIST-4 §6). Full recovery
-replay and materialization preference among overlapping scoped
-Publishers remain separate validation requirements.
+Labeler declares and `inform` where none does (WIST-4 §6).
 
 ## Labels through MCP
 
 `get_labels` returns the current, unretracted, unexpired Labels sealed
-about a subject by subscribed Labelers — with value, expiry, Delta
-binding, treatment and the labeled domain's disputes — and
+about a subject by subscribed Labelers — with value, expiry, the Item ID
+a Label is bound to as `delta`, treatment and the labeled domain's
+disputes — and
 `every_labeler` widens it to every Labeler walked; `list_labelers`
 returns each Labeler's statistics and whether it is subscribed. Labels
 are transported beside the records and never applied to them.
@@ -334,13 +357,15 @@ mismatch with the local sync cursor; `model` (`name`, `version`,
 `weights_hash`, `dim`, `quantization`, `metric` — one of
 `cosine`/`dot`/`euclidean` — `source`); `vectors` (`path`, `sha256`,
 `bytes`, `count`) describing a zstd-compressed JSONL file alongside the
-pack, one row per vector: `{"delta_id", "url", "publisher", "vector":
+pack, one row per vector: `{"item_id", "url", "publisher", "vector":
 [f32, ...]}`. Import verifies, in order: the envelope signature, the
 snapshot binding, the vectors file's hash and byte length, the row count
 and every vector's length against `dim`, then imports only rows whose
-`delta_id` matches a locally-known record (rows for records the log
-doesn't hold, or withdrawn since, are skipped and counted) — a pack with
-zero importable rows is rejected outright. `similar_records` scores
+`item_id` is the Item of a record the log materializes (other rows are
+skipped and counted) — a pack with zero importable rows is rejected
+outright. Imported rows are kept in `embeddings(item_id, url, publisher,
+vector)`; a later sync that withdraws an Item, or removes or replaces the
+record carrying it, deletes its row. `similar_records` scores
 against one log's imported pack; scores never merge across packs or logs,
 since a pack binds one snapshot of one chain and nothing about "similar"
 survives mixing two.
@@ -348,16 +373,29 @@ survives mixing two.
 ## MCP tools
 
 `serve` exposes: `search` (full-text over titles/abstracts, and over Tier
-1 extract text where imported), `get_record`, `get_extract` (Tier 1 body
-text), `get_links` (declared outbound links, Tier 1), `similar_records`
-(nearest neighbors by an imported companion pack). Merging across logs
-happens at query time, in two steps: rows sharing one `delta_id` collapse
-into one, with `provenance` listing every log that carries it (`log_id`,
-`synced_height`, and `unwitnessed` where that log's head was adopted with
-no Cosignature from a Witness this Consumer trusts); rows for the same
-URL and publisher but different `delta_id` (logs that diverged, or synced
-to different heights) resolve to whichever has the later `observed_at`,
-`delta_id` breaking ties (WIST-3 §8).
+1 extract text where imported, ranked by a profile), `check_coverage`,
+`list_profiles`, `get_record`, `get_extract` (Tier 1 body text),
+`get_links` (declared outbound links, Tier 1), `similar_records` (nearest
+neighbors by an imported companion pack), `get_labels` and
+`list_labelers`. A record carries `url`, `publisher`, `item_id`,
+`observed_at`, `title`, `abstract`, `collection`, `attested_at`,
+`generated_at` and `provenance`: the logs holding it, each with `log_id`,
+`synced_height`, `unwitnessed` where that log's head was adopted with no
+Cosignature from a Witness this Consumer trusts, and `halted`.
+
+Logs combine at query time (WIST-3 §7, Several Logs). An Item has one
+Item ID in every Log, so the logs holding one Item hold one record. For
+one Publisher and URL the record shown is the state proved against the
+latest Catalog — the later `generated_at`, then the greater Catalog ID —
+among the logs holding a record or a removal state for it, the greater
+Item ID deciding between states of one Catalog; where that state is a
+removal, or no log materializes its record, the Publisher shows nothing
+for the URL. Of the Publishers left for one URL, the URL's own host is
+taken where present, then the nearest ancestor, then the least domain. A
+Label bound by `delta` applies against that record. Ranking signals and
+embeddings stay each log's own: a search hit is scored by each log
+holding its record, the highest score kept, and `similar_records` scores
+within one log.
 
 ## Install
 
@@ -382,54 +420,17 @@ cargo test
 
 Conformance tests read the spec repo's schemas/vectors from `../spec`
 (sibling checkout) by default, or from `WIST_SPEC_DIR` if set. Building also
-resolves `wist-core` from `../core`. The `e2e` workspace member additionally
-drives real `spake` and `clave` binaries end to end, so `../spake` and
-`../clave` must also be sibling checkouts, rebuilt from their current
-sources on every run (`SPAKE_BIN`/`CLAVE_BIN` override the binary paths and
-skip that build); it seals on the default hourly cadence grid at explicit
-instants (`clave seal --at`), advancing Log time by whole hours while
-Deltas keep wall-clock `observed_at` values; it validates artifacts against the spec's schemas via
-`WIST_SPEC_DIR`, requiring `jsonschema`, `rfc8785`, and `cryptography` on
-`PATH`'s python3 — set `CI=1` to hard-fail instead of skipping when they're
-missing). It then reads the served Log with an independent client,
-`e2e/tlog-client`, built on Go's `golang.org/x/mod/sumdb/note` and `tlog`:
-the head Checkpoint's signature under the Log's verifier key, the root
-recomputed from the tiles, an Inclusion Proof for every leaf and a
-Consistency Proof from every smaller size; it reads the Log once before
-the Log rotates its own signing keys and once after, each time under the
-verifier key of a key valid at the head it reads. It needs a Go toolchain
-and is skipped without one, or fails under `CI=1`. A second suite in the same crate drives the Consumer against
-an Aggregator with no Publisher: a cold start at a Snapshot's Epoch
-followed by continuous sync, a source serving an old head leaving the
-verified head where it is, and a Checkpoint adopted only once a Witness
-in the roster has cosigned it — with a minimal in-process Witness
-answering [tlog-witness] `add-checkpoint` with a cosignature/v1 line.
-The same crate's `baseline` binary drives the pipeline at scale
-for capacity measurements: `cargo run -p e2e --bin baseline -- --domains N
---pages M [--changed-percent P] [--body-words W] [--extra-empty-seals K]
-[--snapshot-shards S] [--compare-rebuild] [--withdraw] [--work-dir DIR] [--keep]
-[--no-tier1] [--skip-consumer]
-[--out report.json]` publishes N loopback sites of M pages
-through the publisher, ingests them through one aggregator behind a
-request-counting proxy, seals, cold-starts a consumer, changes P percent of
-the pages, seals again, seals K further empty Epochs, verifies the history
-and catches the consumer up, reporting wall seconds, bytes and request
-counts per stage together with every repository revision it ran. Each seal
-stage runs `clave seal --no-snapshot` and then `clave snapshot` as separate
-processes, reporting each one's wall seconds and peak resident set size in
-kB (`null` off Unix), the seconds, shard, byte and Payload-read counters
-parsed from their output (`null` for a line the executable did not print),
-and the sizes of the aggregator's SQLite database, its write-ahead log and
-its Snapshot directories. `--snapshot-shards` sets the store's `snapshot_shard_count` before ingestion
-(one shard otherwise). `--skip-consumer` omits the three consumer stages, which read the
-sharded and the unsharded Snapshot layout. `--compare-rebuild` adds a full Snapshot rebuild
-at the same head (`clave snapshot --rebuild`) per seal stage, reported
-under `snapshot_rebuild`. `--withdraw` then withdraws the newest Delta of
-the first domain's Feed and reports one more seal stage under
-`withdrawal`, with the storage sizes before it under `before`.
-`--work-dir` places the temporary directory inside DIR, and `--keep`
-leaves it in place and reports its path as `work_dir`. Set
-`WIST_BUILD_PROFILE=release` to build and time release executables.
+resolves `wist-core` from `../core`. The `e2e` workspace member drives the
+Consumer against a real `clave` binary, so `../clave` must also be a
+sibling checkout, rebuilt from its current sources on every run
+(`CLAVE_BIN` overrides the binary path and skips that build; set
+`WIST_BUILD_PROFILE=release` to build release executables), sealing on the
+default hourly cadence grid at explicit instants (`clave seal --at`): a
+cold start at a Snapshot's Epoch followed by continuous sync, a source
+serving an old head leaving the verified head where it is, and a
+Checkpoint adopted only once a Witness in the roster has cosigned it —
+with a minimal in-process Witness answering [tlog-witness]
+`add-checkpoint` with a cosignature/v1 line.
 
 ## Verification
 
@@ -448,8 +449,9 @@ Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 ## Spec
 
 Protocol definitions live in the sibling [spec repo](../spec) — Graven is a
-consumer of all three: WIST-1 deltas, WIST-2 site publication, and WIST-3
-logbook & distribution (sync, snapshots, proofs).
+consumer of all three: WIST-1 Declarations, Catalogs, Items and Payloads,
+WIST-2 site publication and Labels, and WIST-3 logbook & distribution
+(sync, replay, snapshots, proofs).
 
 ## CI & releases
 

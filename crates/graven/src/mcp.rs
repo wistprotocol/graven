@@ -172,8 +172,11 @@ impl GravenServer {
 Coverage is limited to domains that publish to WIST, so this is not open web \
 discovery: it returns nothing for a domain outside the index, which check_coverage \
 reports before a query is spent. Each hit carries the publishing domain's own signed \
-statement about the page, synced from an append-only log, typically hours fresh, with \
-the log and its synced height on every row. Best for documentation, news, product and \
+statement about the page, synced from an append-only log, typically hours fresh: its \
+item_id (the Item the record carries), the collection and the attested_at and generated_at \
+instants of the Catalog that Item was proved against, and the logs holding it with their \
+synced heights. Where several logs hold a page, the record of the latest Catalog is the one \
+returned. Best for documentation, news, product and \
 catalogue pages from known publishers, and for questions where provenance matters more \
 than reach. Defer to a web search tool for open discovery, for a domain check_coverage \
 does not list, and for anything needing the live page rather than what its publisher \
@@ -259,8 +262,9 @@ at all, and a web search tool is the right destination for it."
 
     #[tool(
         description = "Fetch one record by its exact Normalized URL — the publisher's \
-signed title, abstract and observation instant. Use after search, or when the URL is \
-already known; it does no matching."
+signed title, abstract and observed_at, its item_id, the collection it belongs to, and the \
+attested_at and generated_at instants of the Catalog its Item was proved against, with the \
+logs holding it. Use after search, or when the URL is already known; it does no matching."
     )]
     fn get_record(
         &self,
@@ -323,8 +327,9 @@ in the order declared. This is the publisher's own citation graph, not a crawl."
 
     #[tool(
         description = "Nearest records to one URL by meaning, using an imported embedding \
-pack. Available only where a pack has been imported, and scores are comparable within a \
-single log, never across logs. Use search for keyword matching."
+pack keyed by item_id. Each result carries its item_id, collection, attested_at and \
+generated_at. Available only where a pack has been imported, and scores are comparable \
+within a single log, never across logs. Use search for keyword matching."
     )]
     fn similar_records(
         &self,
@@ -345,8 +350,8 @@ impl GravenServer {
     #[tool(
         description = "The current Labels sealed about one subject — a page URL or a \
 domain — by the Labelers this index subscribes to: each Labeler's own signed statement \
-under a registry name such as wist:spam, with its value, expiry, the publication it is \
-bound to, the treatment the Labeler's definition declares (inform where none), and any \
+under a registry name such as wist:spam, with its value, expiry, the item_id it is bound \
+to as delta (such a Label applies only while the URL's record carries that Item), the treatment the Labeler's definition declares (inform where none), and any \
 disputes the labeled domain sealed in answer. Labels are opinions carried beside the \
 records, never applied to them; pass every_labeler to see unsubscribed Labelers too."
     )]
@@ -544,6 +549,26 @@ mod tests {
         setup_server_dir(dir);
         let store = MultiStore::open_read_only(dir).unwrap();
         GravenServer::new(store)
+    }
+
+    #[test]
+    fn record_tool_descriptions_name_the_record_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = test_server(dir.path());
+        for tool in server.tool_router.list_all() {
+            if !["search", "get_record", "similar_records"].contains(&tool.name.as_ref()) {
+                continue;
+            }
+            let description = tool.description.unwrap_or_default();
+            for field in ["item_id", "collection", "attested_at", "generated_at"] {
+                assert!(
+                    description.contains(field),
+                    "{} names {field}: {description}",
+                    tool.name
+                );
+            }
+            assert!(!description.contains("delta"), "{}", tool.name);
+        }
     }
 
     #[test]
