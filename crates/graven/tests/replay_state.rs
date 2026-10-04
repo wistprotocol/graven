@@ -8,7 +8,7 @@ use wist_core::envelope::sign_envelope;
 const RECORDS: &str = "records.example";
 
 fn sync(fx: &common::Fixture, target: &Path, witnesses: &[String]) -> graven::sync::SyncReport {
-    graven::sync::follow(
+    let report = graven::sync::follow(
         &graven::sync::Follow {
             anchor: fx.anchor_path().to_str().unwrap(),
             log_base: &fx.base_url,
@@ -19,7 +19,9 @@ fn sync(fx: &common::Fixture, target: &Path, witnesses: &[String]) -> graven::sy
         },
         target,
     )
-    .unwrap()
+    .unwrap();
+    common::assert_records_materialized(&common::synced_log_dir(target));
+    report
 }
 
 fn label_on(subject: &str, asserted_at: &str) -> Value {
@@ -92,6 +94,7 @@ fn held_state(target: &Path) -> Vec<(String, Vec<Vec<String>>)> {
     let log_dir = common::synced_log_dir(target);
     [
         "SELECT tuple FROM state_tuples ORDER BY seq",
+        "SELECT url, publisher, item_id, attested_at, collection, generated_at FROM records ORDER BY url",
         "SELECT state FROM declaration_state",
         "SELECT label_id, labeler, subject, name, height, entry_index FROM labels ORDER BY label_id",
         "SELECT dispute_id, label_id, disputant, height FROM disputes ORDER BY dispute_id",
@@ -106,7 +109,7 @@ fn held_state(target: &Path) -> Vec<(String, Vec<Vec<String>>)> {
 
 #[test]
 fn a_store_resumed_at_every_epoch_holds_what_one_uninterrupted_run_holds() {
-    let fx = common::build_fixture(false);
+    let fx = common::build_fixture_without_records();
     let publisher = common::Signer::new([1u8; 32]);
     let stepwise = tempfile::tempdir().unwrap();
     sync(&fx, stepwise.path(), &[]);
@@ -184,13 +187,13 @@ fn a_store_resumed_at_every_epoch_holds_what_one_uninterrupted_run_holds() {
             "withdrawal"
         ]
     );
-    assert_eq!(held[2].1.len(), 1, "the Label");
-    assert_eq!(held[3].1.len(), 1, "the dispute of the Label");
+    assert_eq!(held[3].1.len(), 1, "the Label");
+    assert_eq!(held[4].1.len(), 1, "the dispute of the Label");
 }
 
 #[test]
 fn entries_above_the_adopted_checkpoint_are_not_applied() {
-    let fx = common::build_fixture(false);
+    let fx = common::build_fixture_without_records();
     let witness = common::Witness::new("witness-a.example", [77u8; 32]);
     let roster = vec![witness.verifier_key()];
     let publisher = common::Signer::new([1u8; 32]);

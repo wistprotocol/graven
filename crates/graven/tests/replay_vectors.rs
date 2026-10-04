@@ -187,8 +187,28 @@ impl ServedLog {
         let log_dir = self.log_dir(target);
         std::fs::create_dir_all(&log_dir).unwrap();
         let index = log_dir.join("index.sqlite");
-        common::write_tier0(&index, &[]);
         let conn = Connection::open(&index).unwrap();
+        conn.execute_batch(graven::store::CREATE_RECORDS).unwrap();
+        for tuple in replay.materialized().unwrap() {
+            let record = replay
+                .records()
+                .record(&tuple.publisher, &tuple.url)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO records(url, publisher, item_id, observed_at, attested_at, lang, collection, generated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    &tuple.url,
+                    &tuple.publisher,
+                    &tuple.item_id,
+                    &tuple.observed_at,
+                    &tuple.attested_at,
+                    record.item["meta"]["lang"].as_str(),
+                    &record.collection,
+                    &record.generated_at,
+                ),
+            )
+            .unwrap();
+        }
         conn.execute_batch(graven::store::CREATE_STATE_TUPLES)
             .unwrap();
         conn.execute_batch(graven::store::CREATE_PARAMETERS)
@@ -283,15 +303,21 @@ impl ServedLog {
     }
 
     fn sync(&self, target: &Path) -> Result<u64, String> {
-        graven::sync::run(
+        self.sync_tiers(target, false)
+    }
+
+    fn sync_tiers(&self, target: &Path, tier1: bool) -> Result<u64, String> {
+        let outcome = graven::sync::run(
             self.dir.path().join("log/anchor.json").to_str().unwrap(),
             &self.base_url,
             target,
             true,
-            false,
+            tier1,
         )
         .map(|report| report.head)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+        common::assert_records_materialized(&self.log_dir(target));
+        outcome
     }
 
     fn head(&self, target: &Path) -> u64 {
@@ -517,6 +543,19 @@ fn catalog_sealing_histories_walked_by_the_consumer_hold_each_epochs_state() {
         let once = tempfile::tempdir().unwrap();
         served.install(once.path());
         let _ = served.sync(once.path());
+        assert_eq!(
+            rows(
+                &served.log_dir(once.path()),
+                "SELECT url, publisher, item_id, attested_at FROM records ORDER BY publisher, url",
+                &["url", "publisher", "item", "attested_at"],
+            ),
+            rows(
+                &log_dir,
+                "SELECT url, publisher, item_id, attested_at FROM records ORDER BY publisher, url",
+                &["url", "publisher", "item", "attested_at"],
+            ),
+            "{name}: one uninterrupted run materializes what a run per Epoch does"
+        );
         assert_eq!(
             served.head(once.path()),
             served.head(target.path()),
@@ -932,4 +971,397 @@ fn walked_labels_fill_the_labeler_statistics_the_vector_records() {
         );
         assert_eq!(json!(held), case["rows"], "{name}");
     }
+}
+
+const VECTOR_OBSERVED: &str = "2026-09-30T10:00:00Z";
+const VECTOR_NBF: &str = "2026-09-01T00:00:00Z";
+
+struct Materialization<'v> {
+    vector: &'v Value,
+    case: &'v Value,
+    signers: BTreeMap<String, common::Signer>,
+    declared: BTreeMap<String, Value>,
+    catalogs: BTreeMap<String, String>,
+}
+
+impl<'v> Materialization<'v> {
+    fn new(vector: &'v Value, case: &'v Value) -> Self {
+        let signers = vector["keys"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|key| (key["x"].as_str().unwrap().to_owned(), signer_of(key)))
+            .collect();
+        Materialization {
+            vector,
+            case,
+            signers,
+            declared: BTreeMap::new(),
+            catalogs: BTreeMap::new(),
+        }
+    }
+
+    fn signer(&self, publisher: &str) -> &common::Signer {
+        let x = self.declared[publisher]["publisher"]["keys"][0]["x"]
+            .as_str()
+            .unwrap();
+        &self.signers[x]
+    }
+
+    fn snapshot_declaration(&self, domain: &str) -> Option<Value> {
+        self.case["snapshot"]["tuples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tuple| tuple[0] == "declaration" && tuple[1] == domain)
+            .map(|tuple| tuple[2].clone())
+    }
+
+    fn kept_urls(&self, publisher: &str, height: u64) -> Vec<String> {
+        let mut urls: Vec<String> = self.case["expected"][height as usize]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|record| record["publisher"] == publisher)
+            .map(|record| record["url"].as_str().unwrap().to_owned())
+            .collect();
+        for epoch in &self.case["epochs"].as_array().unwrap()[height as usize..] {
+            for event in epoch["events"].as_array().unwrap() {
+                if event["event"] == "record" && event["publisher"] == publisher {
+                    urls.push(event["item"]["url"].as_str().unwrap().to_owned());
+                }
+            }
+        }
+        urls.sort();
+        urls.dedup();
+        urls
+    }
+
+    fn declaration(&mut self, domain: &str, epoch: &Value) -> Value {
+        let height = epoch["height"].as_u64().unwrap();
+        let envelope = match self.declared.get(domain) {
+            None => self.snapshot_declaration(domain).unwrap_or_else(|| {
+                let docs = signer_of(&self.vector["keys"]["docs"]);
+                let inner = json!({
+                    "wist_version": "1.0.0",
+                    "seq": 0,
+                    "domain": domain,
+                    "keys": [common::key_entry(&docs, VECTOR_NBF)],
+                });
+                sign_envelope(&inner, "publisher", &docs.kid(), &docs.sk).unwrap()
+            }),
+            Some(current) => {
+                let mut inner = current["publisher"].clone();
+                inner["seq"] = json!(inner["seq"].as_u64().unwrap() + 1);
+                inner["prev_declaration"] = json!(common::declaration_hash(current));
+                let scope: Vec<Value> = self
+                    .kept_urls(domain, height)
+                    .iter()
+                    .map(|url| json!({"url": url, "match": "prefix"}))
+                    .collect();
+                inner["collections"] = json!([{"name": "default", "scope": scope}]);
+                let signer = self.signer(domain);
+                sign_envelope(&inner, "publisher", &signer.kid(), &signer.sk).unwrap()
+            }
+        };
+        self.declared.insert(domain.to_owned(), envelope.clone());
+        json!({"type": "publisher_declaration", "body": envelope})
+    }
+
+    fn withdrawal(
+        &self,
+        event: &Value,
+        epoch: &Value,
+        log: &common::Signer,
+        key_id: &str,
+    ) -> Value {
+        let item_id = event["item"].as_str().unwrap();
+        let publisher = self.case["epochs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|epoch| epoch["events"].as_array().unwrap())
+            .find(|e| {
+                e["event"] == "record" && wist_core::item::item_id(&e["item"]).unwrap() == item_id
+            })
+            .unwrap()["publisher"]
+            .clone();
+        let update = json!({
+            "wist_version": "1.0.0",
+            "action": "payload_withdrawal",
+            "subject": publisher,
+            "effective_at": epoch["sealed_at"],
+            "details": {"delta_id": item_id, "legal_basis": "court order 12/2026", "jurisdiction": "BR"},
+        });
+        let body = sign_envelope(&update, "update", key_id, &log.sk).unwrap();
+        assert_eq!(
+            wist_core::registry_updates::update_id(&body).unwrap(),
+            event["update"].as_str().unwrap()
+        );
+        json!({"type": "registry_update", "body": body})
+    }
+
+    fn entries(&mut self, epoch: &Value, log: &common::Signer, key_id: &str) -> Vec<Value> {
+        let mut entries = Vec::new();
+        let mut listed: BTreeMap<String, (String, String, String, Vec<Value>)> = BTreeMap::new();
+        for event in epoch["events"].as_array().unwrap() {
+            match event["event"].as_str().unwrap() {
+                "declaration" => {
+                    let domain = event["domain"].as_str().unwrap().to_owned();
+                    entries.push(self.declaration(&domain, epoch));
+                }
+                "withdrawal" => entries.push(self.withdrawal(event, epoch, log, key_id)),
+                "record" | "removal" => {
+                    let item = if event["event"] == "record" {
+                        event["item"].clone()
+                    } else {
+                        let removed = common::removed_item(
+                            event["publisher"].as_str().unwrap(),
+                            event["url"].as_str().unwrap(),
+                            VECTOR_OBSERVED,
+                        );
+                        assert_eq!(wist_core::item::item_id(&removed).unwrap(), event["item"]);
+                        removed
+                    };
+                    listed
+                        .entry(event["catalog"].as_str().unwrap().to_owned())
+                        .or_insert_with(|| {
+                            (
+                                event["publisher"].as_str().unwrap().to_owned(),
+                                event["collection"].as_str().unwrap_or("default").to_owned(),
+                                event["generated_at"].as_str().unwrap().to_owned(),
+                                Vec::new(),
+                            )
+                        })
+                        .3
+                        .push(item);
+                }
+                "narrowing" | "base" => {}
+                other => panic!("an event {other}"),
+            }
+        }
+        for (vector_id, (publisher, collection, generated_at, items)) in listed {
+            let published = common::publish(
+                self.signer(&publisher),
+                &publisher,
+                &collection,
+                &generated_at,
+                &items,
+            );
+            self.catalogs
+                .insert(published.catalog_id.clone(), vector_id);
+            entries.push(published.catalog);
+            entries.extend(published.items);
+        }
+        entries
+    }
+
+    fn state(&self, log_dir: &Path) -> Value {
+        let mut records = Vec::new();
+        let mut removals = Vec::new();
+        for tuple in tuples(log_dir) {
+            match tuple {
+                StateEntry::Record(r) => records.push(json!({
+                    "publisher": r.publisher,
+                    "url": r.url,
+                    "item": wist_core::item::item_id(&r.item).unwrap(),
+                    "collection": r.collection,
+                    "catalog": self.catalogs[&r.catalog_id],
+                    "generated_at": r.generated_at,
+                })),
+                StateEntry::Removal(r) => removals.push(json!({
+                    "publisher": r.publisher,
+                    "url": r.url,
+                    "item": r.item_id,
+                    "catalog": self.catalogs[&r.catalog_id],
+                    "generated_at": r.generated_at,
+                })),
+                _ => {}
+            }
+        }
+        let materialized = rows(
+            log_dir,
+            "SELECT url, publisher, item_id, observed_at, attested_at FROM records ORDER BY publisher, url",
+            &["url", "publisher", "item_id", "observed_at", "attested_at"],
+        );
+        let tuples: Vec<wist_core::materialization::ContentTuple> =
+            serde_json::from_value(json!(materialized)).unwrap();
+        let links = match common::table_exists(log_dir, "links") {
+            false => Vec::new(),
+            true => rows(
+                log_dir,
+                "SELECT l.source_url, l.target_url, l.position FROM links l
+             JOIN records r ON r.url = l.source_url
+             ORDER BY r.publisher, r.url, l.position",
+                &["source_url", "target_url", "position"],
+            ),
+        };
+        json!({
+            "records": records,
+            "removals": removals,
+            "materialized": materialized,
+            "links": links,
+            "content_digest": wist_core::snapshot::content_digest(&tuples).unwrap(),
+        })
+    }
+
+    fn titles(&self, log_dir: &Path) -> Vec<(Value, Value)> {
+        rows(
+            log_dir,
+            "SELECT item_id, title FROM records ORDER BY item_id",
+            &["item", "title"],
+        )
+        .into_iter()
+        .map(|row| {
+            let payload = &self.vector["payloads"][row["item"].as_str().unwrap()];
+            (
+                row["title"].clone(),
+                payload["content"]["summary"]["title"].clone(),
+            )
+        })
+        .collect()
+    }
+}
+
+fn without_height(expected: &Value) -> Value {
+    let mut expected = expected.clone();
+    expected.as_object_mut().unwrap().remove("height");
+    expected
+}
+
+#[test]
+fn record_materialization_cases_walked_by_the_consumer_hold_each_epochs_records_and_rows() {
+    let vector = vector("wist3/record-materialization.json");
+    let log_key = &vector["keys"]["log"];
+    let log = signer_of(log_key);
+    let key_id = log_key["kid"].as_str().unwrap();
+    let mut walked = 0;
+    for case in vector["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let mut materialization = Materialization::new(&vector, case);
+        let mut served = ServedLog::new(log_key, "materialization-vector-log");
+        for (item_id, payload) in vector["payloads"].as_object().unwrap() {
+            let path = served
+                .dir
+                .path()
+                .join(format!("payloads/{}.json", &item_id["sha256:".len()..]));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, serde_json::to_vec(payload).unwrap()).unwrap();
+        }
+        let target = tempfile::tempdir().unwrap();
+        let log_dir = served.log_dir(target.path());
+        let expected = case["expected"].as_array().unwrap();
+        for (epoch, want) in case["epochs"].as_array().unwrap().iter().zip(expected) {
+            let height = epoch["height"].as_u64().unwrap();
+            let entries = materialization.entries(epoch, &log, key_id);
+            assert_eq!(
+                served.seal(VectorEpoch {
+                    sealed_at: epoch["sealed_at"].as_str().unwrap().to_owned(),
+                    parameters: BTreeMap::new(),
+                    leaves: leaves(&entries),
+                }),
+                height
+            );
+            let label = format!("{name} at {height}");
+            if height == 0 {
+                served.install(target.path());
+            } else {
+                served.amend(target.path());
+                assert_eq!(
+                    served.sync_tiers(target.path(), true),
+                    Ok(height),
+                    "{label}"
+                );
+            }
+            assert_eq!(
+                materialization.state(&log_dir),
+                without_height(want),
+                "{label}"
+            );
+            for (held, signed) in materialization.titles(&log_dir) {
+                assert_eq!(held, signed, "{label}: content from the verified Payload");
+            }
+            walked += 1;
+        }
+    }
+    assert_eq!(walked, 16);
+}
+
+#[test]
+fn materialization_preference_cases_walked_by_the_consumer_materialize_the_preferred_record() {
+    let vector = vector("wist3/materialization-preference.json");
+    let log_key = synthetic_log_key(0x63);
+    let log = signer_of(&log_key);
+    let key_id = log_key["kid"].as_str().unwrap();
+    let mut cases = 0;
+    for case in vector["cases"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        let host = case["host"].as_str().unwrap();
+        let url = format!("https://{host}/page");
+        let records = case["records"].as_array().unwrap();
+        let mut publishers: Vec<&str> = records
+            .iter()
+            .map(|record| record["publisher"].as_str().unwrap())
+            .collect();
+        if case["self_declared"] == true && !publishers.contains(&host) {
+            publishers.push(host);
+        }
+        let signers: BTreeMap<&str, common::Signer> = publishers
+            .iter()
+            .enumerate()
+            .map(|(n, publisher)| (*publisher, common::Signer::new([0x50 + n as u8; 32])))
+            .collect();
+        let declarations: Vec<Value> = publishers
+            .iter()
+            .map(|publisher| match *publisher == host {
+                true => common::declaration_entry(&signers[publisher], publisher),
+                false => common::scoped_declaration_entry(&signers[publisher], publisher, &[host]),
+            })
+            .collect();
+        let mut sealed = Vec::new();
+        for record in records {
+            let publisher = record["publisher"].as_str().unwrap();
+            let item = common::page_item(publisher, &url, "2026-09-30T10:00:00Z");
+            sealed.extend(common::catalog_entries(
+                &signers[publisher],
+                publisher,
+                &hourly(1),
+                std::slice::from_ref(&item),
+            ));
+            if record["withdrawn"] == true {
+                sealed.push(common::withdrawal_entry(&log, key_id, &item, &hourly(1)));
+            }
+        }
+        let mut served = ServedLog::new(&log_key, "preference-vector-log");
+        served.seal(VectorEpoch {
+            sealed_at: hourly(0),
+            parameters: BTreeMap::new(),
+            leaves: leaves(&declarations),
+        });
+        let target = tempfile::tempdir().unwrap();
+        served.install(target.path());
+        served.seal(VectorEpoch {
+            sealed_at: hourly(1),
+            parameters: BTreeMap::new(),
+            leaves: leaves(&sealed),
+        });
+        served.amend(target.path());
+        assert_eq!(served.sync(target.path()), Ok(1), "{label}");
+        let log_dir = served.log_dir(target.path());
+        for record in records {
+            let publisher = record["publisher"].as_str().unwrap();
+            assert!(
+                common::holds_record_tuple(&log_dir, publisher, &url),
+                "{label}: {publisher} holds a record"
+            );
+        }
+        let held = common::record_row(&log_dir, &url).map(|(publisher, _, _)| publisher);
+        assert_eq!(
+            json!(held),
+            case["materialized"],
+            "{label}: the materialized Publisher"
+        );
+        cases += 1;
+    }
+    assert_eq!(cases, 10);
 }

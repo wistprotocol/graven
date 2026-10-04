@@ -27,8 +27,11 @@ pub struct RecordOut {
     pub publisher: String,
     pub item_id: String,
     pub observed_at: String,
-    pub title: String,
+    pub title: Option<String>,
     pub r#abstract: Option<String>,
+    pub collection: Option<String>,
+    pub attested_at: String,
+    pub generated_at: Option<String>,
     pub provenance: Vec<ProvEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ranking: Option<RankingOut>,
@@ -42,6 +45,9 @@ fn to_record_out(hit: MergedHit) -> RecordOut {
         observed_at: hit.observed_at,
         title: hit.title,
         r#abstract: hit.r#abstract,
+        collection: hit.collection,
+        attested_at: hit.attested_at,
+        generated_at: hit.generated_at,
         provenance: hit.provenance,
         ranking: None,
     }
@@ -65,7 +71,10 @@ pub struct SimilarOut {
     pub url: String,
     pub publisher: String,
     pub item_id: String,
-    pub title: String,
+    pub title: Option<String>,
+    pub collection: Option<String>,
+    pub attested_at: String,
+    pub generated_at: Option<String>,
     pub score: f64,
     pub provenance: Vec<ProvEntry>,
 }
@@ -76,6 +85,9 @@ fn to_similar_out(hit: SimilarHit) -> SimilarOut {
         publisher: hit.hit.publisher,
         item_id: hit.hit.item_id,
         title: hit.hit.title,
+        collection: hit.hit.collection,
+        attested_at: hit.hit.attested_at,
+        generated_at: hit.hit.generated_at,
         score: hit.score,
         provenance: hit.hit.provenance,
     }
@@ -195,6 +207,9 @@ signed."
                     observed_at: hit.observed_at,
                     title: hit.title,
                     r#abstract: hit.r#abstract,
+                    collection: hit.collection,
+                    attested_at: hit.attested_at,
+                    generated_at: hit.generated_at,
                     provenance: hit.provenance,
                     ranking: Some(RankingOut {
                         profile: name.clone(),
@@ -411,12 +426,12 @@ mod tests {
         std::fs::create_dir_all(log_dir).unwrap();
         let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
         conn.execute_batch(
-            "CREATE TABLE records(url TEXT, publisher TEXT, item_id TEXT, observed_at TEXT, title TEXT, abstract TEXT, lang TEXT);
+            "CREATE TABLE records(url TEXT, publisher TEXT, item_id TEXT, observed_at TEXT, attested_at TEXT, title TEXT, abstract TEXT, lang TEXT, collection TEXT, generated_at TEXT);
              CREATE VIRTUAL TABLE records_fts USING fts5(title, abstract, content=records, content_rowid=rowid);",
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO records(url, publisher, item_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO records(url, publisher, item_id, observed_at, attested_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7)",
             (
                 "https://example.com/alpha",
                 "example.com",
@@ -429,7 +444,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO records(url, publisher, item_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO records(url, publisher, item_id, observed_at, attested_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7)",
             (
                 "https://example.com/beta",
                 "example.com",
@@ -439,6 +454,11 @@ mod tests {
                 Some("Beta abstract text"),
                 "en",
             ),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE records SET attested_at = ?2, collection = 'docs', generated_at = ?2 WHERE url = ?1",
+            ("https://example.com/beta", "2026-08-09T02:00:00Z"),
         )
         .unwrap();
         conn.execute("INSERT INTO records_fts(records_fts) VALUES('rebuild')", [])
@@ -606,7 +626,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         let hit = &results[0];
         assert_eq!(hit.url, "https://example.com/alpha");
-        assert_eq!(hit.title, "Alpha Title");
+        assert_eq!(hit.title.as_deref(), Some("Alpha Title"));
         assert_eq!(hit.r#abstract.as_deref(), Some("Alpha abstract text"));
         assert_eq!(hit.provenance.len(), 1);
         assert_eq!(hit.provenance[0].log_id, "test-log");
@@ -661,6 +681,23 @@ mod tests {
         assert_eq!(hit.publisher, "example.com");
         assert_eq!(hit.provenance.len(), 1);
         assert_eq!(hit.provenance[0].synced_height, 7);
+    }
+
+    #[test]
+    fn get_record_returns_the_item_collection_and_catalog_instants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(tmp.path());
+        let Json(hit) = server
+            .get_record(Parameters(GetRecordParams {
+                url: "https://example.com/beta".into(),
+            }))
+            .unwrap();
+        let out = serde_json::to_value(&hit).unwrap();
+        assert_eq!(out["item_id"], "sha256:b");
+        assert_eq!(out["collection"], "docs");
+        assert_eq!(out["attested_at"], "2026-08-09T02:00:00Z");
+        assert_eq!(out["generated_at"], "2026-08-09T02:00:00Z");
+        assert!(out.get("delta_id").is_none());
     }
 
     #[test]

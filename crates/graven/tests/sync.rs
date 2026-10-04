@@ -38,7 +38,7 @@ fn cold_sync_verifies_chain_and_populates_store() {
 
     let store = Store::open(&common::synced_log_dir(target.path())).unwrap();
     let alpha = store.get("https://records.example/alpha").unwrap().unwrap();
-    assert_eq!(alpha.title, "Alpha Title");
+    assert_eq!(alpha.title.as_deref(), Some("Alpha Title"));
     assert_eq!(alpha.publisher, fx.domain);
 
     assert!(common::holds_declaration(
@@ -1139,7 +1139,7 @@ fn failed_migration_restores_legacy_layout_and_registers_nothing() {
 
     let store = Store::open(&migrated_dir).unwrap();
     let alpha = store.get("https://records.example/alpha").unwrap().unwrap();
-    assert_eq!(alpha.title, "Alpha Title");
+    assert_eq!(alpha.title.as_deref(), Some("Alpha Title"));
 }
 
 #[test]
@@ -1682,4 +1682,262 @@ fn a_cold_start_replaces_the_verifying_index_a_crash_left_behind() {
     assert_eq!(report.head, 1);
     assert!(!log_dir.join("index.sqlite.verifying").exists());
     assert_eq!(synced_state(target.path()).epoch_number, 1);
+}
+
+fn owner() -> common::Signer {
+    common::Signer::new([1u8; 32])
+}
+
+fn served_page(fx: &common::Fixture, url: &str, content: &common::Content) -> serde_json::Value {
+    let (item, payload) = common::page(common::RECORDS, url, common::OBSERVED, content);
+    common::serve_payload(fx.dir.path(), &item, &payload);
+    item
+}
+
+fn extract_of(log_dir: &std::path::Path, url: &str) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    Connection::open(log_dir.join("index.sqlite"))
+        .unwrap()
+        .query_row("SELECT extract FROM extracts WHERE url = ?1", [url], |r| {
+            r.get(0)
+        })
+        .optional()
+        .unwrap()
+}
+
+fn links_of(log_dir: &std::path::Path, url: &str) -> Vec<(String, i64)> {
+    let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT target_url, position FROM links WHERE source_url = ?1 ORDER BY position")
+        .unwrap();
+    stmt.query_map([url], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+#[test]
+fn cold_sync_materializes_a_post_snapshot_item_whose_payload_cannot_be_obtained_without_content() {
+    let fx = common::build_fixture_without_records();
+    let url = "https://records.example/beta";
+    let (item, _) = common::page(
+        common::RECORDS,
+        url,
+        common::OBSERVED,
+        &common::Content::of("Beta Title"),
+    );
+    common::seal_catalog(&fx, &owner(), common::RECORDS, &[item], &[]);
+    let target = tempfile::tempdir().unwrap();
+    let report = common::sync(&fx, target.path(), false);
+    assert_eq!(report.head, 2);
+    let log_dir = common::synced_log_dir(target.path());
+    common::assert_records_materialized(&log_dir);
+    let beta = Store::open(&log_dir).unwrap().get(url).unwrap().unwrap();
+    assert_eq!(beta.title, None);
+    assert!(beta.r#abstract.is_none());
+}
+
+#[test]
+fn continuous_sync_replaces_the_record_with_the_publishers_new_item() {
+    let fx = common::build_fixture_without_records();
+    let target = tempfile::tempdir().unwrap();
+    let url = "https://records.example/alpha";
+    let first = served_page(
+        &fx,
+        url,
+        &common::Content {
+            r#abstract: Some("Alpha abstract"),
+            ..common::Content::of("Alpha Title")
+        },
+    );
+    common::seal_catalog(&fx, &owner(), common::RECORDS, &[first], &[]);
+    common::sync(&fx, target.path(), false);
+    let second = served_page(
+        &fx,
+        url,
+        &common::Content {
+            r#abstract: Some("Alpha abstract updated"),
+            ..common::Content::of("Alpha Title")
+        },
+    );
+    let second_id = wist_core::item::item_id(&second).unwrap();
+    common::seal_catalog(&fx, &owner(), common::RECORDS, &[second], &[]);
+    let report = common::sync(&fx, target.path(), false);
+    assert_eq!(report.head, 3);
+    let log_dir = common::synced_log_dir(target.path());
+    common::assert_records_materialized(&log_dir);
+    assert_eq!(
+        common::count_where(&log_dir, "records", "url", url),
+        1,
+        "a new Item of a URL replaces its row, never duplicates it"
+    );
+    let hit = Store::open(&log_dir).unwrap().get(url).unwrap().unwrap();
+    assert_eq!(hit.publisher, common::RECORDS);
+    assert_eq!(hit.item_id, second_id);
+    assert_eq!(hit.r#abstract.as_deref(), Some("Alpha abstract updated"));
+    assert_eq!(hit.collection.as_deref(), Some("default"));
+    assert_eq!(
+        hit.generated_at.as_deref(),
+        Some(fx.log_state().head().sealed_at()),
+        "the record carries the instant of the Catalog it was proved against"
+    );
+    assert_eq!(Some(hit.attested_at), hit.generated_at);
+}
+
+#[test]
+fn a_withdrawal_sealed_beside_its_item_keeps_its_content_out_of_the_index() {
+    let fx = common::build_fixture_without_records();
+    let target = tempfile::tempdir().unwrap();
+    common::sync(&fx, target.path(), true);
+    let url = "https://records.example/gamma";
+    let gamma = served_page(&fx, url, &common::Content::of("Gamma Title"));
+    let withdrawal = common::withdrawal_entry(&fx.log, "log1", &gamma, "2026-08-09T14:00:00Z");
+    common::seal_catalog(
+        &fx,
+        &owner(),
+        common::RECORDS,
+        std::slice::from_ref(&gamma),
+        &[withdrawal],
+    );
+    let report = common::sync(&fx, target.path(), true);
+    assert_eq!(report.head, 2);
+    let log_dir = common::synced_log_dir(target.path());
+    common::assert_records_materialized(&log_dir);
+    assert!(Store::open(&log_dir).unwrap().get(url).unwrap().is_none());
+    assert_eq!(extract_of(&log_dir, url), None);
+    assert!(
+        common::holds_record_tuple(&log_dir, common::RECORDS, url),
+        "the withdrawn Item still becomes its URL's record"
+    );
+}
+
+#[test]
+fn incremental_sync_with_tier1_populates_the_extract_of_a_new_record() {
+    let fx = common::build_fixture_without_records();
+    let target = tempfile::tempdir().unwrap();
+    common::sync(&fx, target.path(), true);
+    let url = "https://records.example/extra";
+    let item = served_page(
+        &fx,
+        url,
+        &common::Content {
+            extract: "extra body",
+            ..common::Content::of("Extra")
+        },
+    );
+    common::seal_catalog(&fx, &owner(), common::RECORDS, &[item], &[]);
+    common::sync(&fx, target.path(), true);
+    let log_dir = common::synced_log_dir(target.path());
+    common::assert_records_materialized(&log_dir);
+    assert_eq!(extract_of(&log_dir, url).as_deref(), Some("extra body"));
+    let collection: String = Connection::open(log_dir.join("index.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT collection FROM extracts WHERE url = ?1",
+            [url],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(collection, "default");
+}
+
+#[test]
+fn incremental_sync_with_tier1_replaces_links_and_extract_when_the_item_changes() {
+    let fx = common::build_fixture_without_records();
+    let target = tempfile::tempdir().unwrap();
+    let url = "https://records.example/alpha";
+    let first = served_page(
+        &fx,
+        url,
+        &common::Content {
+            extract: "alpha body",
+            links: &["https://other.example/first"],
+            ..common::Content::of("Alpha Title")
+        },
+    );
+    common::seal_catalog(&fx, &owner(), common::RECORDS, &[first], &[]);
+    common::sync(&fx, target.path(), true);
+    let second = served_page(
+        &fx,
+        url,
+        &common::Content {
+            extract: "alpha body v2",
+            links: &["https://other.example/second"],
+            ..common::Content::of("Alpha Title")
+        },
+    );
+    common::seal_catalog(&fx, &owner(), common::RECORDS, &[second], &[]);
+    common::sync(&fx, target.path(), true);
+    let log_dir = common::synced_log_dir(target.path());
+    common::assert_records_materialized(&log_dir);
+    assert_eq!(extract_of(&log_dir, url).as_deref(), Some("alpha body v2"));
+    assert_eq!(
+        links_of(&log_dir, url),
+        vec![("https://other.example/second".to_string(), 0)]
+    );
+}
+
+#[test]
+fn incremental_sync_with_tier1_leaves_no_extract_when_the_payload_cannot_be_obtained() {
+    let fx = common::build_fixture_without_records();
+    let target = tempfile::tempdir().unwrap();
+    common::sync(&fx, target.path(), true);
+    let url = "https://records.example/no-payload";
+    let (item, _) = common::page(
+        common::RECORDS,
+        url,
+        common::OBSERVED,
+        &common::Content::of("No Payload Title"),
+    );
+    common::seal_catalog(&fx, &owner(), common::RECORDS, &[item], &[]);
+    common::sync(&fx, target.path(), true);
+    let log_dir = common::synced_log_dir(target.path());
+    common::assert_records_materialized(&log_dir);
+    assert_eq!(common::record_row(&log_dir, url).unwrap().2, None);
+    assert_eq!(extract_of(&log_dir, url), None);
+}
+
+#[test]
+fn incremental_sync_with_tier1_purges_the_previous_items_content_when_the_new_payload_cannot_be_obtained(
+) {
+    let fx = common::build_fixture_without_records();
+    let target = tempfile::tempdir().unwrap();
+    let url = "https://records.example/alpha";
+    let first = served_page(
+        &fx,
+        url,
+        &common::Content {
+            extract: "alpha body",
+            links: &["https://other.example/first"],
+            ..common::Content::of("Alpha Title")
+        },
+    );
+    common::seal_catalog(&fx, &owner(), common::RECORDS, &[first], &[]);
+    common::sync(&fx, target.path(), true);
+    let (second, _) = common::page(
+        common::RECORDS,
+        url,
+        common::OBSERVED,
+        &common::Content {
+            extract: "alpha body v2",
+            ..common::Content::of("Alpha Title")
+        },
+    );
+    let second_id = wist_core::item::item_id(&second).unwrap();
+    common::seal_catalog(&fx, &owner(), common::RECORDS, &[second], &[]);
+    common::sync(&fx, target.path(), true);
+    let log_dir = common::synced_log_dir(target.path());
+    common::assert_records_materialized(&log_dir);
+    let (_, item_id, title) = common::record_row(&log_dir, url).unwrap();
+    assert_eq!(item_id, second_id, "the row follows the new Item");
+    assert_eq!(title, None);
+    assert_eq!(
+        extract_of(&log_dir, url),
+        None,
+        "the previous Item's extract does not survive"
+    );
+    assert!(
+        links_of(&log_dir, url).is_empty(),
+        "the previous Item's links do not survive"
+    );
 }

@@ -5,17 +5,21 @@ use super::SyncState;
 use crate::error::{Error, Result};
 use crate::keyset::KeyHistory;
 use crate::store::{table_exists, CREATE_TIER1};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use wist_core::aggregator_keys::Registry;
 use wist_core::checkpoint::{self, check_consistency, Adoption, Checkpoint, WitnessKey};
+use wist_core::declaration::url_host;
 use wist_core::epoch::verify_epoch;
-use wist_core::item::Kind;
+use wist_core::item::{judge_payload_octets, Kind, SizeCaps};
 use wist_core::label::{SealedDispute, SealedLabel};
 use wist_core::merkle::consistency_proof_from;
-use wist_core::objects::{PublisherEnvelope, RegistryUpdateEnvelope};
+use wist_core::objects::{PageItem, Payload, PublisherEnvelope, RegistryUpdateEnvelope};
 use wist_core::parameters::{Amendment, Schedule};
-use wist_core::sealing::{carried_label_ids, Epoch, Judgment, Outcome, Parameters, Replay};
+use wist_core::sealing::{
+    carried_label_ids, Epoch, Judgment, Outcome, Parameters, Removed, Replay,
+};
 use wist_core::timestamp::log_seconds;
 
 /// WIST-4 §9 and ADR-0020.
@@ -142,6 +146,18 @@ impl ChainState {
     pub fn largest(&self) -> u64 {
         self.largest
     }
+
+    pub fn size_caps_at(&self, at: i64) -> Option<SizeCaps> {
+        let parameters = Parameters::from_schedule(self.schedule.as_ref()?, at).ok()?;
+        SizeCaps::new(
+            parameters.get("url_cap_bytes"),
+            parameters.get("extract_cap_bytes"),
+            parameters.get("links_cap_bytes"),
+            parameters.get("link_url_cap_bytes"),
+            parameters.get("summary_cap_bytes"),
+        )
+        .ok()
+    }
 }
 
 fn default_of(parameter: &str) -> u64 {
@@ -166,6 +182,85 @@ pub struct EpochEvent {
     pub disputes: Vec<SealedDispute>,
     /// WIST-3 §3.2: valid or ignored.
     pub label_ids: Vec<String>,
+    /// WIST-3 §7.
+    pub materialized: Vec<(String, Option<MaterializedRow>)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaterializedRow {
+    pub publisher: String,
+    pub item_id: String,
+    pub item: Value,
+    pub collection: String,
+    pub generated_at: String,
+}
+
+impl MaterializedRow {
+    fn key(&self) -> RowKey {
+        RowKey {
+            publisher: self.publisher.clone(),
+            item_id: self.item_id.clone(),
+            collection: Some(self.collection.clone()),
+            generated_at: Some(self.generated_at.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowKey {
+    publisher: String,
+    item_id: String,
+    collection: Option<String>,
+    generated_at: Option<String>,
+}
+
+/// WIST-3 §7, One URL, one Publisher.
+fn affected_urls(
+    replay: &Replay,
+    entries: &[Value],
+    judged: &[Option<Judgment>],
+    removed: &[Removed],
+    withdrawn: &[(String, String, u64)],
+) -> BTreeSet<String> {
+    let mut urls: BTreeSet<String> = removed.iter().map(|r| r.url.clone()).collect();
+    let mut hosts: BTreeSet<&str> = BTreeSet::new();
+    for (entry, judgment) in entries.iter().zip(judged) {
+        match entry["type"].as_str() {
+            Some("publisher_item") if matches!(judgment, Some(Judgment::Valid)) => {
+                if let Some(url) = entry["body"]["item"]["url"].as_str() {
+                    urls.insert(url.to_owned());
+                }
+            }
+            Some("publisher_declaration") => {
+                if let Some(domain) = entry["body"]["publisher"]["domain"].as_str() {
+                    hosts.insert(domain);
+                }
+            }
+            _ => {}
+        }
+    }
+    for (_, url, record) in replay.records().records() {
+        if hosts.contains(url_host(url))
+            || withdrawn
+                .iter()
+                .any(|(item_id, _, _)| *item_id == record.item_id)
+        {
+            urls.insert(url.to_owned());
+        }
+    }
+    urls
+}
+
+fn materialized_row(replay: &Replay, url: &str) -> Option<MaterializedRow> {
+    replay
+        .materialized_record(url)
+        .map(|(publisher, record)| MaterializedRow {
+            publisher: publisher.to_owned(),
+            item_id: record.item_id.clone(),
+            item: record.item.clone(),
+            collection: record.collection.clone(),
+            generated_at: record.generated_at.clone(),
+        })
 }
 
 pub struct ApplyStats {
@@ -555,14 +650,17 @@ fn verify_checkpoint(
             &stored,
         )
         .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
-    let judged = match outcome {
+    let (judged, records_removed) = match outcome {
         Outcome::Rejected { codes } => {
             return Err(Error::Verify(format!(
                 "epoch {n}: the Epoch is rejected ({})",
                 codes.join(", ")
             )))
         }
-        Outcome::Accepted { entries, .. } => entries,
+        Outcome::Accepted {
+            entries,
+            records_removed,
+        } => (entries, records_removed),
     };
     for id in &accepted_here {
         replay.accept_registry_update(id, n);
@@ -590,6 +688,20 @@ fn verify_checkpoint(
     )
     .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
 
+    let withdrawals: Vec<(String, String, u64)> = replay
+        .withdrawals()
+        .entries()
+        .into_iter()
+        .filter(|withdrawal| withdrawal.sealing_height == n)
+        .map(|withdrawal| (withdrawal.item_id, withdrawal.publisher, n))
+        .collect();
+    let materialized = affected_urls(replay, entries, &judged, &records_removed, &withdrawals)
+        .into_iter()
+        .map(|url| {
+            let row = materialized_row(replay, &url);
+            (url, row)
+        })
+        .collect();
     let event = EpochEvent {
         height: n,
         sealed_at,
@@ -599,13 +711,7 @@ fn verify_checkpoint(
             .filter(|entry| entry["type"] == "publisher_declaration")
             .cloned()
             .collect(),
-        withdrawals: replay
-            .withdrawals()
-            .entries()
-            .into_iter()
-            .filter(|withdrawal| withdrawal.sealing_height == n)
-            .map(|withdrawal| (withdrawal.item_id, withdrawal.publisher, n))
-            .collect(),
+        withdrawals,
         publishers: entries
             .iter()
             .filter_map(|entry| match entry["type"].as_str() {
@@ -626,6 +732,7 @@ fn verify_checkpoint(
             .cloned()
             .collect(),
         label_ids,
+        materialized,
     };
     Ok((event, adoption))
 }
@@ -689,32 +796,345 @@ fn remove_ranking_bookkeeping(
     super::persist::replace_inlinks(conn, url, publisher, &[], height)
 }
 
-pub(super) fn remove_by_item_id(
-    conn: &Connection,
-    item_id: &str,
-    height: u64,
-) -> Result<Option<String>> {
-    let row: Option<(String, String)> = conn
-        .query_row(
-            "SELECT url, publisher FROM records WHERE item_id = ?1",
-            [item_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((url, publisher)) = row else {
-        return Ok(None);
-    };
-    conn.execute("DELETE FROM records WHERE item_id = ?1", [item_id])?;
-    remove_derived(conn, item_id, &url)?;
-    remove_ranking_bookkeeping(conn, &url, &publisher, height)?;
-    Ok(Some(url))
+struct StoredRow {
+    key: RowKey,
+    content: bool,
+}
+
+fn stored_rows(conn: &Connection, url: &str) -> Result<Vec<StoredRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT publisher, item_id, collection, generated_at, title IS NOT NULL FROM records WHERE url = ?1",
+    )?;
+    let rows = stmt
+        .query_map([url], |row| {
+            Ok(StoredRow {
+                key: RowKey {
+                    publisher: row.get(0)?,
+                    item_id: row.get(1)?,
+                    collection: row.get(2)?,
+                    generated_at: row.get(3)?,
+                },
+                content: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn single_key(rows: &[StoredRow]) -> Option<Option<RowKey>> {
+    match rows {
+        [] => Some(None),
+        [row] => Some(Some(row.key.clone())),
+        _ => None,
+    }
+}
+
+struct Content {
+    title: String,
+    r#abstract: Option<String>,
+    extract: String,
+    links: Vec<String>,
+}
+
+pub struct Materializer<'a> {
+    pub sources: &'a Sources<'a>,
+    pub chain: &'a ChainState,
+    pub tier1: bool,
+}
+
+impl Materializer<'_> {
+    /// WIST-1 §3.6: a Payload read for a sealed Item keeps the parameter profile of the Epoch
+    /// that first sealed the Item.
+    fn caps(&self, conn: &Connection, replay: &Replay, row: &MaterializedRow) -> SizeCaps {
+        let height = replay
+            .sealed_items()
+            .sealed()
+            .filter(|sealed| {
+                sealed.item_id == row.item_id
+                    && sealed.publisher == row.publisher
+                    && sealed.kind == Kind::Page
+            })
+            .map(|sealed| sealed.height)
+            .min();
+        let sealed_at = height
+            .and_then(|height| super::checkpoints::retained(conn, height).ok().flatten())
+            .and_then(|checkpoint| checkpoint.sealed_at_s().ok())
+            .or(self.chain.prior_at());
+        sealed_at
+            .and_then(|at| self.chain.size_caps_at(at))
+            .unwrap_or_else(SizeCaps::suite)
+    }
+
+    /// WIST-3 §6.1 and §8.
+    fn content(
+        &self,
+        conn: &Connection,
+        replay: &Replay,
+        url: &str,
+        row: &MaterializedRow,
+    ) -> Option<Content> {
+        let caps = self.caps(conn, replay, row);
+        let page: PageItem = serde_json::from_value(row.item.clone()).ok()?;
+        let hex = row.item_id.strip_prefix("sha256:")?;
+        let bound = caps.extract_cap_bytes()
+            + caps.links_cap_bytes()
+            + caps.summary_cap_bytes()
+            + PAYLOAD_FRAMING_BYTES;
+        let fetched = self
+            .sources
+            .verified(&format!("/payloads/{hex}.json"), bound, |octets| {
+                judge_payload_octets(&page, octets, &caps)
+                    .map_err(|code| Error::Verify(format!("{code} the Payload of {url}")))
+            });
+        let octets = match fetched {
+            Ok(octets) => octets,
+            Err(error) => {
+                eprintln!("materializing {url} without content: {error}");
+                return None;
+            }
+        };
+        let payload: Payload =
+            serde_json::from_value(wist_core::json::parse(&octets).ok()?).ok()?;
+        Some(Content {
+            title: payload.content.summary.title,
+            r#abstract: payload.content.summary.r#abstract,
+            extract: payload.content.extract,
+            links: payload.content.links.urls,
+        })
+    }
+
+    fn write_content(
+        &self,
+        conn: &Connection,
+        url: &str,
+        row: &MaterializedRow,
+        content: Option<&Content>,
+        height: u64,
+    ) -> Result<()> {
+        if let Some(content) = content {
+            conn.execute(
+                "UPDATE records SET title = ?3, abstract = ?4 WHERE url = ?1 AND publisher = ?2",
+                (url, &row.publisher, &content.title, &content.r#abstract),
+            )?;
+        }
+        if !self.tier1 {
+            return Ok(());
+        }
+        let links = content.map_or(&[][..], |content| &content.links[..]);
+        if let Some(content) = content {
+            conn.execute(
+                "INSERT INTO extracts(url, publisher, item_id, extract, collection) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(url, publisher) DO UPDATE SET item_id = excluded.item_id, extract = excluded.extract, collection = excluded.collection",
+                (url, &row.publisher, &row.item_id, &content.extract, &row.collection),
+            )?;
+            conn.execute("DELETE FROM links WHERE source_url = ?1", [url])?;
+            for (position, target_url) in links.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO links(source_url, target_url, position) VALUES (?1, ?2, ?3)",
+                    (url, target_url, position as i64),
+                )?;
+            }
+        }
+        super::persist::replace_inlinks(conn, url, &row.publisher, links, height)
+    }
+
+    fn remove(
+        &self,
+        conn: &Connection,
+        url: &str,
+        stored: &StoredRow,
+        replaced_by: Option<&MaterializedRow>,
+        height: u64,
+    ) -> Result<()> {
+        conn.execute(
+            "DELETE FROM records WHERE url = ?1 AND publisher = ?2",
+            (url, &stored.key.publisher),
+        )?;
+        remove_derived(conn, &stored.key.item_id, url)?;
+        if replaced_by.is_none_or(|row| row.publisher != stored.key.publisher) {
+            remove_ranking_bookkeeping(conn, url, &stored.key.publisher, height)?;
+        }
+        Ok(())
+    }
+
+    fn insert(
+        &self,
+        conn: &Connection,
+        replay: &Replay,
+        url: &str,
+        row: &MaterializedRow,
+        height: u64,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO records(url, publisher, item_id, observed_at, attested_at, title, abstract, lang, collection, generated_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?8)",
+            (
+                url,
+                &row.publisher,
+                &row.item_id,
+                row.item["observed_at"].as_str(),
+                &row.generated_at,
+                row.item["meta"]["lang"].as_str(),
+                &row.collection,
+                &row.generated_at,
+            ),
+        )?;
+        record_height(conn, url, &row.publisher, height)?;
+        let content = self.content(conn, replay, url, row);
+        self.write_content(conn, url, row, content.as_ref(), height)
+    }
+
+    /// WIST-3 §7.
+    fn reattest(
+        &self,
+        conn: &Connection,
+        url: &str,
+        row: &MaterializedRow,
+        height: u64,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE records SET attested_at = ?3, collection = ?4, generated_at = ?3 WHERE url = ?1 AND publisher = ?2",
+            (url, &row.publisher, &row.generated_at, &row.collection),
+        )?;
+        if table_exists(conn, "extracts")? {
+            conn.execute(
+                "UPDATE extracts SET collection = ?3 WHERE url = ?1 AND publisher = ?2",
+                (url, &row.publisher, &row.collection),
+            )?;
+        }
+        record_height(conn, url, &row.publisher, height)
+    }
+
+    /// WIST-3 §7.
+    fn apply(
+        &self,
+        conn: &Connection,
+        replay: &Replay,
+        events: &[EpochEvent],
+        stats: &mut ApplyStats,
+    ) -> Result<BTreeSet<String>> {
+        let mut decided: BTreeMap<String, (Option<MaterializedRow>, u64)> = BTreeMap::new();
+        for event in events {
+            for (url, row) in &event.materialized {
+                let previous = match decided.get(url.as_str()) {
+                    Some((held, _)) => Some(held.as_ref().map(MaterializedRow::key)),
+                    None => single_key(&stored_rows(conn, url)?),
+                };
+                if previous != Some(row.as_ref().map(MaterializedRow::key)) {
+                    decided.insert(url.clone(), (row.clone(), event.height));
+                }
+            }
+            for url in withdrawn_rows(conn, event)? {
+                decided.insert(url.clone(), (materialized_row(replay, &url), event.height));
+            }
+        }
+        let mut written = BTreeSet::new();
+        for (url, (row, height)) in &decided {
+            let (url, row, height) = (url.as_str(), row.as_ref(), *height);
+            let stored = stored_rows(conn, url)?;
+            let wanted = row.map(MaterializedRow::key);
+            if single_key(&stored) == Some(wanted.clone()) {
+                continue;
+            }
+            written.insert(url.to_owned());
+            let same_item = |held: &StoredRow| {
+                row.is_some_and(|row| {
+                    held.key.publisher == row.publisher && held.key.item_id == row.item_id
+                })
+            };
+            for held in &stored {
+                if !(same_item(held) && stored.len() == 1) {
+                    self.remove(conn, url, held, row, height)?;
+                    if replay.withdrawals().is_withdrawn(&held.key.item_id) {
+                        stats.withdrawn += 1;
+                    }
+                }
+            }
+            let Some(row) = row else {
+                continue;
+            };
+            match stored.as_slice() {
+                [held] if same_item(held) => {
+                    self.reattest(conn, url, row, height)?;
+                    if !held.content {
+                        written.remove(url);
+                    }
+                }
+                _ => self.insert(conn, replay, url, row, height)?,
+            }
+        }
+        Ok(written)
+    }
+
+    /// WIST-3 §8 cold start step 9.
+    fn retry(&self, conn: &Connection, replay: &Replay, written: &BTreeSet<String>) -> Result<()> {
+        let mut stmt = conn.prepare(
+            "SELECT r.url, r.publisher, r.item_id, h.height FROM records r
+             LEFT JOIN record_heights h ON h.url = r.url AND h.publisher = r.publisher
+             WHERE r.title IS NULL",
+        )?;
+        let missing = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (url, publisher, item_id, height) in missing {
+            if written.contains(&url) {
+                continue;
+            }
+            let Some(row) = materialized_row(replay, &url)
+                .filter(|row| row.publisher == publisher && row.item_id == item_id)
+            else {
+                continue;
+            };
+            if let Some(content) = self.content(conn, replay, &url, &row) {
+                let height = height.map_or(0, |height| height.max(0) as u64);
+                self.write_content(conn, &url, &row, Some(&content), height)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+const PAYLOAD_FRAMING_BYTES: u64 = 4096;
+
+/// WIST-3 §6.2.
+fn withdrawn_rows(conn: &Connection, event: &EpochEvent) -> Result<Vec<String>> {
+    let mut urls = Vec::new();
+    for (item_id, _, _) in &event.withdrawals {
+        let mut stmt = conn.prepare("SELECT url FROM records WHERE item_id = ?1")?;
+        for url in stmt.query_map([item_id], |row| row.get::<_, String>(0))? {
+            let url = url?;
+            if !event
+                .materialized
+                .iter()
+                .any(|(affected, _)| *affected == url)
+            {
+                urls.push(url);
+            }
+        }
+    }
+    Ok(urls)
+}
+
+fn record_height(conn: &Connection, url: &str, publisher: &str, height: u64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO record_heights(url, publisher, height) VALUES (?1, ?2, ?3)
+         ON CONFLICT(url, publisher) DO UPDATE SET height = excluded.height",
+        (url, publisher, height as i64),
+    )?;
+    Ok(())
 }
 
 pub fn apply_events(
     conn: &Connection,
     replay: &Replay,
     events: &[EpochEvent],
-    tier1: bool,
+    materializer: &Materializer,
     walked_from: u64,
 ) -> Result<ApplyStats> {
     let mut stats = ApplyStats {
@@ -722,7 +1142,9 @@ pub fn apply_events(
         labels: 0,
     };
     conn.execute_batch(crate::store::CREATE_LABELS)?;
-    if tier1 {
+    conn.execute_batch(crate::store::CREATE_RANKING)?;
+    crate::store::add_record_columns(conn)?;
+    if materializer.tier1 {
         conn.execute_batch(CREATE_TIER1)?;
     }
     for event in events {
@@ -742,9 +1164,6 @@ pub fn apply_events(
         }
         for (item_id, publisher, height) in &event.withdrawals {
             record_withdrawal(conn, item_id, publisher, *height)?;
-            if remove_by_item_id(conn, item_id, *height)?.is_some() {
-                stats.withdrawn += 1;
-            }
         }
         apply_labels(conn, event, &mut stats)?;
         let label_ids: Vec<(String, Option<String>)> = event
@@ -761,6 +1180,8 @@ pub fn apply_events(
             .collect();
         record_sealed(conn, &label_ids, &[])?;
     }
+    let written = materializer.apply(conn, replay, events, &mut stats)?;
+    materializer.retry(conn, replay, &written)?;
     let items: Vec<(String, String, Kind, u64)> = replay
         .sealed_items()
         .sealed()

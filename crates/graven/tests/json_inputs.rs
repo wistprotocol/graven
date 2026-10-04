@@ -110,3 +110,45 @@ fn a_pack_with_a_repeated_member_imports_nothing() {
         .unwrap_or(0);
     assert_eq!(embeddings, 0);
 }
+
+#[test]
+fn a_payload_with_a_repeated_member_never_materializes_its_fields() {
+    let fx = common::build_fixture_without_records();
+    let publisher = common::Signer::new([1u8; 32]);
+    let beta = "https://records.example/beta";
+    let gamma = "https://records.example/gamma";
+    let (beta_item, beta_payload) = common::page(
+        common::RECORDS,
+        beta,
+        common::OBSERVED,
+        &common::Content::of("Beta Title"),
+    );
+    let (gamma_item, gamma_payload) = common::page(
+        common::RECORDS,
+        gamma,
+        common::OBSERVED,
+        &common::Content::of("Gamma Title"),
+    );
+    common::serve_payload(fx.dir.path(), &beta_item, &beta_payload);
+    common::serve_payload(fx.dir.path(), &gamma_item, &gamma_payload);
+    let path = common::payload_path(fx.dir.path(), &beta_item);
+    let original = std::fs::read(&path).unwrap();
+    std::fs::write(&path, duplicate(&original, "title", "\\u0074itle")).unwrap();
+    common::seal_catalog(
+        &fx,
+        &publisher,
+        common::RECORDS,
+        &[beta_item, gamma_item],
+        &[],
+    );
+    let (report, target) = cold_sync(&fx).unwrap();
+    assert_eq!(report.head, 2);
+    let log_dir = common::synced_log_dir(target.path());
+    common::assert_records_materialized(&log_dir);
+    let store = graven::store::Store::open(&log_dir).unwrap();
+    let held = store.get(beta).unwrap().unwrap();
+    assert_eq!(held.title, None, "a rejected Payload supplies no fields");
+    assert_eq!(held.r#abstract, None);
+    let other = store.get(gamma).unwrap().unwrap();
+    assert_eq!(other.title.as_deref(), Some("Gamma Title"));
+}

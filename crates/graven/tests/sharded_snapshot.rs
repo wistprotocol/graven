@@ -40,7 +40,7 @@ fn assert_serves_every_record(sharded: &ShardedFixture, target: &std::path::Path
             .unwrap()
             .unwrap_or_else(|| panic!("{} is served", record.url));
         assert_eq!(held.publisher, record.publisher);
-        assert_eq!(held.title, record.title);
+        assert_eq!(held.title.as_deref(), Some(record.title.as_str()));
     }
 }
 

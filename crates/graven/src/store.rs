@@ -53,7 +53,7 @@ pub const CREATE_STATE_TUPLES: &str =
 /// WIST-4 §9.
 pub const CREATE_PARAMETERS: &str = "CREATE TABLE IF NOT EXISTS parameters(parameter TEXT NOT NULL, value INTEGER NOT NULL, epoch_number INTEGER NOT NULL, entry_index INTEGER NOT NULL, sealed_at_s INTEGER NOT NULL, effective_at_s INTEGER NOT NULL, PRIMARY KEY(parameter, epoch_number, entry_index))";
 
-pub const CREATE_TIER1: &str = "CREATE TABLE IF NOT EXISTS extracts(url TEXT NOT NULL, publisher TEXT NOT NULL, item_id TEXT NOT NULL, extract TEXT NOT NULL, PRIMARY KEY(url, publisher)); CREATE VIRTUAL TABLE IF NOT EXISTS extracts_fts USING fts5(extract, content=extracts, content_rowid=rowid); CREATE TABLE IF NOT EXISTS links(source_url TEXT NOT NULL, target_url TEXT NOT NULL, position INTEGER NOT NULL)";
+pub const CREATE_TIER1: &str = "CREATE TABLE IF NOT EXISTS extracts(url TEXT NOT NULL, publisher TEXT NOT NULL, item_id TEXT NOT NULL, extract TEXT NOT NULL, collection TEXT, PRIMARY KEY(url, publisher)); CREATE VIRTUAL TABLE IF NOT EXISTS extracts_fts USING fts5(extract, content=extracts, content_rowid=rowid); CREATE TABLE IF NOT EXISTS links(source_url TEXT NOT NULL, target_url TEXT NOT NULL, position INTEGER NOT NULL)";
 
 pub const CREATE_EMBEDDINGS: &str = "CREATE TABLE IF NOT EXISTS embeddings(item_id TEXT PRIMARY KEY, url TEXT NOT NULL, publisher TEXT NOT NULL, vector BLOB NOT NULL); CREATE TABLE IF NOT EXISTS pack_meta(id INTEGER PRIMARY KEY CHECK(id = 1), model_json TEXT NOT NULL, metric TEXT NOT NULL, dim INTEGER NOT NULL, imported_at TEXT NOT NULL, key_b64u TEXT NOT NULL)";
 
@@ -102,9 +102,15 @@ pub struct RecordHit {
     pub publisher: String,
     pub item_id: String,
     pub observed_at: String,
-    pub title: String,
+    pub title: Option<String>,
     pub r#abstract: Option<String>,
+    pub collection: Option<String>,
+    pub attested_at: String,
+    pub generated_at: Option<String>,
 }
+
+const HIT_COLUMNS: &str =
+    "r.url, r.publisher, r.item_id, r.observed_at, r.title, r.abstract, r.collection, r.attested_at, r.generated_at";
 
 fn row_to_hit(row: &rusqlite::Row) -> rusqlite::Result<RecordHit> {
     Ok(RecordHit {
@@ -114,6 +120,9 @@ fn row_to_hit(row: &rusqlite::Row) -> rusqlite::Result<RecordHit> {
         observed_at: row.get(3)?,
         title: row.get(4)?,
         r#abstract: row.get(5)?,
+        collection: row.get(6)?,
+        attested_at: row.get(7)?,
+        generated_at: row.get(8)?,
     })
 }
 
@@ -136,9 +145,29 @@ pub struct MergedHit {
     pub publisher: String,
     pub item_id: String,
     pub observed_at: String,
-    pub title: String,
+    pub title: Option<String>,
     pub r#abstract: Option<String>,
+    pub collection: Option<String>,
+    pub attested_at: String,
+    pub generated_at: Option<String>,
     pub provenance: Vec<ProvEntry>,
+}
+
+impl MergedHit {
+    fn of(hit: RecordHit, provenance: Vec<ProvEntry>) -> Self {
+        MergedHit {
+            url: hit.url,
+            publisher: hit.publisher,
+            item_id: hit.item_id,
+            observed_at: hit.observed_at,
+            title: hit.title,
+            r#abstract: hit.r#abstract,
+            collection: hit.collection,
+            attested_at: hit.attested_at,
+            generated_at: hit.generated_at,
+            provenance,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -186,6 +215,22 @@ fn merge_extract(rows: Vec<(ProvEntry, ExtractRow)>) -> Option<(String, Vec<Prov
 
 fn quote_phrase(q: &str) -> String {
     format!("\"{}\"", q.replace('"', "\"\""))
+}
+
+/// WIST-3 §7: a Consumer MUST NOT require a tier-0 column the tier layout does not name.
+pub(crate) fn add_record_columns(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "records")? {
+        conn.execute_batch(CREATE_RECORDS)?;
+    }
+    for column in ["collection", "generated_at"] {
+        let held: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('records') WHERE name = ?1")?
+            .exists([column])?;
+        if !held {
+            conn.execute(&format!("ALTER TABLE records ADD COLUMN {column} TEXT"), [])?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
@@ -254,24 +299,14 @@ fn score_for(metric: &str, a: &[f32], b: &[f32]) -> Result<f64> {
 }
 
 struct SimilarCandidate {
-    item_id: String,
     vector: Vec<u8>,
-    url: String,
-    publisher: String,
-    observed_at: String,
-    title: String,
-    r#abstract: Option<String>,
+    hit: RecordHit,
 }
 
 fn row_to_similar_candidate(row: &rusqlite::Row) -> rusqlite::Result<SimilarCandidate> {
     Ok(SimilarCandidate {
-        item_id: row.get(0)?,
-        vector: row.get(1)?,
-        url: row.get(2)?,
-        publisher: row.get(3)?,
-        observed_at: row.get(4)?,
-        title: row.get(5)?,
-        r#abstract: row.get(6)?,
+        hit: row_to_hit(row)?,
+        vector: row.get(9)?,
     })
 }
 
@@ -287,15 +322,7 @@ fn merge(rows: Vec<(ProvEntry, RecordHit)>) -> Vec<MergedHit> {
     let mut by_url_publisher: BTreeMap<(String, String), MergedHit> = BTreeMap::new();
     for (_, (hit, mut provenance)) in by_item {
         provenance.sort_by(|a, b| a.log_id.cmp(&b.log_id));
-        let candidate = MergedHit {
-            url: hit.url,
-            publisher: hit.publisher,
-            item_id: hit.item_id,
-            observed_at: hit.observed_at,
-            title: hit.title,
-            r#abstract: hit.r#abstract,
-            provenance,
-        };
+        let candidate = MergedHit::of(hit, provenance);
         let key = (candidate.url.clone(), candidate.publisher.clone());
         match by_url_publisher.get(&key) {
             Some(existing)
@@ -367,8 +394,11 @@ pub struct RankedHit {
     pub publisher: String,
     pub item_id: String,
     pub observed_at: String,
-    pub title: String,
+    pub title: Option<String>,
     pub r#abstract: Option<String>,
+    pub collection: Option<String>,
+    pub attested_at: String,
+    pub generated_at: Option<String>,
     pub score: f64,
     pub signals: crate::ranking::Signals,
     pub explanation: Vec<String>,
@@ -525,6 +555,9 @@ impl MultiStore {
                                 observed_at: ranked.hit.observed_at,
                                 title: ranked.hit.title,
                                 r#abstract: ranked.hit.r#abstract,
+                                collection: ranked.hit.collection,
+                                attested_at: ranked.hit.attested_at,
+                                generated_at: ranked.hit.generated_at,
                                 score: ranked.score,
                                 signals: ranked.signals,
                                 explanation: ranked.explanation,
@@ -745,25 +778,25 @@ impl Store {
     pub fn search_scored(&self, q: &str, limit: usize) -> Result<Vec<(RecordHit, f64)>> {
         let phrase = quote_phrase(q);
         let mut scored: Vec<(RecordHit, f64)> = Vec::new();
-        let mut stmt = self.conn.prepare(
-            "SELECT r.url, r.publisher, r.item_id, r.observed_at, r.title, r.abstract, bm25(records_fts)
-             FROM records_fts f JOIN records r ON r.rowid = f.rowid
-             WHERE records_fts MATCH ?1 ORDER BY bm25(records_fts) LIMIT ?2",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {HIT_COLUMNS}, bm25(records_fts)
+                 FROM records_fts f JOIN records r ON r.rowid = f.rowid
+                 WHERE records_fts MATCH ?1 ORDER BY bm25(records_fts) LIMIT ?2"
+        ))?;
         for row in stmt.query_map((phrase.as_str(), limit as i64), |row| {
-            Ok((row_to_hit(row)?, row.get::<_, f64>(6)?))
+            Ok((row_to_hit(row)?, row.get::<_, f64>(9)?))
         })? {
             scored.push(row?);
         }
         if table_exists(&self.conn, "extracts")? {
-            let mut estmt = self.conn.prepare(
-                "SELECT r.url, r.publisher, r.item_id, r.observed_at, r.title, r.abstract, bm25(extracts_fts)
-                 FROM extracts_fts f JOIN extracts e ON e.rowid = f.rowid
-                 JOIN records r ON r.url = e.url AND r.publisher = e.publisher
-                 WHERE extracts_fts MATCH ?1 ORDER BY bm25(extracts_fts) LIMIT ?2",
-            )?;
+            let mut estmt = self.conn.prepare(&format!(
+                "SELECT {HIT_COLUMNS}, bm25(extracts_fts)
+                     FROM extracts_fts f JOIN extracts e ON e.rowid = f.rowid
+                     JOIN records r ON r.url = e.url AND r.publisher = e.publisher
+                     WHERE extracts_fts MATCH ?1 ORDER BY bm25(extracts_fts) LIMIT ?2"
+            ))?;
             for row in estmt.query_map((phrase.as_str(), limit as i64), |row| {
-                Ok((row_to_hit(row)?, row.get::<_, f64>(6)?))
+                Ok((row_to_hit(row)?, row.get::<_, f64>(9)?))
             })? {
                 let (hit, bm25) = row?;
                 match scored.iter_mut().find(|(h, _)| h.item_id == hit.item_id) {
@@ -794,22 +827,22 @@ impl Store {
 
     pub fn search(&self, q: &str, limit: usize) -> Result<Vec<RecordHit>> {
         let phrase = quote_phrase(q);
-        let mut stmt = self.conn.prepare(
-            "SELECT r.url, r.publisher, r.item_id, r.observed_at, r.title, r.abstract
-             FROM records_fts f JOIN records r ON r.rowid = f.rowid
-             WHERE records_fts MATCH ?1 LIMIT ?2",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {HIT_COLUMNS}
+                 FROM records_fts f JOIN records r ON r.rowid = f.rowid
+                 WHERE records_fts MATCH ?1 LIMIT ?2"
+        ))?;
         let mut rows = stmt
             .query_map((phrase.as_str(), limit as i64), row_to_hit)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         if table_exists(&self.conn, "extracts")? {
-            let mut estmt = self.conn.prepare(
-                "SELECT r.url, r.publisher, r.item_id, r.observed_at, r.title, r.abstract
-                 FROM extracts_fts f JOIN extracts e ON e.rowid = f.rowid
-                 JOIN records r ON r.url = e.url AND r.publisher = e.publisher
-                 WHERE extracts_fts MATCH ?1 LIMIT ?2",
-            )?;
+            let mut estmt = self.conn.prepare(&format!(
+                "SELECT {HIT_COLUMNS}
+                     FROM extracts_fts f JOIN extracts e ON e.rowid = f.rowid
+                     JOIN records r ON r.url = e.url AND r.publisher = e.publisher
+                     WHERE extracts_fts MATCH ?1 LIMIT ?2"
+            ))?;
             let mut seen: std::collections::HashSet<String> =
                 rows.iter().map(|h| h.item_id.clone()).collect();
             for hit in estmt
@@ -847,15 +880,41 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows
-            .into_iter()
-            .filter(|row| {
-                !(row.expires_at.as_deref().zip(head_sealed_at)).is_some_and(|(expiry, head)| {
+        let mut applying = Vec::new();
+        for row in rows {
+            let expired =
+                (row.expires_at.as_deref().zip(head_sealed_at)).is_some_and(|(expiry, head)| {
                     wist_core::publisher_time::compare(expiry, head)
                         != Some(std::cmp::Ordering::Greater)
-                })
-            })
-            .collect())
+                });
+            if !expired && self.binding_applies(&row)? {
+                applying.push(row);
+            }
+        }
+        Ok(applying)
+    }
+
+    /// WIST-2 §3.3: `records` holds the subject URL's materialized record alone, so it is the one
+    /// the rule selects.
+    fn binding_applies(&self, row: &LabelRow) -> Result<bool> {
+        if row.delta.is_none() {
+            return Ok(true);
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT publisher, item_id FROM records WHERE url = ?1")?;
+        let held = stmt
+            .query_map([&row.subject], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(wist_core::label::materialized_binding_applies(
+            row.delta.as_deref(),
+            &row.subject,
+            false,
+            held.iter()
+                .map(|(publisher, item_id)| (publisher.as_str(), item_id.as_str(), false)),
+        ))
     }
 
     pub fn label_id_of(&self, row: &LabelRow) -> Result<Option<String>> {
@@ -960,8 +1019,7 @@ impl Store {
     pub fn get(&self, url: &str) -> Result<Option<RecordHit>> {
         self.conn
             .query_row(
-                "SELECT url, publisher, item_id, observed_at, title, abstract
-                 FROM records WHERE url = ?1 LIMIT 1",
+                &format!("SELECT {HIT_COLUMNS} FROM records r WHERE r.url = ?1 LIMIT 1"),
                 [url],
                 row_to_hit,
             )
@@ -1036,17 +1094,17 @@ impl Store {
         };
         let target_vec = blob_to_vec(&target_blob)?;
 
-        let mut stmt = self.conn.prepare(
-            "SELECT e.item_id, e.vector, r.url, r.publisher, r.observed_at, r.title, r.abstract
-             FROM embeddings e JOIN records r ON r.item_id = e.item_id",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {HIT_COLUMNS}, e.vector
+                 FROM embeddings e JOIN records r ON r.item_id = e.item_id"
+        ))?;
         let candidates = stmt
             .query_map([], row_to_similar_candidate)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut scored: Vec<(f64, SimilarCandidate)> = Vec::new();
         for candidate in candidates {
-            if candidate.item_id == self_item_id {
+            if candidate.hit.item_id == self_item_id {
                 continue;
             }
             let vector = blob_to_vec(&candidate.vector)?;
@@ -1057,7 +1115,7 @@ impl Store {
         scored.sort_by(|a, b| {
             b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.item_id.cmp(&b.1.item_id))
+                .then_with(|| a.1.hit.item_id.cmp(&b.1.hit.item_id))
         });
         scored.truncate(k);
 
@@ -1065,15 +1123,7 @@ impl Store {
             scored
                 .into_iter()
                 .map(|(score, candidate)| SimilarHit {
-                    hit: MergedHit {
-                        url: candidate.url,
-                        publisher: candidate.publisher,
-                        item_id: candidate.item_id,
-                        observed_at: candidate.observed_at,
-                        title: candidate.title,
-                        r#abstract: candidate.r#abstract,
-                        provenance: vec![provenance.clone()],
-                    },
+                    hit: MergedHit::of(candidate.hit, vec![provenance.clone()]),
                     score,
                 })
                 .collect(),
@@ -1088,12 +1138,12 @@ mod tests {
     fn seed(dir: &Path) {
         let conn = Connection::open(dir.join("index.sqlite")).unwrap();
         conn.execute_batch(
-            "CREATE TABLE records(url TEXT, publisher TEXT, item_id TEXT, observed_at TEXT, title TEXT, abstract TEXT, lang TEXT);
+            "CREATE TABLE records(url TEXT, publisher TEXT, item_id TEXT, observed_at TEXT, attested_at TEXT, title TEXT, abstract TEXT, lang TEXT, collection TEXT, generated_at TEXT);
              CREATE VIRTUAL TABLE records_fts USING fts5(title, abstract, content=records, content_rowid=rowid);",
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO records(url, publisher, item_id, observed_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO records(url, publisher, item_id, observed_at, attested_at, title, abstract, lang) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7)",
             (
                 "https://example.com/alpha",
                 "example.com",
@@ -1125,7 +1175,7 @@ mod tests {
         let hits = store.search("Alpha", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://example.com/alpha");
-        assert_eq!(hits[0].title, "Alpha Title");
+        assert_eq!(hits[0].title.as_deref(), Some("Alpha Title"));
         assert_eq!(hits[0].r#abstract.as_deref(), Some("Alpha abstract text"));
         assert!(store.search("nonexistent-term", 10).unwrap().is_empty());
     }
@@ -1177,7 +1227,10 @@ mod tests {
             publisher: "example.com".into(),
             item_id: item_id.into(),
             observed_at: observed_at.into(),
-            title: "T".into(),
+            title: Some("T".into()),
+            collection: None,
+            attested_at: observed_at.into(),
+            generated_at: None,
             r#abstract: None,
         }
     }
@@ -1278,12 +1331,12 @@ mod tests {
         std::fs::create_dir_all(log_dir).unwrap();
         let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS records(url TEXT, publisher TEXT, item_id TEXT, observed_at TEXT, title TEXT, abstract TEXT, lang TEXT);
+            "CREATE TABLE IF NOT EXISTS records(url TEXT, publisher TEXT, item_id TEXT, observed_at TEXT, attested_at TEXT, title TEXT, abstract TEXT, lang TEXT, collection TEXT, generated_at TEXT);
              CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(title, abstract, content=records, content_rowid=rowid);",
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO records(url, publisher, item_id, observed_at, title, abstract, lang) VALUES (?1, 'example.com', ?2, ?3, ?4, NULL, 'en')",
+            "INSERT INTO records(url, publisher, item_id, observed_at, attested_at, title, abstract, lang) VALUES (?1, 'example.com', ?2, ?3, ?3, ?4, NULL, 'en')",
             (url, item_id, observed_at, title),
         )
         .unwrap();

@@ -329,3 +329,59 @@ fn sealed_labels_and_disputes_beyond_the_clock_allowance_are_ignored() {
         0
     );
 }
+
+#[test]
+fn a_label_bound_to_an_item_applies_only_while_the_materialized_record_carries_it() {
+    let fx = common::build_fixture_without_records();
+    let target = tempfile::tempdir().unwrap();
+    sync(&fx, target.path());
+    let owner = common::Signer::new([1u8; 32]);
+    let url = "https://records.example/bound";
+    let page = |title: &str| {
+        let (item, payload) = common::page(
+            common::RECORDS,
+            url,
+            common::OBSERVED,
+            &common::Content::of(title),
+        );
+        common::serve_payload(fx.dir.path(), &item, &payload);
+        item
+    };
+    let first = page("First");
+    let labeler = common::Signer::new([2u8; 32]);
+    let (_, bound) = label_entry(
+        &labeler,
+        json!({"wist_version": "1.0.0", "labeler": common::BETA_DOMAIN, "subject": url, "name": "wist:spam", "asserted_at": "2026-08-09T12:30:00Z", "delta": wist_core::item::item_id(&first).unwrap()}),
+    );
+    append_epoch(&fx, &[bound]);
+    sync(&fx, target.path());
+    let log_dir = common::synced_log_dir(target.path());
+    let applying = || {
+        Store::open(&log_dir)
+            .unwrap()
+            .labels_for(url, None)
+            .unwrap()
+    };
+    assert!(
+        applying().is_empty(),
+        "no materialized record carries the Item"
+    );
+
+    common::seal_catalog(&fx, &owner, common::RECORDS, &[first], &[]);
+    sync(&fx, target.path());
+    common::assert_records_materialized(&log_dir);
+    assert_eq!(
+        applying().len(),
+        1,
+        "the materialized record carries the Item"
+    );
+
+    let second = page("Second");
+    common::seal_catalog(&fx, &owner, common::RECORDS, &[second], &[]);
+    sync(&fx, target.path());
+    common::assert_records_materialized(&log_dir);
+    assert!(
+        applying().is_empty(),
+        "the materialized record carries another Item"
+    );
+}

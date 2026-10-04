@@ -77,8 +77,11 @@ fn hit() -> RecordHit {
         publisher: "sub.example".to_string(),
         item_id: format!("sha256:{:064x}", 1),
         observed_at: "2026-08-02T12:00:00Z".to_string(),
-        title: "A".to_string(),
+        title: Some("A".to_string()),
         r#abstract: None,
+        collection: None,
+        attested_at: "2026-08-02T12:00:00Z".to_string(),
+        generated_at: None,
     }
 }
 

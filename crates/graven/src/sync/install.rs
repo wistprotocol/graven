@@ -108,15 +108,14 @@ fn shard_of(publisher: &str, count: usize) -> usize {
     wist_core::snapshot::shard_of(publisher, count) as usize
 }
 
-/// WIST-3 §7: a Consumer MUST NOT require a tier-0 column the tier layout does not name.
-fn add_store_columns(conn: &Connection) -> Result<()> {
-    for column in ["collection", "generated_at"] {
-        let held: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('records') WHERE name = ?1")?
-            .exists([column])?;
-        if !held {
-            conn.execute(&format!("ALTER TABLE records ADD COLUMN {column} TEXT"), [])?;
-        }
+fn drop_withdrawn_rows(conn: &Connection, item_id: &str) -> Result<()> {
+    let urls: Vec<String> = conn
+        .prepare("SELECT url FROM records WHERE item_id = ?1")?
+        .query_map([item_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    conn.execute("DELETE FROM records WHERE item_id = ?1", [item_id])?;
+    for url in urls {
+        super::history::remove_derived(conn, item_id, &url)?;
     }
     Ok(())
 }
@@ -618,7 +617,7 @@ pub(super) fn snapshot(
     ) = snapshot_documents(sources, anchor, dir, from, tier1)?;
 
     let conn = Connection::open(&tmp_sqlite_path)?;
-    add_store_columns(&conn)?;
+    crate::store::add_record_columns(&conn)?;
     conn.execute(CREATE_UNIQUE_INDEX, [])?;
     conn.execute(CREATE_DECLARATIONS, [])?;
 
@@ -679,7 +678,7 @@ pub(super) fn snapshot(
             // Entry.
             StateEntry::Withdrawal(w) => {
                 record_withdrawal(&conn, &w.item_id, &w.publisher, w.sealing_height)?;
-                let _ = super::history::remove_by_item_id(&conn, &w.item_id, w.sealing_height)?;
+                drop_withdrawn_rows(&conn, &w.item_id)?;
             }
             StateEntry::Label(l) => super::persist::adopt_label_tuple(&conn, l)?,
             StateEntry::Dispute(d) => super::persist::adopt_dispute_tuple(&conn, d)?,

@@ -5,7 +5,7 @@ use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cell::{RefCell, RefMut};
@@ -880,13 +880,40 @@ pub fn declaration_entry(publisher: &Signer, domain: &str) -> Value {
 }
 
 pub fn page_item(publisher: &str, url: &str, observed_at: &str) -> Value {
+    page(publisher, url, observed_at, &Content::of(url)).0
+}
+
+pub struct Content<'a> {
+    pub title: &'a str,
+    pub r#abstract: Option<&'a str>,
+    pub extract: &'a str,
+    pub links: &'a [&'a str],
+}
+
+impl<'a> Content<'a> {
+    pub fn of(text: &'a str) -> Self {
+        Content {
+            title: text,
+            r#abstract: None,
+            extract: text,
+            links: &[],
+        }
+    }
+}
+
+/// WIST-1 §3.6.
+pub fn page(publisher: &str, url: &str, observed_at: &str, content: &Content) -> (Value, Value) {
     let salt = b64u_encode(&[5u8; 16]);
+    let mut summary = serde_json::json!({"title": content.title});
+    if let Some(text) = content.r#abstract {
+        summary["abstract"] = text.into();
+    }
     let content = serde_json::json!({
-        "extract": url,
-        "links": {"total": 0, "urls": []},
-        "summary": {"title": url},
+        "extract": content.extract,
+        "links": {"total": content.links.len(), "urls": content.links},
+        "summary": summary,
     });
-    serde_json::json!({
+    let item = serde_json::json!({
         "publisher": publisher,
         "url": url,
         "observed_at": observed_at,
@@ -896,7 +923,215 @@ pub fn page_item(publisher: &str, url: &str, observed_at: &str) -> Value {
             "bytes": jcs::canonicalize(&content).unwrap().len(),
         },
         "meta": {"lang": "en"},
-    })
+    });
+    let payload = serde_json::json!({"wist_version": "1.0.0", "salt": salt, "content": content});
+    (item, payload)
+}
+
+/// WIST-3 §6.1.
+pub fn payload_path(dir: &Path, item: &Value) -> PathBuf {
+    let item_id = wist_core::item::item_id(item).unwrap();
+    dir.join("payloads")
+        .join(format!("{}.json", item_id.trim_start_matches("sha256:")))
+}
+
+pub fn serve_payload(dir: &Path, item: &Value, payload: &Value) {
+    let path = payload_path(dir, item);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, serde_json::to_vec(payload).unwrap()).unwrap();
+}
+
+pub fn scoped_declaration_entry(publisher: &Signer, domain: &str, scope: &[&str]) -> Value {
+    let doc = serde_json::json!({
+        "wist_version": "1.0.0",
+        "domain": domain,
+        "keys": [key_entry(publisher, "2026-08-09T00:00:00Z")],
+        "seq": 0,
+        "subdomain_scope": scope,
+    });
+    let body = sign_envelope(&doc, "publisher", &publisher.kid(), &publisher.sk).unwrap();
+    serde_json::json!({"type": "publisher_declaration", "body": body})
+}
+
+pub fn catalog_entries(
+    signer: &Signer,
+    publisher: &str,
+    generated_at: &str,
+    items: &[Value],
+) -> Vec<Value> {
+    let published = publish(signer, publisher, "default", generated_at, items);
+    std::iter::once(published.catalog)
+        .chain(published.items)
+        .collect()
+}
+
+pub fn withdrawal_entry(log: &Signer, key_id: &str, item: &Value, effective_at: &str) -> Value {
+    let update = serde_json::json!({
+        "wist_version": "1.0.0",
+        "action": "payload_withdrawal",
+        "subject": item["publisher"],
+        "details": {
+            "delta_id": wist_core::item::item_id(item).unwrap(),
+            "legal_basis": "court order",
+            "jurisdiction": "EU",
+        },
+        "effective_at": effective_at,
+    });
+    let body = sign_envelope(&update, "update", key_id, &log.sk).unwrap();
+    serde_json::json!({"type": "registry_update", "body": body})
+}
+
+pub const RECORDS: &str = "records.example";
+pub const OBSERVED: &str = "2026-08-09T12:00:00Z";
+
+pub fn seal_catalog(
+    fx: &Fixture,
+    signer: &Signer,
+    publisher: &str,
+    items: &[Value],
+    extra: &[Value],
+) -> u64 {
+    let at = next_instant(fx);
+    let mut entries = catalog_entries(signer, publisher, &at, items);
+    entries.extend_from_slice(extra);
+    seal_next(fx, &at, &entries)
+}
+
+pub fn sync(fx: &Fixture, target: &Path, tier1: bool) -> graven::sync::SyncReport {
+    graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target,
+        true,
+        tier1,
+    )
+    .unwrap()
+}
+
+pub fn record_row(log_dir: &Path, url: &str) -> Option<(String, String, Option<String>)> {
+    Connection::open(log_dir.join("index.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT publisher, item_id, title FROM records WHERE url = ?1",
+            [url],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .unwrap()
+}
+
+pub fn table_exists(log_dir: &Path, table: &str) -> bool {
+    graven_table_exists(
+        &Connection::open(log_dir.join("index.sqlite")).unwrap(),
+        table,
+    )
+}
+
+pub fn count_where(log_dir: &Path, table: &str, column: &str, value: &str) -> i64 {
+    let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+    if !graven_table_exists(&conn, table) {
+        return 0;
+    }
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+        [value],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn graven_table_exists(conn: &Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+        [table],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap()
+        > 0
+}
+
+pub fn holds_record_tuple(log_dir: &Path, publisher: &str, url: &str) -> bool {
+    state_tuples(log_dir)
+        .iter()
+        .any(|tuple| tuple[0] == "record" && tuple[1] == publisher && tuple[2] == url)
+}
+
+/// WIST-3 §7.
+pub fn assert_records_materialized(log_dir: &Path) {
+    let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+    let state = graven::store::synced_state(log_dir).unwrap();
+    let head = graven::sync::checkpoints::retained(&conn, state.epoch_number)
+        .unwrap()
+        .unwrap();
+    let declarations: String = conn
+        .query_row(
+            "SELECT state FROM declaration_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let declarations = graven::keyset::KeyHistory::from_state(&declarations)
+        .unwrap()
+        .declarations()
+        .clone();
+    let tuples: Vec<StateEntry> = state_tuples(log_dir)
+        .into_iter()
+        .map(|tuple| serde_json::from_value(tuple).unwrap())
+        .collect();
+    let replay = wist_core::sealing::Replay::resumed(
+        head.epoch_number(),
+        head.sealed_at(),
+        declarations,
+        &tuples,
+    )
+    .unwrap();
+    let wanted: Vec<Value> = replay
+        .materialized()
+        .unwrap()
+        .into_iter()
+        .map(|tuple| {
+            let record = replay
+                .records()
+                .record(&tuple.publisher, &tuple.url)
+                .unwrap();
+            serde_json::json!([
+                tuple.url,
+                tuple.publisher,
+                tuple.item_id,
+                tuple.observed_at,
+                tuple.attested_at,
+                record.collection,
+                record.generated_at,
+                record.item["meta"]["lang"],
+            ])
+        })
+        .collect();
+    let mut stmt = conn
+        .prepare(
+            "SELECT url, publisher, item_id, observed_at, attested_at, collection, generated_at, lang
+             FROM records ORDER BY publisher, url",
+        )
+        .unwrap();
+    let held: Vec<Value> = stmt
+        .query_map([], |row| {
+            Ok(serde_json::json!([
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ]))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        held, wanted,
+        "the records rows are the materialized records"
+    );
 }
 
 pub fn removed_item(publisher: &str, url: &str, observed_at: &str) -> Value {
@@ -1228,11 +1463,31 @@ pub fn build_fixture_with_tier1() -> Fixture {
 }
 
 pub fn build_fixture_with_state(extra: Vec<StateEntry>, floor: u64) -> Fixture {
-    build_fixture_state("graven-test-log", 9, false, false, extra, floor, Vec::new())
+    build_fixture_state(
+        "graven-test-log",
+        9,
+        false,
+        false,
+        extra,
+        floor,
+        Some(Vec::new()),
+    )
 }
 
 pub fn build_fixture_with_tier0(records: Vec<RecordFixture>) -> Fixture {
-    build_fixture_state("graven-test-log", 9, false, false, Vec::new(), 0, records)
+    build_fixture_state(
+        "graven-test-log",
+        9,
+        false,
+        false,
+        Vec::new(),
+        0,
+        Some(records),
+    )
+}
+
+pub fn build_fixture_without_records() -> Fixture {
+    build_fixture_state("graven-test-log", 9, false, false, Vec::new(), 0, None)
 }
 
 fn build_fixture_full(
@@ -1248,7 +1503,7 @@ fn build_fixture_full(
         include_tier1,
         Vec::new(),
         0,
-        Vec::new(),
+        Some(Vec::new()),
     )
 }
 
@@ -1259,7 +1514,7 @@ fn build_fixture_state(
     include_tier1: bool,
     extra_state: Vec<StateEntry>,
     floor: u64,
-    extra_records: Vec<RecordFixture>,
+    extra_records: Option<Vec<RecordFixture>>,
 ) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let log = Signer::new([seed; 32]);
@@ -1284,12 +1539,13 @@ fn build_fixture_state(
     };
 
     let snapdir = snapshot_dir(dir.path(), &snapshot_date, 0);
-    let mut tier0_records: Vec<RecordFixture> = if duplicate_tier0_record {
-        vec![record1.clone(), record1.clone()]
-    } else {
-        vec![record1.clone()]
+    let tier0_records: Vec<RecordFixture> = match extra_records {
+        None => Vec::new(),
+        Some(extra) if duplicate_tier0_record => {
+            [vec![record1.clone(), record1.clone()], extra].concat()
+        }
+        Some(extra) => [vec![record1.clone()], extra].concat(),
     };
-    tier0_records.extend(extra_records);
     let sqlite_bytes = write_tier0(&snapdir.join("tier0/index.sqlite"), &tier0_records);
     let content_digest_value = content_digest(&tier0_records);
 

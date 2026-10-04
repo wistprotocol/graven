@@ -573,7 +573,11 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
         &tx,
         &replay,
         &walk.events,
-        context.tier1,
+        &Materializer {
+            sources: context.sources,
+            chain: &chain,
+            tier1: context.tier1,
+        },
         local.epoch_number,
     )?;
     fetch_definitions(
@@ -813,7 +817,11 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
         &installed.conn,
         &replay,
         &events,
-        context.tier1,
+        &Materializer {
+            sources: context.sources,
+            chain: &installed.chain,
+            tier1: context.tier1,
+        },
         anchor.epoch_number(),
     )?;
     fetch_definitions(
