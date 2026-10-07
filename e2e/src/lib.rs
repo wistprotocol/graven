@@ -385,14 +385,25 @@ pub fn serve_sites(
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct RequestLog(Arc<Mutex<Vec<(String, String)>>>);
+pub struct RequestLog(Arc<Mutex<Vec<LoggedRequest>>>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggedRequest {
+    pub host: String,
+    pub path: String,
+    pub octets: u64,
+}
 
 impl RequestLog {
-    fn push(&self, host: &str, path: &str) {
+    fn push(&self, host: &str, path: &str, octets: u64) {
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((host.to_string(), path.to_string()));
+            .push(LoggedRequest {
+                host: host.to_string(),
+                path: path.to_string(),
+                octets,
+            });
     }
 
     pub fn clear(&self) {
@@ -404,10 +415,20 @@ impl RequestLog {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|(requested, _)| requested == host)
-            .map(|(_, path)| path.clone())
+            .filter(|logged| logged.host == host)
+            .map(|logged| logged.path.clone())
             .collect()
     }
+
+    pub fn requests(&self) -> Vec<LoggedRequest> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SiteCounters {
+    pub requests: Arc<AtomicU64>,
+    pub octets: Arc<AtomicU64>,
 }
 
 pub fn serve_sites_logged(
@@ -417,13 +438,28 @@ pub fn serve_sites_logged(
     std::collections::BTreeMap<String, Arc<AtomicU64>>,
     RequestLog,
 ) {
+    let (addr, counters, log) = serve_sites_counted(sites);
+    let requests = counters
+        .into_iter()
+        .map(|(host, counters)| (host, counters.requests))
+        .collect();
+    (addr, requests, log)
+}
+
+pub fn serve_sites_counted(
+    sites: std::collections::BTreeMap<String, PathBuf>,
+) -> (
+    String,
+    std::collections::BTreeMap<String, SiteCounters>,
+    RequestLog,
+) {
     let log = RequestLog::default();
     let recorder = log.clone();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind site proxy");
     let addr = listener.local_addr().expect("local_addr").to_string();
-    let counters: std::collections::BTreeMap<String, Arc<AtomicU64>> = sites
+    let counters: std::collections::BTreeMap<String, SiteCounters> = sites
         .keys()
-        .map(|host| (host.clone(), Arc::new(AtomicU64::new(0))))
+        .map(|host| (host.clone(), SiteCounters::default()))
         .collect();
     let routes = Arc::new((sites, counters.clone()));
     std::thread::spawn(move || {
@@ -457,9 +493,12 @@ pub fn serve_sites_logged(
                 let (dirs, counters) = &*routes;
                 match dirs.get(host) {
                     Some(dir) => {
-                        counters[host].fetch_add(1, Ordering::Relaxed);
-                        recorder.push(host, rel);
-                        respond_file(stream, &dir.join(rel));
+                        let body = std::fs::read(dir.join(rel)).ok();
+                        let octets = body.as_ref().map_or(0, |body| body.len() as u64);
+                        counters[host].requests.fetch_add(1, Ordering::Relaxed);
+                        counters[host].octets.fetch_add(octets, Ordering::Relaxed);
+                        recorder.push(host, rel, octets);
+                        respond_body(stream, body);
                     }
                     None => {
                         let _ = (&stream).write_all(
@@ -473,9 +512,9 @@ pub fn serve_sites_logged(
     (addr, counters, log)
 }
 
-fn respond_file(mut stream: TcpStream, path: &Path) {
-    match std::fs::read(path) {
-        Ok(bytes) => {
+fn respond_body(mut stream: TcpStream, body: Option<Vec<u8>>) {
+    match body {
+        Some(bytes) => {
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 bytes.len()
@@ -483,7 +522,7 @@ fn respond_file(mut stream: TcpStream, path: &Path) {
             let _ = stream.write_all(header.as_bytes());
             let _ = stream.write_all(&bytes);
         }
-        Err(_) => {
+        None => {
             let _ = stream.write_all(
                 b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             );
@@ -1254,11 +1293,22 @@ impl Site {
         key_id: &str,
         key: &wist_core::crypto::SigningKey,
     ) -> Value {
+        let built = wist_core::tree::build(list, &wist_core::tree::TreeBounds::suite())
+            .expect("build the tree files");
+        self.serve_catalog_with_tree(list, &built, generated_at, key_id, key)
+    }
+
+    pub fn serve_catalog_with_tree(
+        &self,
+        list: &[Value],
+        built: &wist_core::tree::Built,
+        generated_at: &str,
+        key_id: &str,
+        key: &wist_core::crypto::SigningKey,
+    ) -> Value {
         let served = self.catalog();
         let served_list = self.served_list();
         let dir = self.collection_dir();
-        let built = wist_core::tree::build(list, &wist_core::tree::TreeBounds::suite())
-            .expect("build the tree files");
         std::fs::create_dir_all(dir.join("tree")).expect("create the tree directory");
         for (hex, octets) in &built.files {
             std::fs::write(dir.join("tree").join(hex), octets).expect("write a tree file");
