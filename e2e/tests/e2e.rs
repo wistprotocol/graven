@@ -391,6 +391,11 @@ impl Grid {
         self.hours_ahead += 1;
         at
     }
+
+    fn skip_to(&mut self, hours_ahead: i64) {
+        assert!(hours_ahead >= self.hours_ahead, "the grid never moves back");
+        self.hours_ahead = hours_ahead;
+    }
 }
 
 fn served_generated_at(site: &Site) -> String {
@@ -2589,6 +2594,1886 @@ fn collection_keys_sign_only_their_own_collection_and_a_removed_delegate_key_sig
     .expect("serve the owner's blog Catalog again");
 
     validate_artifacts(&docs.out, &aggregator.data);
+    record.write();
+    eprintln!("completed in {:?}", started.elapsed());
+}
+
+fn domain_publications<'a>(entries: &'a [Value], host: &str) -> Vec<&'a Value> {
+    entries
+        .iter()
+        .filter(|entry| {
+            (entry["type"] == "publisher_catalog" && entry["body"]["catalog"]["publisher"] == host)
+                || (entry["type"] == "publisher_item" && entry["body"]["item"]["publisher"] == host)
+        })
+        .collect()
+}
+
+fn declare_collection(
+    spake: &Path,
+    clave: &Path,
+    http: &reqwest::blocking::Client,
+    site: &Site,
+    aggregators: &[&Aggregator],
+    grid: &mut Grid,
+    prefix: &str,
+) -> u64 {
+    site.init(spake);
+    ping_all(spake, http, site, aggregators, &[]);
+    let declared_epoch = seal_all(clave, aggregators, &grid.next());
+    site.collection_command(
+        spake,
+        "add",
+        &["--name", &site.collection, "--prefix", prefix, "--confirm"],
+    );
+    declared_epoch
+}
+
+fn instant_from_now(seconds: i64) -> String {
+    jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() + seconds)
+        .expect("the instant is in range")
+        .to_string()
+}
+
+fn serve_bytes(site: &Site, octets: &[u8]) {
+    std::fs::write(site.collection_dir().join("catalog.json"), octets).expect("serve a Catalog");
+}
+
+fn served_bytes(site: &Site) -> Vec<u8> {
+    std::fs::read(site.collection_dir().join("catalog.json")).expect("read the served Catalog")
+}
+
+#[test]
+fn a_stale_catalog_and_one_beyond_the_clock_are_refused_and_an_equal_one_served_again_is_idempotent(
+) {
+    let started = Instant::now();
+    let mut record = RunRecord::new("e2e-catalog-order");
+    let Binaries {
+        spake,
+        clave,
+        graven,
+    } = binaries();
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+
+    let site = Site::new(root, "localhost", "docs");
+    let docs_prefix = format!("https://{}/docs/", site.host);
+    site.write_page(
+        "docs/a.html",
+        &marked_page("Alpha", "alpha notes about quince", &[]),
+    );
+    site.write_page(
+        "docs/b.html",
+        &marked_page("Beta", "beta notes about medlar", &[]),
+    );
+    let a_url = site.url("docs/a.html");
+    let b_url = site.url("docs/b.html");
+    let (proxy_addr, _) = serve_sites(BTreeMap::from([(site.host.clone(), site.out.clone())]));
+    let proxy = format!("http://{proxy_addr}");
+    let aggregator = start_aggregator(
+        &clave,
+        root.join("clave-data"),
+        Some(&suffix_list()),
+        Some(&proxy),
+    );
+    let base = aggregator.base_url.clone();
+    let http = reqwest::blocking::Client::new();
+    let mut grid = Grid::new();
+    let mut refused: Vec<(String, String)> = Vec::new();
+
+    let declared_epoch = declare_collection(
+        &spake,
+        &clave,
+        &http,
+        &site,
+        &[&aggregator],
+        &mut grid,
+        &docs_prefix,
+    );
+    record.exercised("declaration", declared_epoch);
+    site.publish(&spake);
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let first_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("publication", first_epoch);
+    let stale_octets = served_bytes(&site);
+    let stale = site.catalog();
+
+    site.write_page(
+        "docs/a.html",
+        &marked_page("Alpha", "alpha notes about quince revised", &[]),
+    );
+    site.publish(&spake);
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let edit_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("edited_catalog", edit_epoch);
+    let latest = site.catalog();
+    let latest_octets = served_bytes(&site);
+    let latest_id = catalog_id(&latest);
+    let a_item = site.item_id(&a_url);
+    let gdir = root.join("graven-store");
+    follow(&graven, &aggregator, &gdir, true);
+    let held = consumer_records(&gdir, &aggregator.log_id, &site.host);
+    assert_eq!(held.len(), 2, "{held:?}");
+
+    let assert_nothing_sealed = |epoch: u64, case: &str| {
+        let sealed = epoch_entries(&http, &base, epoch);
+        assert!(
+            domain_publications(&sealed, &site.host).is_empty(),
+            "{case} sealed a Catalog or an Item: {sealed:?}"
+        );
+        let (_, state) = head_snapshot_state(&aggregator.data);
+        assert_eq!(
+            latest_catalog(&state, &site),
+            latest,
+            "{case} replaced the latest Catalog"
+        );
+        sync(&graven, &gdir);
+        assert_eq!(
+            consumer_records(&gdir, &aggregator.log_id, &site.host),
+            held,
+            "{case} changed the Consumer's records"
+        );
+        let mut mcp = McpClient::start(&graven, &gdir);
+        assert_eq!(mcp.get_record(&a_url)["item_id"], a_item.as_str(), "{case}");
+        drop(mcp);
+    };
+    let assert_last_accepted = |status: &Value| {
+        let docs = status_collection(status, "docs");
+        assert_eq!(docs["latest"], latest_id.as_str(), "{status}");
+        assert_eq!(docs["accepted"], latest_id.as_str(), "{status}");
+        assert!(
+            docs["waiting"].as_array().is_some_and(Vec::is_empty),
+            "{status}"
+        );
+    };
+
+    serve_bytes(&site, &stale_octets);
+    let stale_id = catalog_id(&stale);
+    refused.push(("WIST2-E05".into(), stale_id.clone()));
+    let status = site.ping_and_wait_allowing(&spake, &http, &aggregator, &allowed(&refused));
+    assert_eq!(
+        status_rejection(&status, "WIST2-E05", &stale_id)["collection"],
+        "docs",
+        "{status}"
+    );
+    assert_last_accepted(&status);
+    let stale_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("stale_catalog_discarded", stale_epoch);
+    assert_nothing_sealed(stale_epoch, "a stale Catalog");
+
+    serve_bytes(&site, &latest_octets);
+    let status = site.ping_and_wait_allowing(&spake, &http, &aggregator, &allowed(&refused));
+    assert!(
+        status["rejections"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|rejection| rejection["id"] != latest_id.as_str()),
+        "the latest Catalog served again was refused: {status}"
+    );
+    assert_last_accepted(&status);
+    let reserved_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("equal_catalog_served_again_is_idempotent", reserved_epoch);
+    assert_nothing_sealed(reserved_epoch, "the latest Catalog served again");
+
+    let docs_kid = site.collection_key_ids()[0].clone();
+    let docs_key = site.signing_key(&docs_kid);
+    let shorter: Vec<Value> = site
+        .served_list()
+        .into_iter()
+        .filter(|item| item["url"] != b_url.as_str())
+        .collect();
+    let equal_instant =
+        site.serve_catalog(&shorter, &served_generated_at(&site), &docs_kid, &docs_key);
+    let equal_instant_id = catalog_id(&equal_instant);
+    assert_ne!(equal_instant_id, latest_id);
+    refused.push(("WIST2-E05".into(), equal_instant_id.clone()));
+    let status = site.ping_and_wait_allowing(&spake, &http, &aggregator, &allowed(&refused));
+    status_rejection(&status, "WIST2-E05", &equal_instant_id);
+    assert_last_accepted(&status);
+    let equal_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("other_catalog_of_an_equal_instant_discarded", equal_epoch);
+    assert_nothing_sealed(equal_epoch, "a Catalog of the latest one's instant");
+    serve_bytes(&site, &latest_octets);
+
+    let ahead = site.serve_catalog(
+        &site.served_list(),
+        &instant_from_now(600 + 3600),
+        &docs_kid,
+        &docs_key,
+    );
+    let ahead_id = catalog_id(&ahead);
+    refused.push(("WIST1-E06".into(), ahead_id.clone()));
+    let status = site.ping_and_wait_allowing(&spake, &http, &aggregator, &allowed(&refused));
+    assert_eq!(
+        status_rejection(&status, "WIST1-E06", &ahead_id)["collection"],
+        "docs",
+        "{status}"
+    );
+    assert_last_accepted(&status);
+    let ahead_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("catalog_beyond_the_clock_refused", ahead_epoch);
+    assert_nothing_sealed(ahead_epoch, "a Catalog beyond the clock rule");
+    serve_bytes(&site, &latest_octets);
+
+    site.write_page(
+        "docs/b.html",
+        &marked_page("Beta", "beta notes about medlar and sloe", &[]),
+    );
+    site.publish(&spake);
+    site.ping_and_wait_allowing(&spake, &http, &aggregator, &allowed(&refused));
+    let next_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("next_catalog_after_the_refusals", next_epoch);
+    let sealed = epoch_entries(&http, &base, next_epoch);
+    let catalogs = entries_of(&sealed, "publisher_catalog");
+    assert_eq!(catalogs.len(), 1, "{sealed:?}");
+    assert_eq!(catalogs[0]["body"], site.catalog());
+    let items = entries_of(&sealed, "publisher_item");
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["body"]["item"]["url"], b_url.as_str());
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    assert_eq!(mcp.get_record(&b_url)["item_id"], site.item_id(&b_url));
+    assert_eq!(mcp.get_record(&a_url)["item_id"], a_item.as_str());
+    assert!(hits_for(&mcp.search("sloe"), &b_url).is_some());
+    drop(mcp);
+
+    validate_artifacts(&site.out, &aggregator.data);
+    record.write();
+    eprintln!("completed in {:?}", started.elapsed());
+}
+
+fn record_tuples(state: &[Value], domain: &str) -> Vec<Value> {
+    state
+        .iter()
+        .filter(|tuple| tuple[0] == "record" && tuple[1] == domain)
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn one_catalog_sealed_by_two_logs_is_one_record_and_the_latest_catalog_decides_between_them() {
+    let started = Instant::now();
+    let mut record = RunRecord::new("e2e-two-logs");
+    let Binaries {
+        spake,
+        clave,
+        graven,
+    } = binaries();
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+
+    let site = Site::new(root, "localhost", "docs");
+    let docs_prefix = format!("https://{}/docs/", site.host);
+    site.write_page(
+        "docs/a.html",
+        &marked_page("Alpha", "alpha notes about bergamot", &[]),
+    );
+    site.write_page(
+        "docs/b.html",
+        &marked_page("Beta", "beta notes about yuzu", &[]),
+    );
+    let a_url = site.url("docs/a.html");
+    let b_url = site.url("docs/b.html");
+    let (proxy_addr, _) = serve_sites(BTreeMap::from([(site.host.clone(), site.out.clone())]));
+    let proxy = format!("http://{proxy_addr}");
+    let first_log = start_aggregator(
+        &clave,
+        root.join("clave-data"),
+        Some(&suffix_list()),
+        Some(&proxy),
+    );
+    let second_log = start_aggregator(
+        &clave,
+        root.join("clave-data-2"),
+        Some(&suffix_list()),
+        Some(&proxy),
+    );
+    let both = [&first_log, &second_log];
+    let http = reqwest::blocking::Client::new();
+    let mut grid = Grid::new();
+
+    let declared_epoch =
+        declare_collection(&spake, &clave, &http, &site, &both, &mut grid, &docs_prefix);
+    record.exercised("declaration", declared_epoch);
+    site.publish(&spake);
+    ping_all(&spake, &http, &site, &both, &[]);
+    let published_epoch = seal_all(&clave, &both, &grid.next());
+    record.exercised("one_catalog_sealed_by_two_logs", published_epoch);
+
+    let served = site.catalog();
+    let sealed: Vec<Vec<Value>> = both
+        .iter()
+        .map(|log| epoch_entries(&http, &log.base_url, published_epoch))
+        .collect();
+    for (log, entries) in both.iter().zip(&sealed) {
+        let catalogs = entries_of(entries, "publisher_catalog");
+        assert_eq!(catalogs.len(), 1, "{}: {entries:?}", log.log_id);
+        assert_eq!(catalogs[0]["body"], served, "{}", log.log_id);
+    }
+    let sealed_ids = |entries: &[Value]| -> Vec<String> {
+        let mut ids: Vec<String> = entries_of(entries, "publisher_item")
+            .iter()
+            .map(|entry| item_id(&entry["body"]["item"]))
+            .collect();
+        ids.sort();
+        ids
+    };
+    let mut served_ids = vec![site.item_id(&a_url), site.item_id(&b_url)];
+    served_ids.sort();
+    assert_eq!(sealed_ids(&sealed[0]), served_ids);
+    assert_eq!(sealed_ids(&sealed[1]), served_ids);
+    let (_, first_state) = head_snapshot_state(&first_log.data);
+    let (_, second_state) = head_snapshot_state(&second_log.data);
+    assert_eq!(
+        record_tuples(&first_state, &site.host),
+        record_tuples(&second_state, &site.host),
+        "the two Logs hold different records of one Catalog"
+    );
+    assert_eq!(
+        latest_catalog(&first_state, &site),
+        latest_catalog(&second_state, &site)
+    );
+
+    let gdir = root.join("graven-store");
+    follow(&graven, &first_log, &gdir, true);
+    follow(&graven, &second_log, &gdir, false);
+    let first_rows = consumer_records(&gdir, &first_log.log_id, &site.host);
+    assert_eq!(
+        first_rows,
+        consumer_records(&gdir, &second_log.log_id, &site.host),
+        "the Consumer holds different records of one Catalog from the two Logs"
+    );
+    assert_eq!(first_rows.len(), 2, "{first_rows:?}");
+    let provenance_logs = |record: &Value| -> Vec<String> {
+        let mut logs: Vec<String> = record["provenance"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p["log_id"].as_str().map(str::to_string))
+            .collect();
+        logs.sort();
+        logs
+    };
+    let mut both_ids = vec![first_log.log_id.clone(), second_log.log_id.clone()];
+    both_ids.sort();
+    let mut mcp = McpClient::start(&graven, &gdir);
+    let a = mcp.get_record(&a_url);
+    assert_eq!(a["item_id"], site.item_id(&a_url), "{a}");
+    assert_eq!(provenance_logs(&a), both_ids, "{a}");
+    let hits = mcp.search("bergamot");
+    assert_eq!(
+        hits.iter()
+            .filter(|hit| hit["url"] == a_url.as_str())
+            .count(),
+        1,
+        "one Catalog sealed by two Logs answers twice: {hits:?}"
+    );
+    drop(mcp);
+
+    site.write_page(
+        "docs/a.html",
+        &marked_page("Alpha", "alpha notes about bergamot and citron", &[]),
+    );
+    site.publish(&spake);
+    site.ping_and_wait(&spake, &http, &first_log);
+    let ahead_epoch = seal_all(&clave, &both, &grid.next());
+    record.exercised("later_catalog_sealed_by_one_log", ahead_epoch);
+    assert!(domain_publications(
+        &epoch_entries(&http, &second_log.base_url, ahead_epoch),
+        &site.host
+    )
+    .is_empty());
+    sync(&graven, &gdir);
+    let edited = site.item_id(&a_url);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    let a = mcp.get_record(&a_url);
+    assert_eq!(
+        a["item_id"],
+        edited.as_str(),
+        "the Consumer did not take the record proved against the latest Catalog: {a}"
+    );
+    assert_eq!(
+        provenance_logs(&a),
+        std::slice::from_ref(&first_log.log_id),
+        "{a}"
+    );
+    drop(mcp);
+
+    site.ping_and_wait(&spake, &http, &second_log);
+    let caught_up_epoch = seal_all(&clave, &both, &grid.next());
+    record.exercised("later_catalog_sealed_by_the_other_log", caught_up_epoch);
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    let a = mcp.get_record(&a_url);
+    assert_eq!(a["item_id"], edited.as_str(), "{a}");
+    assert_eq!(provenance_logs(&a), both_ids, "{a}");
+    drop(mcp);
+
+    site.remove_page("docs/b.html");
+    site.publish(&spake);
+    site.ping_and_wait(&spake, &http, &first_log);
+    let removal_epoch = seal_all(&clave, &both, &grid.next());
+    record.exercised("removal_sealed_by_one_log", removal_epoch);
+    sync(&graven, &gdir);
+    assert!(
+        url_tuple(
+            &head_snapshot_state(&second_log.data).1,
+            "record",
+            &site.host,
+            &b_url
+        )
+        .is_some(),
+        "the Log not pinged removed the record"
+    );
+    let mut mcp = McpClient::start(&graven, &gdir);
+    not_found(&mut mcp, &b_url);
+    drop(mcp);
+    site.ping_and_wait(&spake, &http, &second_log);
+    let removed_epoch = seal_all(&clave, &both, &grid.next());
+    record.exercised("removal_sealed_by_the_other_log", removed_epoch);
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    not_found(&mut mcp, &b_url);
+    assert_eq!(mcp.get_record(&a_url)["item_id"], edited.as_str());
+    drop(mcp);
+
+    validate_artifacts(&site.out, &first_log.data);
+    record.write();
+    eprintln!("completed in {:?}", started.elapsed());
+}
+
+fn listed_item_ids(site: &Site) -> BTreeMap<String, String> {
+    site.served_list()
+        .iter()
+        .map(|item| {
+            (
+                item["url"].as_str().expect("an Item's url").to_string(),
+                item_id(item),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_builder_restored_from_the_served_tree_changes_no_item() {
+    let started = Instant::now();
+    let mut record = RunRecord::new("e2e-restored-builder");
+    let Binaries {
+        spake,
+        clave,
+        graven,
+    } = binaries();
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+
+    let site = Site::new(root, "localhost", "docs");
+    let docs_prefix = format!("https://{}/docs/", site.host);
+    for (page, title, body) in [
+        ("docs/a.html", "Alpha", "alpha notes about lovage"),
+        ("docs/b.html", "Beta", "beta notes about borage"),
+        ("docs/c.html", "Gamma", "gamma notes about chervil"),
+    ] {
+        site.write_page(page, &marked_page(title, body, &[]));
+    }
+    let a_url = site.url("docs/a.html");
+    let (proxy_addr, _) = serve_sites(BTreeMap::from([(site.host.clone(), site.out.clone())]));
+    let proxy = format!("http://{proxy_addr}");
+    let aggregator = start_aggregator(
+        &clave,
+        root.join("clave-data"),
+        Some(&suffix_list()),
+        Some(&proxy),
+    );
+    let base = aggregator.base_url.clone();
+    let http = reqwest::blocking::Client::new();
+    let mut grid = Grid::new();
+
+    let declared_epoch = declare_collection(
+        &spake,
+        &clave,
+        &http,
+        &site,
+        &[&aggregator],
+        &mut grid,
+        &docs_prefix,
+    );
+    record.exercised("declaration", declared_epoch);
+    site.publish(&spake);
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let published_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("publication", published_epoch);
+    let gdir = root.join("graven-store");
+    follow(&graven, &aggregator, &gdir, true);
+    let held = consumer_records(&gdir, &aggregator.log_id, &site.host);
+    let published = listed_item_ids(&site);
+    assert_eq!(published.len(), 3, "{published:?}");
+
+    let restored = Site {
+        host: site.host.clone(),
+        collection: site.collection.clone(),
+        pages: site.pages.clone(),
+        out: site.out.clone(),
+        state: root.join("state-restored"),
+        stream: site.stream.clone(),
+    };
+    std::fs::create_dir_all(&restored.state).expect("create the restored state directory");
+    for entry in std::fs::read_dir(&site.state).expect("read the state directory") {
+        let entry = entry.expect("state directory entry");
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("seed-") || name.starts_with("recovery-seed-") {
+            std::fs::copy(entry.path(), restored.state.join(&name)).expect("copy a key seed");
+        }
+    }
+    let catalog_before = served_bytes(&site);
+    restored.publish(&spake);
+    assert_eq!(
+        listed_item_ids(&restored),
+        published,
+        "the restored Builder lists other Items for unchanged pages"
+    );
+    let resigned = served_bytes(&site) != catalog_before;
+    restored.ping_and_wait(&spake, &http, &aggregator);
+    let restored_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("builder_restored_from_the_served_tree", restored_epoch);
+    let sealed = epoch_entries(&http, &base, restored_epoch);
+    assert!(
+        entries_of(&sealed, "publisher_item").is_empty(),
+        "the restored Builder's Catalog sealed Items: {sealed:?}"
+    );
+    assert_eq!(
+        entries_of(&sealed, "publisher_catalog").len(),
+        usize::from(resigned),
+        "{sealed:?}"
+    );
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert_eq!(latest_catalog(&state, &restored), restored.catalog());
+    assert_collection_complete(&state, &restored);
+    sync(&graven, &gdir);
+    assert_eq!(
+        consumer_records(&gdir, &aggregator.log_id, &site.host)
+            .into_iter()
+            .map(|row| (row.url, row.item_id))
+            .collect::<Vec<_>>(),
+        held.iter()
+            .map(|row| (row.url.clone(), row.item_id.clone()))
+            .collect::<Vec<_>>(),
+        "the Consumer's records changed after the restored Builder published"
+    );
+
+    restored.write_page(
+        "docs/a.html",
+        &marked_page("Alpha", "alpha notes about lovage and sweet cicely", &[]),
+    );
+    restored.publish(&spake);
+    let edited = listed_item_ids(&restored);
+    for (url, id) in &published {
+        if *url == a_url {
+            assert_ne!(edited[url], *id, "the edited page kept its Item");
+        } else {
+            assert_eq!(edited[url], *id, "an unchanged page {url} took a new Item");
+        }
+    }
+    restored.ping_and_wait(&spake, &http, &aggregator);
+    let edit_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("edit_by_the_restored_builder", edit_epoch);
+    let sealed = epoch_entries(&http, &base, edit_epoch);
+    let items = entries_of(&sealed, "publisher_item");
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["body"]["item"]["url"], a_url.as_str());
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    assert_eq!(mcp.get_record(&a_url)["item_id"], edited[&a_url].as_str());
+    assert!(hits_for(&mcp.search("cicely"), &a_url).is_some());
+    drop(mcp);
+
+    validate_artifacts(&site.out, &aggregator.data);
+    record.write();
+    eprintln!("completed in {:?}", started.elapsed());
+}
+
+fn consumer_state_tuples(dir: &Path, log_id: &str) -> Vec<Value> {
+    let conn = rusqlite::Connection::open(log_store_dir(dir, log_id).join("index.sqlite"))
+        .expect("open the Consumer's index");
+    let mut statement = conn
+        .prepare("SELECT tuple FROM state_tuples ORDER BY seq")
+        .expect("read the Consumer's state tuples");
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query the Consumer's state tuples")
+        .map(|tuple| {
+            serde_json::from_str(&tuple.expect("a state tuple")).expect("a state tuple is JSON")
+        })
+        .collect()
+}
+
+fn tuples_of(state: &[Value], kind: &str) -> Vec<Value> {
+    let mut tuples: Vec<Value> = state
+        .iter()
+        .filter(|tuple| tuple[0] == kind)
+        .cloned()
+        .collect();
+    tuples.sort_by_key(|tuple| tuple.to_string());
+    tuples
+}
+
+fn assert_root_recomputes(state: &[Value], host: &str, collection: &str) {
+    let latest = collection_tuple(state, host, collection)[3].clone();
+    let mut items: Vec<Value> = state
+        .iter()
+        .filter(|tuple| tuple[0] == "record" && tuple[1] == host && tuple[4] == collection)
+        .map(|tuple| tuple[3].clone())
+        .collect();
+    let listed: Vec<Value> = state
+        .iter()
+        .filter(|tuple| tuple[0] == "removal" && tuple[1] == host)
+        .map(|tuple| {
+            let removed = json!({
+                "publisher": host,
+                "url": tuple[2],
+                "observed_at": tuple[5],
+                "removed": true,
+            });
+            assert_eq!(
+                item_id(&removed),
+                tuple[3],
+                "the removal state of {} names no Item of kind removed observed at its Catalog's instant",
+                tuple[2]
+            );
+            removed
+        })
+        .collect();
+    items.extend(listed);
+    assert_eq!(
+        format!(
+            "sha256:{}",
+            wist_core::crypto::hex_encode(&wist_core::item::root(&items).expect("root"))
+        ),
+        latest["catalog"]["root"],
+        "the records of {host} {collection} do not recompute its latest Catalog's root"
+    );
+}
+
+fn text_emission(url: &str, title: &str, text: &str) -> Value {
+    json!({
+        "url": url,
+        "lang": "en",
+        "modified": now_rfc3339(),
+        "title": title,
+        "text": text,
+    })
+}
+
+#[test]
+fn a_consumer_resumed_from_a_snapshot_holds_a_masked_record_and_the_replaying_consumers_attested_at(
+) {
+    let started = Instant::now();
+    let mut record = RunRecord::new("e2e-masked-record");
+    let Binaries {
+        spake,
+        clave,
+        graven,
+    } = binaries();
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+
+    let parent = Site::new(root, "localhost", "default");
+    let child = Site::new(root, "sub.localhost", "default");
+    let home_url = parent.url("home.html");
+    let shared_url = child.url("shared.html");
+    child.write_page(
+        "shared.html",
+        &marked_page("Shared", "shared notes the subdomain publishes itself", &[]),
+    );
+    let (proxy_addr, _) = serve_sites(BTreeMap::from([
+        (parent.host.clone(), parent.out.clone()),
+        (child.host.clone(), child.out.clone()),
+    ]));
+    let proxy = format!("http://{proxy_addr}");
+    let aggregator = start_aggregator(
+        &clave,
+        root.join("clave-data"),
+        Some(&suffix_list()),
+        Some(&proxy),
+    );
+    let log_id = aggregator.log_id.clone();
+    let http = reqwest::blocking::Client::new();
+    let mut grid = Grid::new();
+
+    parent.init(&spake);
+    parent.ping_and_wait(&spake, &http, &aggregator);
+    let declared_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("declaration", declared_epoch);
+    let owner = parent.declaration();
+    let owner_kid = parent.owner_key_ids()[0].clone();
+    let mut scoped = owner["publisher"].clone();
+    scoped["seq"] = json!(owner["publisher"]["seq"].as_u64().expect("seq") + 1);
+    scoped["prev_declaration"] =
+        json!(wist_core::declaration::inner_hash(&owner).expect("owner hash"));
+    scoped["subdomain_scope"] = json!([child.host]);
+    let scoped = wist_core::envelope::sign_envelope(
+        &scoped,
+        "publisher",
+        &owner_kid,
+        &parent.signing_key(&owner_kid),
+    )
+    .expect("sign the Declaration scoping the subdomain");
+    std::fs::write(
+        parent.out.join(".well-known/wist/publisher.json"),
+        serde_json::to_vec(&scoped).expect("serialize the Declaration"),
+    )
+    .expect("serve the Declaration scoping the subdomain");
+    parent.ping_and_wait(&spake, &http, &aggregator);
+    let scoped_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("declaration_scoping_a_subdomain", scoped_epoch);
+
+    parent.write_stream(
+        "complete",
+        &[
+            text_emission(&home_url, "Home", "home notes about the parent orchard"),
+            text_emission(&shared_url, "Shared", "shared notes the parent publishes"),
+        ],
+    );
+    parent.apply_stream(&spake);
+    parent.ping_and_wait(&spake, &http, &aggregator);
+    let published_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("parent_publishes_a_subdomain_url", published_epoch);
+    let parent_shared = parent.item_id(&shared_url);
+    let replaying = root.join("graven-replaying");
+    follow(&graven, &aggregator, &replaying, true);
+    let mut mcp = McpClient::start(&graven, &replaying);
+    assert_eq!(
+        mcp.get_record(&shared_url)["publisher"],
+        parent.host.as_str(),
+        "the parent's record is not materialized before the subdomain declares"
+    );
+    drop(mcp);
+
+    child.init(&spake);
+    child.publish(&spake);
+    child.ping_and_wait(&spake, &http, &aggregator);
+    let masking_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised(
+        "subdomain_declares_and_masks_the_parents_record",
+        masking_epoch,
+    );
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    let masked = url_tuple(&state, "record", &parent.host, &shared_url)
+        .unwrap_or_else(|| panic!("the masked record left the Log's state: {state:?}"));
+    assert_eq!(item_id(&masked[3]), parent_shared);
+    assert!(url_tuple(&state, "record", &child.host, &shared_url).is_some());
+    assert_root_recomputes(&state, &parent.host, "default");
+
+    sync(&graven, &replaying);
+    let resumed = root.join("graven-resumed");
+    follow(&graven, &aggregator, &resumed, true);
+    let resumed_floor = graven::store::synced_state(&log_store_dir(&resumed, &log_id))
+        .expect("read the sync state")
+        .walk_floor;
+    assert_eq!(
+        resumed_floor,
+        Some(masking_epoch),
+        "the resumed Consumer was not installed from the Snapshot at the head"
+    );
+    let assert_paths_agree = |stage: &str| {
+        assert_eq!(
+            record_rows(&resumed, &log_id),
+            record_rows(&replaying, &log_id),
+            "{stage}: the resumed and the replaying Consumer hold different records"
+        );
+        let resumed_state = consumer_state_tuples(&resumed, &log_id);
+        let replaying_state = consumer_state_tuples(&replaying, &log_id);
+        for kind in ["record", "removal", "collection"] {
+            assert_eq!(
+                tuples_of(&resumed_state, kind),
+                tuples_of(&replaying_state, kind),
+                "{stage}: the two Consumers hold different {kind} state"
+            );
+        }
+        for consumer_state in [&resumed_state, &replaying_state] {
+            assert_root_recomputes(consumer_state, &parent.host, "default");
+            assert_root_recomputes(consumer_state, &child.host, "default");
+        }
+    };
+    assert_paths_agree("after the masking");
+    let resumed_state = consumer_state_tuples(&resumed, &log_id);
+    assert_eq!(
+        url_tuple(&resumed_state, "record", &parent.host, &shared_url).map(|t| t[3].clone()),
+        Some(masked[3].clone()),
+        "the resumed Consumer holds no masked record"
+    );
+    let answers = |dir: &Path| -> Vec<Value> {
+        let mut mcp = McpClient::start(&graven, dir);
+        let answers = [&home_url, &shared_url]
+            .iter()
+            .map(|url| {
+                let found = mcp.get_record(url);
+                json!([found["publisher"], found["item_id"], found["attested_at"]])
+            })
+            .collect();
+        drop(mcp);
+        answers
+    };
+    let resumed_answers = answers(&resumed);
+    assert_eq!(resumed_answers, answers(&replaying));
+    assert_eq!(resumed_answers[0][2], served_generated_at(&parent).as_str());
+    assert_eq!(resumed_answers[1][0], child.host.as_str());
+    assert_eq!(resumed_answers[1][2], served_generated_at(&child).as_str());
+
+    child.remove_page("shared.html");
+    child.publish(&spake);
+    child.ping_and_wait(&spake, &http, &aggregator);
+    let removal_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("subdomains_own_record_removed", removal_epoch);
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert!(url_tuple(&state, "record", &parent.host, &shared_url).is_some());
+    assert!(url_tuple(&state, "record", &child.host, &shared_url).is_none());
+    sync(&graven, &replaying);
+    sync(&graven, &resumed);
+    assert_paths_agree("after the subdomain's removal");
+    for dir in [&resumed, &replaying] {
+        let mut mcp = McpClient::start(&graven, dir);
+        not_found(&mut mcp, &shared_url);
+        assert_eq!(mcp.get_record(&home_url)["publisher"], parent.host.as_str());
+        drop(mcp);
+    }
+
+    validate_artifacts(&parent.out, &aggregator.data);
+    record.write();
+    eprintln!("completed in {:?}", started.elapsed());
+}
+
+fn label_file(labeler: &Site, id: &str) -> Value {
+    read_json(
+        &labeler
+            .out
+            .join(".well-known/wist/labels")
+            .join(format!("{}.json", id.trim_start_matches("sha256:"))),
+    )
+}
+
+fn serve_earlier_label(labeler: &Site, earlier: &Value) -> Value {
+    let kid = labeler.owner_key_ids()[0].clone();
+    let key = labeler.signing_key(&kid);
+    let label = wist_core::envelope::sign_envelope(earlier, "label", &kid, &key)
+        .expect("sign the earlier Label");
+    let id = wist_core::label::label_id(earlier).expect("compute the Label ID");
+    std::fs::write(
+        labeler
+            .out
+            .join(".well-known/wist/labels")
+            .join(format!("{}.json", id.trim_start_matches("sha256:"))),
+        serde_json::to_vec(&label).expect("serialize the Label"),
+    )
+    .expect("serve the earlier Label");
+    let feed_path = labeler.out.join(".well-known/wist/label-feed.json");
+    let mut feed = read_json(&feed_path)["feed"].clone();
+    wait_until_after(
+        feed["generated_at"]
+            .as_str()
+            .expect("the feed's generated_at"),
+    );
+    feed["generated_at"] = json!(now_rfc3339());
+    feed["deltas"]
+        .as_array_mut()
+        .expect("the feed lists IDs")
+        .push(json!(id));
+    let feed =
+        wist_core::envelope::sign_envelope(&feed, "feed", &kid, &key).expect("sign the Label Feed");
+    std::fs::write(
+        &feed_path,
+        serde_json::to_vec(&feed).expect("serialize the Label Feed"),
+    )
+    .expect("serve the Label Feed");
+    label
+}
+
+fn consumer_rows(dir: &Path, log_id: &str, query: &str, columns: usize) -> Vec<Value> {
+    let conn = rusqlite::Connection::open(log_store_dir(dir, log_id).join("index.sqlite"))
+        .expect("open the Consumer's index");
+    let mut statement = conn.prepare(query).expect("prepare the Consumer query");
+    statement
+        .query_map([], |row| {
+            (0..columns)
+                .map(|column| {
+                    Ok(match row.get::<_, rusqlite::types::Value>(column)? {
+                        rusqlite::types::Value::Null => Value::Null,
+                        rusqlite::types::Value::Integer(n) => json!(n),
+                        rusqlite::types::Value::Text(text) => json!(text),
+                        other => panic!("unexpected column value {other:?}"),
+                    })
+                })
+                .collect::<rusqlite::Result<Vec<Value>>>()
+                .map(Value::Array)
+        })
+        .expect("query the Consumer")
+        .map(|row| row.expect("a Consumer row"))
+        .collect()
+}
+
+fn consumer_label_table(dir: &Path, log_id: &str) -> Vec<Value> {
+    consumer_rows(
+        dir,
+        log_id,
+        "SELECT labeler, subject, name, label_id, value, asserted_at, expires_at, delta, height
+         FROM label_current WHERE retracted = 0 ORDER BY labeler, subject, name",
+        9,
+    )
+}
+
+fn consumer_dispute_table(dir: &Path, log_id: &str) -> Vec<Value> {
+    consumer_rows(
+        dir,
+        log_id,
+        "SELECT label_id, disputant, asserted_at, height FROM dispute_current
+         ORDER BY label_id, disputant",
+        4,
+    )
+}
+
+fn sealed_bodies(entries: &[Value], kind: &str, member: &str) -> Vec<Value> {
+    entries_of(entries, kind)
+        .iter()
+        .map(|entry| entry["body"][member].clone())
+        .collect()
+}
+
+#[test]
+fn a_retracted_label_stays_retracted_against_an_earlier_label_and_both_consumer_paths_agree() {
+    let started = Instant::now();
+    let mut record = RunRecord::new("e2e-label-order");
+    let Binaries {
+        spake,
+        clave,
+        graven,
+    } = binaries();
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+
+    let site = Site::new(root, "localhost", "default");
+    site.write_page(
+        "a.html",
+        &marked_page("Alpha", "alpha notes about samphire", &[]),
+    );
+    site.write_page(
+        "b.html",
+        &marked_page("Beta", "beta notes about purslane", &[]),
+    );
+    let labeler = Site::new(root, "labeler.localhost", "default");
+    let a_url = site.url("a.html");
+    let b_url = site.url("b.html");
+    let (proxy_addr, _) = serve_sites(BTreeMap::from([
+        (site.host.clone(), site.out.clone()),
+        (labeler.host.clone(), labeler.out.clone()),
+    ]));
+    let proxy = format!("http://{proxy_addr}");
+    let aggregator = start_aggregator(
+        &clave,
+        root.join("clave-data"),
+        Some(&suffix_list()),
+        Some(&proxy),
+    );
+    let log_id = aggregator.log_id.clone();
+    let base = aggregator.base_url.clone();
+    let http = reqwest::blocking::Client::new();
+    let mut grid = Grid::new();
+
+    for publisher in [&site, &labeler] {
+        publisher.init(&spake);
+        publisher.publish(&spake);
+        publisher.ping_and_wait(&spake, &http, &aggregator);
+    }
+    let published_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("publication", published_epoch);
+    let replaying = root.join("graven-replaying");
+    follow(&graven, &aggregator, &replaying, true);
+
+    let spam = |args: &[&str]| -> String {
+        let mut full = vec!["--subject", &a_url, "--name", "wist:spam"];
+        full.extend_from_slice(args);
+        label_command(&spake, &labeler, &full)
+    };
+    let first_id = spam(&["--value", "900000"]);
+    let kept_id = label_command(
+        &spake,
+        &labeler,
+        &[
+            "--subject",
+            &b_url,
+            "--name",
+            "wist:spam",
+            "--value",
+            "400000",
+        ],
+    );
+    labeler.ping_and_wait(&spake, &http, &aggregator);
+    let label_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("label", label_epoch);
+    let first = label_file(&labeler, &first_id);
+    let mut sealed_labels =
+        sealed_bodies(&epoch_entries(&http, &base, label_epoch), "label", "label");
+    sealed_labels.sort_by_key(|label| label["subject"].to_string());
+    assert_eq!(
+        sealed_labels,
+        [
+            first["label"].clone(),
+            label_file(&labeler, &kept_id)["label"].clone()
+        ]
+    );
+
+    run(
+        &spake,
+        &[
+            "dispute",
+            "--out",
+            s(&site.out),
+            "--state",
+            s(&site.state),
+            "--label",
+            &first_id,
+            "--subject",
+            &a_url,
+            "--log",
+            "log.localhost",
+            "--height",
+            &label_epoch.to_string(),
+        ],
+    );
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let dispute_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("label_dispute", dispute_epoch);
+    let disputes = sealed_bodies(
+        &epoch_entries(&http, &base, dispute_epoch),
+        "dispute",
+        "dispute",
+    );
+    assert_eq!(disputes.len(), 1, "{disputes:?}");
+    assert_eq!(disputes[0]["label"], first_id.as_str());
+    assert_eq!(disputes[0]["disputant"], site.host.as_str());
+
+    wait_until_after(first["label"]["asserted_at"].as_str().expect("asserted_at"));
+    let retraction_id = spam(&["--retract"]);
+    labeler.ping_and_wait(&spake, &http, &aggregator);
+    let retraction_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("label_removed_by_retraction", retraction_epoch);
+    let retraction = label_file(&labeler, &retraction_id);
+    assert_eq!(retraction["label"]["retracted"], true, "{retraction}");
+    assert_eq!(
+        sealed_bodies(
+            &epoch_entries(&http, &base, retraction_epoch),
+            "label",
+            "label"
+        ),
+        [retraction["label"].clone()]
+    );
+
+    let mut earlier = first["label"].clone();
+    earlier["value"] = json!(500000);
+    assert!(
+        earlier["asserted_at"].as_str() < retraction["label"]["asserted_at"].as_str(),
+        "{earlier} is not earlier than {retraction}"
+    );
+    let earlier_label = serve_earlier_label(&labeler, &earlier);
+    labeler.ping_and_wait(&spake, &http, &aggregator);
+    let earlier_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("label_with_an_earlier_asserted_at", earlier_epoch);
+    assert_eq!(
+        sealed_bodies(
+            &epoch_entries(&http, &base, earlier_epoch),
+            "label",
+            "label"
+        ),
+        [earlier_label["label"].clone()],
+        "the Label with an earlier asserted_at was not sealed"
+    );
+
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    let labels = tuples_of(&state, "label");
+    assert_eq!(labels.len(), 1, "{labels:?}");
+    assert_eq!(labels[0][2], b_url.as_str());
+    assert_eq!(labels[0][8], kept_id.as_str());
+    let dispute_tuples = tuples_of(&state, "dispute");
+    assert_eq!(dispute_tuples.len(), 1, "{dispute_tuples:?}");
+    assert_eq!(dispute_tuples[0][1], first_id.as_str());
+    assert_eq!(dispute_tuples[0][2], site.host.as_str());
+
+    sync(&graven, &replaying);
+    let resumed = root.join("graven-resumed");
+    follow(&graven, &aggregator, &resumed, true);
+    let replaying_labels = consumer_label_table(&replaying, &log_id);
+    assert_eq!(
+        replaying_labels,
+        [json!([
+            labeler.host,
+            b_url,
+            "wist:spam",
+            kept_id,
+            400000,
+            labels[0][5],
+            null,
+            null,
+            label_epoch
+        ])],
+        "the replaying Consumer's label table is not the Log's"
+    );
+    assert_eq!(
+        consumer_label_table(&resumed, &log_id),
+        replaying_labels,
+        "the resumed Consumer's label table differs from the replaying one's"
+    );
+    let replaying_disputes = consumer_dispute_table(&replaying, &log_id);
+    assert_eq!(
+        replaying_disputes,
+        [json!([
+            first_id,
+            site.host,
+            disputes[0]["asserted_at"],
+            dispute_epoch
+        ])]
+    );
+    assert_eq!(
+        consumer_dispute_table(&resumed, &log_id),
+        replaying_disputes
+    );
+    let label_answers = |dir: &Path| -> Vec<Value> {
+        let mut mcp = McpClient::start(&graven, dir);
+        let answers = [&a_url, &b_url]
+            .iter()
+            .map(|url| mcp.tool_call("get_labels", json!({"subject": url, "every_labeler": true})))
+            .map(|labels| {
+                json!(labels
+                    .as_array()
+                    .expect("get_labels returns an array")
+                    .iter()
+                    .map(|label| json!([label["label_id"], label["value"]]))
+                    .collect::<Vec<_>>())
+            })
+            .collect();
+        drop(mcp);
+        answers
+    };
+    let replaying_answers = label_answers(&replaying);
+    assert_eq!(
+        replaying_answers,
+        [json!([]), json!([[kept_id, 400000]])],
+        "the earlier Label applied, or the retraction did not hold"
+    );
+    assert_eq!(label_answers(&resumed), replaying_answers);
+
+    validate_artifacts(&labeler.out, &aggregator.data);
+    record.write();
+    eprintln!("completed in {:?}", started.elapsed());
+}
+
+fn http_status(http: &reqwest::blocking::Client, url: &str) -> u16 {
+    http.get(url)
+        .send()
+        .unwrap_or_else(|e| panic!("GET {url}: {e}"))
+        .status()
+        .as_u16()
+}
+
+#[test]
+fn a_withdrawal_filed_with_two_logs_under_one_legal_basis_is_sealed_by_each() {
+    let started = Instant::now();
+    let mut record = RunRecord::new("e2e-withdrawal");
+    let Binaries {
+        spake,
+        clave,
+        graven,
+    } = binaries();
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+
+    let site = Site::new(root, "localhost", "docs");
+    let docs_prefix = format!("https://{}/docs/", site.host);
+    site.write_page(
+        "docs/a.html",
+        &marked_page("Alpha", "alpha notes about angelica", &[]),
+    );
+    site.write_page(
+        "docs/b.html",
+        &marked_page("Beta", "beta notes about tansy", &[]),
+    );
+    let a_url = site.url("docs/a.html");
+    let b_url = site.url("docs/b.html");
+    let (proxy_addr, _) = serve_sites(BTreeMap::from([(site.host.clone(), site.out.clone())]));
+    let proxy = format!("http://{proxy_addr}");
+    let first_log = start_aggregator(
+        &clave,
+        root.join("clave-data"),
+        Some(&suffix_list()),
+        Some(&proxy),
+    );
+    let second_log = start_aggregator(
+        &clave,
+        root.join("clave-data-2"),
+        Some(&suffix_list()),
+        Some(&proxy),
+    );
+    let both = [&first_log, &second_log];
+    let http = reqwest::blocking::Client::new();
+    let mut grid = Grid::new();
+
+    let declared_epoch =
+        declare_collection(&spake, &clave, &http, &site, &both, &mut grid, &docs_prefix);
+    record.exercised("declaration", declared_epoch);
+    site.publish(&spake);
+    ping_all(&spake, &http, &site, &both, &[]);
+    let published_epoch = seal_all(&clave, &both, &grid.next());
+    record.exercised("publication", published_epoch);
+    let gdir = root.join("graven-store");
+    follow(&graven, &first_log, &gdir, true);
+    follow(&graven, &second_log, &gdir, false);
+
+    let withdrawn = site.served_item(&a_url);
+    let withdrawn_id = item_id(&withdrawn);
+    let payload_file = format!(
+        "{}.json",
+        wist_core::item::payload_name(&withdrawn).expect("the Payload name")
+    );
+    for log in both {
+        assert_eq!(
+            http_status(&http, &format!("{}/payloads/{payload_file}", log.base_url)),
+            200,
+            "{} does not serve the Payload before the withdrawal",
+            log.log_id
+        );
+    }
+    run(
+        &spake,
+        &[
+            "withdraw",
+            "--out",
+            s(&site.out),
+            "--state",
+            s(&site.state),
+            "--collection",
+            &site.collection,
+            "--item-id",
+            &withdrawn_id,
+        ],
+    );
+    assert!(
+        !site
+            .collection_dir()
+            .join("payloads")
+            .join(&payload_file)
+            .exists(),
+        "the Publisher still serves the withdrawn Payload"
+    );
+    let legal_basis = "court order 2026/117";
+    let jurisdiction = "EU";
+    for log in both {
+        run(
+            &clave,
+            &[
+                "withdraw",
+                "--data",
+                s(&log.data),
+                "--domain",
+                &site.host,
+                "--item-id",
+                &withdrawn_id,
+                "--legal-basis",
+                legal_basis,
+                "--jurisdiction",
+                jurisdiction,
+            ],
+        );
+    }
+    let withdrawal_epoch = seal_all(&clave, &both, &grid.next());
+    record.exercised("withdrawal_sealed_by_two_logs", withdrawal_epoch);
+
+    for log in both {
+        let sealed = epoch_entries(&http, &log.base_url, withdrawal_epoch);
+        let acts = sealed_bodies(&sealed, "registry_update", "update");
+        assert_eq!(acts.len(), 1, "{}: {sealed:?}", log.log_id);
+        assert_eq!(acts[0]["action"], "payload_withdrawal", "{}", acts[0]);
+        assert_eq!(acts[0]["subject"], site.host.as_str(), "{}", acts[0]);
+        assert_eq!(
+            acts[0]["details"],
+            json!({
+                "delta_id": withdrawn_id,
+                "legal_basis": legal_basis,
+                "jurisdiction": jurisdiction,
+            }),
+            "{}",
+            acts[0]
+        );
+        let (_, state) = head_snapshot_state(&log.data);
+        assert_eq!(
+            tuples_of(&state, "withdrawal"),
+            [json!([
+                "withdrawal",
+                withdrawn_id,
+                site.host,
+                withdrawal_epoch
+            ])],
+            "{}",
+            log.log_id
+        );
+        assert_eq!(
+            url_tuple(&state, "record", &site.host, &a_url).map(|t| item_id(&t[3])),
+            Some(withdrawn_id.clone()),
+            "the withdrawal removed the record in {}",
+            log.log_id
+        );
+        assert_eq!(
+            http_status(&http, &format!("{}/payloads/{payload_file}", log.base_url)),
+            404,
+            "{} still serves the withdrawn Payload",
+            log.log_id
+        );
+    }
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    not_found(&mut mcp, &a_url);
+    assert!(
+        hits_for(&mcp.search("angelica"), &a_url).is_none(),
+        "the withdrawn content is still searchable"
+    );
+    assert_eq!(mcp.get_record(&b_url)["url"], b_url.as_str());
+    drop(mcp);
+
+    site.publish(&spake);
+    let republished = site.item_id(&a_url);
+    assert_ne!(
+        republished, withdrawn_id,
+        "the Publisher listed the withdrawn Item again"
+    );
+    ping_all(&spake, &http, &site, &both, &[]);
+    let republished_epoch = seal_all(&clave, &both, &grid.next());
+    record.exercised(
+        "content_published_again_under_a_fresh_salt",
+        republished_epoch,
+    );
+    for log in both {
+        let sealed = epoch_entries(&http, &log.base_url, republished_epoch);
+        let items = entries_of(&sealed, "publisher_item");
+        assert_eq!(items.len(), 1, "{}: {sealed:?}", log.log_id);
+        assert_eq!(item_id(&items[0]["body"]["item"]), republished);
+    }
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    let a = mcp.get_record(&a_url);
+    assert_eq!(a["item_id"], republished.as_str(), "{a}");
+    assert_eq!(a["provenance"].as_array().map(Vec::len), Some(2), "{a}");
+    assert!(hits_for(&mcp.search("angelica"), &a_url).is_some());
+    drop(mcp);
+
+    validate_artifacts(&site.out, &first_log.data);
+    record.write();
+    eprintln!("completed in {:?}", started.elapsed());
+}
+
+fn change_parameter(clave: &Path, aggregator: &Aggregator, parameter: &str, value: i64, at: &str) {
+    run(
+        clave,
+        &[
+            "param-change",
+            "--data",
+            s(&aggregator.data),
+            "--parameter",
+            parameter,
+            "--value",
+            &value.to_string(),
+            "--effective-at",
+            at,
+        ],
+    );
+}
+
+#[test]
+fn a_change_above_the_per_domain_capacity_seals_over_several_epochs_and_each_entry_verifies_alone()
+{
+    let started = Instant::now();
+    let mut record = RunRecord::new("e2e-domain-capacity");
+    let Binaries {
+        spake,
+        clave,
+        graven,
+    } = binaries();
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+
+    let site = Site::new(root, "localhost", "docs");
+    let docs_prefix = format!("https://{}/docs/", site.host);
+    let page = |n: usize| format!("docs/page-{n}.html");
+    for n in 1..=2 {
+        site.write_page(
+            &page(n),
+            &marked_page(
+                &format!("Page {n}"),
+                &format!("first notes number {n}"),
+                &[],
+            ),
+        );
+    }
+    let (proxy_addr, _) = serve_sites(BTreeMap::from([(site.host.clone(), site.out.clone())]));
+    let proxy = format!("http://{proxy_addr}");
+    let aggregator = start_aggregator(
+        &clave,
+        root.join("clave-data"),
+        Some(&suffix_list()),
+        Some(&proxy),
+    );
+    let base = aggregator.base_url.clone();
+    let http = reqwest::blocking::Client::new();
+    let mut grid = Grid::new();
+
+    let capacity = 3;
+    // WIST-4 §5: `labeler_epoch_entries_max` never exceeds `domain_epoch_entries_max`, and an
+    // amendment takes effect no earlier than `param_grace_days` (7) after its Epoch's `sealed_at`.
+    let in_force_hours = 7 * 24 + 2;
+    let in_force_at = grid_instant(in_force_hours);
+    change_parameter(
+        &clave,
+        &aggregator,
+        "labeler_epoch_entries_max",
+        capacity,
+        &in_force_at,
+    );
+    let labeler_cap_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("labeler_cap_lowered", labeler_cap_epoch);
+    change_parameter(
+        &clave,
+        &aggregator,
+        "domain_epoch_entries_max",
+        capacity,
+        &in_force_at,
+    );
+    let capacity_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("domain_capacity_lowered", capacity_epoch);
+    grid.skip_to(in_force_hours);
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    for parameter in ["labeler_epoch_entries_max", "domain_epoch_entries_max"] {
+        assert!(
+            state.iter().any(|tuple| tuple[0] == "parameter"
+                && tuple[1] == parameter
+                && tuple[2] == in_force_at.as_str()
+                && tuple[3] == capacity),
+            "no {parameter} amendment in the Snapshot state: {state:?}"
+        );
+    }
+
+    let declared_epoch = declare_collection(
+        &spake,
+        &clave,
+        &http,
+        &site,
+        &[&aggregator],
+        &mut grid,
+        &docs_prefix,
+    );
+    record.exercised("declaration", declared_epoch);
+    site.publish(&spake);
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let published_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("publication_within_the_capacity", published_epoch);
+    assert_eq!(
+        domain_publications(&epoch_entries(&http, &base, published_epoch), &site.host).len(),
+        3
+    );
+    let gdir = root.join("graven-store");
+    follow(&graven, &aggregator, &gdir, true);
+
+    site.remove_page(&page(1));
+    for n in 3..=8 {
+        site.write_page(
+            &page(n),
+            &marked_page(
+                &format!("Page {n}"),
+                &format!("later notes number {n}"),
+                &[],
+            ),
+        );
+    }
+    site.publish(&spake);
+    let changed = site.catalog();
+    let changed_inner: wist_core::objects::Catalog =
+        serde_json::from_value(changed["catalog"].clone()).expect("the Catalog form");
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let mut sealed_items: Vec<Value> = Vec::new();
+    let mut expected = [(1, 1, 1), (0, 0, 3), (0, 0, 2)].into_iter();
+    let mut epochs = Vec::new();
+    while sealed_items.len() < 7 {
+        let epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+        epochs.push(epoch);
+        let sealed = epoch_entries(&http, &base, epoch);
+        let publications = domain_publications(&sealed, &site.host);
+        assert!(
+            publications.len() <= capacity as usize,
+            "Epoch {epoch} carries {} Entries of the domain: {publications:?}",
+            publications.len()
+        );
+        let catalogs = entries_of(&sealed, "publisher_catalog");
+        let items = entries_of(&sealed, "publisher_item");
+        let removed = items
+            .iter()
+            .filter(|entry| entry["body"]["item"]["removed"] == true)
+            .count();
+        assert_eq!(
+            Some((catalogs.len(), removed, items.len() - removed)),
+            expected.next(),
+            "Epoch {epoch} does not take the capacity Catalogs first, then removals, then pages: {sealed:?}"
+        );
+        if let Some(catalog) = catalogs.first() {
+            assert_eq!(catalog["body"], changed);
+        }
+        for entry in &items {
+            assert_eq!(entry["body"]["catalog"], catalog_id(&changed), "{entry}");
+            wist_core::proof::verify(
+                &entry["body"]["item"],
+                &entry["body"]["proof"],
+                &changed_inner,
+            )
+            .unwrap_or_else(|code| panic!("a sealed Item does not verify alone: {code}: {entry}"));
+        }
+        sealed_items.extend(items.into_iter().cloned());
+        if sealed_items.len() < 7 {
+            let status = fetch_status(&http, &base, &site.host).expect("the status of the domain");
+            let waiting = status_collection(&status, "docs")["waiting"].clone();
+            assert_eq!(
+                waiting.as_array().map(Vec::len),
+                Some(7 - sealed_items.len()),
+                "{status}"
+            );
+            assert!(
+                waiting
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .all(|wait| wait["deferrals"] == json!(["capacity"])),
+                "the waiting Items are not deferred by the capacity alone: {status}"
+            );
+        }
+        sync(&graven, &gdir);
+        assert_eq!(
+            consumer_records(&gdir, &aggregator.log_id, &site.host).len(),
+            1 + sealed_items
+                .iter()
+                .filter(|entry| entry["body"]["item"].get("removed").is_none())
+                .count(),
+            "the Consumer's records at Epoch {epoch} are not the sealed ones"
+        );
+    }
+    for (n, epoch) in epochs.iter().enumerate() {
+        record.exercised(&format!("change_above_the_capacity_part_{}", n + 1), *epoch);
+    }
+    assert_eq!(epochs.len(), 3, "{epochs:?}");
+    let mut sealed_urls: Vec<&str> = sealed_items
+        .iter()
+        .filter_map(|entry| entry["body"]["item"]["url"].as_str())
+        .collect();
+    sealed_urls.sort();
+    let mut changed_urls: Vec<String> = [1, 3, 4, 5, 6, 7, 8]
+        .iter()
+        .map(|n| site.url(&page(*n)))
+        .collect();
+    changed_urls.sort();
+    assert_eq!(sealed_urls, changed_urls);
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert_collection_complete(&state, &site);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    not_found(&mut mcp, &site.url(&page(1)));
+    for n in 2..=8 {
+        assert_eq!(
+            mcp.get_record(&site.url(&page(n)))["item_id"],
+            site.item_id(&site.url(&page(n)))
+        );
+    }
+    drop(mcp);
+    let resumed = root.join("graven-resumed");
+    follow(&graven, &aggregator, &resumed, true);
+    assert_eq!(
+        record_rows(&resumed, &aggregator.log_id),
+        record_rows(&gdir, &aggregator.log_id)
+    );
+
+    validate_artifacts(&site.out, &aggregator.data);
+    record.write();
+    eprintln!("completed in {:?}", started.elapsed());
+}
+
+fn waiting_ids(status: &Value, collection: &str) -> Vec<(String, Value)> {
+    status_collection(status, collection)["waiting"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|wait| {
+            (
+                wait["id"].as_str().unwrap_or_default().to_string(),
+                wait["deferrals"].clone(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_recovery_window_queues_catalogs_of_both_keys_and_settlement_seals_the_latest_survivor() {
+    let started = Instant::now();
+    let mut record = RunRecord::new("e2e-recovery");
+    let Binaries {
+        spake,
+        clave,
+        graven,
+    } = binaries();
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+
+    let site = Site::new(root, "localhost", "default");
+    site.write_page(
+        "first.html",
+        &marked_page(
+            "First",
+            "custodian notes published before the recovery",
+            &[],
+        ),
+    );
+    let first_url = site.url("first.html");
+    let fresh_url = site.url("fresh.html");
+    let later_url = site.url("later.html");
+    let stale_url = site.url("stale.html");
+    let (proxy_addr, _) = serve_sites(BTreeMap::from([(site.host.clone(), site.out.clone())]));
+    let proxy = format!("http://{proxy_addr}");
+    let aggregator = start_aggregator(
+        &clave,
+        root.join("clave-data"),
+        Some(&suffix_list()),
+        Some(&proxy),
+    );
+    let base = aggregator.base_url.clone();
+    let http = reqwest::blocking::Client::new();
+    let mut grid = Grid::new();
+    let mut refused: Vec<(String, String)> = Vec::new();
+    let recovery_seed = root.join("offline/recovery.seed");
+
+    site.init(&spake);
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let declared_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("declaration", declared_epoch);
+    run(
+        &spake,
+        &[
+            "recovery-init",
+            "--out",
+            s(&site.out),
+            "--state",
+            s(&site.state),
+            "--seed-out",
+            s(&recovery_seed),
+        ],
+    );
+    let committed = site.declaration();
+    let recovery_kid = committed["publisher"]["recovery_keys"][0]["kid"]
+        .as_str()
+        .unwrap_or_else(|| panic!("recovery-init declared no recovery key: {committed}"))
+        .to_string();
+    site.publish(&spake);
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let published_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("publication_with_a_recovery_key", published_epoch);
+    let gdir = root.join("graven-store");
+    follow(&graven, &aggregator, &gdir, true);
+
+    validate_artifacts(&site.out, &aggregator.data);
+
+    let old_kid = site.owner_key_ids()[0].clone();
+    let old_key = site.signing_key(&old_kid);
+    run(
+        &spake,
+        &[
+            "recover",
+            "--out",
+            s(&site.out),
+            "--state",
+            s(&site.state),
+            "--recovery-seed",
+            s(&recovery_seed),
+        ],
+    );
+    let recovered = site.declaration();
+    assert_eq!(
+        recovered["sig"]["key_id"],
+        recovery_kid.as_str(),
+        "{recovered}"
+    );
+    assert!(
+        !site.owner_key_ids().contains(&old_kid),
+        "the recovery kept the stolen key: {recovered}"
+    );
+    site.write_page(
+        "fresh.html",
+        &marked_page("Fresh", "sturdy notes signed under the recovered key", &[]),
+    );
+    site.publish(&spake);
+    let first_queued = site.catalog();
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let window_hours = grid.hours_ahead;
+    let window_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("recovery_window_opened", window_epoch);
+    let sealed = epoch_entries(&http, &base, window_epoch);
+    assert_eq!(
+        sealed_bodies(&sealed, "publisher_declaration", "publisher"),
+        [recovered["publisher"].clone()]
+    );
+    assert!(
+        domain_publications(&sealed, &site.host).is_empty(),
+        "a Catalog or an Item was sealed in the Epoch opening the window: {sealed:?}"
+    );
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    let window = state_tuple(&state, "recovery_window", &site.host)
+        .unwrap_or_else(|| panic!("no recovery_window tuple: {state:?}"));
+    assert_eq!(window[2], window_epoch, "{window}");
+
+    let mut stale_list = site.served_list();
+    let template = stale_list
+        .iter()
+        .find(|item| item["url"] == fresh_url.as_str())
+        .cloned()
+        .expect("the fresh page's Item");
+    let mut stale_item = template.clone();
+    stale_item["url"] = json!(stale_url);
+    site.serve_payload_as(&template, &stale_item);
+    stale_list.push(stale_item);
+    let spake_catalog = served_bytes(&site);
+    wait_until_after(&served_generated_at(&site));
+    let stale_generated_at = now_rfc3339();
+    let stale = site.serve_catalog(&stale_list, &stale_generated_at, &old_kid, &old_key);
+    let stale_id = catalog_id(&stale);
+    site.ping_and_wait_allowing(&spake, &http, &aggregator, &allowed(&refused));
+    serve_bytes(&site, &spake_catalog);
+    wait_until_after(&stale_generated_at);
+    site.write_page(
+        "later.html",
+        &marked_page("Later", "patient notes published inside the window", &[]),
+    );
+    site.publish(&spake);
+    let survivor = site.catalog();
+    let survivor_id = catalog_id(&survivor);
+    assert_ne!(survivor_id, catalog_id(&first_queued));
+    refused.push(("WIST2-E08".into(), survivor_id.clone()));
+    let status = site.ping_and_wait_allowing(&spake, &http, &aggregator, &allowed(&refused));
+    let waiting = waiting_ids(&status, "default");
+    for id in [&survivor_id, &stale_id] {
+        assert!(
+            waiting.iter().any(|(waiting_id, _)| waiting_id == id),
+            "the window does not queue {id}: {status}"
+        );
+    }
+    let open_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("catalogs_of_both_keys_queued_in_the_window", open_epoch);
+    let sealed = epoch_entries(&http, &base, open_epoch);
+    assert!(
+        domain_publications(&sealed, &site.host).is_empty(),
+        "a Catalog or an Item was sealed inside the window: {sealed:?}"
+    );
+    let status = fetch_status(&http, &base, &site.host).expect("the status of the domain");
+    assert!(
+        waiting_ids(&status, "default")
+            .iter()
+            .all(|(_, deferrals)| *deferrals == json!(["recovery_window"])),
+        "what the window holds is not deferred by the window alone: {status}"
+    );
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert_eq!(
+        state_tuple(&state, "recovery_window", &site.host).map(|t| t[2].clone()),
+        Some(json!(window_epoch))
+    );
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    assert_eq!(mcp.get_record(&first_url)["url"], first_url.as_str());
+    for queued in [&fresh_url, &later_url, &stale_url] {
+        not_found(&mut mcp, queued);
+    }
+    drop(mcp);
+
+    // WIST-1 §5.2: the window ends `recovery_window_days` (7) after the `sealed_at` of the Epoch
+    // that opened it, and the first Epoch at or after that instant settles the queue.
+    grid.skip_to(window_hours + 7 * 24);
+    let settlement_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("recovery_settlement", settlement_epoch);
+    let sealed = epoch_entries(&http, &base, settlement_epoch);
+    assert_eq!(
+        sealed_bodies(&sealed, "publisher_catalog", "catalog"),
+        [survivor["catalog"].clone()],
+        "settlement did not seal the surviving Catalog of latest instant: {sealed:?}"
+    );
+    let mut sealed_urls: Vec<String> = entries_of(&sealed, "publisher_item")
+        .iter()
+        .map(|entry| {
+            entry["body"]["item"]["url"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    sealed_urls.sort();
+    let mut survivor_urls = vec![fresh_url.clone(), later_url.clone()];
+    survivor_urls.sort();
+    assert_eq!(sealed_urls, survivor_urls);
+    let status = fetch_status(&http, &base, &site.host).expect("the status of the domain");
+    status_rejection(&status, "WIST1-E13", &stale_id);
+    refused.push(("WIST1-E13".into(), stale_id.clone()));
+    assert_eq!(
+        status_collection(&status, "default")["latest"],
+        survivor_id.as_str()
+    );
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert!(
+        state_tuple(&state, "recovery_window", &site.host).is_none(),
+        "the window did not settle: {state:?}"
+    );
+    assert_eq!(latest_catalog(&state, &site), survivor);
+    assert!(url_tuple(&state, "record", &site.host, &stale_url).is_none());
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    for url in [&first_url, &fresh_url, &later_url] {
+        assert_eq!(mcp.get_record(url)["url"], url.as_str());
+    }
+    not_found(&mut mcp, &stale_url);
+    drop(mcp);
+
+    let rotated_seed = root.join("offline/recovery-next.seed");
+    run(
+        &spake,
+        &[
+            "recovery-rotate",
+            "--out",
+            s(&site.out),
+            "--state",
+            s(&site.state),
+            "--recovery-seed",
+            s(&recovery_seed),
+            "--seed-out",
+            s(&rotated_seed),
+        ],
+    );
+    let rotated = site.declaration();
+    assert_eq!(rotated["sig"]["key_id"], recovery_kid.as_str(), "{rotated}");
+    assert_ne!(
+        rotated["publisher"]["recovery_keys"][0]["kid"],
+        recovery_kid.as_str(),
+        "{rotated}"
+    );
+    site.ping_and_wait_allowing(&spake, &http, &aggregator, &allowed(&refused));
+    let rotation_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("recovery_key_rotation", rotation_epoch);
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert_eq!(
+        state_tuple(&state, "declaration", &site.host).map(|t| t[2].clone()),
+        Some(rotated.clone())
+    );
+    assert_eq!(
+        state_tuple(&state, "recovery_window", &site.host).map(|t| t[2].clone()),
+        Some(json!(rotation_epoch)),
+        "the recovery-signed rotation opened no window"
+    );
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    assert_eq!(mcp.get_record(&later_url)["url"], later_url.as_str());
+    drop(mcp);
+
     record.write();
     eprintln!("completed in {:?}", started.elapsed());
 }
