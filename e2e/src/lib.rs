@@ -839,8 +839,23 @@ impl Site {
         format!("https://{}/{page}", self.host)
     }
 
+    pub fn with_collection(&self, collection: &str) -> Site {
+        Site {
+            host: self.host.clone(),
+            collection: collection.to_string(),
+            pages: self.pages.clone(),
+            out: self.out.clone(),
+            state: self.state.clone(),
+            stream: self.stream.clone(),
+        }
+    }
+
     pub fn write_page(&self, page: &str, html: &str) {
-        std::fs::write(self.pages.join(page), html).expect("write a page");
+        let path = self.pages.join(page);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create the page's directory");
+        }
+        std::fs::write(path, html).expect("write a page");
     }
 
     pub fn remove_page(&self, page: &str) {
@@ -1040,6 +1055,216 @@ impl Site {
         status
     }
 
+    pub fn collection_command(&self, spake: &Path, command: &str, args: &[&str]) -> String {
+        let mut full = vec![
+            "collection",
+            command,
+            "--out",
+            s(&self.out),
+            "--state",
+            s(&self.state),
+        ];
+        full.extend_from_slice(args);
+        String::from_utf8_lossy(&run(spake, &full).stdout).to_string()
+    }
+
+    pub fn emit_from(&self, spake: &Path, dir: &Path, base_url: &str, complete: bool) {
+        let mut args = vec![
+            "emit",
+            "--out",
+            s(&self.out),
+            "--state",
+            s(&self.state),
+            "--collection",
+            &self.collection,
+            "--dir",
+            s(dir),
+            "--base-url",
+            base_url,
+            "--output",
+            s(&self.stream),
+        ];
+        if complete {
+            args.push("--complete");
+        }
+        run(spake, &args);
+    }
+
+    pub fn write_stream(&self, mode: &str, lines: &[Value]) {
+        let mut stream = json!({
+            "wist_emission": "1",
+            "publisher": self.host,
+            "collection": self.collection,
+            "mode": mode,
+        })
+        .to_string();
+        for line in lines {
+            stream.push('\n');
+            stream.push_str(&line.to_string());
+        }
+        stream.push('\n');
+        stream.push_str(&json!({"end": true, "count": lines.len()}).to_string());
+        stream.push('\n');
+        std::fs::write(&self.stream, stream).expect("write the Emission stream");
+    }
+
+    pub fn apply_stream(&self, spake: &Path) -> String {
+        let output = run(
+            spake,
+            &[
+                "publish",
+                "--out",
+                s(&self.out),
+                "--state",
+                s(&self.state),
+                "--collection",
+                &self.collection,
+                "--stream",
+                s(&self.stream),
+            ],
+        );
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    pub fn collection_dir(&self) -> PathBuf {
+        self.out
+            .join(".well-known/wist/collections")
+            .join(&self.collection)
+    }
+
+    pub fn declared_collection(&self) -> Value {
+        let declaration = self.declaration();
+        declaration["publisher"]["collections"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|collection| collection["name"] == self.collection.as_str())
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "the served Declaration names no Collection {}: {declaration}",
+                    self.collection
+                )
+            })
+    }
+
+    pub fn collection_key_ids(&self) -> Vec<String> {
+        self.declared_collection()["keys"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|key| key["kid"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    pub fn owner_key_ids(&self) -> Vec<String> {
+        self.declaration()["publisher"]["keys"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|key| key["kid"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    pub fn signing_key(&self, kid: &str) -> wist_core::crypto::SigningKey {
+        let path = self.state.join(format!("seed-{kid}"));
+        let seed: [u8; 32] = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .try_into()
+            .unwrap_or_else(|_| panic!("{} is not a 32-octet seed", path.display()));
+        wist_core::crypto::SigningKey::from_seed(&seed)
+    }
+
+    pub fn served_list(&self) -> Vec<Value> {
+        let catalog: wist_core::objects::Catalog =
+            serde_json::from_value(self.catalog()["catalog"].clone())
+                .expect("the served Catalog has the Catalog form");
+        let tree = self.collection_dir().join("tree");
+        match wist_core::tree::walk(&catalog, &wist_core::tree::TreeBounds::suite(), |hex| {
+            match std::fs::read(tree.join(hex)) {
+                Ok(octets) => wist_core::tree::TreeFetch::Octets(octets),
+                Err(_) => wist_core::tree::TreeFetch::Failed,
+            }
+        }) {
+            wist_core::tree::Walk::Listed(list) => list,
+            other => panic!(
+                "the served tree of {} does not walk: {other:?}",
+                self.collection
+            ),
+        }
+    }
+
+    pub fn serve_payload_as(&self, served: &Value, item: &Value) {
+        let payloads = self.collection_dir().join("payloads");
+        let name = |item: &Value| {
+            format!(
+                "{}.json",
+                wist_core::item::payload_name(item).expect("an Item has a Payload name")
+            )
+        };
+        std::fs::copy(payloads.join(name(served)), payloads.join(name(item)))
+            .expect("serve the Payload under the new Item");
+    }
+
+    pub fn serve_catalog(
+        &self,
+        list: &[Value],
+        generated_at: &str,
+        key_id: &str,
+        key: &wist_core::crypto::SigningKey,
+    ) -> Value {
+        let served = self.catalog();
+        let served_list = self.served_list();
+        let dir = self.collection_dir();
+        let built = wist_core::tree::build(list, &wist_core::tree::TreeBounds::suite())
+            .expect("build the tree files");
+        std::fs::create_dir_all(dir.join("tree")).expect("create the tree directory");
+        for (hex, octets) in &built.files {
+            std::fs::write(dir.join("tree").join(hex), octets).expect("write a tree file");
+        }
+        let root = wist_core::item::root(list).expect("compute the root");
+        let inner = json!({
+            "wist_version": served["catalog"]["wist_version"],
+            "publisher": self.host,
+            "collection": self.collection,
+            "generated_at": generated_at,
+            "size": list.len(),
+            "root": format!("sha256:{}", wist_core::crypto::hex_encode(&root)),
+            "tree": built.tree,
+        });
+        let envelope = wist_core::envelope::sign_envelope(&inner, "catalog", key_id, key)
+            .expect("sign the Catalog");
+        let served_catalog: wist_core::objects::Catalog =
+            serde_json::from_value(served["catalog"].clone()).expect("the served Catalog form");
+        let new_catalog: wist_core::objects::Catalog =
+            serde_json::from_value(inner).expect("the built Catalog form");
+        if let Some(written) = wist_core::change_list::write(
+            Some(wist_core::change_list::Listed {
+                catalog: &served_catalog,
+                list: &served_list,
+            }),
+            wist_core::change_list::Listed {
+                catalog: &new_catalog,
+                list,
+            },
+        )
+        .expect("write the change list")
+        {
+            std::fs::create_dir_all(dir.join("changes")).expect("create the changes directory");
+            std::fs::write(
+                dir.join("changes").join(format!("{}.json", written.name)),
+                written.octets,
+            )
+            .expect("write the change list");
+        }
+        std::fs::write(
+            dir.join("catalog.json"),
+            serde_json::to_vec(&envelope).expect("serialize the Catalog"),
+        )
+        .expect("serve the Catalog");
+        envelope
+    }
+
     pub fn ping(&self, spake: &Path, log_base: &str) {
         run(
             spake,
@@ -1054,6 +1279,115 @@ impl Site {
             ],
         );
     }
+}
+
+pub fn wait_until_after(instant: &str) {
+    poll_until(Duration::from_secs(5), Duration::from_millis(50), || {
+        (now_rfc3339().as_str() > instant).then_some(())
+    });
+}
+
+fn fetch_ok(http: &reqwest::blocking::Client, url: &str) -> Vec<u8> {
+    let response = http
+        .get(url)
+        .send()
+        .unwrap_or_else(|e| panic!("GET {url}: {e}"));
+    assert!(
+        response.status().is_success(),
+        "GET {url} answered {}",
+        response.status()
+    );
+    response
+        .bytes()
+        .unwrap_or_else(|e| panic!("read the body of {url}: {e}"))
+        .to_vec()
+}
+
+pub fn epoch_tree_size(http: &reqwest::blocking::Client, base: &str, epoch: u64) -> u64 {
+    let note = fetch_ok(
+        http,
+        &format!("{base}{}", wist_core::checkpoint::archive_path(epoch)),
+    );
+    wist_core::checkpoint::Checkpoint::parse(&String::from_utf8_lossy(&note))
+        .unwrap_or_else(|e| panic!("parse the Checkpoint of Epoch {epoch}: {e}"))
+        .tree_size()
+}
+
+pub fn sealed_entries(
+    http: &reqwest::blocking::Client,
+    base: &str,
+    from: u64,
+    to: u64,
+) -> Vec<Value> {
+    let mut entries = Vec::new();
+    for bundle in wist_core::tiles::entry_bundles_for_range(from, to, to) {
+        let path = bundle.path();
+        let leaves = wist_core::tiles::decode_entry_bundle_at(
+            &path,
+            &fetch_ok(http, &format!("{base}{path}")),
+        )
+        .unwrap_or_else(|e| panic!("decode the entry bundle {path}: {e}"));
+        let (start, _) = bundle.leaf_range();
+        for (offset, leaf) in leaves.iter().enumerate() {
+            let index = start + offset as u64;
+            if (from..to).contains(&index) {
+                entries.push(
+                    serde_json::from_slice(leaf)
+                        .unwrap_or_else(|e| panic!("parse the Entry at leaf {index}: {e}")),
+                );
+            }
+        }
+    }
+    entries
+}
+
+pub fn epoch_entries(http: &reqwest::blocking::Client, base: &str, epoch: u64) -> Vec<Value> {
+    let from = match epoch.checked_sub(1) {
+        Some(previous) => epoch_tree_size(http, base, previous),
+        None => 0,
+    };
+    sealed_entries(http, base, from, epoch_tree_size(http, base, epoch))
+}
+
+pub fn log_entries(http: &reqwest::blocking::Client, base: &str, epoch: u64) -> Vec<Value> {
+    sealed_entries(http, base, 0, epoch_tree_size(http, base, epoch))
+}
+
+pub fn head_snapshot_state(clave_data: &Path) -> (u64, Vec<Value>) {
+    let index = read_json(&clave_data.join("snapshots/index.json"));
+    let head = index["index"]["snapshots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .max_by_key(|snapshot| snapshot["tree_size"].as_u64())
+        .unwrap_or_else(|| panic!("no Snapshot in {index}"));
+    let manifest_path = clave_data.join(
+        head["manifest_url"]
+            .as_str()
+            .expect("manifest_url")
+            .trim_start_matches('/'),
+    );
+    let manifest = read_json(&manifest_path);
+    let state = read_json(
+        &manifest_path
+            .parent()
+            .expect("the manifest has a directory")
+            .join(
+                manifest["manifest"]["state"]["path"]
+                    .as_str()
+                    .expect("state path"),
+            ),
+    );
+    let epoch = manifest["manifest"]["epoch_number"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the Snapshot manifest states no epoch_number: {manifest}"));
+    (
+        epoch,
+        state["state"]["entries"]
+            .as_array()
+            .expect("state entries")
+            .clone(),
+    )
 }
 
 pub fn read_json(path: &Path) -> Value {

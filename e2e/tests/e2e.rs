@@ -1,8 +1,9 @@
 use e2e::{
-    checkpoint_verifier_key, graven_bin, grid_instant, marked_page, read_json, resolve_sibling_bin,
+    checkpoint_verifier_key, epoch_entries, fetch_status, graven_bin, grid_instant,
+    head_snapshot_state, log_entries, marked_page, now_rfc3339, read_json, resolve_sibling_bin,
     run, run_with_env, s, seal_epoch, serve_sites, start_aggregator, synced_heads,
-    wait_until_status_active, wait_until_unreachable, workspace_root, Aggregator, McpClient, Site,
-    SyncedHead,
+    wait_until_after, wait_until_status_active, wait_until_unreachable, workspace_root, Aggregator,
+    McpClient, Site, SyncedHead,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -1542,6 +1543,1052 @@ fn the_consumer_follows_aggregator_key_rotation_and_refuses_a_snapshot_under_a_r
 
     validate_artifacts(&site.out, &data);
     verify_with_external_tlog_client(&base, &admitted_verifier_key);
+    record.write();
+    eprintln!("completed in {:?}", started.elapsed());
+}
+
+fn entries_of<'a>(entries: &'a [Value], kind: &str) -> Vec<&'a Value> {
+    entries
+        .iter()
+        .filter(|entry| entry["type"] == kind)
+        .collect()
+}
+
+fn url_tuple(state: &[Value], kind: &str, domain: &str, url: &str) -> Option<Value> {
+    state
+        .iter()
+        .find(|tuple| tuple[0] == kind && tuple[1] == domain && tuple[2] == url)
+        .cloned()
+}
+
+fn collection_tuple(state: &[Value], domain: &str, name: &str) -> Value {
+    url_tuple(state, "collection", domain, name)
+        .unwrap_or_else(|| panic!("no collection tuple for {domain} {name}: {state:?}"))
+}
+
+fn catalog_id(envelope: &Value) -> String {
+    wist_core::catalog::catalog_id(&envelope["catalog"]).expect("compute the Catalog ID")
+}
+
+fn item_id(item: &Value) -> String {
+    wist_core::item::item_id(item).expect("compute the Item ID")
+}
+
+fn status_collection(status: &Value, name: &str) -> Value {
+    status["collections"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|collection| collection["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("the status lists no Collection {name}: {status}"))
+}
+
+fn status_rejection(status: &Value, code: &str, id: &str) -> Value {
+    status["rejections"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|rejection| rejection["code"] == code && rejection["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("the status reports no {code} for {id}: {status}"))
+}
+
+fn allowed(refused: &[(String, String)]) -> Vec<(&str, &str)> {
+    refused
+        .iter()
+        .map(|(code, id)| (code.as_str(), id.as_str()))
+        .collect()
+}
+
+fn consumer_records(dir: &Path, log_id: &str, domain: &str) -> Vec<graven::sync::RecordRow> {
+    record_rows(dir, log_id)
+        .into_iter()
+        .filter(|row| row.publisher == domain)
+        .collect()
+}
+
+fn generate_page(served_root: &Path, path: &str, html: &str) {
+    let file = served_root.join(path);
+    std::fs::create_dir_all(file.parent().expect("a page has a directory"))
+        .expect("create the page's directory");
+    std::fs::write(file, html).expect("write a generated page");
+}
+
+fn assert_collection_complete(state: &[Value], site: &Site) {
+    let served = site.catalog();
+    assert_eq!(
+        collection_tuple(state, &site.host, &site.collection)[3],
+        served,
+        "the latest Catalog of {} is not the served one",
+        site.collection
+    );
+    let list = site.served_list();
+    let mut recorded: Vec<Value> = state
+        .iter()
+        .filter(|tuple| {
+            tuple[0] == "record" && tuple[1] == site.host && tuple[4] == site.collection.as_str()
+        })
+        .map(|tuple| tuple[3].clone())
+        .collect();
+    let mut listed_pages: Vec<String> = list
+        .iter()
+        .filter(|item| item.get("removed").is_none())
+        .map(item_id)
+        .collect();
+    let mut recorded_ids: Vec<String> = recorded.iter().map(item_id).collect();
+    listed_pages.sort();
+    recorded_ids.sort();
+    assert_eq!(
+        recorded_ids, listed_pages,
+        "the records of {} are not the page Items of its latest Catalog",
+        site.collection
+    );
+    for removed in list.iter().filter(|item| item.get("removed").is_some()) {
+        let url = removed["url"].as_str().expect("a removed Item's url");
+        let removal = url_tuple(state, "removal", &site.host, url)
+            .unwrap_or_else(|| panic!("no removal state for {url}: {state:?}"));
+        assert_eq!(removal[3], item_id(removed), "{removal}");
+        recorded.push(removed.clone());
+    }
+    assert_eq!(
+        format!(
+            "sha256:{}",
+            wist_core::crypto::hex_encode(&wist_core::item::root(&recorded).expect("root"))
+        ),
+        served["catalog"]["root"],
+        "the records and removal states of {} do not recompute its latest Catalog's root",
+        site.collection
+    );
+}
+
+fn generated_page(n: usize) -> String {
+    format!("docs/page-{n:03}.html")
+}
+
+#[test]
+fn a_declared_collection_seals_its_emissions_and_refuses_an_item_outside_its_scope() {
+    let started = Instant::now();
+    let mut record = RunRecord::new("e2e-declared-collection");
+    let Binaries {
+        spake,
+        clave,
+        graven,
+    } = binaries();
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+
+    let site = Site::new(root, "localhost", "docs");
+    let site_root = format!("https://{}/", site.host);
+    let docs_prefix = format!("{site_root}docs/");
+    let page_url = |n: usize| format!("{site_root}{}", generated_page(n));
+    for n in 1..=100 {
+        generate_page(
+            &site.out,
+            &generated_page(n),
+            &marked_page(
+                &format!("Generated page {n}"),
+                &format!("static generator output number {n}"),
+                &[],
+            ),
+        );
+    }
+    let (proxy_addr, _) = serve_sites(BTreeMap::from([(site.host.clone(), site.out.clone())]));
+    let proxy = format!("http://{proxy_addr}");
+    let aggregator = start_aggregator(
+        &clave,
+        root.join("clave-data"),
+        Some(&suffix_list()),
+        Some(&proxy),
+    );
+    let base = aggregator.base_url.clone();
+    let http = reqwest::blocking::Client::new();
+    let mut grid = Grid::new();
+    let mut refused: Vec<(String, String)> = Vec::new();
+
+    site.init(&spake);
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let declared_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("declaration", declared_epoch);
+
+    site.collection_command(
+        &spake,
+        "add",
+        &["--name", "docs", "--prefix", &docs_prefix, "--confirm"],
+    );
+    site.emit_from(&spake, &site.out, &site_root, true);
+    site.apply_stream(&spake);
+    let status = site.ping_and_wait(&spake, &http, &aggregator);
+    assert_eq!(
+        status_collection(&status, "docs")["accepted"],
+        catalog_id(&site.catalog()),
+        "{status}"
+    );
+    let first_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("first_publication_of_a_generated_site", first_epoch);
+
+    let first_catalog = site.catalog();
+    let sealed = epoch_entries(&http, &base, first_epoch);
+    let catalogs = entries_of(&sealed, "publisher_catalog");
+    assert_eq!(catalogs.len(), 1, "{catalogs:?}");
+    assert_eq!(catalogs[0]["body"], first_catalog);
+    let items = entries_of(&sealed, "publisher_item");
+    assert_eq!(items.len(), 100, "one Item per generated page");
+    assert!(
+        items
+            .iter()
+            .all(|entry| entry["body"]["collection"] == "docs"
+                && entry["body"]["catalog"] == catalog_id(&first_catalog).as_str()
+                && entry["body"]["item"].get("removed").is_none()),
+        "{items:?}"
+    );
+    let status = fetch_status(&http, &base, &site.host).expect("the status of the domain");
+    let docs = status_collection(&status, "docs");
+    assert_eq!(docs["latest"], catalog_id(&first_catalog), "{status}");
+    assert!(
+        docs["waiting"].as_array().is_some_and(Vec::is_empty),
+        "{status}"
+    );
+    let (snapshot_epoch, state) = head_snapshot_state(&aggregator.data);
+    assert_eq!(snapshot_epoch, first_epoch);
+    assert_collection_complete(&state, &site);
+
+    let gdir = root.join("graven-store");
+    follow(&graven, &aggregator, &gdir, true);
+    let rows = consumer_records(&gdir, &aggregator.log_id, &site.host);
+    assert_eq!(rows.len(), 100, "{rows:?}");
+    assert!(
+        rows.iter()
+            .all(|row| row.collection.as_deref() == Some("docs")),
+        "{rows:?}"
+    );
+    let mut mcp = McpClient::start(&graven, &gdir);
+    let seventh = mcp.get_record(&page_url(7));
+    assert_eq!(seventh["item_id"], site.item_id(&page_url(7)), "{seventh}");
+    assert_eq!(seventh["collection"], "docs", "{seventh}");
+    let hits = mcp.search("generator");
+    assert!(
+        !hits.is_empty()
+            && hits.iter().all(|hit| hit["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with(&docs_prefix))),
+        "{hits:?}"
+    );
+    drop(mcp);
+
+    generate_page(
+        &site.out,
+        &generated_page(7),
+        &marked_page(
+            "Generated page 7 revised",
+            "marmalade revision of page seven",
+            &[],
+        ),
+    );
+    std::fs::remove_file(site.out.join(generated_page(42))).expect("remove a generated page");
+    site.emit_from(&spake, &site.out, &site_root, true);
+    site.apply_stream(&spake);
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let edit_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("page_edited_and_page_removed", edit_epoch);
+
+    let edited_catalog = site.catalog();
+    let sealed = epoch_entries(&http, &base, edit_epoch);
+    let catalogs = entries_of(&sealed, "publisher_catalog");
+    assert_eq!(catalogs.len(), 1, "{catalogs:?}");
+    assert_eq!(catalogs[0]["body"], edited_catalog);
+    let items = entries_of(&sealed, "publisher_item");
+    assert_eq!(items.len(), 2, "{items:?}");
+    let edited = items
+        .iter()
+        .find(|entry| entry["body"]["item"]["url"] == page_url(7))
+        .unwrap_or_else(|| panic!("no Item of the edited page: {items:?}"));
+    assert!(edited["body"]["item"].get("removed").is_none(), "{edited}");
+    assert_eq!(item_id(&edited["body"]["item"]), site.item_id(&page_url(7)));
+    let removal = items
+        .iter()
+        .find(|entry| entry["body"]["item"]["url"] == page_url(42))
+        .unwrap_or_else(|| panic!("no Item of the removed page: {items:?}"));
+    assert_eq!(removal["body"]["item"]["removed"], true, "{removal}");
+    let edited_inner: wist_core::objects::Catalog =
+        serde_json::from_value(edited_catalog["catalog"].clone()).expect("the Catalog form");
+    wist_core::proof::verify(
+        &removal["body"]["item"],
+        &removal["body"]["proof"],
+        &edited_inner,
+    )
+    .unwrap_or_else(|code| panic!("the removal is not proved against its Catalog: {code}"));
+    let status = fetch_status(&http, &base, &site.host).expect("the status of the domain");
+    assert_eq!(
+        status_collection(&status, "docs")["latest"],
+        catalog_id(&edited_catalog),
+        "{status}"
+    );
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert!(url_tuple(&state, "record", &site.host, &page_url(42)).is_none());
+    assert_eq!(
+        url_tuple(&state, "removal", &site.host, &page_url(42))
+            .unwrap_or_else(|| panic!("no removal state for the removed page"))[4],
+        catalog_id(&edited_catalog)
+    );
+    assert_collection_complete(&state, &site);
+
+    sync(&graven, &gdir);
+    assert_eq!(
+        consumer_records(&gdir, &aggregator.log_id, &site.host).len(),
+        99
+    );
+    let mut mcp = McpClient::start(&graven, &gdir);
+    assert_eq!(
+        mcp.get_record(&page_url(7))["item_id"],
+        site.item_id(&page_url(7))
+    );
+    assert!(
+        hits_for(&mcp.search("marmalade"), &page_url(7)).is_some(),
+        "the edited page is not searchable by its new text"
+    );
+    not_found(&mut mcp, &page_url(42));
+    drop(mcp);
+
+    let order_url = format!("{docs_prefix}orders/1001");
+    let order_text = "Order 1001 confirmed: two jars of quince preserve leave the warehouse today.";
+    let order_links = [
+        "https://example.org/track/1001",
+        "https://example.net/preserves/quince",
+    ];
+    site.write_stream(
+        "incremental",
+        &[json!({
+            "url": order_url,
+            "lang": "en",
+            "modified": now_rfc3339(),
+            "title": "Order 1001",
+            "text": order_text,
+            "links": order_links,
+        })],
+    );
+    site.apply_stream(&spake);
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let text_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("text_emission_of_a_client_rendered_page", text_epoch);
+
+    let sealed = epoch_entries(&http, &base, text_epoch);
+    assert_eq!(entries_of(&sealed, "publisher_catalog").len(), 1);
+    let items = entries_of(&sealed, "publisher_item");
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["body"]["item"]["url"], order_url.as_str());
+    let order_item = site.served_item(&order_url);
+    assert_eq!(items[0]["body"]["item"], order_item);
+    let payload = read_json(&site.collection_dir().join("payloads").join(format!(
+        "{}.json",
+        wist_core::item::payload_name(&order_item).expect("Payload name")
+    )));
+    assert_eq!(payload["content"]["extract"], order_text, "{payload}");
+    assert_eq!(
+        payload["content"]["links"]["urls"],
+        json!(order_links),
+        "{payload}"
+    );
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    let order_record = url_tuple(&state, "record", &site.host, &order_url)
+        .unwrap_or_else(|| panic!("no record of the text Emission"));
+    assert_eq!(order_record[3], order_item);
+    assert_eq!(order_record[4], "docs");
+
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    assert_eq!(mcp.get_record(&order_url)["item_id"], item_id(&order_item));
+    assert_eq!(mcp.get_extract(&order_url)["extract"], order_text);
+    let links = mcp.tool_call("get_links", json!({"url": order_url}));
+    let links: Vec<(String, i64)> = links
+        .as_array()
+        .unwrap_or_else(|| panic!("get_links returns no array: {links}"))
+        .iter()
+        .map(|link| {
+            (
+                link["target_url"].as_str().unwrap_or_default().to_string(),
+                link["position"].as_i64().unwrap_or(-1),
+            )
+        })
+        .collect();
+    assert_eq!(
+        links,
+        [
+            (order_links[0].to_string(), 0),
+            (order_links[1].to_string(), 1)
+        ]
+    );
+    drop(mcp);
+
+    let private_url = format!("{site_root}private/ledger.html");
+    generate_page(
+        &site.out,
+        "private/ledger.html",
+        &marked_page(
+            "Ledger",
+            "private ledger the generator emits by mistake",
+            &[],
+        ),
+    );
+    site.emit_from(&spake, &site.out, &site_root, false);
+    assert!(
+        !std::fs::read_to_string(&site.stream)
+            .expect("read the emitted stream")
+            .contains(&private_url),
+        "emit wrote a URL its Collection's Scope does not cover"
+    );
+    std::fs::remove_file(site.out.join(generated_page(13))).expect("remove a generated page");
+    site.write_stream(
+        "incremental",
+        &[json!({"url": page_url(13), "removed": true})],
+    );
+    site.apply_stream(&spake);
+    let spake_catalog =
+        std::fs::read(site.collection_dir().join("catalog.json")).expect("read the served Catalog");
+    let mut faulty_list = site.served_list();
+    let template = faulty_list
+        .iter()
+        .find(|item| item["url"] == page_url(21))
+        .cloned()
+        .expect("a page Item to copy");
+    let mut outside = template.clone();
+    outside["url"] = json!(private_url);
+    site.serve_payload_as(&template, &outside);
+    faulty_list.push(outside.clone());
+    wait_until_after(&served_generated_at(&site));
+    let faulty_generated_at = now_rfc3339();
+    let docs_kid = site.collection_key_ids()[0].clone();
+    let faulty = site.serve_catalog(
+        &faulty_list,
+        &faulty_generated_at,
+        &docs_kid,
+        &site.signing_key(&docs_kid),
+    );
+    let outside_id = item_id(&outside);
+    refused.push(("WIST1-E03".into(), outside_id.clone()));
+    let status = site.ping_and_wait_allowing(&spake, &http, &aggregator, &allowed(&refused));
+    let rejection = status_rejection(&status, "WIST1-E03", &outside_id);
+    assert_eq!(rejection["collection"], "docs", "{rejection}");
+    assert_eq!(rejection["urls"], json!([private_url]), "{rejection}");
+    assert_eq!(
+        status_collection(&status, "docs")["accepted"],
+        catalog_id(&faulty),
+        "{status}"
+    );
+    let refusal_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("item_outside_the_scope", refusal_epoch);
+    record.exercised("removal_beside_a_refused_item", refusal_epoch);
+
+    let sealed = epoch_entries(&http, &base, refusal_epoch);
+    let catalogs = entries_of(&sealed, "publisher_catalog");
+    assert_eq!(catalogs.len(), 1, "{catalogs:?}");
+    assert_eq!(catalogs[0]["body"], faulty);
+    let items = entries_of(&sealed, "publisher_item");
+    assert_eq!(
+        items.len(),
+        1,
+        "the removal beside the refused Item is sealed with its Catalog: {items:?}"
+    );
+    assert_eq!(items[0]["body"]["item"]["url"], page_url(13));
+    assert_eq!(items[0]["body"]["item"]["removed"], true);
+    let private_key = wist_core::crypto::hex_encode(&wist_core::item::key(&private_url));
+    let leaked: Vec<Value> = log_entries(&http, &base, refusal_epoch)
+        .into_iter()
+        .filter(|entry| {
+            let text = entry.to_string();
+            text.contains(&private_url) || text.contains(&private_key)
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "sealed Entries name the refused Item: {leaked:?}"
+    );
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert!(url_tuple(&state, "record", &site.host, &private_url).is_none());
+    assert!(url_tuple(&state, "record", &site.host, &page_url(13)).is_none());
+    assert_eq!(
+        url_tuple(&state, "removal", &site.host, &page_url(13))
+            .unwrap_or_else(|| panic!("no removal state beside the refused Item"))[4],
+        catalog_id(&faulty)
+    );
+    let status = fetch_status(&http, &base, &site.host).expect("the status of the domain");
+    assert_eq!(
+        status_collection(&status, "docs")["latest"],
+        catalog_id(&faulty),
+        "{status}"
+    );
+    status_rejection(&status, "WIST1-E03", &outside_id);
+
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    not_found(&mut mcp, &private_url);
+    not_found(&mut mcp, &page_url(13));
+    drop(mcp);
+
+    std::fs::write(site.collection_dir().join("catalog.json"), &spake_catalog)
+        .expect("serve the Publisher's own Catalog again");
+    wait_until_after(&faulty_generated_at);
+    generate_page(
+        &site.out,
+        &generated_page(21),
+        &marked_page(
+            "Generated page 21 revised",
+            "lantern revision of page twenty-one",
+            &[],
+        ),
+    );
+    site.emit_from(&spake, &site.out, &site_root, false);
+    site.apply_stream(&spake);
+    assert!(
+        site.served_list()
+            .iter()
+            .all(|item| item["url"] != private_url.as_str()),
+        "the Publisher's next Catalog lists the refused Item"
+    );
+    refused.push(("WIST2-E08".into(), catalog_id(&site.catalog())));
+    site.ping_and_wait_allowing(&spake, &http, &aggregator, &allowed(&refused));
+    let dropped_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    assert_eq!(
+        status_collection(
+            &fetch_status(&http, &base, &site.host).expect("the status of the domain"),
+            "docs"
+        )["latest"],
+        catalog_id(&site.catalog())
+    );
+    record.exercised("catalog_without_the_refused_item", dropped_epoch);
+    let sealed = epoch_entries(&http, &base, dropped_epoch);
+    assert_eq!(entries_of(&sealed, "publisher_catalog").len(), 1);
+    let items = entries_of(&sealed, "publisher_item");
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["body"]["item"]["url"], page_url(21));
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert_collection_complete(&state, &site);
+
+    sync(&graven, &gdir);
+    assert_eq!(
+        consumer_records(&gdir, &aggregator.log_id, &site.host).len(),
+        99
+    );
+    let mut mcp = McpClient::start(&graven, &gdir);
+    assert!(hits_for(&mcp.search("lantern"), &page_url(21)).is_some());
+    not_found(&mut mcp, &page_url(13));
+    not_found(&mut mcp, &private_url);
+    drop(mcp);
+
+    validate_artifacts(&site.out, &aggregator.data);
+    record.write();
+    eprintln!("completed in {:?}", started.elapsed());
+}
+
+#[test]
+fn a_narrowed_scope_removes_records_at_its_epoch_and_a_reversed_pending_narrowing_removes_none() {
+    let started = Instant::now();
+    let mut record = RunRecord::new("e2e-scope-narrowing");
+    let Binaries {
+        spake,
+        clave,
+        graven,
+    } = binaries();
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+
+    let site = Site::new(root, "localhost", "docs");
+    let prefix = |path: &str| format!("https://{}/{path}/", site.host);
+    site.write_page(
+        "docs/guide.html",
+        &marked_page("Guide", "guide notes about saffron", &[]),
+    );
+    site.write_page(
+        "drafts/plan.html",
+        &marked_page("Plan", "draft plan about cardamom", &[]),
+    );
+    site.write_page(
+        "notes/log.html",
+        &marked_page("Log", "field notes about juniper", &[]),
+    );
+    let guide_url = site.url("docs/guide.html");
+    let plan_url = site.url("drafts/plan.html");
+    let log_url = site.url("notes/log.html");
+    let (proxy_addr, _) = serve_sites(BTreeMap::from([(site.host.clone(), site.out.clone())]));
+    let proxy = format!("http://{proxy_addr}");
+    let aggregator = start_aggregator(
+        &clave,
+        root.join("clave-data"),
+        Some(&suffix_list()),
+        Some(&proxy),
+    );
+    let http = reqwest::blocking::Client::new();
+    let mut grid = Grid::new();
+
+    site.init(&spake);
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let declared_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("declaration", declared_epoch);
+    site.collection_command(
+        &spake,
+        "add",
+        &[
+            "--name",
+            "docs",
+            "--prefix",
+            &prefix("docs"),
+            "--prefix",
+            &prefix("drafts"),
+            "--prefix",
+            &prefix("notes"),
+            "--confirm",
+        ],
+    );
+    site.publish(&spake);
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let published_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("publication", published_epoch);
+    let gdir = root.join("graven-store");
+    follow(&graven, &aggregator, &gdir, true);
+    let all_urls = [&guide_url, &plan_url, &log_url];
+    let assert_recorded = |state: &[Value], urls: &[&String]| {
+        for url in urls {
+            assert!(
+                url_tuple(state, "record", &site.host, url).is_some(),
+                "no record of {url}: {state:?}"
+            );
+        }
+    };
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert_recorded(&state, &all_urls);
+
+    let owner = site.declaration();
+    let owner_seq = owner["publisher"]["seq"].as_u64().expect("owner seq");
+    let thief = wist_core::crypto::SigningKey::from_seed(&[43u8; 32]);
+    let thief_entry = wist_core::objects::PublisherKey::new(
+        &thief.public().to_b64u(),
+        u64::try_from(jiff::Timestamp::now().as_second() - 3600).expect("unix second"),
+        None,
+    );
+    let mut pending_publisher = owner["publisher"].clone();
+    pending_publisher["seq"] = json!(owner_seq + 1);
+    pending_publisher["prev_declaration"] =
+        json!(wist_core::declaration::inner_hash(&owner).expect("owner hash"));
+    pending_publisher["keys"] = json!([thief_entry.clone()]);
+    if let Some(publisher) = pending_publisher.as_object_mut() {
+        publisher.remove("next_keys");
+        publisher.remove("recovery_keys");
+    }
+    for collection in pending_publisher["collections"]
+        .as_array_mut()
+        .expect("the owner's Declaration names Collections")
+    {
+        if let Some(scope) = collection["scope"].as_array_mut() {
+            scope.retain(|entry| entry["url"] != prefix("notes").as_str());
+        }
+    }
+    let pending = wist_core::envelope::sign_envelope(
+        &pending_publisher,
+        "publisher",
+        &thief_entry.kid,
+        &thief,
+    )
+    .expect("sign the pending Declaration");
+    std::fs::write(
+        site.out.join(".well-known/wist/publisher.json"),
+        serde_json::to_vec(&pending).expect("serialize the pending Declaration"),
+    )
+    .expect("serve the pending Declaration");
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let pending_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("pending_declaration_narrowing_the_scope", pending_epoch);
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert_eq!(
+        state_tuple(&state, "declaration", &site.host).map(|t| t[2].clone()),
+        Some(owner.clone()),
+        "the pending Declaration took the Declaration in force"
+    );
+    assert_eq!(
+        state_tuple(&state, "pending_declaration", &site.host).map(|t| t[2].clone()),
+        Some(pending.clone())
+    );
+    assert_recorded(&state, &all_urls);
+    let still_pending_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("pending_narrowing_before_activation", still_pending_epoch);
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert!(state_tuple(&state, "pending_declaration", &site.host).is_some());
+    assert_recorded(&state, &all_urls);
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    assert_eq!(mcp.get_record(&log_url)["url"], log_url);
+    drop(mcp);
+
+    run(
+        &spake,
+        &[
+            "rotate",
+            "--out",
+            s(&site.out),
+            "--state",
+            s(&site.state),
+            "--restore",
+            "--seq",
+            &(owner_seq + 2).to_string(),
+            "--overlap-seconds",
+            "86400",
+        ],
+    );
+    site.sign_due(&spake);
+    let reversed = site.declaration();
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let reversal_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("reversal_of_a_pending_narrowing", reversal_epoch);
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert_eq!(
+        state_tuple(&state, "declaration", &site.host).map(|t| t[2].clone()),
+        Some(reversed)
+    );
+    assert!(state_tuple(&state, "pending_declaration", &site.host).is_none());
+    assert_recorded(&state, &all_urls);
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    for url in all_urls {
+        assert_eq!(mcp.get_record(url)["url"], url.as_str());
+    }
+    drop(mcp);
+    validate_artifacts(&site.out, &aggregator.data);
+
+    site.collection_command(
+        &spake,
+        "scope-remove",
+        &["--name", "docs", "--url", &prefix("drafts"), "--confirm"],
+    );
+    let narrowed = site.declaration();
+    site.ping_and_wait(&spake, &http, &aggregator);
+    let narrowing_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("owner_narrows_the_scope", narrowing_epoch);
+    let sealed = epoch_entries(&http, &aggregator.base_url, narrowing_epoch);
+    let declarations = entries_of(&sealed, "publisher_declaration");
+    assert_eq!(declarations.len(), 1, "{sealed:?}");
+    assert_eq!(declarations[0]["body"], narrowed);
+    assert!(
+        entries_of(&sealed, "publisher_item").is_empty(),
+        "{sealed:?}"
+    );
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    let declaration = state_tuple(&state, "declaration", &site.host).expect("declaration tuple");
+    assert_eq!(declaration[2], narrowed);
+    assert_eq!(declaration[3], narrowing_epoch);
+    assert!(
+        url_tuple(&state, "record", &site.host, &plan_url).is_none(),
+        "the narrowing left the record under the removed prefix"
+    );
+    assert!(
+        url_tuple(&state, "removal", &site.host, &plan_url).is_none(),
+        "a record narrowing removed left a removal state"
+    );
+    assert_recorded(&state, &[&guide_url, &log_url]);
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    not_found(&mut mcp, &plan_url);
+    assert!(hits_for(&mcp.search("cardamom"), &plan_url).is_none());
+    assert_eq!(mcp.get_record(&guide_url)["url"], guide_url);
+    assert_eq!(mcp.get_record(&log_url)["url"], log_url);
+    drop(mcp);
+
+    record.write();
+    eprintln!("completed in {:?}", started.elapsed());
+}
+
+fn latest_catalog(state: &[Value], site: &Site) -> Value {
+    collection_tuple(state, &site.host, &site.collection)[3].clone()
+}
+
+#[test]
+fn collection_keys_sign_only_their_own_collection_and_a_removed_delegate_key_signs_nothing() {
+    let started = Instant::now();
+    let mut record = RunRecord::new("e2e-collection-keys");
+    let Binaries {
+        spake,
+        clave,
+        graven,
+    } = binaries();
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+
+    let docs = Site::new(root, "localhost", "docs");
+    let blog = docs.with_collection("blog");
+    let docs_prefix = format!("https://{}/docs/", docs.host);
+    let blog_prefix = format!("https://{}/blog/", docs.host);
+    docs.write_page(
+        "docs/guide.html",
+        &marked_page("Guide", "guide about tamarind", &[]),
+    );
+    docs.write_page(
+        "blog/first.html",
+        &marked_page("First post", "first post about sorrel", &[]),
+    );
+    docs.write_page(
+        "blog/second.html",
+        &marked_page("Second post", "second post about fennel", &[]),
+    );
+    let guide_url = docs.url("docs/guide.html");
+    let first_url = docs.url("blog/first.html");
+    let second_url = docs.url("blog/second.html");
+    let (proxy_addr, _) = serve_sites(BTreeMap::from([(docs.host.clone(), docs.out.clone())]));
+    let proxy = format!("http://{proxy_addr}");
+    let aggregator = start_aggregator(
+        &clave,
+        root.join("clave-data"),
+        Some(&suffix_list()),
+        Some(&proxy),
+    );
+    let base = aggregator.base_url.clone();
+    let http = reqwest::blocking::Client::new();
+    let mut grid = Grid::new();
+    let mut refused: Vec<(String, String)> = Vec::new();
+
+    docs.init(&spake);
+    docs.ping_and_wait(&spake, &http, &aggregator);
+    let declared_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("declaration", declared_epoch);
+    docs.collection_command(
+        &spake,
+        "add",
+        &["--name", "docs", "--prefix", &docs_prefix, "--confirm"],
+    );
+    docs.publish(&spake);
+    docs.ping_and_wait(&spake, &http, &aggregator);
+    let docs_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("first_collection_with_its_own_key", docs_epoch);
+    blog.collection_command(
+        &spake,
+        "add",
+        &["--name", "blog", "--prefix", &blog_prefix, "--no-key"],
+    );
+    blog.sign_due(&spake);
+    blog.ping_and_wait(&spake, &http, &aggregator);
+    blog.collection_command(&spake, "key-add", &["--name", "blog"]);
+    blog.publish(&spake);
+    blog.ping_and_wait(&spake, &http, &aggregator);
+    let keyed_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("second_collection_keyed_by_key_add", keyed_epoch);
+
+    let docs_kid = docs.collection_key_ids()[0].clone();
+    let blog_kid = blog.collection_key_ids()[0].clone();
+    let owner_kids = docs.owner_key_ids();
+    assert_ne!(docs_kid, blog_kid);
+    assert!(!owner_kids.contains(&docs_kid) && !owner_kids.contains(&blog_kid));
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    for (site, kid, prefix, urls) in [
+        (&docs, &docs_kid, &docs_prefix, vec![&guide_url]),
+        (
+            &blog,
+            &blog_kid,
+            &blog_prefix,
+            vec![&first_url, &second_url],
+        ),
+    ] {
+        let latest = latest_catalog(&state, site);
+        assert_eq!(latest, site.catalog());
+        assert_eq!(latest["sig"]["key_id"], kid.as_str(), "{latest}");
+        assert!(
+            site.served_list().iter().all(|item| item["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with(prefix.as_str()))),
+            "the Catalog of {} lists a URL outside its Scope",
+            site.collection
+        );
+        for url in urls {
+            let tuple = url_tuple(&state, "record", &site.host, url)
+                .unwrap_or_else(|| panic!("no record of {url}: {state:?}"));
+            assert_eq!(tuple[4], site.collection.as_str(), "{tuple}");
+        }
+    }
+    let gdir = root.join("graven-store");
+    follow(&graven, &aggregator, &gdir, true);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    assert_eq!(mcp.get_record(&guide_url)["collection"], "docs");
+    assert_eq!(mcp.get_record(&first_url)["collection"], "blog");
+    drop(mcp);
+
+    let blog_catalog = std::fs::read(blog.collection_dir().join("catalog.json"))
+        .expect("read the served blog Catalog");
+    let blog_latest = blog.catalog();
+    let crossed_url = docs.url("blog/crossed.html");
+    let mut crossed_list = blog.served_list();
+    let template = crossed_list
+        .iter()
+        .find(|item| item["url"] == first_url.as_str())
+        .cloned()
+        .expect("a blog page Item to copy");
+    let mut crossed_item = template.clone();
+    crossed_item["url"] = json!(crossed_url);
+    blog.serve_payload_as(&template, &crossed_item);
+    crossed_list.push(crossed_item);
+    wait_until_after(&served_generated_at(&blog));
+    let crossed = blog.serve_catalog(
+        &crossed_list,
+        &now_rfc3339(),
+        &docs_kid,
+        &docs.signing_key(&docs_kid),
+    );
+    refused.push(("WIST1-E02".into(), catalog_id(&crossed)));
+    let status = blog.ping_and_wait_allowing(&spake, &http, &aggregator, &allowed(&refused));
+    assert_eq!(
+        status_rejection(&status, "WIST1-E02", &catalog_id(&crossed))["collection"],
+        "blog",
+        "{status}"
+    );
+    let crossed_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("catalog_signed_by_another_collections_key", crossed_epoch);
+    let sealed = epoch_entries(&http, &base, crossed_epoch);
+    assert!(
+        entries_of(&sealed, "publisher_catalog").is_empty(),
+        "{sealed:?}"
+    );
+    assert!(
+        entries_of(&sealed, "publisher_item").is_empty(),
+        "{sealed:?}"
+    );
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert_eq!(latest_catalog(&state, &blog), blog_latest);
+    assert!(url_tuple(&state, "record", &docs.host, &crossed_url).is_none());
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    not_found(&mut mcp, &crossed_url);
+    drop(mcp);
+    std::fs::write(blog.collection_dir().join("catalog.json"), &blog_catalog)
+        .expect("serve the Publisher's own blog Catalog again");
+
+    let docs_catalog = std::fs::read(docs.collection_dir().join("catalog.json"))
+        .expect("read the served docs Catalog");
+    wait_until_after(&served_generated_at(&docs));
+    let reaching_generated_at = now_rfc3339();
+    let reaching_removal = json!({
+        "publisher": docs.host,
+        "url": first_url,
+        "observed_at": reaching_generated_at,
+        "removed": true,
+    });
+    let mut reaching_list = docs.served_list();
+    reaching_list.push(reaching_removal.clone());
+    let reaching = docs.serve_catalog(
+        &reaching_list,
+        &reaching_generated_at,
+        &docs_kid,
+        &docs.signing_key(&docs_kid),
+    );
+    let reaching_id = item_id(&reaching_removal);
+    refused.push(("WIST1-E03".into(), reaching_id.clone()));
+    let status = docs.ping_and_wait_allowing(&spake, &http, &aggregator, &allowed(&refused));
+    let rejection = status_rejection(&status, "WIST1-E03", &reaching_id);
+    assert_eq!(rejection["collection"], "docs", "{rejection}");
+    assert_eq!(rejection["urls"], json!([first_url]), "{rejection}");
+    let reaching_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("removal_naming_another_collections_url", reaching_epoch);
+    let sealed = epoch_entries(&http, &base, reaching_epoch);
+    assert!(
+        entries_of(&sealed, "publisher_item")
+            .iter()
+            .all(|entry| entry["body"]["item"]["url"] != first_url.as_str()),
+        "{sealed:?}"
+    );
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert_eq!(latest_catalog(&state, &docs), reaching);
+    let first_record = url_tuple(&state, "record", &docs.host, &first_url)
+        .unwrap_or_else(|| panic!("the other Collection's record left: {state:?}"));
+    assert_eq!(first_record[4], "blog");
+    assert!(url_tuple(&state, "removal", &docs.host, &first_url).is_none());
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    assert_eq!(mcp.get_record(&first_url)["collection"], "blog");
+    drop(mcp);
+    std::fs::write(docs.collection_dir().join("catalog.json"), &docs_catalog)
+        .expect("serve the Publisher's own docs Catalog again");
+
+    let delegate_key = blog.signing_key(&blog_kid);
+    wait_until_after(&reaching_generated_at);
+    docs.write_page(
+        "docs/guide.html",
+        &marked_page("Guide", "guide about tamarind and hibiscus", &[]),
+    );
+    blog.collection_command(
+        &spake,
+        "key-remove",
+        &["--name", "blog", "--kid", &blog_kid, "--confirm"],
+    );
+    docs.publish(&spake);
+    blog.sign_due(&spake);
+    let key_removed = docs.declaration();
+    let owner_signed = blog.catalog();
+    assert!(
+        owner_kids.contains(
+            &owner_signed["sig"]["key_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        ),
+        "the Publisher did not sign the blog Catalog with an owner key: {owner_signed}"
+    );
+    refused.push(("WIST2-E08".into(), catalog_id(&docs.catalog())));
+    docs.ping_and_wait_allowing(&spake, &http, &aggregator, &allowed(&refused));
+    let key_removal_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("delegate_key_removed_and_owner_catalog", key_removal_epoch);
+    let sealed = epoch_entries(&http, &base, key_removal_epoch);
+    assert_eq!(
+        entries_of(&sealed, "publisher_declaration")
+            .iter()
+            .map(|entry| entry["body"].clone())
+            .collect::<Vec<_>>(),
+        [key_removed]
+    );
+    assert!(
+        entries_of(&sealed, "publisher_catalog")
+            .iter()
+            .any(|entry| entry["body"] == owner_signed),
+        "the owner's blog Catalog is not sealed with the Declaration that removed the delegate key: {sealed:?}"
+    );
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert_eq!(
+        collection_tuple(&state, &blog.host, "blog")[4],
+        key_removal_epoch
+    );
+
+    let mut delegate_list = blog.served_list();
+    let mut delegate_item = template.clone();
+    delegate_item["url"] = json!(docs.url("blog/delegated.html"));
+    blog.serve_payload_as(&template, &delegate_item);
+    delegate_list.push(delegate_item.clone());
+    wait_until_after(&served_generated_at(&blog));
+    let delegated = blog.serve_catalog(&delegate_list, &now_rfc3339(), &blog_kid, &delegate_key);
+    refused.push(("WIST1-E02".into(), catalog_id(&delegated)));
+    let status = blog.ping_and_wait_allowing(&spake, &http, &aggregator, &allowed(&refused));
+    assert_eq!(
+        status_rejection(&status, "WIST1-E02", &catalog_id(&delegated))["collection"],
+        "blog",
+        "{status}"
+    );
+    let delegated_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
+    record.exercised("catalog_signed_by_a_removed_delegate_key", delegated_epoch);
+    let sealed = epoch_entries(&http, &base, delegated_epoch);
+    assert!(
+        entries_of(&sealed, "publisher_catalog").is_empty(),
+        "{sealed:?}"
+    );
+    let (_, state) = head_snapshot_state(&aggregator.data);
+    assert_eq!(latest_catalog(&state, &blog), owner_signed);
+    let delegated_url = docs.url("blog/delegated.html");
+    assert!(url_tuple(&state, "record", &docs.host, &delegated_url).is_none());
+    sync(&graven, &gdir);
+    let mut mcp = McpClient::start(&graven, &gdir);
+    not_found(&mut mcp, &delegated_url);
+    assert_eq!(mcp.get_record(&first_url)["collection"], "blog");
+    assert_eq!(mcp.get_record(&second_url)["collection"], "blog");
+    assert!(hits_for(&mcp.search("hibiscus"), &guide_url).is_some());
+    drop(mcp);
+    std::fs::write(
+        blog.collection_dir().join("catalog.json"),
+        serde_json::to_vec(&owner_signed).expect("serialize the owner's Catalog"),
+    )
+    .expect("serve the owner's blog Catalog again");
+
+    validate_artifacts(&docs.out, &aggregator.data);
     record.write();
     eprintln!("completed in {:?}", started.elapsed());
 }
