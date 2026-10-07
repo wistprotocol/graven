@@ -380,6 +380,45 @@ pub fn serve_static_counted(dir: PathBuf) -> (String, Arc<AtomicU64>) {
 pub fn serve_sites(
     sites: std::collections::BTreeMap<String, PathBuf>,
 ) -> (String, std::collections::BTreeMap<String, Arc<AtomicU64>>) {
+    let (addr, counters, _) = serve_sites_logged(sites);
+    (addr, counters)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RequestLog(Arc<Mutex<Vec<(String, String)>>>);
+
+impl RequestLog {
+    fn push(&self, host: &str, path: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((host.to_string(), path.to_string()));
+    }
+
+    pub fn clear(&self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    pub fn paths(&self, host: &str) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(requested, _)| requested == host)
+            .map(|(_, path)| path.clone())
+            .collect()
+    }
+}
+
+pub fn serve_sites_logged(
+    sites: std::collections::BTreeMap<String, PathBuf>,
+) -> (
+    String,
+    std::collections::BTreeMap<String, Arc<AtomicU64>>,
+    RequestLog,
+) {
+    let log = RequestLog::default();
+    let recorder = log.clone();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind site proxy");
     let addr = listener.local_addr().expect("local_addr").to_string();
     let counters: std::collections::BTreeMap<String, Arc<AtomicU64>> = sites
@@ -391,6 +430,7 @@ pub fn serve_sites(
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let routes = routes.clone();
+            let recorder = recorder.clone();
             std::thread::spawn(move || {
                 let Ok(clone) = stream.try_clone() else {
                     return;
@@ -418,6 +458,7 @@ pub fn serve_sites(
                 match dirs.get(host) {
                     Some(dir) => {
                         counters[host].fetch_add(1, Ordering::Relaxed);
+                        recorder.push(host, rel);
                         respond_file(stream, &dir.join(rel));
                     }
                     None => {
@@ -429,7 +470,7 @@ pub fn serve_sites(
             });
         }
     });
-    (addr, counters)
+    (addr, counters, log)
 }
 
 fn respond_file(mut stream: TcpStream, path: &Path) {

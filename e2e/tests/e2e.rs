@@ -1,9 +1,9 @@
 use e2e::{
     checkpoint_verifier_key, epoch_entries, fetch_status, graven_bin, grid_instant,
     head_snapshot_state, log_entries, marked_page, now_rfc3339, read_json, resolve_sibling_bin,
-    run, run_with_env, s, seal_epoch, serve_sites, start_aggregator, synced_heads,
-    wait_until_after, wait_until_status_active, wait_until_unreachable, workspace_root, Aggregator,
-    McpClient, Site, SyncedHead,
+    run, run_with_env, s, seal_epoch, serve_sites, serve_sites_logged, start_aggregator,
+    synced_heads, wait_until_after, wait_until_status_active, wait_until_unreachable,
+    workspace_root, Aggregator, McpClient, RequestLog, Site, SyncedHead,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -4476,4 +4476,322 @@ fn a_recovery_window_queues_catalogs_of_both_keys_and_settlement_seals_the_lates
 
     record.write();
     eprintln!("completed in {:?}", started.elapsed());
+}
+
+// WIST-2 §3.1: a value of the suite, which no Log amends.
+const CHANGE_CHAIN_MAX: usize = 16;
+
+struct ChainRun {
+    record: RunRecord,
+    binaries: Binaries,
+    _tmp: tempfile::TempDir,
+    site: Site,
+    aggregator: Aggregator,
+    requests: RequestLog,
+    http: reqwest::blocking::Client,
+    grid: Grid,
+    gdir: PathBuf,
+    base_id: String,
+}
+
+impl ChainRun {
+    fn start(name: &str) -> Self {
+        let mut record = RunRecord::new(name);
+        let binaries = binaries();
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let root = tmp.path().to_path_buf();
+        let site = Site::new(&root, "localhost", "docs");
+        let docs_prefix = format!("https://{}/docs/", site.host);
+        for (page, title, body) in [
+            ("docs/a.html", "Alpha", "alpha notes about quince"),
+            ("docs/b.html", "Beta", "beta notes about medlar"),
+            ("docs/c.html", "Gamma", "gamma notes about sloe"),
+        ] {
+            site.write_page(page, &marked_page(title, body, &[]));
+        }
+        let (proxy_addr, _, requests) =
+            serve_sites_logged(BTreeMap::from([(site.host.clone(), site.out.clone())]));
+        let proxy = format!("http://{proxy_addr}");
+        let aggregator = start_aggregator(
+            &binaries.clave,
+            root.join("clave-data"),
+            Some(&suffix_list()),
+            Some(&proxy),
+        );
+        let http = reqwest::blocking::Client::new();
+        let mut grid = Grid::new();
+        let declared_epoch = declare_collection(
+            &binaries.spake,
+            &binaries.clave,
+            &http,
+            &site,
+            &[&aggregator],
+            &mut grid,
+            &docs_prefix,
+        );
+        record.exercised("declaration", declared_epoch);
+        site.publish(&binaries.spake);
+        site.ping_and_wait(&binaries.spake, &http, &aggregator);
+        let published_epoch = seal_epoch(&binaries.clave, &aggregator.data, &grid.next());
+        record.exercised("publication", published_epoch);
+        let gdir = root.join("graven-store");
+        follow(&binaries.graven, &aggregator, &gdir, true);
+        let base_id = catalog_id(&site.catalog());
+        ChainRun {
+            record,
+            binaries,
+            _tmp: tmp,
+            site,
+            aggregator,
+            requests,
+            http,
+            grid,
+            gdir,
+            base_id,
+        }
+    }
+
+    fn sign_catalogs(&self, count: usize) -> Vec<String> {
+        let mut signed = Vec::new();
+        for n in 0..count {
+            match n {
+                0 => self.site.write_page(
+                    "docs/d.html",
+                    &marked_page("Delta", "delta notes about rowan", &[]),
+                ),
+                1 => self.site.remove_page("docs/c.html"),
+                _ => self.site.write_page(
+                    "docs/a.html",
+                    &marked_page("Alpha", &format!("alpha notes about quince {n}"), &[]),
+                ),
+            }
+            self.site.publish(&self.binaries.spake);
+            let id = catalog_id(&self.site.catalog());
+            assert!(
+                signed.last() != Some(&id) && id != self.base_id,
+                "publish signed no new Catalog at its run {n}"
+            );
+            signed.push(id);
+        }
+        signed
+    }
+
+    fn change_list_path(&self, catalog_id: &str) -> PathBuf {
+        self.site.collection_dir().join("changes").join(format!(
+            "{}.json",
+            catalog_id
+                .strip_prefix("sha256:")
+                .expect("a Catalog ID is sha256:<hex>")
+        ))
+    }
+
+    fn assert_change_lists_served(&self, signed: &[String]) {
+        let mut previous = self.base_id.clone();
+        for id in signed {
+            let list = read_json(&self.change_list_path(id));
+            assert_eq!(list["catalog"], id.as_str(), "{list}");
+            assert_eq!(
+                list["previous"],
+                previous.as_str(),
+                "the change list leading to {id} names another previous Catalog: {list}"
+            );
+            previous = id.clone();
+        }
+    }
+
+    fn pull(&mut self, refused: &[(String, String)]) -> Value {
+        self.requests.clear();
+        self.site.ping_and_wait_allowing(
+            &self.binaries.spake,
+            &self.http,
+            &self.aggregator,
+            &allowed(refused),
+        )
+    }
+
+    fn collection_requests(&self, directory: &str) -> Vec<String> {
+        let prefix = format!(
+            ".well-known/wist/collections/{}/{directory}/",
+            self.site.collection
+        );
+        self.requests
+            .paths(&self.site.host)
+            .iter()
+            .filter_map(|path| path.strip_prefix(&prefix).map(str::to_string))
+            .collect()
+    }
+
+    fn requested_change_lists(&self) -> Vec<String> {
+        self.collection_requests("changes")
+            .iter()
+            .map(|file| {
+                format!(
+                    "sha256:{}",
+                    file.strip_suffix(".json")
+                        .expect("a change list is named <hex>.json")
+                )
+            })
+            .collect()
+    }
+
+    fn assert_tree_walked(&self) {
+        let root = self.site.catalog()["catalog"]["tree"]
+            .as_str()
+            .and_then(|tree| tree.strip_prefix("sha256:"))
+            .expect("the served Catalog names its root tree file")
+            .to_string();
+        assert!(
+            self.collection_requests("tree").contains(&root),
+            "the pull fetched no root tree file of the served Catalog: {:?}",
+            self.requests.paths(&self.site.host)
+        );
+    }
+
+    fn assert_accepted_latest(&self, status: &Value) {
+        assert_eq!(
+            status_collection(status, &self.site.collection)["accepted"],
+            catalog_id(&self.site.catalog()).as_str(),
+            "{status}"
+        );
+    }
+
+    fn seal_and_assert_records(&mut self, scenario: &str) {
+        let epoch = seal_epoch(
+            &self.binaries.clave,
+            &self.aggregator.data,
+            &self.grid.next(),
+        );
+        self.record.exercised(scenario, epoch);
+        let sealed = epoch_entries(&self.http, &self.aggregator.base_url, epoch);
+        let catalogs = entries_of(&sealed, "publisher_catalog");
+        assert_eq!(catalogs.len(), 1, "{sealed:?}");
+        assert_eq!(catalogs[0]["body"], self.site.catalog());
+        let (_, state) = head_snapshot_state(&self.aggregator.data);
+        assert_collection_complete(&state, &self.site);
+        sync(&self.binaries.graven, &self.gdir);
+        let held: BTreeMap<String, String> =
+            consumer_records(&self.gdir, &self.aggregator.log_id, &self.site.host)
+                .into_iter()
+                .map(|row| (row.url, row.item_id))
+                .collect();
+        let listed: BTreeMap<String, String> = self
+            .site
+            .served_list()
+            .iter()
+            .filter(|item| item.get("removed").is_none())
+            .map(|item| {
+                (
+                    item["url"].as_str().expect("an Item's url").to_string(),
+                    item_id(item),
+                )
+            })
+            .collect();
+        assert_eq!(
+            held, listed,
+            "the Consumer's records are not the page Items of the latest Catalog"
+        );
+    }
+
+    fn finish(self, started: Instant) {
+        validate_artifacts(&self.site.out, &self.aggregator.data);
+        self.record.write();
+        eprintln!("completed in {:?}", started.elapsed());
+    }
+}
+
+#[test]
+fn a_pull_obtains_the_latest_list_by_a_chain_of_change_chain_max_change_lists_and_fetches_no_tree_file(
+) {
+    let started = Instant::now();
+    let mut run = ChainRun::start("e2e-change-list-chain");
+    let signed = run.sign_catalogs(CHANGE_CHAIN_MAX);
+    run.assert_change_lists_served(&signed);
+    let latest = signed.last().expect("Catalogs were signed").clone();
+
+    let status = run.pull(&[]);
+    assert_eq!(
+        status_collection(&status, "docs")["accepted"],
+        latest.as_str()
+    );
+    let reversed: Vec<String> = signed.iter().rev().cloned().collect();
+    assert_eq!(
+        run.requested_change_lists(),
+        reversed,
+        "the pull read another chain than the one from the latest Catalog back to the held list"
+    );
+    assert!(
+        run.collection_requests("tree").is_empty(),
+        "a pull that obtained the list by its chain fetched tree files: {:?}",
+        run.collection_requests("tree")
+    );
+    run.seal_and_assert_records("list_obtained_by_a_chain_of_change_lists");
+    run.finish(started);
+}
+
+#[test]
+fn a_chain_missing_a_change_list_is_discarded_with_wist2_e08_and_the_walk_accepts_the_catalog() {
+    let started = Instant::now();
+    let mut run = ChainRun::start("e2e-change-list-discarded");
+    let signed = run.sign_catalogs(2);
+    run.assert_change_lists_served(&signed);
+    let (middle, latest) = (signed[0].clone(), signed[1].clone());
+    let missing = run.change_list_path(&middle);
+    let kept = std::fs::read(&missing).expect("read the change list");
+    std::fs::remove_file(&missing).expect("stop serving the change list");
+
+    let refused = vec![("WIST2-E08".to_string(), latest.clone())];
+    let status = run.pull(&refused);
+    let rejection = status_rejection(&status, "WIST2-E08", &latest);
+    assert_eq!(rejection["collection"], "docs", "{rejection}");
+    assert_eq!(rejection["condition"], "fetch", "{rejection}");
+    assert_eq!(rejection["change_list"], middle.as_str(), "{rejection}");
+    run.assert_accepted_latest(&status);
+    assert_eq!(
+        run.requested_change_lists(),
+        vec![latest.clone(), middle.clone()],
+        "the pull read another chain than the one ending at the missing change list"
+    );
+    run.assert_tree_walked();
+    std::fs::write(&missing, kept).expect("serve the change list again");
+
+    run.seal_and_assert_records("chain_discarded_and_list_walked");
+    run.finish(started);
+}
+
+#[test]
+fn a_base_behind_change_chain_max_change_lists_is_left_or_discarded_for_chain_and_the_walk_accepts_the_catalog(
+) {
+    let started = Instant::now();
+    let mut run = ChainRun::start("e2e-change-list-chain-beyond-the-bound");
+    let signed = run.sign_catalogs(CHANGE_CHAIN_MAX + 1);
+    run.assert_change_lists_served(&signed);
+    let latest = signed.last().expect("Catalogs were signed").clone();
+
+    let refused = vec![("WIST2-E08".to_string(), latest.clone())];
+    let status = run.pull(&refused);
+    run.assert_accepted_latest(&status);
+    let read = run.requested_change_lists();
+    let reversed: Vec<String> = signed.iter().rev().cloned().collect();
+    let discarded = status["rejections"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|rejection| rejection["code"] == "WIST2-E08" && rejection["id"] == latest.as_str())
+        .cloned();
+    match discarded {
+        Some(rejection) => {
+            assert_eq!(rejection["collection"], "docs", "{rejection}");
+            assert_eq!(rejection["condition"], "chain", "{rejection}");
+            assert_eq!(rejection["change_list"], signed[1].as_str(), "{rejection}");
+            assert_eq!(read, reversed[..CHANGE_CHAIN_MAX].to_vec());
+        }
+        None => assert!(
+            read.len() <= CHANGE_CHAIN_MAX && reversed.starts_with(&read),
+            "a chain left without a report read lists outside the first change_chain_max: {read:?}"
+        ),
+    }
+    run.assert_tree_walked();
+
+    run.seal_and_assert_records("chain_beyond_change_chain_max_and_list_walked");
+    run.finish(started);
 }
