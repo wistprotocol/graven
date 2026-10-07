@@ -1,6 +1,6 @@
 # graven
 
-The publication format — Declarations, Collections, Catalogs, Items and Payloads — targets [WIST specification revision `0f7c054b1b870cf063c05776b888fb26f46c73a6`](https://github.com/wistprotocol/spec/tree/0f7c054b1b870cf063c05776b888fb26f46c73a6). Object version `1.0.0` alone does not identify a compatible draft.
+The publication format — Declarations, Collections, Catalogs, Items and Payloads — targets [WIST specification revision `f4acfefbe7d3cdb8e82ed34053377159d8782890`](https://github.com/wistprotocol/spec/tree/f4acfefbe7d3cdb8e82ed34053377159d8782890). Object version `1.0.0` alone does not identify a compatible draft.
 
 WIST Protocol consumer and MCP server. Graven cold-syncs a verified Snapshot,
 then applies incremental Epochs to a separate SQLite index per Log (WIST-3 §8).
@@ -65,8 +65,9 @@ keyed by Item ID, are persisted in `index.sqlite` too, so an incremental
 sync reloads them without re-walking the Log from genesis. A `sync_state`
 row written in a superseded format — before the Log became one growing
 tree, before its fields were renamed to `epoch_number`/`tree_size`,
-before the key registry kept each key's accepted acts, or before records
-were keyed by Item ID — is refused with an instruction to remove the
+before the key registry kept each key's accepted acts, before records
+were keyed by Item ID, or before link rows and Item sightings were kept
+per Item — is refused with an instruction to remove the
 log's directory and follow the Log again, never reinterpreted.
 A divergence leaves an evidence bundle under
 `<dir>/logs/<sanitized-log-id>/evidence/`: `equivocation-epoch-<N>/` with
@@ -187,7 +188,7 @@ or no source served a head at all.
 Log-signed `parameter_change` acts replay through core's accepted-schedule
 rules (WIST-4 §9, ADR-0020): rejected amendments are ignored, an amendment
 cannot cut the cap below an Epoch already sealed, and an Epoch above the cap
-in force at its instant fails the sync. The accepted schedule, the largest
+is rejected (see Publication replay). The accepted schedule, the largest
 Epoch seen and the previous instant persist in the sync cursor and the
 `parameters` table; a cold start seeds the schedule from the Snapshot's
 `parameter` tuples, so pending amendments survive. Any mismatch fails the
@@ -218,10 +219,13 @@ it judges Publisher Declarations, Catalogs (`publisher_catalog`) against
 their Collection's keys and scope, Items (`publisher_item`) against the
 Catalog their inclusion proof names, `payload_withdrawal` acts, Labels
 and disputes. An Entry that fails its checks is ignored, reported on
-stderr with its codes, and changes no state. An Epoch the replay rejects
-stops the sync with its codes and leaves the stored head and state
-unchanged. The store changes only once a Checkpoint is adopted, and
-Entries above the adopted tree size are not applied.
+stderr with its codes, and changes no state. An Epoch the replay rejects,
+or one over the smallest `epoch_cap_bytes` in force at its `sealed_at`
+or at any accepted later `effective_at` (`WIST3-E03`), applies its key
+acts alone: the walk continues past it, its Checkpoint is judged under
+the keys those acts leave valid, and the sync report lists it with its
+codes (WIST-3 §3.3). The store changes only once a Checkpoint is
+adopted, and Entries above the adopted tree size are not applied.
 
 `records` holds exactly the materialized records of the replayed state:
 a valid Item of kind `page` makes the record of its Publisher and URL; a
@@ -243,9 +247,9 @@ monotonic and hash-linked, every key identifier occurring once across
 `keys` and `recovery_keys` with no public key in both sets (`WIST1-E08`,
 ADR-0023), an ordinary rotation carrying `recovery_keys` byte-identical to
 its predecessor's (or introducing them for the first time), and a
-declaration signed by a `recovery_keys` entry opening a 7-day recovery
-window that takes precedence over any ordinary declaration sealed inside
-it. The signer is resolved by `sig.key_id` among the usable previous
+declaration signed by a `recovery_keys` entry opening a recovery
+window of `recovery_window_days` (7 by default) that takes precedence
+over any ordinary declaration sealed inside it. The signer is resolved by `sig.key_id` among the usable previous
 signing and recovery bindings and the incoming signing bindings (keys that
 are not canonical, non-small-order Ed25519 points are excluded; `WIST1-E02`
 names none, `WIST1-E01` verifies under none), and continuity follows the
@@ -352,22 +356,22 @@ same way as every other WIST envelope, against a key the caller supplies
 explicitly with `--key`: trust in a pack is trust in its publisher, the
 protocol makes no claim about vector correctness). `pack` fields:
 `wist_version`; `content_digest` and `tree_size`, binding the pack to
-one exact synced snapshot of one log (WIST-3 §7) — `pack import` rejects a
-mismatch with the local sync cursor; `model` (`name`, `version`,
-`weights_hash`, `dim`, `quantization`, `metric` — one of
+one exact Snapshot of one log (WIST-3 §7) — `pack import` rejects a
+pack that does not name the Snapshot the store installed; `model`
+(`name`, `version`, `weights_hash`, `dim`, `quantization`, `metric` — one of
 `cosine`/`dot`/`euclidean` — `source`); `vectors` (`path`, `sha256`,
 `bytes`, `count`) describing a zstd-compressed JSONL file alongside the
 pack, one row per vector: `{"item_id", "url", "publisher", "vector":
 [f32, ...]}`. Import verifies, in order: the envelope signature, the
 snapshot binding, the vectors file's hash and byte length, the row count
 and every vector's length against `dim`, then imports only rows whose
-`item_id` is the Item of a record the log materializes (other rows are
-skipped and counted) — a pack with zero importable rows is rejected
-outright. Imported rows are kept in `embeddings(item_id, url, publisher,
+`item_id`, `url` and `publisher` match a record the log materializes
+(other rows are skipped and counted) — a pack with zero importable rows
+is rejected outright. Imported rows are kept in `embeddings(item_id, url, publisher,
 vector)`; a later sync that withdraws an Item, or removes or replaces the
 record carrying it, deletes its row. `similar_records` scores
 against one log's imported pack; scores never merge across packs or logs,
-since a pack binds one snapshot of one chain and nothing about "similar"
+since a pack binds one Snapshot of one log and nothing about "similar"
 survives mixing two.
 
 ## MCP tools
@@ -455,7 +459,27 @@ records the Replay resumed from the store materializes. The tests cover:
 - an Aggregator key added and the genesis key removed, the Checkpoints'
   signers at each step, a Consumer cold-started after the removal holding
   the same records as the one that followed, and a Snapshot signed by the
-  removed key refused with `WIST3-E04`.
+  removed key refused with `WIST3-E04`;
+- a declared Collection sealing its emissions and refusing an Item
+  outside its Scope, a narrowed Scope removing records at its Epoch while
+  a reversed pending narrowing removes none, and Collection keys signing
+  only their own Collection while a removed delegate key signs nothing;
+- a stale Catalog and one beyond the clock refused and an equal one
+  served again read as idempotent, one Catalog sealed by two Logs read as
+  one record with the latest Catalog deciding between them, and a
+  Publisher state directory restored from the served tree changing no
+  Item;
+- a Consumer resumed from a Snapshot holding a masked record and the
+  replaying Consumer's `attested_at`, a retracted Label staying retracted
+  against an earlier Label on both Consumer paths, a withdrawal filed with
+  two Logs under one legal basis sealed by each, a change above the
+  per-domain capacity sealing over several Epochs with each Entry
+  verifying alone, and a recovery window queuing Catalogs of both keys
+  with settlement sealing the latest survivor;
+- a pull obtaining the latest list by a chain of `change_chain_max`
+  change lists without fetching a tree file, and a chain missing a change
+  list, or a base more than `change_chain_max` change lists behind, giving
+  up the chain with `WIST2-E08` while the tree walk accepts the Catalog.
 
 Each test validates the served artifacts against the spec's schemas and
 conformance reference with `e2e/validate_artifacts.py` through
@@ -480,9 +504,11 @@ and a Checkpoint adopted only once a Witness in the roster has cosigned it
 
 The crate's `baseline` binary drives the pipeline at scale for capacity
 measurements: `cargo run -p e2e --bin baseline -- --domains N --pages M
-[--changed-percent P] [--body-words W] [--extra-empty-seals K]
-[--snapshot-shards S] [--compare-rebuild] [--withdraw] [--work-dir DIR]
-[--keep] [--no-tier1] [--skip-consumer] [--out report.json]` writes N
+[--large-domains L --large-pages Q] [--changed-percent P] [--body-words W]
+[--extra-empty-seals K] [--snapshot-shards S] [--compare-rebuild]
+[--withdraw] [--update-by chain|walk] [--tree-bound [--tree-bound-items I]]
+[--work-dir DIR] [--keep] [--no-tier1] [--skip-consumer] [--out
+report.json]` writes N
 loopback sites of M marked pages, publishes each into its `default`
 Collection, ingests them through one Aggregator behind a request-counting
 proxy, seals, cold-starts a Consumer, changes P percent of the pages,
@@ -504,6 +530,13 @@ site's first page and reports one more seal stage under `withdrawal`, with
 the storage sizes before it under `before`. `--work-dir` places the
 temporary directory inside DIR, and `--keep` leaves it in place and prints
 its path on standard error; the report names no host, path or hardware.
+`--large-domains` adds L sites of Q pages each, reported apart from the N
+sites. `--update-by walk` deletes the served change lists before the
+update pull, so the Aggregator walks each tree; `chain`, the default,
+keeps them. `--tree-bound` adds one site whose Collection serves a
+hand-built tree with buckets filled to `tree_file_cap_bytes` and I Items
+(1 024 by default) held singly at `tree_depth_max`, reported under
+`tree_bound`.
 
 ## Verification
 
