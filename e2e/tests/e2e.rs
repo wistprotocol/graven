@@ -3131,19 +3131,18 @@ fn a_builder_restored_from_the_served_tree_changes_no_item() {
         published,
         "the restored Builder lists other Items for unchanged pages"
     );
-    let resigned = served_bytes(&site) != catalog_before;
+    assert_eq!(
+        served_bytes(&site),
+        catalog_before,
+        "the restored Builder signed a Catalog for an unchanged list before it was due"
+    );
     restored.ping_and_wait(&spake, &http, &aggregator);
     let restored_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
     record.exercised("builder_restored_from_the_served_tree", restored_epoch);
     let sealed = epoch_entries(&http, &base, restored_epoch);
     assert!(
-        entries_of(&sealed, "publisher_item").is_empty(),
-        "the restored Builder's Catalog sealed Items: {sealed:?}"
-    );
-    assert_eq!(
-        entries_of(&sealed, "publisher_catalog").len(),
-        usize::from(resigned),
-        "{sealed:?}"
+        domain_publications(&sealed, &site.host).is_empty(),
+        "the restored Builder's run sealed a Catalog or an Item: {sealed:?}"
     );
     let (_, state) = head_snapshot_state(&aggregator.data);
     assert_eq!(latest_catalog(&state, &restored), restored.catalog());
