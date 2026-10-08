@@ -1,6 +1,6 @@
 {
   "name": "wist-graven",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "WIST protocol consumer: verified sync + local MCP search over publisher-signed web records",
   "bin": { "graven": "graven.js" },
   "scripts": { "postinstall": "node install.js", "test": "node --test" },
