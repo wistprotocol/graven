@@ -510,8 +510,8 @@ pub(super) fn adopt_label_tuple(
 ) -> Result<()> {
     conn.execute_batch(crate::store::CREATE_LABELS)?;
     conn.execute(
-        "INSERT INTO label_current(labeler, subject, name, label_id, value, asserted_at, retracted, expires_at, delta, height, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, 0)
-         ON CONFLICT(labeler, subject, name) DO UPDATE SET label_id = excluded.label_id, value = excluded.value, asserted_at = excluded.asserted_at, retracted = 0, expires_at = excluded.expires_at, delta = excluded.delta, height = excluded.height, entry_index = 0",
+        "INSERT INTO label_current(labeler, subject, name, label_id, value, asserted_at, retracted, expires_at, delta, height, entry_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)
+         ON CONFLICT(labeler, subject, name) DO UPDATE SET label_id = excluded.label_id, value = excluded.value, asserted_at = excluded.asserted_at, retracted = excluded.retracted, expires_at = excluded.expires_at, delta = excluded.delta, height = excluded.height, entry_index = 0",
         rusqlite::params![
             entry.labeler,
             entry.subject,
@@ -519,6 +519,7 @@ pub(super) fn adopt_label_tuple(
             entry.label_id,
             entry.value.map(|v| v as i64),
             entry.asserted_at,
+            entry.retracted,
             entry.expires_at,
             entry.delta,
             entry.sealing_height as i64

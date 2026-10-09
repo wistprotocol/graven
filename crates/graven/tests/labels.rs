@@ -144,6 +144,7 @@ fn snapshot_label_and_dispute_tuples_are_adopted() {
         name: "wist:copied".into(),
         value: None,
         asserted_at: "2026-08-01T00:00:00Z".into(),
+        retracted: false,
         expires_at: None,
         delta: None,
         label_id: adopted_id.clone(),

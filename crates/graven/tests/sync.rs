@@ -1374,6 +1374,7 @@ fn cold_start_adopts_withdrawal_and_label_tuples() {
             name: "wist:spam".into(),
             value: None,
             asserted_at: "2026-08-09T12:00:00Z".into(),
+            retracted: false,
             expires_at: None,
             delta: None,
             label_id: format!("sha256:{}", "c".repeat(64)),

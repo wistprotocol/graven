@@ -190,6 +190,7 @@ fn dispute_naming_an_adopted_label_still_checks_authority() {
         name: "wist:mismatch".into(),
         value: None,
         asserted_at: "2026-08-01T00:00:00Z".into(),
+        retracted: false,
         expires_at: None,
         delta: None,
         label_id: known_id.clone(),
@@ -348,6 +349,7 @@ fn resumed_labeler_activity_matches_a_full_replay() {
         name: "wist:spam".into(),
         value: None,
         asserted_at: "2026-08-09T01:00:00Z".into(),
+        retracted: false,
         expires_at: None,
         delta: None,
         label_id: format!("sha256:{}", "9".repeat(64)),
@@ -412,4 +414,259 @@ fn resumed_labeler_activity_matches_a_full_replay() {
         !far_resumed.spam_urls.contains(subject),
         "the resumed index must read the same inactivity verdict as a full replay"
     );
+}
+
+struct Epoch {
+    sealed_at: &'static str,
+    labels: Vec<Value>,
+}
+
+fn serve_log(
+    log_id: &str,
+    seed: u8,
+    labeler: &Signer,
+    domain: &str,
+    epochs: &[Epoch],
+    snapshot_height: u64,
+) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let log = Signer::new([seed; 32]);
+    let declaration = common::build_declaration(labeler, domain);
+    let mut state = Log::new(dir.path(), Signer::new([seed; 32]), log_id);
+    let mut current: std::collections::BTreeMap<
+        (String, String, String),
+        wist_core::label::SealedLabel,
+    > = std::collections::BTreeMap::new();
+    for (height, epoch) in epochs.iter().enumerate() {
+        let height = height as u64;
+        let wrapped: Vec<Value> = epoch
+            .labels
+            .iter()
+            .map(|inner| label_entry(labeler, inner.clone()).1)
+            .collect();
+        state.seal(epoch.sealed_at, &wrapped);
+        for inner in &epoch.labels {
+            let label: wist_core::objects::Label = serde_json::from_value(inner.clone()).unwrap();
+            let triple = (
+                label.labeler.clone(),
+                label.subject.clone(),
+                label.name.clone(),
+            );
+            let newer = current.get(&triple).is_none_or(|held| {
+                wist_core::publisher_time::compare(&label.asserted_at, &held.label.asserted_at)
+                    != Some(std::cmp::Ordering::Less)
+            });
+            if newer {
+                current.insert(
+                    triple,
+                    wist_core::label::SealedLabel {
+                        label_id: wist_core::label::label_id(inner).unwrap(),
+                        label,
+                        height,
+                        entry_index: 0,
+                    },
+                );
+            }
+        }
+        if height != snapshot_height {
+            continue;
+        }
+        let tuples = current
+            .values()
+            .map(|sealed| StateEntry::Label(wist_core::label::label_tuple(sealed)))
+            .collect();
+        let snapshot_date = "2026-08-09";
+        let snapdir = common::snapshot_dir(dir.path(), snapshot_date, height);
+        let sqlite_bytes = common::write_tier0(&snapdir.join("tier0/index.sqlite"), &[]);
+        let content_digest_value = common::content_digest(&[]);
+        let (state_bytes, state_digest_value) = common::write_state_with(
+            &snapdir.join("state.json"),
+            &log,
+            3600,
+            &[(domain.to_string(), declaration.clone())],
+            state.tree_size(),
+            tuples,
+            0,
+        );
+        write_manifest(
+            &snapdir.join("manifest.json"),
+            &log,
+            snapshot_date,
+            height,
+            state.tree_size(),
+            &state.root_token(),
+            &content_digest_value,
+            &state_bytes,
+            &state_digest_value,
+            &sqlite_bytes,
+        );
+        write_index(
+            &dir.path().join("snapshots/index.json"),
+            &log,
+            snapshot_date,
+            state.tree_size(),
+            &common::manifest_url(snapshot_date, height),
+            &content_digest_value,
+        );
+    }
+    let base_url = format!("http://{}", common::serve_static(dir.path().to_path_buf()));
+    (dir, base_url)
+}
+
+type CurrentRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    i64,
+);
+
+fn synced_label_current(
+    log_id: &str,
+    seed: u8,
+    labeler: &Signer,
+    domain: &str,
+    epochs: &[Epoch],
+    snapshot_height: u64,
+    subject: &str,
+) -> (Vec<CurrentRow>, usize) {
+    let (dir, base_url) = serve_log(log_id, seed, labeler, domain, epochs, snapshot_height);
+    let target = tempfile::tempdir().unwrap();
+    graven::sync::run(
+        dir.path().join("log/anchor.json").to_str().unwrap(),
+        &base_url,
+        target.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    let log_dir = graven::registry::log_dir(target.path(), log_id);
+    common::assert_records_materialized(&log_dir);
+    let conn = rusqlite::Connection::open(log_dir.join("index.sqlite")).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT labeler, subject, name, label_id, value, asserted_at, retracted, expires_at, delta, height FROM label_current ORDER BY labeler, subject, name",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<CurrentRow>>>()
+        .unwrap();
+    let head_sealed_at = epochs.last().unwrap().sealed_at;
+    let applying = Store::open(&log_dir)
+        .unwrap()
+        .current_labels(subject, Some(head_sealed_at))
+        .unwrap()
+        .len();
+    (rows, applying)
+}
+
+fn spam_label(domain: &str, subject: &str, asserted_at: &str) -> Value {
+    json!({"wist_version": "1.0.0", "labeler": domain, "subject": subject, "name": "wist:spam", "asserted_at": asserted_at})
+}
+
+/// WIST-3 §7 and §8 step 4, WIST-2 §3.3.
+#[test]
+fn a_resumed_retraction_stays_current_against_an_earlier_label_sealed_above_the_snapshot() {
+    let domain = "retracting.example";
+    let subject = "https://victim.example/retracted";
+    let labeler = Signer::new([60u8; 32]);
+    let retraction = json!({"wist_version": "1.0.0", "labeler": domain, "subject": subject, "name": "wist:spam", "asserted_at": "2026-08-09T02:00:00Z", "retracted": true});
+    let epochs = [
+        Epoch {
+            sealed_at: "2026-08-09T00:00:00Z",
+            labels: Vec::new(),
+        },
+        Epoch {
+            sealed_at: "2026-08-09T01:00:00Z",
+            labels: vec![spam_label(domain, subject, "2026-08-09T01:00:00Z")],
+        },
+        Epoch {
+            sealed_at: "2026-08-09T02:00:00Z",
+            labels: vec![retraction.clone()],
+        },
+        Epoch {
+            sealed_at: "2026-08-09T03:00:00Z",
+            labels: vec![spam_label(domain, subject, "2026-08-09T01:30:00Z")],
+        },
+    ];
+    let log_id = "resumed-retraction";
+    let (replayed, replayed_applying) =
+        synced_label_current(log_id, 61, &labeler, domain, &epochs, 0, subject);
+    let (resumed, resumed_applying) =
+        synced_label_current(log_id, 61, &labeler, domain, &epochs, 2, subject);
+
+    let retraction_id = wist_core::label::label_id(&retraction).unwrap();
+    assert_eq!(resumed.len(), 1, "{resumed:?}");
+    assert_eq!(resumed[0].3.as_deref(), Some(retraction_id.as_str()));
+    assert_eq!(resumed[0].5, "2026-08-09T02:00:00Z");
+    assert_eq!(
+        resumed[0].6, 1,
+        "the adopted retraction must stay retracted"
+    );
+    assert_eq!(resumed[0].9, 2);
+    assert_eq!(resumed, replayed, "resume and full replay must agree");
+    assert_eq!(resumed_applying, 0);
+    assert_eq!(replayed_applying, 0);
+}
+
+/// WIST-3 §7 and §8 step 4, WIST-2 §3.3.
+#[test]
+fn a_resumed_expired_label_stays_current_against_an_earlier_label_sealed_above_the_snapshot() {
+    let domain = "expiring.example";
+    let subject = "https://victim.example/expired";
+    let labeler = Signer::new([62u8; 32]);
+    let expiring = json!({"wist_version": "1.0.0", "labeler": domain, "subject": subject, "name": "wist:spam", "asserted_at": "2026-08-09T01:00:00Z", "expires_at": "2026-08-09T01:30:00Z"});
+    let epochs = [
+        Epoch {
+            sealed_at: "2026-08-09T00:00:00Z",
+            labels: Vec::new(),
+        },
+        Epoch {
+            sealed_at: "2026-08-09T01:00:00Z",
+            labels: vec![expiring.clone()],
+        },
+        Epoch {
+            sealed_at: "2026-08-09T02:00:00Z",
+            labels: Vec::new(),
+        },
+        Epoch {
+            sealed_at: "2026-08-09T03:00:00Z",
+            labels: vec![spam_label(domain, subject, "2026-08-09T00:30:00Z")],
+        },
+    ];
+    let log_id = "resumed-expiry";
+    let (replayed, replayed_applying) =
+        synced_label_current(log_id, 63, &labeler, domain, &epochs, 0, subject);
+    let (resumed, resumed_applying) =
+        synced_label_current(log_id, 63, &labeler, domain, &epochs, 2, subject);
+
+    let expiring_id = wist_core::label::label_id(&expiring).unwrap();
+    assert_eq!(resumed.len(), 1, "{resumed:?}");
+    assert_eq!(resumed[0].3.as_deref(), Some(expiring_id.as_str()));
+    assert_eq!(resumed[0].6, 0);
+    assert_eq!(resumed[0].7.as_deref(), Some("2026-08-09T01:30:00Z"));
+    assert_eq!(resumed[0].9, 1);
+    assert_eq!(resumed, replayed, "resume and full replay must agree");
+    assert_eq!(resumed_applying, 0, "the expired Label applies nothing");
+    assert_eq!(replayed_applying, 0);
 }

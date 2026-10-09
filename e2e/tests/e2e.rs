@@ -3664,6 +3664,26 @@ fn a_retracted_label_stays_retracted_against_an_earlier_label_and_both_consumer_
         ),
         [retraction["label"].clone()]
     );
+    let assert_head_state = |at: &str| -> Vec<Value> {
+        let (_, state) = head_snapshot_state(&aggregator.data);
+        let labels = tuples_of(&state, "label");
+        assert_eq!(labels.len(), 2, "{at}: {labels:?}");
+        assert_eq!(labels[0][2], a_url.as_str(), "{at}");
+        assert_eq!(labels[0][6], true, "{at}");
+        assert_eq!(labels[0][9], retraction_id.as_str(), "{at}");
+        assert_eq!(labels[0][10], retraction_epoch, "{at}");
+        assert_eq!(labels[1][2], b_url.as_str(), "{at}");
+        assert_eq!(labels[1][6], false, "{at}");
+        assert_eq!(labels[1][9], kept_id.as_str(), "{at}");
+        let dispute_tuples = tuples_of(&state, "dispute");
+        assert_eq!(dispute_tuples.len(), 1, "{at}: {dispute_tuples:?}");
+        assert_eq!(dispute_tuples[0][1], first_id.as_str(), "{at}");
+        assert_eq!(dispute_tuples[0][2], site.host.as_str(), "{at}");
+        labels
+    };
+    assert_head_state("the retraction's Snapshot");
+    let resumed = root.join("graven-resumed");
+    follow(&graven, &aggregator, &resumed, true);
 
     let mut earlier = first["label"].clone();
     earlier["value"] = json!(500000);
@@ -3685,19 +3705,10 @@ fn a_retracted_label_stays_retracted_against_an_earlier_label_and_both_consumer_
         "the Label with an earlier asserted_at was not sealed"
     );
 
-    let (_, state) = head_snapshot_state(&aggregator.data);
-    let labels = tuples_of(&state, "label");
-    assert_eq!(labels.len(), 1, "{labels:?}");
-    assert_eq!(labels[0][2], b_url.as_str());
-    assert_eq!(labels[0][8], kept_id.as_str());
-    let dispute_tuples = tuples_of(&state, "dispute");
-    assert_eq!(dispute_tuples.len(), 1, "{dispute_tuples:?}");
-    assert_eq!(dispute_tuples[0][1], first_id.as_str());
-    assert_eq!(dispute_tuples[0][2], site.host.as_str());
+    let labels = assert_head_state("the earlier Label's Snapshot");
 
     sync(&graven, &replaying);
-    let resumed = root.join("graven-resumed");
-    follow(&graven, &aggregator, &resumed, true);
+    sync(&graven, &resumed);
     let replaying_labels = consumer_label_table(&replaying, &log_id);
     assert_eq!(
         replaying_labels,
@@ -3707,7 +3718,7 @@ fn a_retracted_label_stays_retracted_against_an_earlier_label_and_both_consumer_
             "wist:spam",
             kept_id,
             400000,
-            labels[0][5],
+            labels[1][5],
             null,
             null,
             label_epoch
