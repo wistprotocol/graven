@@ -128,7 +128,7 @@ impl ServedLog {
         for (height, epoch) in self.epochs.iter().enumerate() {
             let at = log_seconds(&epoch.sealed_at).unwrap();
             let mut wanted = epoch.parameters.clone();
-            wanted.insert("epoch_cadence_seconds".into(), 1);
+            wanted.entry("epoch_cadence_seconds".into()).or_insert(1);
             for (index, (parameter, value)) in wanted.into_iter().enumerate() {
                 if schedule.value_at(&parameter, at) == Some(value) {
                     continue;

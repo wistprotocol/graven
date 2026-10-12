@@ -1686,3 +1686,107 @@ fn a_parameter_change_breaking_its_contract_or_major_version_changes_no_schedule
         assert!(walk_one_act(&signed(changed)).is_empty(), "{label}");
     }
 }
+
+struct GenesisCadenceLog {
+    served: ServedLog,
+    parameters: BTreeMap<String, i64>,
+    update_id: String,
+}
+
+fn genesis_cadence_log(log_id: &str) -> GenesisCadenceLog {
+    let genesis_sealed_at = "2026-08-02T13:00:00Z";
+    let at = log_seconds(genesis_sealed_at).unwrap();
+    let mut served = ServedLog::new(&synthetic_log_key(0x63), log_id);
+    let signer = common::Signer::new(served.log.log.seed);
+    let act = common::parameter_act(
+        &served.log_key_id,
+        &signer,
+        "epoch_cadence_seconds",
+        900,
+        genesis_sealed_at,
+    );
+    let disposition = wist_core::parameters::Schedule::new(at).apply_act(
+        &act["body"],
+        wist_core::parameters::ActPosition {
+            epoch_number: 0,
+            entry_index: 0,
+            sealed_at_s: at,
+        },
+        0,
+        served.log_key(),
+    );
+    let wist_core::parameters::Disposition::Accepted(amendment) = disposition else {
+        panic!("a genesis amendment effective at Epoch 0's sealed_at is accepted: {disposition:?}");
+    };
+    assert_eq!((amendment.value, amendment.effective_at_s), (900, at));
+    let parameters = BTreeMap::from([(amendment.parameter, amendment.value)]);
+    served.seal(VectorEpoch {
+        sealed_at: genesis_sealed_at.into(),
+        parameters: parameters.clone(),
+        leaves: leaves(std::slice::from_ref(&act)),
+    });
+    GenesisCadenceLog {
+        served,
+        parameters,
+        update_id: wist_core::registry_updates::update_id(&act["body"]).unwrap(),
+    }
+}
+
+fn seal_epoch_1_and_sync_from_a_genesis_snapshot(
+    epoch_1_sealed_at: &str,
+) -> (Result<u64, String>, u64) {
+    let mut log = genesis_cadence_log("genesis-cadence-log");
+    log.served.seal(VectorEpoch {
+        sealed_at: epoch_1_sealed_at.into(),
+        parameters: log.parameters.clone(),
+        leaves: Vec::new(),
+    });
+    log.served.snapshot(
+        0,
+        "2026-08-02",
+        vec![StateEntry::RegistryUpdate(
+            wist_core::objects::RegistryUpdateEntry {
+                update_id: log.update_id.clone(),
+                sealing_height: 0,
+            },
+        )],
+        &Held::default(),
+    );
+    let target = tempfile::tempdir().unwrap();
+    let outcome = log.served.sync(target.path());
+    (outcome, log.served.head(target.path()))
+}
+
+fn seal_epoch_1_and_sync_from_an_installed_genesis(
+    epoch_1_sealed_at: &str,
+) -> (Result<u64, String>, u64) {
+    let mut log = genesis_cadence_log("genesis-cadence-installed-log");
+    let target = tempfile::tempdir().unwrap();
+    log.served.install(target.path());
+    log.served.seal(VectorEpoch {
+        sealed_at: epoch_1_sealed_at.into(),
+        parameters: log.parameters.clone(),
+        leaves: Vec::new(),
+    });
+    let outcome = log.served.sync(target.path());
+    (outcome, log.served.head(target.path()))
+}
+
+/// WIST-4 §5 and WIST-3 §3.1: a genesis amendment is in force from Epoch 0's `sealed_at`, so it
+/// sets the grid Epoch 1 seals on.
+#[test]
+fn a_genesis_cadence_amendment_sets_the_grid_epoch_1_seals_on() {
+    for sync in [
+        seal_epoch_1_and_sync_from_a_genesis_snapshot,
+        seal_epoch_1_and_sync_from_an_installed_genesis,
+    ] {
+        assert_eq!(sync("2026-08-02T13:15:00Z"), (Ok(1), 1));
+        let (outcome, head) = sync("2026-08-02T13:10:00Z");
+        let error = outcome.unwrap_err();
+        assert!(
+            error.contains("WIST3-E03") && error.contains("off the cadence grid"),
+            "{error}"
+        );
+        assert_eq!(head, 0, "the verified head stays at Epoch 0");
+    }
+}

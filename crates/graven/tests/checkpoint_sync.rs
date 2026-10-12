@@ -343,8 +343,12 @@ fn the_sequence_vector_applies_each_failures_disposition_at_the_verified_head() 
     let cadence = vector["epoch_cadence_seconds"].as_i64().unwrap();
     for case in vector["sequence_cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
-        let previous = Checkpoint::parse(case["verified_checkpoint"].as_str().unwrap()).unwrap();
         let offered = Checkpoint::parse(case["offered_checkpoint"].as_str().unwrap()).unwrap();
+        if case["verified_checkpoint"].is_null() {
+            judge_genesis_case(name, case, &log_id, &registry, &offered);
+            continue;
+        }
+        let previous = Checkpoint::parse(case["verified_checkpoint"].as_str().unwrap()).unwrap();
         let reached = case["verified_head_epoch_number"].as_u64().unwrap();
         assert_eq!(previous.epoch_number(), reached, "{name}");
         // WIST-3 §3.1: below the previous tree size, the keys valid at the previous height speak
@@ -434,6 +438,40 @@ fn the_sequence_vector_applies_each_failures_disposition_at_the_verified_head() 
                 );
             }
             other => panic!("{name}: unknown expectation {other}"),
+        }
+    }
+}
+
+fn judge_genesis_case(
+    name: &str,
+    case: &Value,
+    log_id: &str,
+    registry: &wist_core::aggregator_keys::Registry,
+    offered: &Checkpoint,
+) {
+    assert!(case["verified_head_epoch_number"].is_null(), "{name}");
+    assert_eq!(
+        wist_core::checkpoint::verify(offered, log_id, &registry.valid_at(0), &[]).is_ok(),
+        case["signature_verifies"].as_bool().unwrap(),
+        "{name}: the signature status the vector states"
+    );
+    let outcome = wist_core::checkpoint::check_genesis(offered);
+    match case["expected"].as_str().unwrap() {
+        "valid" => {
+            outcome.unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                case["expected_head_epoch_number"].as_u64(),
+                Some(offered.epoch_number()),
+                "{name}"
+            );
+        }
+        expected => {
+            let error = outcome.unwrap_err();
+            assert_eq!(error.code(), Some(expected), "{name}: {error}");
+            assert!(
+                case["expected_head_epoch_number"].is_null(),
+                "{name}: no head is verified"
+            );
         }
     }
 }
