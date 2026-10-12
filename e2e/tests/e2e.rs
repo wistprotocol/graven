@@ -3302,25 +3302,11 @@ fn a_consumer_resumed_from_a_snapshot_holds_a_masked_record_and_the_replaying_co
     parent.ping_and_wait(&spake, &http, &aggregator);
     let declared_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
     record.exercised("declaration", declared_epoch);
-    let owner = parent.declaration();
-    let owner_kid = parent.owner_key_ids()[0].clone();
-    let mut scoped = owner["publisher"].clone();
-    scoped["seq"] = json!(owner["publisher"]["seq"].as_u64().expect("seq") + 1);
-    scoped["prev_declaration"] =
-        json!(wist_core::declaration::inner_hash(&owner).expect("owner hash"));
-    scoped["subdomain_scope"] = json!([child.host]);
-    let scoped = wist_core::envelope::sign_envelope(
-        &scoped,
-        "publisher",
-        &owner_kid,
-        &parent.signing_key(&owner_kid),
-    )
-    .expect("sign the Declaration scoping the subdomain");
-    std::fs::write(
-        parent.out.join(".well-known/wist/publisher.json"),
-        serde_json::to_vec(&scoped).expect("serialize the Declaration"),
-    )
-    .expect("serve the Declaration scoping the subdomain");
+    parent.collection_command(&spake, "subdomain-add", &["--host", &child.host]);
+    assert_eq!(
+        parent.declaration()["publisher"]["subdomain_scope"],
+        json!([child.host])
+    );
     parent.ping_and_wait(&spake, &http, &aggregator);
     let scoped_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
     record.exercised("declaration_scoping_a_subdomain", scoped_epoch);
@@ -3448,42 +3434,6 @@ fn label_file(labeler: &Site, id: &str) -> Value {
             .join(".well-known/wist/labels")
             .join(format!("{}.json", id.trim_start_matches("sha256:"))),
     )
-}
-
-fn serve_earlier_label(labeler: &Site, earlier: &Value) -> Value {
-    let kid = labeler.owner_key_ids()[0].clone();
-    let key = labeler.signing_key(&kid);
-    let label = wist_core::envelope::sign_envelope(earlier, "label", &kid, &key)
-        .expect("sign the earlier Label");
-    let id = wist_core::label::label_id(earlier).expect("compute the Label ID");
-    std::fs::write(
-        labeler
-            .out
-            .join(".well-known/wist/labels")
-            .join(format!("{}.json", id.trim_start_matches("sha256:"))),
-        serde_json::to_vec(&label).expect("serialize the Label"),
-    )
-    .expect("serve the earlier Label");
-    let feed_path = labeler.out.join(".well-known/wist/label-feed.json");
-    let mut feed = read_json(&feed_path)["feed"].clone();
-    wait_until_after(
-        feed["generated_at"]
-            .as_str()
-            .expect("the feed's generated_at"),
-    );
-    feed["generated_at"] = json!(now_rfc3339());
-    feed["deltas"]
-        .as_array_mut()
-        .expect("the feed lists IDs")
-        .push(json!(id));
-    let feed =
-        wist_core::envelope::sign_envelope(&feed, "feed", &kid, &key).expect("sign the Label Feed");
-    std::fs::write(
-        &feed_path,
-        serde_json::to_vec(&feed).expect("serialize the Label Feed"),
-    )
-    .expect("serve the Label Feed");
-    label
 }
 
 fn consumer_rows(dir: &Path, log_id: &str, query: &str, columns: usize) -> Vec<Value> {
@@ -3685,13 +3635,18 @@ fn a_retracted_label_stays_retracted_against_an_earlier_label_and_both_consumer_
     let resumed = root.join("graven-resumed");
     follow(&graven, &aggregator, &resumed, true);
 
-    let mut earlier = first["label"].clone();
-    earlier["value"] = json!(500000);
+    let earlier_asserted_at = first["label"]["asserted_at"]
+        .as_str()
+        .expect("asserted_at")
+        .to_owned();
     assert!(
-        earlier["asserted_at"].as_str() < retraction["label"]["asserted_at"].as_str(),
-        "{earlier} is not earlier than {retraction}"
+        Some(earlier_asserted_at.as_str()) < retraction["label"]["asserted_at"].as_str(),
+        "{earlier_asserted_at} is not earlier than {retraction}"
     );
-    let earlier_label = serve_earlier_label(&labeler, &earlier);
+    let earlier_id = spam(&["--value", "500000", "--asserted-at", &earlier_asserted_at]);
+    let earlier_label = label_file(&labeler, &earlier_id);
+    assert_eq!(earlier_label["label"]["asserted_at"], earlier_asserted_at);
+    assert_eq!(earlier_label["label"]["value"], 500000);
     labeler.ping_and_wait(&spake, &http, &aggregator);
     let earlier_epoch = seal_epoch(&clave, &aggregator.data, &grid.next());
     record.exercised("label_with_an_earlier_asserted_at", earlier_epoch);
