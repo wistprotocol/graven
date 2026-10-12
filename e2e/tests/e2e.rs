@@ -4032,8 +4032,8 @@ fn a_change_above_the_per_domain_capacity_seals_over_several_epochs_and_each_ent
     let mut grid = Grid::new();
 
     let capacity = 3;
-    // WIST-4 §5: `labeler_epoch_entries_max` never exceeds `domain_epoch_entries_max`, and an
-    // amendment takes effect no earlier than `param_grace_days` (7) after its Epoch's `sealed_at`.
+    // WIST-4 §5: `labeler_epoch_entries_max` never exceeds `domain_epoch_entries_max`. Issued
+    // before Epoch 0 seals, these are genesis amendments carrying the explicit instant given here.
     let in_force_hours = 7 * 24 + 2;
     let in_force_at = grid_instant(in_force_hours);
     change_parameter(
