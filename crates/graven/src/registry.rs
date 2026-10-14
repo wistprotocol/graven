@@ -14,6 +14,8 @@ pub struct LogEntry {
     /// WIST-3 §5: never read from the Log.
     #[serde(default)]
     pub witnesses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up_epochs: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -130,6 +132,7 @@ mod tests {
                 tier1: true,
                 mirrors: Vec::new(),
                 witnesses: Vec::new(),
+                catch_up_epochs: None,
             }],
         };
         save(dir.path(), &reg).unwrap();
@@ -188,6 +191,7 @@ mod tests {
             tier1: false,
             mirrors: Vec::new(),
             witnesses: Vec::new(),
+            catch_up_epochs: None,
         }
     }
 

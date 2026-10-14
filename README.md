@@ -166,7 +166,15 @@ rejects verifies at no height and is refused as soon as the tuples are
 authenticated. A cold start that commits no state leaves the Log
 unregistered where this run was the one that registered it; one that
 adopted a Checkpoint keeps the registration and reports a failure above
-that head as an incremental sync does. A sync reads no Mirror list.
+that head as an incremental sync does. A store whose verified head lags
+the newest Checkpoint by at least N Epochs reads the Snapshot index; when
+the newest Snapshot stands at least N Epochs above the head, it is
+installed as a cold start installs it, after its `aggregator_key` tuples
+are checked against the held registry (WIST-3 §7) and its Checkpoint
+against the held tree (a tree that does not extend the head is
+`WIST3-E02`), and replaces the store atomically. A rejected Snapshot is
+reported and the sync walks instead; `--catch-up-epochs <N>` on `follow`
+or `sync` sets N (default 720). A sync reads no Mirror list.
 The Checkpoint a Consumer adopts as its head must carry Cosignatures
 from at least `checkpoint_witness_quorum` distinct Witnesses of its
 roster, read as in force at that Checkpoint's `sealed_at` (WIST-3 §5,

@@ -17,6 +17,7 @@ fn sync_from(
             witnesses: &[],
             tier1: false,
             allow_http: true,
+            catch_up_epochs: None,
         },
         dir,
     );

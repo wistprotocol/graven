@@ -107,8 +107,7 @@ fn key_ids_valid_at(log_dir: &Path, height: u64) -> Vec<String> {
 }
 
 /// WIST-3 §3.4, §7 and §8: a cold start authenticates the state file's key tuples from the Anchor
-/// and verifies the three documents under the keys valid at the adopted head. The cases that hold
-/// a Consumer registry describe a catch-up through a Snapshot, which this Consumer does not make.
+/// and verifies the three documents under the keys valid at the adopted head.
 #[test]
 fn snapshot_keys_cases_cold_started_accept_or_reject_with_wist3_e04() {
     let vector = vector();
@@ -162,4 +161,185 @@ fn snapshot_keys_cases_cold_started_accept_or_reject_with_wist3_e04() {
         replayed += 1;
     }
     assert_eq!(replayed, 31);
+}
+
+fn cold_start(history: &Value, case: &Value, target: &Path) -> graven::sync::SyncReport {
+    let (dir, base_url) = serve(history, case);
+    graven::sync::run(
+        dir.path().join("log/anchor.json").to_str().unwrap(),
+        &base_url,
+        target,
+        true,
+        false,
+    )
+    .unwrap_or_else(|e| panic!("{}: {e}", case["name"]))
+}
+
+fn holding_case(vector: &Value, verified_head: u64) -> &Value {
+    let name = match verified_head {
+        1 => "resume after the genesis key's removal",
+        2 => "resume across a key addition",
+        3 => "the index signed by a key added above the Snapshot's Epoch",
+        other => panic!("no accept case adopts epoch {other}"),
+    };
+    let case = vector["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == name)
+        .unwrap();
+    assert_eq!(case["adopted_head"], verified_head, "{name}");
+    case
+}
+
+fn held_registry(log_dir: &Path) -> Vec<Value> {
+    let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT key_id, public_key, added_height, removed_height FROM aggregator_keys ORDER BY key_id",
+        )
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok(serde_json::json!([
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Option<i64>>(3)?
+        ]))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+fn sync_state(log_dir: &Path) -> graven::sync::SyncState {
+    graven::sync::load_sync_state(&Connection::open(log_dir.join("index.sqlite")).unwrap())
+        .unwrap()
+        .unwrap()
+}
+
+fn table_dump(log_dir: &Path) -> std::collections::BTreeMap<String, Vec<String>> {
+    let conn = Connection::open(log_dir.join("index.sqlite")).unwrap();
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    tables
+        .into_iter()
+        .map(|table| {
+            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let columns = stmt.column_count();
+            let mut rows: Vec<String> = stmt
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|i| {
+                            row.get::<_, rusqlite::types::Value>(i)
+                                .map(|v| format!("{v:?}"))
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map(|values| values.join("|"))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows.sort();
+            (table, rows)
+        })
+        .collect()
+}
+
+/// WIST-3 §7 and §8 "Catch-up decision".
+#[test]
+fn snapshot_keys_catch_up_cases_install_or_reject_against_the_held_registry() {
+    let vector = vector();
+    let history = &vector["history"];
+    let log_id = history["log_id"].as_str().unwrap();
+    let mut replayed = 0;
+    for case in vector["cases"].as_array().unwrap() {
+        let Some(consumer_registry) = case.get("consumer_registry") else {
+            continue;
+        };
+        let name = case["name"].as_str().unwrap();
+        let verified_head = consumer_registry["verified_head"].as_u64().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let log_dir = graven::registry::log_dir(target.path(), log_id);
+        cold_start(history, holding_case(&vector, verified_head), target.path());
+        if name == "a tuple for a key the Consumer's registry does not hold" {
+            Connection::open(log_dir.join("index.sqlite"))
+                .unwrap()
+                .execute(
+                    "DELETE FROM aggregator_keys WHERE key_id = 'test-snap-d'",
+                    [],
+                )
+                .unwrap();
+        }
+        let expected_registry: Vec<Value> = consumer_registry["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| serde_json::json!([entry[1], entry[2], entry[3], entry[4]]))
+            .collect();
+        assert_eq!(held_registry(&log_dir), expected_registry, "{name}");
+        let held = sync_state(&log_dir);
+        assert_eq!(held.epoch_number, verified_head, "{name}");
+
+        let (dir, base_url) = serve(history, case);
+        let anchor = dir.path().join("log/anchor.json");
+        let mut registered = graven::registry::load(target.path()).unwrap();
+        registered.logs[0].anchor = anchor.to_str().unwrap().to_owned();
+        registered.logs[0].base = base_url.clone();
+        graven::registry::save(target.path(), &registered).unwrap();
+        let report = graven::sync::follow(
+            &graven::sync::Follow {
+                anchor: anchor.to_str().unwrap(),
+                log_base: &base_url,
+                mirrors: &[],
+                witnesses: &[],
+                tier1: false,
+                allow_http: true,
+                catch_up_epochs: Some(0),
+            },
+            target.path(),
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(report.epoch_number_before, Some(verified_head), "{name}");
+        assert_eq!(report.head, 3, "{name}");
+        let caught_up = sync_state(&log_dir);
+        match case["expected"].as_str().unwrap() {
+            "accept" => {
+                assert!(report.snapshot_rejected.is_none(), "{name}: {report}");
+                assert_eq!(
+                    serde_json::json!(key_ids_valid_at(&log_dir, 3)),
+                    case["key_ids_at_adopted_head"],
+                    "{name}"
+                );
+                assert_eq!(caught_up.walk_floor, Some(3), "{name}");
+                let fresh = tempfile::tempdir().unwrap();
+                graven::sync::run(
+                    anchor.to_str().unwrap(),
+                    &base_url,
+                    fresh.path(),
+                    true,
+                    false,
+                )
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(
+                    table_dump(&log_dir),
+                    table_dump(&graven::registry::log_dir(fresh.path(), log_id)),
+                    "{name}"
+                );
+            }
+            code => {
+                let rejection = report.snapshot_rejected.clone().unwrap_or_default();
+                assert!(rejection.contains(code), "{name}: {report}");
+                assert_eq!(caught_up.walk_floor, held.walk_floor, "{name}");
+                assert_eq!(caught_up.content_digest, held.content_digest, "{name}");
+            }
+        }
+        replayed += 1;
+    }
+    assert_eq!(replayed, 4);
 }

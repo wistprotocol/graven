@@ -540,6 +540,7 @@ mod tests {
                     tier1: false,
                     mirrors: Vec::new(),
                     witnesses: Vec::new(),
+                    catch_up_epochs: None,
                 }],
             },
         )

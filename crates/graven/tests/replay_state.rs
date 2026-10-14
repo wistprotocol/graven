@@ -16,6 +16,7 @@ fn sync(fx: &common::Fixture, target: &Path, witnesses: &[String]) -> graven::sy
             witnesses,
             tier1: false,
             allow_http: true,
+            catch_up_epochs: None,
         },
         target,
     )

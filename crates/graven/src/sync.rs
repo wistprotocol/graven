@@ -55,6 +55,7 @@ pub struct SyncReport {
     pub withdrawn: u64,
     /// WIST-1 §5.2: walked by this run and applying nothing.
     pub rejected: Vec<RejectedEpoch>,
+    pub snapshot_rejected: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,11 +90,16 @@ impl std::fmt::Display for SyncReport {
             let rejected: Vec<String> = self.rejected.iter().map(ToString::to_string).collect();
             write!(f, ", rejected epochs {}", rejected.join("; "))?;
         }
+        if let Some(rejection) = &self.snapshot_rejected {
+            write!(f, ", snapshot catch-up rejected: {rejection}")?;
+        }
         Ok(())
     }
 }
 
 pub const SYNC_STATE_FORMAT: u32 = 7;
+
+pub const DEFAULT_CATCH_UP_EPOCHS: u64 = 720;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncState {
@@ -141,6 +147,7 @@ pub struct Follow<'a> {
     pub witnesses: &'a [String],
     pub tier1: bool,
     pub allow_http: bool,
+    pub catch_up_epochs: Option<u64>,
 }
 
 pub fn run(
@@ -158,6 +165,7 @@ pub fn run(
             witnesses: &[],
             tier1,
             allow_http,
+            catch_up_epochs: None,
         },
         dir,
     )
@@ -274,6 +282,7 @@ pub fn run_all(dir: &Path, allow_http: bool) -> Result<Vec<SyncReport>> {
                     witnesses: &entry.witnesses,
                     tier1: entry.tier1,
                     allow_http,
+                    catch_up_epochs: entry.catch_up_epochs,
                 },
                 dir,
             )
@@ -309,6 +318,9 @@ fn register(dir: &Path, config: &Follow, log_id: &str) -> Result<LogEntry> {
             if !config.witnesses.is_empty() {
                 entry.witnesses = config.witnesses.to_vec();
             }
+            if config.catch_up_epochs.is_some() {
+                entry.catch_up_epochs = config.catch_up_epochs;
+            }
             entry.clone()
         }
         None => {
@@ -319,6 +331,7 @@ fn register(dir: &Path, config: &Follow, log_id: &str) -> Result<LogEntry> {
                 tier1: config.tier1,
                 mirrors: config.mirrors.to_vec(),
                 witnesses: config.witnesses.to_vec(),
+                catch_up_epochs: config.catch_up_epochs,
             };
             reg.logs.push(entry.clone());
             entry
@@ -401,7 +414,10 @@ fn run_registered(
         subscriptions: &subscriptions,
     };
     if synced {
-        return run_incremental(&context);
+        return run_incremental(
+            &context,
+            entry.catch_up_epochs.unwrap_or(DEFAULT_CATCH_UP_EPOCHS),
+        );
     }
     run_cold_start(&context).map_err(|error| match holds_verified_head(&log_dir) {
         true => error,
@@ -599,7 +615,13 @@ fn walk_to_adoption(
     })
 }
 
-fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
+struct Held {
+    keys: Registry,
+    tree: Tree,
+    head: Checkpoint,
+}
+
+fn run_incremental(context: &SyncContext, catch_up_epochs: u64) -> Result<SyncReport> {
     let index_sqlite_path = context.log_dir.join("index.sqlite");
     let conn = Connection::open(&index_sqlite_path)?;
     let local = load_sync_state(&conn)?
@@ -611,17 +633,6 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
         )
     })?;
     let cadence = ChainState::restore(&local, load_parameters(&conn)?).cadence();
-    let unchanged = |stale: bool| SyncReport {
-        log_id: context.log_id.to_string(),
-        epoch_number_before: Some(local.epoch_number),
-        head: local.epoch_number,
-        tree_size: local.tree_size,
-        root: local.root.clone(),
-        unwitnessed: local.unwitnessed,
-        stale,
-        withdrawn: 0,
-        rejected: Vec::new(),
-    };
 
     let keys = load_aggregator_keys(&conn, context.anchor, local.epoch_number)?;
     let offered = match offered_above(context, &conn, local.epoch_number, &keys) {
@@ -640,15 +651,103 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
             )
         }
     };
+    let walk = Incremental {
+        local: &local,
+        head: &head,
+        cadence,
+    };
+    let newest = offered
+        .checkpoints
+        .last()
+        .map_or(local.epoch_number, Checkpoint::epoch_number);
+    // WIST-3 §8 "Catch-up decision".
+    let Some(floor) = local
+        .epoch_number
+        .checked_add(catch_up_epochs)
+        .filter(|floor| newest >= *floor)
+    else {
+        return walk_incremental(context, &conn, &walk, offered, None);
+    };
+    let snapshot_epoch = match newest_snapshot_epoch(context.sources) {
+        Ok(epoch_number) => epoch_number,
+        Err(error) => {
+            eprintln!(
+                "log {}: {error}; no Snapshot index is readable, so the sync walks from the verified head",
+                context.log_id
+            );
+            return walk_incremental(context, &conn, &walk, offered, None);
+        }
+    };
+    if snapshot_epoch < floor {
+        return walk_incremental(context, &conn, &walk, offered, None);
+    }
+    let held = Held {
+        keys,
+        tree: Tree::load(&conn)?,
+        head: head.clone(),
+    };
+    drop(conn);
+    let snapshot_rejected = match snapshot_sync(context, Some(&held)) {
+        Ok(Installed::Done(report)) => return report,
+        Ok(Installed::Behind(epoch_number)) => {
+            eprintln!(
+                "log {}: the newest Snapshot now stands at epoch {epoch_number}, below the verified head at epoch {}; walking instead",
+                context.log_id, local.epoch_number
+            );
+            None
+        }
+        Err(error) if error.code().as_deref() == Some("WIST3-E02") => return Err(error),
+        Err(error) => {
+            eprintln!(
+                "log {}: {error}; walking from the verified head instead of catching up through the Snapshot",
+                context.log_id
+            );
+            Some(error.to_string())
+        }
+    };
+    let conn = Connection::open(&index_sqlite_path)?;
+    walk_incremental(context, &conn, &walk, offered, snapshot_rejected)
+}
+
+struct Incremental<'a> {
+    local: &'a SyncState,
+    head: &'a Checkpoint,
+    cadence: i64,
+}
+
+fn walk_incremental(
+    context: &SyncContext,
+    conn: &Connection,
+    walk_from: &Incremental,
+    offered: Offered,
+    snapshot_rejected: Option<String>,
+) -> Result<SyncReport> {
+    let Incremental {
+        local,
+        head,
+        cadence,
+    } = *walk_from;
+    let unchanged = |stale: bool| SyncReport {
+        log_id: context.log_id.to_string(),
+        epoch_number_before: Some(local.epoch_number),
+        head: local.epoch_number,
+        tree_size: local.tree_size,
+        root: local.root.clone(),
+        unwitnessed: local.unwitnessed,
+        stale,
+        withdrawn: 0,
+        rejected: Vec::new(),
+        snapshot_rejected: snapshot_rejected.clone(),
+    };
     if offered.checkpoints.is_empty() {
-        let report = unchanged(checkpoints::warn_if_stale(context.log_id, &head, cadence));
+        let report = unchanged(checkpoints::warn_if_stale(context.log_id, head, cadence));
         return match offered.stopped {
             None => Ok(report),
             Some(stop) => Err(stopped_run(&report, stop)),
         };
     }
 
-    let walked = walk_to_adoption(context, &conn, &local, &head, &offered.checkpoints)?;
+    let walked = walk_to_adoption(context, conn, local, head, &offered.checkpoints)?;
     let stopped = first_stop(offered.stopped, walked.stopped);
     let Some((restored, walk, adopted, unwitnessed)) = walked.adopted else {
         if stopped.is_none() {
@@ -657,7 +756,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
                 context.log_id, local.epoch_number
             );
         }
-        let report = unchanged(checkpoints::warn_if_stale(context.log_id, &head, cadence));
+        let report = unchanged(checkpoints::warn_if_stale(context.log_id, head, cadence));
         return match stopped {
             None => Ok(report),
             Some(stop) => Err(stopped_run(&report, stop)),
@@ -739,6 +838,7 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
         stale,
         withdrawn: stats.withdrawn,
         rejected,
+        snapshot_rejected,
     };
     match stopped {
         None => Ok(report),
@@ -748,15 +848,29 @@ fn run_incremental(context: &SyncContext) -> Result<SyncReport> {
 
 /// WIST-3 §9 `WIST3-E04`: "reject the entire Snapshot and re-fetch, from another Mirror if needed".
 enum ColdStart {
-    Done(SyncReport),
+    Installed(Installed),
     Rejected { error: Error, next: usize },
 }
 
+enum Installed {
+    Done(Result<SyncReport>),
+    Behind(u64),
+}
+
 fn run_cold_start(context: &SyncContext) -> Result<SyncReport> {
+    match snapshot_sync(context, None)? {
+        Installed::Done(report) => report,
+        Installed::Behind(epoch_number) => Err(Error::Verify(format!(
+            "the Snapshot at epoch {epoch_number} stands below the verified head"
+        ))),
+    }
+}
+
+fn snapshot_sync(context: &SyncContext, held: Option<&Held>) -> Result<Installed> {
     let mut from = 0;
     loop {
-        match cold_start_at(context, from)? {
-            ColdStart::Done(report) => return Ok(report),
+        match cold_start_at(context, held, from)? {
+            ColdStart::Installed(installed) => return Ok(installed),
             ColdStart::Rejected { error, next } => {
                 if next >= context.sources.count() {
                     return Err(error);
@@ -789,7 +903,64 @@ fn verify_unsealed(
     Ok(())
 }
 
-fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
+// WIST-3 §8 step 5: a Snapshot's Checkpoint not extending the verified head is `WIST3-E02`.
+fn extended_tree(context: &SyncContext, held: &Held, offered: &Checkpoint) -> Result<Tree> {
+    let head = &held.head;
+    let diverged = |detail: &str, tiles: Option<&Tree>| {
+        checkpoints::divergence(
+            context.log_dir,
+            context.log_id,
+            &held.keys,
+            head.epoch_number(),
+            Some(head),
+            offered,
+            tiles,
+            detail,
+        )
+    };
+    if offered.tree_size() < head.tree_size() {
+        return Err(diverged(
+            "the Snapshot's Checkpoint states a smaller tree than the verified head's",
+            None,
+        ));
+    }
+    let mut tree = held.tree.clone();
+    match tree::extend(
+        context.sources,
+        &mut tree,
+        head.tree_size(),
+        offered.tree_size(),
+        offered.root(),
+    ) {
+        Ok(()) => {
+            if wist_core::tiles::check_tree(tree.reader(), head.tree_size(), head.root()).is_err() {
+                return Err(diverged(
+                    "the tree the Snapshot's Checkpoint states does not extend the verified head's",
+                    Some(&tree),
+                ));
+            }
+            Ok(tree)
+        }
+        Err(range_error) => {
+            match tree::offered_tree(context.sources, offered.tree_size(), offered.root())? {
+                Some(offered_tree) => {
+                    let prefix =
+                        wist_core::merkle::root_from(offered_tree.reader(), head.tree_size())?;
+                    if prefix != *head.root() {
+                        return Err(diverged(
+                            "the tree the Snapshot's Checkpoint states does not extend the verified head's",
+                            Some(&offered_tree),
+                        ));
+                    }
+                    Ok(offered_tree)
+                }
+                None => Err(range_error),
+            }
+        }
+    }
+}
+
+fn cold_start_at(context: &SyncContext, held: Option<&Held>, from: usize) -> Result<ColdStart> {
     let mut installed = install::snapshot(
         context.sources,
         context.anchor,
@@ -798,6 +969,24 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
         from,
     )?;
     let next_source = installed.source + 1;
+    if let Some(held) = held {
+        // WIST-3 §7: rejected as soon as the tuples are authenticated.
+        if let Err(error) = wist_core::aggregator_keys::check_catch_up(
+            &held.keys,
+            held.head.epoch_number(),
+            &installed.aggregator_keys,
+        ) {
+            return Ok(ColdStart::Rejected {
+                error: error.into(),
+                next: next_source,
+            });
+        }
+        if installed.manifest.epoch_number < held.head.epoch_number() {
+            return Ok(ColdStart::Installed(Installed::Behind(
+                installed.manifest.epoch_number,
+            )));
+        }
+    }
     // WIST-3 §8 steps 4–5.
     let (anchor, verification) = checkpoints::manifest_anchor(
         context.sources,
@@ -819,13 +1008,19 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
         Some(sealed_at_s),
     );
     save_history(&installed.conn, &installed.history)?;
-    let mut tree = Tree::new();
-    tree::seed(
-        context.sources,
-        &mut tree,
-        anchor.tree_size(),
-        anchor.root(),
-    )?;
+    let tree = match held {
+        Some(held) => extended_tree(context, held, &anchor)?,
+        None => {
+            let mut tree = Tree::new();
+            tree::seed(
+                context.sources,
+                &mut tree,
+                anchor.tree_size(),
+                anchor.root(),
+            )?;
+            tree
+        }
+    };
     tree.save(&installed.conn)?;
     installed.suffix_lists.save(&installed.conn)?;
     save_parameters(&installed.conn, &installed.chain)?;
@@ -984,7 +1179,7 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
 
     let report = SyncReport {
         log_id: context.log_id.to_string(),
-        epoch_number_before: None,
+        epoch_number_before: held.map(|held| held.head.epoch_number()),
         head: sync_state.epoch_number,
         tree_size: sync_state.tree_size,
         root: sync_state.root.clone(),
@@ -992,11 +1187,12 @@ fn cold_start_at(context: &SyncContext, from: usize) -> Result<ColdStart> {
         stale,
         withdrawn: stats.withdrawn,
         rejected,
+        snapshot_rejected: None,
     };
-    match stopped {
-        None => Ok(ColdStart::Done(report)),
+    Ok(ColdStart::Installed(Installed::Done(match stopped {
+        None => Ok(report),
         Some(stop) => Err(stopped_run(&report, stop)),
-    }
+    })))
 }
 
 /// The index row is authoritative; this file is advisory.

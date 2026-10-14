@@ -1612,6 +1612,7 @@ mod tests {
                 tier1: false,
                 mirrors: Vec::new(),
                 witnesses: Vec::new(),
+                catch_up_epochs: None,
             })
             .collect();
         crate::registry::save(dir, &crate::registry::Registry { logs }).unwrap();
@@ -1950,6 +1951,7 @@ mod tests {
                     tier1: false,
                     mirrors: Vec::new(),
                     witnesses: Vec::new(),
+                    catch_up_epochs: None,
                 }],
             },
         )
@@ -1987,6 +1989,7 @@ mod tests {
                         tier1: false,
                         mirrors: Vec::new(),
                         witnesses: Vec::new(),
+                        catch_up_epochs: None,
                     },
                     crate::registry::LogEntry {
                         log_id: "host:9".into(),
@@ -1995,6 +1998,7 @@ mod tests {
                         tier1: false,
                         mirrors: Vec::new(),
                         witnesses: Vec::new(),
+                        catch_up_epochs: None,
                     },
                 ],
             },

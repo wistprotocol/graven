@@ -33,6 +33,10 @@ enum Command {
         /// supplying any replaces the roster held for the log.
         #[arg(long = "witness")]
         witnesses: Vec<String>,
+        /// Catch up through the newest Snapshot instead of walking when it
+        /// stands at least N Epochs above the verified head; default 720.
+        #[arg(long = "catch-up-epochs", value_name = "N")]
+        catch_up_epochs: Option<u64>,
     },
     Sync {
         #[arg(long)]
@@ -49,6 +53,10 @@ enum Command {
         mirrors: Vec<String>,
         #[arg(long = "witness")]
         witnesses: Vec<String>,
+        /// Catch up through the newest Snapshot instead of walking when it
+        /// stands at least N Epochs above the verified head; default 720.
+        #[arg(long = "catch-up-epochs", value_name = "N", requires = "anchor")]
+        catch_up_epochs: Option<u64>,
     },
     Serve {
         #[arg(long)]
@@ -130,6 +138,7 @@ fn main() -> Result<(), graven::Error> {
             allow_http,
             mirrors,
             witnesses,
+            catch_up_epochs,
         } => {
             let report = graven::sync::follow(
                 &graven::sync::Follow {
@@ -139,6 +148,7 @@ fn main() -> Result<(), graven::Error> {
                     witnesses: &witnesses,
                     tier1,
                     allow_http,
+                    catch_up_epochs,
                 },
                 &dir,
             )?;
@@ -152,6 +162,7 @@ fn main() -> Result<(), graven::Error> {
             allow_http,
             mirrors,
             witnesses,
+            catch_up_epochs,
         } => match (anchor, log_base) {
             (Some(anchor), Some(log_base)) => {
                 let report = graven::sync::follow(
@@ -162,6 +173,7 @@ fn main() -> Result<(), graven::Error> {
                         witnesses: &witnesses,
                         tier1,
                         allow_http,
+                        catch_up_epochs,
                     },
                     &dir,
                 )?;

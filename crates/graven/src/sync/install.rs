@@ -556,6 +556,26 @@ fn documents(
     })
 }
 
+pub(super) fn newest_snapshot_epoch(sources: &Sources) -> Result<u64> {
+    let mut last: Option<Error> = None;
+    for at in 0..sources.count() {
+        let read = index_entry(sources, at).and_then(|(entry, _)| {
+            sources
+                .whole_from(&entry.manifest_url, at, |bytes| {
+                    agreeing_manifest(&entry, bytes)
+                })
+                .map(|((envelope, _), _)| envelope.manifest.epoch_number)
+        });
+        match read {
+            Ok(epoch_number) => return Ok(epoch_number),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        Error::Fetch(format!("WIST3-E01 no source holds {SNAPSHOT_INDEX_PATH}"))
+    }))
+}
+
 /// WIST-3 §9 `WIST3-E04`: the rejection stands only where no source's index yields a Snapshot that
 /// verifies.
 fn snapshot_documents(

@@ -2112,3 +2112,127 @@ fn a_rejected_epoch_applies_its_key_acts_alone_and_the_walk_goes_on() {
         1
     );
 }
+
+fn follow_catching_up(
+    anchor: &std::path::Path,
+    base_url: &str,
+    target: &std::path::Path,
+    catch_up_epochs: Option<u64>,
+) -> Result<graven::sync::SyncReport, graven::Error> {
+    graven::sync::follow(
+        &graven::sync::Follow {
+            anchor: anchor.to_str().unwrap(),
+            log_base: base_url,
+            mirrors: &[],
+            witnesses: &[],
+            tier1: false,
+            allow_http: true,
+            catch_up_epochs,
+        },
+        target,
+    )
+}
+
+/// WIST-3 §8 "Catch-up decision".
+#[test]
+fn a_head_lagging_by_fewer_than_the_catch_up_epochs_walks_without_reading_the_snapshot_index() {
+    let fx = common::build_fixture(false);
+    let served = tempfile::tempdir().unwrap();
+    common::copy_dir(fx.dir.path(), served.path());
+    let (addr, requests) = common::serve_recording(served.path().to_path_buf());
+    let base_url = format!("http://{addr}");
+    let target = tempfile::tempdir().unwrap();
+    let report = follow_catching_up(&fx.anchor_path(), &base_url, target.path(), None).unwrap();
+    assert_eq!(report.head, 1);
+
+    common::extend_fixture(&fx);
+    common::copy_dir(fx.dir.path(), served.path());
+    std::fs::remove_file(served.path().join("snapshots/index.json")).unwrap();
+    requests.lock().unwrap().clear();
+
+    let report = follow_catching_up(&fx.anchor_path(), &base_url, target.path(), None).unwrap();
+    assert_eq!(report.epoch_number_before, Some(1));
+    assert_eq!(report.head, 2);
+    assert!(report.snapshot_rejected.is_none());
+    assert!(
+        !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path == "/snapshots/index.json"),
+        "one Epoch of lag is below the default threshold of {}",
+        graven::sync::DEFAULT_CATCH_UP_EPOCHS
+    );
+}
+
+/// WIST-3 §8 step 5 and "Catch-up decision".
+#[test]
+fn a_snapshot_whose_checkpoint_does_not_extend_the_verified_head_is_divergence() {
+    let fx = common::build_fixture(false);
+    let target = tempfile::tempdir().unwrap();
+    let report = follow_catching_up(&fx.anchor_path(), &fx.base_url, target.path(), None).unwrap();
+    assert_eq!(report.head, 1);
+    let honest_size = fx.head_tree_size();
+
+    let publisher = common::Signer::new([1u8; 32]);
+    let fork_entries: Vec<serde_json::Value> = (0..honest_size + 2)
+        .map(|i| common::declaration_entry(&publisher, &format!("fork-{i}.example")))
+        .collect();
+    let mut forked = common::Log::new(
+        fx.dir.path(),
+        common::Signer::new([9u8; 32]),
+        "graven-test-log",
+    );
+    forked.seal("2026-08-09T12:00:00Z", &fork_entries);
+    forked.seal("2026-08-09T13:00:00Z", &[]);
+    let head = forked.seal("2026-08-09T14:00:00Z", &[]);
+
+    let date = "2026-08-10";
+    let snapdir = common::snapshot_dir(fx.dir.path(), date, 2);
+    let tier0 = common::write_tier0(&snapdir.join("tier0/index.sqlite"), &[]);
+    let (state_bytes, state_digest) = common::write_state(
+        &snapdir.join("state.json"),
+        &fx.log,
+        3600,
+        &[],
+        head.tree_size(),
+    );
+    let digest = common::content_digest(&[]);
+    common::write_manifest(
+        &snapdir.join("manifest.json"),
+        &fx.log,
+        date,
+        2,
+        head.tree_size(),
+        &head.root_token(),
+        &digest,
+        &state_bytes,
+        &state_digest,
+        &tier0,
+    );
+    common::write_index(
+        &fx.dir.path().join("snapshots/index.json"),
+        &fx.log,
+        date,
+        head.tree_size(),
+        &common::manifest_url(date, 2),
+        &digest,
+    );
+
+    let error = follow_catching_up(&fx.anchor_path(), &fx.base_url, target.path(), Some(0))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("WIST3-E02"), "{error}");
+    assert!(error.contains("the Snapshot's Checkpoint"), "{error}");
+    let log_dir = common::synced_log_dir(target.path());
+    assert!(log_dir.join(graven::sync::checkpoints::HALT_FILE).exists());
+    assert!(log_dir
+        .join("evidence/divergence-epoch-000000002/offered.checkpoint")
+        .exists());
+    let held =
+        graven::sync::load_sync_state(&Connection::open(log_dir.join("index.sqlite")).unwrap())
+            .unwrap()
+            .unwrap();
+    assert_eq!(held.epoch_number, 1);
+    assert!(!log_dir.join("index.sqlite.verifying").exists());
+}
