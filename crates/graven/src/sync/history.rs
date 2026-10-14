@@ -634,13 +634,7 @@ fn verify_checkpoint(
         let Some(body) = act_of(entry, *eligible, &["suffix_list_update"]) else {
             continue;
         };
-        if suffix_lists.apply_act(
-            inputs.sources.client(),
-            inputs.sources.primary(),
-            n,
-            body,
-            log_key,
-        )? {
+        if suffix_lists.apply_act(inputs.sources, n, body, log_key)? {
             accepted_here.extend(registry_update_id(body));
         }
     }

@@ -273,8 +273,19 @@ fn the_cold_start_vector_matches_a_manifest_to_the_checkpoint_at_its_epoch() {
         let served = serving_archive(manifest.epoch_number, case["checkpoint"].as_str().unwrap());
         let (addr, _) = common::serve_recording(served.path().to_path_buf());
         let sources = Sources::new(&client, vec![base(&addr)]);
+        let log_dir = tempfile::tempdir().unwrap();
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let outcome =
-            checkpoints::manifest_anchor(&sources, &manifest, state_tree_size, &log_id, &keys, &[]);
+            checkpoints::manifest_anchor(&sources, &manifest, state_tree_size, &log_id, &keys, &[])
+                .and_then(|(anchor, verification)| {
+                    checkpoints::manifest_agrees(
+                        log_dir.path(),
+                        &manifest,
+                        &manifest_bytes,
+                        &anchor,
+                    )
+                    .map(|()| (anchor, verification))
+                });
         let expected = case["expected"].as_str().unwrap();
         match expected {
             "valid" => {
@@ -291,6 +302,11 @@ fn the_cold_start_vector_matches_a_manifest_to_the_checkpoint_at_its_epoch() {
                 assert!(
                     case["expected_head_epoch_number"].is_null(),
                     "{name}: no Checkpoint becomes the verified head"
+                );
+                assert_eq!(
+                    checkpoints::halt(log_dir.path()).is_some(),
+                    expected == "WIST3-E02",
+                    "{name}: only a manifest contradicting its Checkpoint halts the Log"
                 );
             }
             other => panic!("{name}: unknown expectation {other}"),

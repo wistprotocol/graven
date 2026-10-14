@@ -998,6 +998,21 @@ fn cold_start_at(context: &SyncContext, held: Option<&Held>, from: usize) -> Res
             .valid_at(installed.manifest.epoch_number),
         context.witnesses,
     )?;
+    if let Some(held) = held.filter(|held| held.head.epoch_number() == anchor.epoch_number()) {
+        checkpoints::agrees_with_retained(
+            context.log_dir,
+            context.log_id,
+            &held.keys,
+            &held.head,
+            &anchor,
+        )?;
+    }
+    checkpoints::manifest_agrees(
+        context.log_dir,
+        &installed.manifest,
+        &installed.manifest_bytes,
+        &anchor,
+    )?;
     let sealed_at_s = anchor.sealed_at_s()?;
     installed.chain.seed_prior(sealed_at_s);
     let anchor_adoption =

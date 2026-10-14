@@ -1,10 +1,9 @@
 //! WIST-4 §3.1 and WIST-3 §3.2.
+use super::source::Sources;
 use crate::error::{Error, Result};
-use crate::fetch::{resolve, Client};
-use reqwest::Url;
 use rusqlite::Connection;
 use serde_json::Value;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use wist_core::crypto::PublicKey;
@@ -16,20 +15,30 @@ pub struct SuffixLists {
     parsed: BTreeMap<String, Arc<SuffixList>>,
 }
 
-fn fetch(client: &Client, base: &Url, identifier: &str) -> Result<Vec<u8>> {
+// WIST-3 §9 `WIST3-E01`.
+fn fetch(sources: &Sources, identifier: &str) -> Result<Vec<u8>> {
     let hex = identifier.strip_prefix("sha256:").unwrap_or(identifier);
-    let url = resolve(base, &format!("/log/suffix-lists/{hex}.dat"))?;
-    let octets = client.get_bytes(&url).map_err(|e| {
-        Error::Verify(format!(
-            "WIST3-E01 suffix-list snapshot {identifier} is not obtainable: {e}"
-        ))
-    })?;
-    if suffix_list::identifier(&octets) != identifier {
-        return Err(Error::Verify(format!(
-            "WIST3-E03 the file served for suffix-list snapshot {identifier} does not hash to it"
-        )));
-    }
-    Ok(octets)
+    let path = format!("/log/suffix-lists/{hex}.dat");
+    let mismatched = Cell::new(false);
+    sources
+        .whole(&path, |octets| {
+            if suffix_list::identifier(octets) != identifier {
+                mismatched.set(true);
+                return Err(Error::Verify(format!(
+                    "WIST3-E03 the file served for suffix-list snapshot {identifier} does not hash to it"
+                )));
+            }
+            Ok(octets.to_vec())
+        })
+        .map(|(octets, _)| octets)
+        .map_err(|e| match mismatched.get() {
+            true => Error::Verify(format!(
+                "WIST3-E03 no source serves a file for suffix-list snapshot {identifier} that hashes to it"
+            )),
+            false => Error::Verify(format!(
+                "WIST3-E01 suffix-list snapshot {identifier} is not obtainable: {e}"
+            )),
+        })
 }
 
 impl SuffixLists {
@@ -81,15 +90,9 @@ impl SuffixLists {
     }
 
     /// WIST-3 §8 step 10: the file is obtained before any Epoch's capacity is checked under it.
-    pub fn adopt(
-        &mut self,
-        client: &Client,
-        base: &Url,
-        identifier: &str,
-        height: u64,
-    ) -> Result<()> {
+    pub fn adopt(&mut self, sources: &Sources, identifier: &str, height: u64) -> Result<()> {
         if !self.octets.contains_key(identifier) {
-            let octets = fetch(client, base, identifier)?;
+            let octets = fetch(sources, identifier)?;
             self.octets.insert(identifier.to_string(), octets);
         }
         self.replay.adopt(identifier, height);
@@ -118,8 +121,7 @@ impl SuffixLists {
     /// mismatched file fails the walk.
     pub fn apply_act(
         &mut self,
-        client: &Client,
-        base: &Url,
+        sources: &Sources,
         height: u64,
         body: &Value,
         log_key: impl Fn(&str) -> Option<PublicKey>,
@@ -133,7 +135,7 @@ impl SuffixLists {
             let mut fetched = fetched.borrow_mut();
             fetched
                 .entry(identifier.to_string())
-                .or_insert_with(|| fetch(client, base, identifier))
+                .or_insert_with(|| fetch(sources, identifier))
                 .as_ref()
                 .map_or(HeldFile::Unobtainable, |file| {
                     HeldFile::Bytes(file.len() as u64)

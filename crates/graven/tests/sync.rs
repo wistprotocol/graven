@@ -2307,3 +2307,211 @@ fn a_snapshot_whose_checkpoint_does_not_extend_the_verified_head_is_divergence()
     assert_eq!(held.epoch_number, 1);
     assert!(!log_dir.join("index.sqlite.verifying").exists());
 }
+
+fn snapshot_at_head(
+    fx: &common::Fixture,
+    root_hash: Option<&str>,
+) -> wist_core::checkpoint::Checkpoint {
+    let head = fx.log_state().head().clone();
+    let epoch_number = head.epoch_number();
+    let date = "2026-08-10";
+    let snapdir = common::snapshot_dir(fx.dir.path(), date, epoch_number);
+    let tier0 = common::write_tier0(&snapdir.join("tier0/index.sqlite"), &[]);
+    let (state_bytes, state_digest) = common::write_state(
+        &snapdir.join("state.json"),
+        &fx.log,
+        3600,
+        &[],
+        head.tree_size(),
+    );
+    let digest = common::content_digest(&[]);
+    common::write_manifest(
+        &snapdir.join("manifest.json"),
+        &fx.log,
+        date,
+        epoch_number,
+        head.tree_size(),
+        root_hash.unwrap_or(&head.root_token()),
+        &digest,
+        &state_bytes,
+        &state_digest,
+        &tier0,
+    );
+    common::write_index(
+        &fx.dir.path().join("snapshots/index.json"),
+        &fx.log,
+        date,
+        head.tree_size(),
+        &common::manifest_url(date, epoch_number),
+        &digest,
+    );
+    head
+}
+
+fn serve_archived(fx: &common::Fixture, checkpoint: &wist_core::checkpoint::Checkpoint) {
+    std::fs::write(
+        fx.dir
+            .path()
+            .join(format!("log/checkpoints/{:09}", checkpoint.epoch_number())),
+        checkpoint.encode(),
+    )
+    .unwrap();
+}
+
+fn retained_note(log_dir: &std::path::Path, epoch_number: u64) -> String {
+    Connection::open(log_dir.join("index.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT note FROM checkpoints WHERE epoch_number = ?1",
+            [epoch_number as i64],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn restated(head: &wist_core::checkpoint::Checkpoint) -> wist_core::checkpoint::Checkpoint {
+    wist_core::checkpoint::Checkpoint::new(
+        head.origin(),
+        head.tree_size(),
+        *head.root(),
+        head.epoch_number(),
+        "2026-08-09T13:30:00Z",
+    )
+    .unwrap()
+}
+
+/// WIST-3 §5 and §8 step 5.
+#[test]
+fn a_catch_up_snapshot_whose_checkpoint_restates_the_verified_head_with_other_note_text_is_equivocation(
+) {
+    let fx = common::build_fixture(false);
+    let target = tempfile::tempdir().unwrap();
+    follow_catching_up(&fx.anchor_path(), &fx.base_url, target.path(), None).unwrap();
+    let log_dir = common::synced_log_dir(target.path());
+    let head = snapshot_at_head(&fx, None);
+    let before = retained_note(&log_dir, head.epoch_number());
+    let mut offered = restated(&head);
+    offered.sign(&fx.log.sk);
+    serve_archived(&fx, &offered);
+
+    let error = follow_catching_up(&fx.anchor_path(), &fx.base_url, target.path(), Some(0))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("WIST3-E02"), "{error}");
+    let bundle = log_dir.join(format!(
+        "evidence/equivocation-epoch-{:09}",
+        head.epoch_number()
+    ));
+    assert!(error.contains(&bundle.display().to_string()), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(bundle.join("retained.checkpoint")).unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read_to_string(bundle.join("offered.checkpoint")).unwrap(),
+        offered.encode()
+    );
+    assert!(log_dir.join(graven::sync::checkpoints::HALT_FILE).exists());
+    assert_eq!(retained_note(&log_dir, head.epoch_number()), before);
+}
+
+/// WIST-3 §5: a note no key valid at its height signs is no evidence.
+#[test]
+fn a_catch_up_snapshot_checkpoint_at_the_verified_head_no_valid_key_signs_is_no_evidence() {
+    for signer in [None, Some(common::Signer::new([3u8; 32]))] {
+        let fx = common::build_fixture(false);
+        let target = tempfile::tempdir().unwrap();
+        follow_catching_up(&fx.anchor_path(), &fx.base_url, target.path(), None).unwrap();
+        let log_dir = common::synced_log_dir(target.path());
+        let head = snapshot_at_head(&fx, None);
+        let before = retained_note(&log_dir, head.epoch_number());
+        let mut offered = restated(&head);
+        if let Some(signer) = &signer {
+            offered.sign(&signer.sk);
+        }
+        serve_archived(&fx, &offered);
+
+        let report =
+            follow_catching_up(&fx.anchor_path(), &fx.base_url, target.path(), Some(0)).unwrap();
+        assert_eq!(report.head, head.epoch_number());
+        let message = report.snapshot_rejected.unwrap_or_default();
+        assert!(message.contains("WIST3-E03"), "{message}");
+        assert!(!message.contains("WIST3-E02"), "{message}");
+        assert!(!log_dir.join("evidence").exists());
+        assert!(!log_dir.join(graven::sync::checkpoints::HALT_FILE).exists());
+        assert_eq!(retained_note(&log_dir, head.epoch_number()), before);
+    }
+}
+
+fn assert_manifest_divergence(log_dir: &std::path::Path, error: &str, epoch_number: u64) {
+    assert!(error.contains("WIST3-E02"), "{error}");
+    let bundle = log_dir.join(format!("evidence/manifest-epoch-{epoch_number:09}"));
+    assert!(error.contains(&bundle.display().to_string()), "{error}");
+    let checkpoint = wist_core::checkpoint::Checkpoint::parse(
+        &std::fs::read_to_string(bundle.join("offered.checkpoint")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(checkpoint.epoch_number(), epoch_number);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["manifest"]["epoch_number"], epoch_number);
+    assert_ne!(manifest["manifest"]["root_hash"], checkpoint.root_token());
+    assert!(log_dir.join(graven::sync::checkpoints::HALT_FILE).exists());
+}
+
+/// WIST-3 §8 step 5 and §9 `WIST3-E02`.
+#[test]
+fn a_cold_start_manifest_stating_another_root_than_its_checkpoint_preserves_both_and_halts() {
+    let fx = common::build_fixture(false);
+    let other_root = fx.log_state().root_token();
+    common::rewrite_manifest(
+        &common::snapshot_dir(fx.dir.path(), &fx.snapshot_date, 0).join("manifest.json"),
+        &fx.log,
+        |manifest| manifest["root_hash"] = serde_json::json!(other_root),
+    );
+    let target = tempfile::tempdir().unwrap();
+    let log_dir = common::synced_log_dir(target.path());
+
+    let error = follow_catching_up(&fx.anchor_path(), &fx.base_url, target.path(), None)
+        .unwrap_err()
+        .to_string();
+    assert_manifest_divergence(&log_dir, &error, 0);
+    assert!(!log_dir.join("index.sqlite").exists());
+
+    let refused = follow_catching_up(&fx.anchor_path(), &fx.base_url, target.path(), None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("WIST3-E02") && refused.contains("diverged"),
+        "{refused}"
+    );
+}
+
+/// WIST-3 §8 step 5: "a catch-up through a Snapshot (below) included".
+#[test]
+fn a_catch_up_manifest_stating_another_root_than_its_checkpoint_preserves_both_and_halts() {
+    let fx = common::build_fixture(false);
+    let target = tempfile::tempdir().unwrap();
+    follow_catching_up(&fx.anchor_path(), &fx.base_url, target.path(), None).unwrap();
+    let log_dir = common::synced_log_dir(target.path());
+    let epoch0_root = fx.log_state().checkpoints[0].root_token();
+    let head = snapshot_at_head(&fx, Some(&epoch0_root));
+
+    let error = follow_catching_up(&fx.anchor_path(), &fx.base_url, target.path(), Some(0))
+        .unwrap_err()
+        .to_string();
+    assert_manifest_divergence(&log_dir, &error, head.epoch_number());
+    let held =
+        graven::sync::load_sync_state(&Connection::open(log_dir.join("index.sqlite")).unwrap())
+            .unwrap()
+            .unwrap();
+    assert_eq!(held.epoch_number, head.epoch_number());
+
+    let refused = follow_catching_up(&fx.anchor_path(), &fx.base_url, target.path(), Some(0))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("WIST3-E02") && refused.contains("diverged"),
+        "{refused}"
+    );
+}

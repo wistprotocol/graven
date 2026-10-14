@@ -105,8 +105,7 @@ fn archived_verified(
     verify(&bytes)
 }
 
-/// WIST-3 §8 steps 4 and 5: `epoch_number` only selects the file; a manifest mismatch on the
-/// verified note is divergence and is never re-fetched.
+/// WIST-3 §8 steps 4 and 5: `epoch_number` only selects the file.
 pub fn manifest_anchor(
     sources: &Sources,
     manifest: &SnapshotManifest,
@@ -116,15 +115,89 @@ pub fn manifest_anchor(
     witnesses: &[WitnessKey],
 ) -> Result<(Checkpoint, Verification)> {
     wist_core::snapshot::check_state_tree_size(manifest, state_tree_size)?;
-    let (anchor, verification) = archived_verified(
+    archived_verified(
         sources,
         manifest.epoch_number,
         log_id,
         aggregator_keys,
         witnesses,
+    )
+}
+
+/// WIST-3 §8 step 5 and §9 `WIST3-E02`: a mismatch on the verified note is divergence and is never
+/// re-fetched.
+pub fn manifest_agrees(
+    log_dir: &Path,
+    manifest: &SnapshotManifest,
+    manifest_bytes: &[u8],
+    anchor: &Checkpoint,
+) -> Result<()> {
+    let Err(error) = wist_core::snapshot::check_manifest_anchor(manifest, anchor) else {
+        return Ok(());
+    };
+    if error.code() != Some("WIST3-E02") {
+        return Err(error.into());
+    }
+    let dir = evidence_dir(log_dir, "manifest", manifest.epoch_number);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("offered.checkpoint"), anchor.encode())?;
+    std::fs::write(dir.join("manifest.json"), manifest_bytes)?;
+    record_halt(
+        log_dir,
+        manifest.epoch_number,
+        "a Snapshot manifest states another tree_size or root_hash than the Checkpoint at its epoch_number",
+        &dir,
     )?;
-    wist_core::snapshot::check_manifest_anchor(manifest, &anchor)?;
-    Ok((anchor, verification))
+    Err(Error::Verify(format!(
+        "{error}; the Checkpoint and the manifest are preserved in {}, and nothing more is applied from this Aggregator",
+        dir.display()
+    )))
+}
+
+/// WIST-3 §5.
+pub fn agrees_with_retained(
+    log_dir: &Path,
+    log_id: &str,
+    registry: &Registry,
+    retained: &Checkpoint,
+    offered: &Checkpoint,
+) -> Result<()> {
+    match checkpoint::progression(offered, retained.epoch_number(), Some(retained)) {
+        Ok(_) => Ok(()),
+        Err(error) if error.code() == Some("WIST3-E02") => Err(equivocation(
+            log_dir, log_id, registry, retained, offered, &error,
+        )?),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// WIST-3 §5 rollback rule: a differing note is evidence only if the keys valid at its height verify
+/// it; otherwise `WIST3-E03`.
+fn equivocation(
+    log_dir: &Path,
+    log_id: &str,
+    registry: &Registry,
+    retained: &Checkpoint,
+    offered: &Checkpoint,
+    error: &impl std::fmt::Display,
+) -> Result<Error> {
+    checkpoint::verify(
+        offered,
+        log_id,
+        &registry.valid_at(offered.epoch_number()),
+        &[],
+    )?;
+    let dir = record_equivocation(log_dir, retained, offered)?;
+    record_halt(
+        log_dir,
+        offered.epoch_number(),
+        "two Checkpoints of one Epoch state different note text",
+        &dir,
+    )?;
+    Ok(Error::Verify(format!(
+        "{error}; the two Checkpoints are preserved in {}, and nothing more is applied from this Aggregator",
+        dir.display()
+    )))
 }
 
 /// WIST-3 §3.1 at the verified head: a smaller tree's contradicting root is §5's third Equivocation
@@ -336,8 +409,6 @@ pub fn divergence(
     ))
 }
 
-/// WIST-3 §5 rollback rule: a differing note at a retained height is evidence only if the keys
-/// valid at that height verify it; otherwise `WIST3-E03`.
 pub fn progression(
     log_dir: &Path,
     conn: &Connection,
@@ -349,28 +420,12 @@ pub fn progression(
     let held = retained(conn, offered.epoch_number())?;
     match checkpoint::progression(offered, head_epoch_number, held.as_ref()) {
         Ok(progression) => Ok(progression),
-        Err(error) => {
-            if let (Some("WIST3-E02"), Some(held)) = (error.code(), held.as_ref()) {
-                checkpoint::verify(
-                    offered,
-                    log_id,
-                    &registry.valid_at(offered.epoch_number()),
-                    &[],
-                )?;
-                let dir = record_equivocation(log_dir, held, offered)?;
-                record_halt(
-                    log_dir,
-                    offered.epoch_number(),
-                    "two Checkpoints of one Epoch state different note text",
-                    &dir,
-                )?;
-                return Err(Error::Verify(format!(
-                    "{error}; the two Checkpoints are preserved in {}, and nothing more is applied from this Aggregator",
-                    dir.display()
-                )));
-            }
-            Err(error.into())
-        }
+        Err(error) => match (error.code(), held.as_ref()) {
+            (Some("WIST3-E02"), Some(held)) => Err(equivocation(
+                log_dir, log_id, registry, held, offered, &error,
+            )?),
+            _ => Err(error.into()),
+        },
     }
 }
 

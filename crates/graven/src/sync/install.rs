@@ -314,6 +314,7 @@ pub(super) struct Installation {
     tmp_sqlite_path: PathBuf,
     pub(super) conn: Connection,
     pub(super) manifest: SnapshotManifest,
+    pub(super) manifest_bytes: Vec<u8>,
     /// WIST-3 §8 step 4: must equal the manifest's (`WIST3-E04`).
     pub(super) state_tree_size: u64,
     pub(super) content_digest: String,
@@ -366,6 +367,7 @@ fn parse_document<T: serde::de::DeserializeOwned>(
 /// The guard of `tmp_sqlite_path` removes it unless the Snapshot is installed.
 struct Documents {
     manifest: SnapshotManifest,
+    manifest_bytes: Vec<u8>,
     state: SnapshotState,
     keys: Registry,
     unsealed: Vec<Unsealed>,
@@ -451,9 +453,10 @@ fn documents(
     tier1: bool,
 ) -> Result<Documents> {
     let (entry, index) = index_entry(sources, at)?;
-    let ((manifest_envelope, manifest_value), manifest_url) =
+    let ((manifest_envelope, manifest_value, manifest_bytes), manifest_url) =
         sources.whole_from(&entry.manifest_url, at, |bytes| {
             agreeing_manifest(&entry, bytes)
+                .map(|(envelope, value)| (envelope, value, bytes.to_vec()))
         })?;
     let manifest = manifest_envelope.manifest;
     let snapshot_base = manifest_directory(&entry.manifest_url);
@@ -546,6 +549,7 @@ fn documents(
 
     Ok(Documents {
         manifest,
+        manifest_bytes,
         state,
         keys,
         unsealed,
@@ -605,11 +609,10 @@ pub(super) fn snapshot(
     tier1: bool,
     from: usize,
 ) -> Result<Installation> {
-    let client = sources.client();
-    let base = sources.primary();
     let (
         Documents {
             manifest,
+            manifest_bytes,
             state,
             keys: aggregator_keys,
             unsealed,
@@ -690,7 +693,7 @@ pub(super) fn snapshot(
             }
             StateEntry::Dispute(d) => super::persist::adopt_dispute_tuple(&conn, d)?,
             StateEntry::SuffixList(s) => {
-                suffix_lists.adopt(client, base, &s.identifier, s.sealing_height)?;
+                suffix_lists.adopt(sources, &s.identifier, s.sealing_height)?;
             }
             StateEntry::Collection(_)
             | StateEntry::Record(_)
@@ -751,6 +754,7 @@ pub(super) fn snapshot(
         content_digest: manifest.content_digest.clone(),
         state_tree_size: state.tree_size,
         manifest,
+        manifest_bytes,
         history,
         aggregator_keys,
         chain,

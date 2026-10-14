@@ -263,3 +263,136 @@ fn capacity_is_counted_per_registrable_domain_under_the_adopted_tuple() {
         ]
     );
 }
+
+fn sync_with_mirror(
+    fx: &common::Fixture,
+    target: &std::path::Path,
+    mirror: &str,
+) -> graven::error::Result<graven::sync::SyncReport> {
+    graven::sync::follow(
+        &graven::sync::Follow {
+            anchor: fx.anchor_path().to_str().unwrap(),
+            log_base: &fx.base_url,
+            mirrors: &[mirror.to_owned()],
+            witnesses: &[],
+            tier1: false,
+            allow_http: true,
+            catch_up_epochs: None,
+        },
+        target,
+    )
+}
+
+type Requests = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+fn mirror_of(fx: &common::Fixture) -> (tempfile::TempDir, String, Requests) {
+    let dir = tempfile::tempdir().unwrap();
+    common::copy_dir(fx.dir.path(), dir.path());
+    let (addr, requests) = common::serve_recording(dir.path().to_path_buf());
+    (dir, format!("http://{addr}"), requests)
+}
+
+fn list_path(identifier: &str) -> String {
+    format!(
+        "/log/suffix-lists/{}.dat",
+        identifier.strip_prefix("sha256:").unwrap()
+    )
+}
+
+fn asked_for(requests: &Requests, path: &str) -> bool {
+    requests
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|seen| seen == path)
+}
+
+/// WIST-3 §9 `WIST3-E01`.
+#[test]
+fn a_suffix_list_snapshot_missing_at_the_primary_is_fetched_from_the_mirror_during_the_walk() {
+    let fx = common::build_fixture(false);
+    let target = tempfile::tempdir().unwrap();
+    sync(&fx, target.path()).unwrap();
+    let identifier = serve_list(&fx, LIST);
+    let height = append_epoch(&fx, &[suffix_act(&fx, &identifier, LIST.len())]);
+    let (_mirror_dir, mirror, requests) = mirror_of(&fx);
+    std::fs::remove_file(fx.dir.path().join(&list_path(&identifier)[1..])).unwrap();
+
+    let report = sync_with_mirror(&fx, target.path(), &mirror).unwrap();
+    assert_eq!(report.head, height);
+    assert!(asked_for(&requests, &list_path(&identifier)));
+    assert_eq!(
+        held(target.path()),
+        (vec![identifier.clone()], vec![(height as i64, identifier)])
+    );
+}
+
+/// WIST-3 §6 and §9 `WIST3-E03`: integrity never depends on the source.
+#[test]
+fn a_suffix_list_file_not_hashing_to_its_name_at_the_primary_is_fetched_from_the_mirror() {
+    let fx = common::build_fixture(false);
+    let target = tempfile::tempdir().unwrap();
+    sync(&fx, target.path()).unwrap();
+    let identifier = serve_list(&fx, LIST);
+    let height = append_epoch(&fx, &[suffix_act(&fx, &identifier, LIST.len())]);
+    let (_mirror_dir, mirror, requests) = mirror_of(&fx);
+    std::fs::write(fx.dir.path().join(&list_path(&identifier)[1..]), b"net\n").unwrap();
+
+    let report = sync_with_mirror(&fx, target.path(), &mirror).unwrap();
+    assert_eq!(report.head, height);
+    assert!(asked_for(&requests, &list_path(&identifier)));
+}
+
+/// WIST-3 §9 `WIST3-E01`.
+#[test]
+fn a_suffix_list_snapshot_no_source_serves_fails_the_walk_with_e01() {
+    let fx = common::build_fixture(false);
+    let target = tempfile::tempdir().unwrap();
+    sync(&fx, target.path()).unwrap();
+    let identifier = serve_list(&fx, LIST);
+    append_epoch(&fx, &[suffix_act(&fx, &identifier, LIST.len())]);
+    let (mirror_dir, mirror, requests) = mirror_of(&fx);
+    for served in [fx.dir.path(), mirror_dir.path()] {
+        std::fs::remove_file(served.join(&list_path(&identifier)[1..])).unwrap();
+    }
+
+    let error = sync_with_mirror(&fx, target.path(), &mirror)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("WIST3-E01"), "{error}");
+    assert!(asked_for(&requests, &list_path(&identifier)));
+}
+
+/// WIST-3 §8 step 4 and §9 `WIST3-E01`.
+#[test]
+fn a_cold_start_fetches_the_suffix_list_in_force_from_the_mirror_when_the_primary_lacks_it() {
+    let identifier = wist_core::suffix_list::identifier(LIST);
+    let tuple = vec![StateEntry::SuffixList(SuffixListEntry {
+        identifier: identifier.clone(),
+        sealing_height: 0,
+    })];
+    let fx = common::build_fixture_with_state(tuple.clone(), 0);
+    let (mirror_dir, mirror, requests) = mirror_of(&fx);
+    let hex = identifier.strip_prefix("sha256:").unwrap();
+    std::fs::create_dir_all(mirror_dir.path().join("log/suffix-lists")).unwrap();
+    std::fs::write(
+        mirror_dir
+            .path()
+            .join(format!("log/suffix-lists/{hex}.dat")),
+        LIST,
+    )
+    .unwrap();
+
+    let target = tempfile::tempdir().unwrap();
+    sync_with_mirror(&fx, target.path(), &mirror).unwrap();
+    assert!(asked_for(&requests, &list_path(&identifier)));
+    assert_eq!(held(target.path()).1, vec![(0, identifier.clone())]);
+
+    let fx = common::build_fixture_with_state(tuple, 0);
+    let (_mirror_dir, mirror, _requests) = mirror_of(&fx);
+    let target = tempfile::tempdir().unwrap();
+    let error = sync_with_mirror(&fx, target.path(), &mirror)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("WIST3-E01"), "{error}");
+}
