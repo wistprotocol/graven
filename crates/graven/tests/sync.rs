@@ -1547,6 +1547,77 @@ fn a_cap_below_a_sealed_epoch_is_not_accepted() {
 }
 
 #[test]
+fn an_epoch_rejected_for_its_size_does_not_bind_a_later_cap_amendment() {
+    let fx = common::build_fixture(false);
+    let before = tempfile::tempdir().unwrap();
+    common::sync(&fx, before.path(), false);
+    let fixture = synced_state(before.path()).largest_epoch_bytes;
+    let (_, first) = seal_next(
+        &fx,
+        "2026-08-09T14:00:00Z",
+        &[parameter_change(
+            &fx,
+            "epoch_cap_bytes",
+            CAP,
+            "2026-08-16T14:00:00Z",
+        )],
+    );
+    let (over, oversized) = seal_next(&fx, "2026-08-10T14:00:00Z", &bulk_declarations(200));
+    assert!(oversized > CAP as u64);
+    let lower = CAP - 2_000;
+    let (_, third) = seal_next(
+        &fx,
+        "2026-08-11T14:00:00Z",
+        &[parameter_change(
+            &fx,
+            "epoch_cap_bytes",
+            lower,
+            "2026-08-18T14:00:00Z",
+        )],
+    );
+    let largest = fixture.max(first).max(third);
+    assert!(largest <= lower as u64 && (lower as u64) < oversized);
+
+    let target = tempfile::tempdir().unwrap();
+    let report = graven::sync::run(
+        fx.anchor_path().to_str().unwrap(),
+        &fx.base_url,
+        target.path(),
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        report
+            .rejected
+            .iter()
+            .map(|epoch| (epoch.epoch_number, epoch.codes.clone()))
+            .collect::<Vec<_>>(),
+        [(over, vec!["WIST3-E03".to_owned()])]
+    );
+    let conn =
+        Connection::open(common::synced_log_dir(target.path()).join("index.sqlite")).unwrap();
+    let schedule: Vec<(i64, i64)> = conn
+        .prepare(
+            "SELECT value, effective_at_s FROM parameters WHERE parameter = 'epoch_cap_bytes' ORDER BY effective_at_s",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let effective = |at: &str| wist_core::timestamp::log_seconds(at).unwrap();
+    assert_eq!(
+        schedule,
+        [
+            (CAP, effective("2026-08-16T14:00:00Z")),
+            (lower, effective("2026-08-18T14:00:00Z")),
+        ]
+    );
+    assert_eq!(synced_state(target.path()).largest_epoch_bytes, largest);
+}
+
+#[test]
 fn a_fractional_epoch_timestamp_fails_the_sync() {
     let fx = common::build_fixture(false);
     fx.log_state()

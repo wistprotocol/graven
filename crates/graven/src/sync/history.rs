@@ -547,7 +547,7 @@ fn verify_checkpoint(
     let at = checkpoint
         .sealed_at_s()
         .map_err(|e| Error::Verify(format!("epoch {n}: WIST3-E03 {e}")))?;
-    // WIST-4 §5: every Epoch's size counts toward the largest, a rejected one's included.
+    // WIST-4 §5: an Epoch's size enters M unless the Epoch is rejected for its size.
     let largest = chain.largest.max(octets);
     let mut candidate = chain.schedule_at(at).clone();
     let mut parameter_acts: Vec<String> = Vec::new();
@@ -572,7 +572,10 @@ fn verify_checkpoint(
         .map_err(|e| Error::Verify(format!("epoch {n}: {e}")))?;
     let recovery_window_days = parameters.get("recovery_window_days");
     let suffix_list = suffix_lists.in_force_at_epoch(n)?;
-    chain.largest = largest;
+    let size_rejected = octets > candidate.epoch_size_bounds(at).0;
+    if !size_rejected {
+        chain.largest = largest;
+    }
     chain.prior_at = Some(at);
 
     let root = checkpoint.root_token();
@@ -592,7 +595,7 @@ fn verify_checkpoint(
     };
     // WIST-4 §5 and WIST-3 §6: an Epoch over the smallest cap at its `sealed_at` and at every
     // accepted later `effective_at` is rejected whole.
-    let outcome = if octets > candidate.epoch_size_bounds(at).0 {
+    let outcome = if size_rejected {
         replay.reject_epoch(&epoch, vec!["WIST3-E03".to_owned()])
     } else {
         replay.epoch_stored(&epoch, &stored)
