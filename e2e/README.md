@@ -45,7 +45,7 @@ round without samples fails its latency check).
 | `--round-bound-seconds` | 300 | How long a round waits for its pulls, and the pull bound its checks apply |
 | `--status-bound-ms` | 500 | Bound on the status endpoint's p99 latency |
 | `--labelers` | 0 (2 in `skew`) | Labeler sites, each publishing `--labels-per-round` (20) `wist:spam` Labels on random pages per round |
-| `--work-dir DIR`, `--keep` | | Place, and keep, the temporary directory |
+| `--work-dir DIR`, `--keep` | | Place, and keep, the temporary directory; a run whose data exceeds the temporary filesystem (a 200 000-page backfill writes several GB) needs a directory on disk |
 | `--out PATH` | | Write the JSON report there; without it the report goes to standard output |
 
 The report carries the scenario, the raw arguments, the resolved
