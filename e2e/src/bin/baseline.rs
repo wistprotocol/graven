@@ -1,11 +1,12 @@
 use e2e::{
-    after_this_second, consumer_report, dir_bytes, free_loopback_addr, graven_bin, grid_instant,
-    host_name, log_tree_size, merge, now_rfc3339, page, peak_rss_kb, ping_until_admitted,
-    reports_since, reset_peak_rss, resolve_sibling_bin, revisions, round_report, run, run_measured,
-    s, seal_epoch, sealed_stage, serve_sites_counted, snapshot_report, spawn_clave_serve_with,
-    storage_bytes, sync_args, timed, wait_all_pulled, wait_until_after, write_pages, RequestLog,
-    SealStage, Site,
+    after_this_second, consumer_report, consumer_state, copy_dir, dir_bytes, free_loopback_addr,
+    graven_bin, grid_instant, host_name, log_tree_size, merge, now_rfc3339, page, peak_rss_kb,
+    ping_until_admitted, reports_since, reset_peak_rss, resolve_sibling_bin, revisions,
+    round_report, run, run_measured, s, seal_epoch, sealed_stage, serve_sites_counted,
+    snapshot_report, spawn_clave_serve_with, storage_bytes, sync_args, timed, wait_all_pulled,
+    wait_until_after, write_pages, RequestLog, SealStage, Site,
 };
+use graven::sync::SyncState;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -35,6 +36,44 @@ impl UpdateBy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatchUpBy {
+    Walk,
+    Snapshot,
+    Both,
+}
+
+impl CatchUpBy {
+    fn parse(value: &str) -> Self {
+        match value {
+            "walk" => CatchUpBy::Walk,
+            "snapshot" => CatchUpBy::Snapshot,
+            "both" => CatchUpBy::Both,
+            other => panic!("--catch-up-by takes walk, snapshot or both, not {other}"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            CatchUpBy::Walk => "walk",
+            CatchUpBy::Snapshot => "snapshot",
+            CatchUpBy::Both => "both",
+        }
+    }
+
+    fn walks(self) -> bool {
+        self != CatchUpBy::Snapshot
+    }
+
+    fn snapshots(self) -> bool {
+        self != CatchUpBy::Walk
+    }
+}
+
+fn same_head(a: &SyncState, b: &SyncState) -> bool {
+    (a.epoch_number, a.tree_size, &a.root) == (b.epoch_number, b.tree_size, &b.root)
+}
+
 struct Args {
     domains: usize,
     pages: usize,
@@ -49,6 +88,7 @@ struct Args {
     compare_rebuild: bool,
     withdraw: bool,
     update_by: UpdateBy,
+    catch_up_by: CatchUpBy,
     tree_bound: bool,
     tree_bound_items: usize,
     work_dir: Option<PathBuf>,
@@ -71,6 +111,7 @@ fn args() -> Args {
         compare_rebuild: false,
         withdraw: false,
         update_by: UpdateBy::Chain,
+        catch_up_by: CatchUpBy::Both,
         tree_bound: false,
         tree_bound_items: 1024,
         work_dir: None,
@@ -100,6 +141,7 @@ fn args() -> Args {
             "--compare-rebuild" => args.compare_rebuild = true,
             "--withdraw" => args.withdraw = true,
             "--update-by" => args.update_by = UpdateBy::parse(&value()),
+            "--catch-up-by" => args.catch_up_by = CatchUpBy::parse(&value()),
             "--tree-bound" => args.tree_bound = true,
             "--tree-bound-items" => {
                 args.tree_bound_items = value().parse().expect("--tree-bound-items")
@@ -308,6 +350,7 @@ fn main() {
         "snapshot_shards": args.snapshot_shards,
         "skip_consumer": args.skip_consumer,
         "update_by": args.update_by.name(),
+        "catch_up_by": args.catch_up_by.name(),
         "tree_bound": args.tree_bound,
         "tree_bound_items": args.tree_bound.then_some(args.tree_bound_items),
         "build_profile": e2e::build_profile(),
@@ -548,9 +591,51 @@ fn main() {
     });
     report["stages"]["verify_history"] = json!({ "seconds": verify_s, "epochs": epochs });
 
-    if !args.skip_consumer {
+    let gdir_by_snapshot = root.join("graven-store-by-snapshot");
+    let by_snapshot = !args.skip_consumer && args.catch_up_by.snapshots();
+    if by_snapshot {
+        copy_dir(&gdir, &gdir_by_snapshot);
+    }
+    let mut walked = None;
+    if !args.skip_consumer && args.catch_up_by.walks() {
         let catch_up = run_measured(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
         report["stages"]["consumer_catch_up"] = consumer_report(&catch_up, &gdir);
+        if by_snapshot {
+            walked = Some(consumer_state(&gdir));
+        }
+    }
+    if by_snapshot {
+        let before = consumer_state(&gdir_by_snapshot);
+        let mut sync = sync_args(&anchor, &clave_base, &gdir_by_snapshot, args.tier1);
+        sync.extend(["--catch-up-epochs", "0"]);
+        let catch_up = run_measured(&graven, &sync);
+        let after = consumer_state(&gdir_by_snapshot);
+        let mut stage = consumer_report(&catch_up, &gdir_by_snapshot);
+        merge(
+            &mut stage,
+            json!({
+                "head_epoch": after.epoch_number,
+                "tree_size": after.tree_size,
+                "root": after.root,
+                "snapshot_installed": after.walk_floor != before.walk_floor,
+                "walk_floor_before": before.walk_floor,
+                "walk_floor_after": after.walk_floor,
+                "same_head_as_walk": walked.as_ref().map(|walked| same_head(walked, &after)),
+            }),
+        );
+        if let Some(walked) = &walked {
+            assert!(
+                same_head(walked, &after),
+                "the walking consumer ends at epoch {} (tree size {}, root {}) and the Snapshot one at epoch {} (tree size {}, root {})",
+                walked.epoch_number,
+                walked.tree_size,
+                walked.root,
+                after.epoch_number,
+                after.tree_size,
+                after.root
+            );
+        }
+        report["stages"]["consumer_catch_up_by_snapshot"] = stage;
     }
     let gdir2 = root.join("graven-store-2");
     if !args.skip_consumer {
@@ -715,6 +800,53 @@ mod tests {
     #[should_panic(expected = "--update-by takes chain or walk")]
     fn update_by_refuses_another_mode() {
         UpdateBy::parse("tree");
+    }
+
+    #[test]
+    fn catch_up_by_parses_walk_snapshot_and_both() {
+        assert_eq!(CatchUpBy::parse("walk"), CatchUpBy::Walk);
+        assert_eq!(CatchUpBy::parse("snapshot"), CatchUpBy::Snapshot);
+        assert_eq!(CatchUpBy::parse("both"), CatchUpBy::Both);
+        assert_eq!(CatchUpBy::Snapshot.name(), "snapshot");
+    }
+
+    #[test]
+    #[should_panic(expected = "--catch-up-by takes walk, snapshot or both")]
+    fn catch_up_by_refuses_another_path() {
+        CatchUpBy::parse("chain");
+    }
+
+    #[test]
+    fn catch_up_by_walk_runs_no_snapshot_catch_up_and_snapshot_no_walk() {
+        assert!(CatchUpBy::Walk.walks() && !CatchUpBy::Walk.snapshots());
+        assert!(!CatchUpBy::Snapshot.walks() && CatchUpBy::Snapshot.snapshots());
+        assert!(CatchUpBy::Both.walks() && CatchUpBy::Both.snapshots());
+    }
+
+    fn state(epoch_number: u64, tree_size: u64, root: &str, walk_floor: Option<u64>) -> SyncState {
+        SyncState {
+            format: 7,
+            tree_size,
+            epoch_number,
+            root: root.into(),
+            unwitnessed: false,
+            content_digest: None,
+            snapshot_tree_size: None,
+            schedule_first_s: None,
+            prior_sealed_at_s: None,
+            largest_epoch_bytes: 0,
+            walk_floor,
+            rejected_epochs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn same_head_compares_epoch_tree_size_and_root_but_not_the_walk_floor() {
+        let walked = state(5, 40, "sha256:aa", Some(0));
+        assert!(same_head(&walked, &state(5, 40, "sha256:aa", Some(4))));
+        assert!(!same_head(&walked, &state(4, 40, "sha256:aa", Some(0))));
+        assert!(!same_head(&walked, &state(5, 41, "sha256:aa", Some(0))));
+        assert!(!same_head(&walked, &state(5, 40, "sha256:bb", Some(0))));
     }
 
     #[test]

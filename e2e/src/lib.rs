@@ -2229,6 +2229,38 @@ pub fn consumer_report(run: &Measured, dir: &Path) -> Value {
     })
 }
 
+pub fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap_or_else(|e| panic!("create {}: {e}", to.display()));
+    for entry in std::fs::read_dir(from).unwrap_or_else(|e| panic!("read {}: {e}", from.display()))
+    {
+        let entry = entry.expect("directory entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target)
+                .unwrap_or_else(|e| panic!("copy {}: {e}", entry.path().display()));
+        }
+    }
+}
+
+pub fn consumer_state(dir: &Path) -> graven::sync::SyncState {
+    let logs: Vec<PathBuf> = std::fs::read_dir(dir.join("logs"))
+        .expect("the consumer's store holds a logs directory")
+        .map(|entry| entry.expect("directory entry").path().join("index.sqlite"))
+        .filter(|index| index.is_file())
+        .collect();
+    let [index] = logs.as_slice() else {
+        panic!("the consumer's store follows {} logs, not one", logs.len());
+    };
+    let conn =
+        rusqlite::Connection::open_with_flags(index, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open the consumer's index");
+    graven::sync::load_sync_state(&conn)
+        .expect("read the consumer's sync state")
+        .expect("the consumer's index holds a sync state")
+}
+
 pub struct LogKey {
     pub key_id: String,
     pub note_key_id: String,
@@ -2343,6 +2375,59 @@ snapshot took 450 ms
             peak_rss_kb: Some(1234),
             stdout: stdout.into(),
         }
+    }
+
+    #[test]
+    fn copy_dir_copies_nested_files() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let from = root.path().join("from");
+        std::fs::create_dir_all(from.join("logs/a")).expect("nested directory");
+        std::fs::write(from.join("registry.json"), "{}").expect("file");
+        std::fs::write(from.join("logs/a/index.sqlite"), "db").expect("nested file");
+        let to = root.path().join("to");
+        copy_dir(&from, &to);
+        assert_eq!(
+            std::fs::read(to.join("registry.json")).expect("copy"),
+            b"{}"
+        );
+        assert_eq!(
+            std::fs::read(to.join("logs/a/index.sqlite")).expect("nested copy"),
+            b"db"
+        );
+    }
+
+    #[test]
+    fn consumer_state_reads_the_sync_state_of_the_one_followed_log() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let log = root.path().join("logs").join("log-a");
+        std::fs::create_dir_all(&log).expect("log directory");
+        let state = graven::sync::SyncState {
+            format: graven::sync::SYNC_STATE_FORMAT,
+            tree_size: 12,
+            epoch_number: 3,
+            root: "sha256:ab".into(),
+            unwitnessed: false,
+            content_digest: None,
+            snapshot_tree_size: None,
+            schedule_first_s: None,
+            prior_sealed_at_s: None,
+            largest_epoch_bytes: 0,
+            walk_floor: Some(2),
+            rejected_epochs: Vec::new(),
+        };
+        let conn = rusqlite::Connection::open(log.join("index.sqlite")).expect("index");
+        graven::sync::save_sync_state(&conn, &state).expect("save");
+        drop(conn);
+        let read = consumer_state(root.path());
+        assert_eq!(
+            (
+                read.epoch_number,
+                read.tree_size,
+                read.root,
+                read.walk_floor
+            ),
+            (3, 12, "sha256:ab".to_string(), Some(2))
+        );
     }
 
     #[test]
