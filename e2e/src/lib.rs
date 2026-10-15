@@ -1,8 +1,9 @@
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -299,6 +300,10 @@ impl Aggregator {
         self.child = None;
     }
 
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|child| child.0.id())
+    }
+
     pub fn start(&mut self, bin: &Path, proxy: Option<&str>) {
         assert!(
             self.child.is_none(),
@@ -429,6 +434,48 @@ impl RequestLog {
 pub struct SiteCounters {
     pub requests: Arc<AtomicU64>,
     pub octets: Arc<AtomicU64>,
+    pub delays: Arc<AtomicU64>,
+    pub failures: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    Unavailable,
+    Hang(Duration),
+    Close,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostBehavior {
+    pub delay: Option<Duration>,
+    pub failure: Option<Failure>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Behaviors(Arc<Mutex<BTreeMap<String, HostBehavior>>>);
+
+impl Behaviors {
+    pub fn set(&self, host: &str, behavior: HostBehavior) {
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if behavior == HostBehavior::default() {
+            map.remove(host);
+        } else {
+            map.insert(host.to_string(), behavior);
+        }
+    }
+
+    pub fn clear(&self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    pub fn get(&self, host: &str) -> HostBehavior {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(host)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 pub fn serve_sites_logged(
@@ -453,6 +500,20 @@ pub fn serve_sites_counted(
     std::collections::BTreeMap<String, SiteCounters>,
     RequestLog,
 ) {
+    let (addr, counters, log, _) = serve_sites_with_behaviors(sites);
+    (addr, counters, log)
+}
+
+pub fn serve_sites_with_behaviors(
+    sites: std::collections::BTreeMap<String, PathBuf>,
+) -> (
+    String,
+    std::collections::BTreeMap<String, SiteCounters>,
+    RequestLog,
+    Behaviors,
+) {
+    let behaviors = Behaviors::default();
+    let injected = behaviors.clone();
     let log = RequestLog::default();
     let recorder = log.clone();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind site proxy");
@@ -467,6 +528,7 @@ pub fn serve_sites_counted(
             let Ok(stream) = stream else { continue };
             let routes = routes.clone();
             let recorder = recorder.clone();
+            let injected = injected.clone();
             std::thread::spawn(move || {
                 let Ok(clone) = stream.try_clone() else {
                     return;
@@ -493,6 +555,18 @@ pub fn serve_sites_counted(
                 let (dirs, counters) = &*routes;
                 match dirs.get(host) {
                     Some(dir) => {
+                        let behavior = injected.get(host);
+                        if let Some(delay) = behavior.delay {
+                            counters[host].delays.fetch_add(1, Ordering::Relaxed);
+                            std::thread::sleep(delay);
+                        }
+                        if let Some(failure) = behavior.failure {
+                            counters[host].failures.fetch_add(1, Ordering::Relaxed);
+                            counters[host].requests.fetch_add(1, Ordering::Relaxed);
+                            recorder.push(host, rel, 0);
+                            inject(stream, failure);
+                            return;
+                        }
                         let body = std::fs::read(dir.join(rel)).ok();
                         let octets = body.as_ref().map_or(0, |body| body.len() as u64);
                         counters[host].requests.fetch_add(1, Ordering::Relaxed);
@@ -509,7 +583,20 @@ pub fn serve_sites_counted(
             });
         }
     });
-    (addr, counters, log)
+    (addr, counters, log, behaviors)
+}
+
+fn inject(mut stream: TcpStream, failure: Failure) {
+    match failure {
+        Failure::Unavailable => {
+            let _ = stream.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+        Failure::Hang(duration) => std::thread::sleep(duration),
+        Failure::Close => {}
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 fn respond_body(mut stream: TcpStream, body: Option<Vec<u8>>) {
@@ -1488,6 +1575,724 @@ pub fn read_json(path: &Path) -> Value {
     .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
+pub fn words(seed: u64, count: usize) -> String {
+    let mut x = seed
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    let mut out = String::new();
+    for i in 0..count {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let len = 3 + (x % 8) as usize;
+        for k in 0..len {
+            out.push((b'a' + ((x >> (k * 5)) % 26) as u8) as char);
+        }
+        out.push(if i % 17 == 16 { '.' } else { ' ' });
+    }
+    out
+}
+
+pub fn page(host: &str, j: usize, body_words: usize, revision: u64) -> String {
+    format!(
+        "<html lang=\"en\"><head><title>Page {j} of {host}</title><meta name=\"wist\" content=\"publish\"></head><body><!--wist:content--><h1>Page {j}</h1><p>{}</p><!--/wist:content--></body></html>",
+        words(revision * 1_000_003 + j as u64, body_words)
+    )
+}
+
+pub fn write_pages(site: &Site, pages: usize, body_words: usize, revision: u64) {
+    for j in 0..pages {
+        site.write_page(
+            &format!("p{j}.html"),
+            &page(&site.host, j, body_words, revision),
+        );
+    }
+}
+
+pub fn dir_bytes(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if meta.is_file() {
+        return meta.len();
+    }
+    std::fs::read_dir(path)
+        .map(|entries| entries.flatten().map(|e| dir_bytes(&e.path())).sum())
+        .unwrap_or(0)
+}
+
+pub fn git_revision(repo: &Path) -> String {
+    Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+pub fn revisions() -> Value {
+    let siblings = workspace_root()
+        .parent()
+        .expect("graven repo has a parent directory")
+        .to_path_buf();
+    json!({
+        "spake": git_revision(&siblings.join("spake")),
+        "clave": git_revision(&siblings.join("clave")),
+        "graven": git_revision(&siblings.join("graven")),
+        "core": git_revision(&siblings.join("core")),
+        "spec": git_revision(&siblings.join("spec")),
+    })
+}
+
+pub fn timed<T>(f: impl FnOnce() -> T) -> (T, f64) {
+    let start = Instant::now();
+    let value = f();
+    (value, start.elapsed().as_secs_f64())
+}
+
+pub struct Measured {
+    pub seconds: f64,
+    pub peak_rss_kb: Option<u64>,
+    pub stdout: String,
+}
+
+fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<String> {
+    let mut pipe = pipe.expect("piped stream");
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    })
+}
+
+#[cfg(unix)]
+fn reap(child: &mut Child) -> (ExitStatus, Option<u64>) {
+    use std::os::unix::process::ExitStatusExt;
+    let pid = child.id() as libc::pid_t;
+    let mut status = 0;
+    // SAFETY: rusage is plain old data, so the all-zero value is valid.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: pid is this process's unreaped child and both out-pointers are live locals.
+        let reaped = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+        if reaped == pid {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::Interrupted,
+            "wait4 {pid}: {err}"
+        );
+    }
+    let max_rss = u64::try_from(usage.ru_maxrss).unwrap_or(0);
+    // ru_maxrss is in bytes on Apple platforms and in kilobytes elsewhere.
+    let kb = if cfg!(target_vendor = "apple") {
+        max_rss / 1024
+    } else {
+        max_rss
+    };
+    (ExitStatus::from_raw(status), Some(kb))
+}
+
+#[cfg(not(unix))]
+fn reap(child: &mut Child) -> (ExitStatus, Option<u64>) {
+    (child.wait().expect("wait for child"), None)
+}
+
+pub fn run_measured(bin: &Path, args: &[&str]) -> Measured {
+    let start = Instant::now();
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {} {args:?}: {e}", bin.display()));
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let (status, peak_rss_kb) = reap(&mut child);
+    let seconds = start.elapsed().as_secs_f64();
+    let stdout = stdout.join().expect("stdout reader");
+    let stderr = stderr.join().expect("stderr reader");
+    assert!(
+        status.success(),
+        "{} {args:?} failed: status={status:?}\nstdout={stdout}\nstderr={stderr}",
+        bin.display(),
+    );
+    Measured {
+        seconds,
+        peak_rss_kb,
+        stdout,
+    }
+}
+
+pub fn reported_seconds(stdout: &str, prefix: &str) -> Option<f64> {
+    stdout.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(prefix)?
+            .strip_suffix(" ms")?
+            .parse::<f64>()
+            .ok()
+            .map(|ms| ms / 1000.0)
+    })
+}
+
+pub fn reported_count(stdout: &str, prefix: &str) -> Option<u64> {
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(prefix)?.parse().ok())
+}
+
+fn shards_rebuilt(stdout: &str) -> Option<(u64, u64)> {
+    stdout.lines().find_map(|line| {
+        let (_, tail) = line
+            .trim()
+            .strip_prefix("snapshot built at epoch ")?
+            .rsplit_once(", ")?;
+        let (rebuilt, count) = tail.strip_suffix(" shards rebuilt")?.split_once(" of ")?;
+        Some((rebuilt.parse().ok()?, count.parse().ok()?))
+    })
+}
+
+fn snapshot_outcome(stdout: &str) -> Option<&'static str> {
+    stdout.lines().find_map(|line| {
+        let line = line.trim();
+        [
+            ("snapshot built at ", "built"),
+            ("snapshot current at ", "current"),
+            ("snapshot superseded ", "superseded"),
+            ("snapshot not built", "unsealed"),
+        ]
+        .into_iter()
+        .find_map(|(prefix, outcome)| line.starts_with(prefix).then_some(outcome))
+    })
+}
+
+pub fn snapshot_report(run: &Measured) -> Value {
+    let out = run.stdout.as_str();
+    let shards = shards_rebuilt(out);
+    json!({
+        "outcome": snapshot_outcome(out),
+        "seconds": run.seconds,
+        "reported_seconds": reported_seconds(out, "snapshot took "),
+        "peak_rss_kb": run.peak_rss_kb,
+        "shards_rebuilt": shards.map(|(rebuilt, _)| rebuilt),
+        "shard_count": shards.map(|(_, count)| count),
+        "bytes_written": reported_count(out, "snapshot bytes written "),
+        "bytes_reused": reported_count(out, "snapshot bytes reused "),
+        "cache_bytes_written": reported_count(out, "snapshot cache bytes written "),
+        "payloads_read": reported_count(out, "snapshot payloads read "),
+        "payload_bytes_read": reported_count(out, "snapshot payload bytes read "),
+    })
+}
+
+pub struct SealStage {
+    pub seal: Measured,
+    pub snapshot: Measured,
+    pub rebuild: Option<Measured>,
+}
+
+impl SealStage {
+    pub fn run(clave: &Path, data: &Path, at: &str, compare_rebuild: bool) -> Self {
+        let data = s(data);
+        let seal = run_measured(
+            clave,
+            &["seal", "--data", data, "--at", at, "--no-snapshot"],
+        );
+        let snapshot = run_measured(clave, &["snapshot", "--data", data]);
+        let rebuild = compare_rebuild
+            .then(|| run_measured(clave, &["snapshot", "--data", data, "--rebuild"]));
+        SealStage {
+            seal,
+            snapshot,
+            rebuild,
+        }
+    }
+
+    pub fn seal_seconds(&self) -> Option<f64> {
+        reported_seconds(&self.seal.stdout, "seal took ")
+    }
+
+    pub fn rebuild_report(&self) -> Value {
+        self.rebuild.as_ref().map_or(Value::Null, snapshot_report)
+    }
+
+    pub fn report(&self, data: &Path) -> Value {
+        let mut report = json!({
+            "seconds": self.seal.seconds + self.snapshot.seconds,
+            "seal_seconds": self.seal_seconds(),
+            "seal_peak_rss_kb": self.seal.peak_rss_kb,
+            "snapshot_seconds": reported_seconds(&self.snapshot.stdout, "snapshot took "),
+            "snapshot": snapshot_report(&self.snapshot),
+            "snapshot_rebuild": self.rebuild_report(),
+            "entry_bundle_bytes": dir_bytes(&data.join("tile/entries")),
+            "tile_bytes": dir_bytes(&data.join("tile")),
+            "checkpoint_bytes": dir_bytes(&data.join("log/checkpoints")),
+            "payloads_bytes": dir_bytes(&data.join("payloads")),
+            "data_dir_bytes": dir_bytes(data),
+        });
+        merge(&mut report, storage_bytes(data));
+        report
+    }
+}
+
+pub fn storage_bytes(data: &Path) -> Value {
+    json!({
+        "sqlite_bytes": dir_bytes(&data.join("clave.sqlite")),
+        "sqlite_wal_bytes": dir_bytes(&data.join("clave.sqlite-wal")),
+        "snapshots_bytes": dir_bytes(&data.join("snapshots")),
+        "snapshot_shards_bytes": dir_bytes(&data.join("snapshot-shards")),
+        "snapshot_build_bytes": dir_bytes(&data.join("snapshot-build")),
+    })
+}
+
+pub fn merge(into: &mut Value, from: Value) {
+    let (Value::Object(into), Value::Object(from)) = (into, from) else {
+        panic!("merge expects two JSON objects");
+    };
+    into.extend(from);
+}
+
+// WIST-2 §5.3: a chain the Aggregator discards or cannot read is reported and the list is walked.
+pub const PULL_REPORTS_ALLOWED: &[&str] = &["WIST2-E08"];
+
+pub fn pulled_within(
+    http: &reqwest::blocking::Client,
+    base: &str,
+    hosts: &[String],
+    since: &str,
+    timeout: Duration,
+) -> BTreeMap<String, f64> {
+    let since: BTreeMap<String, String> = hosts
+        .iter()
+        .map(|host| (host.clone(), since.to_string()))
+        .collect();
+    pulled_each_since(http, base, &since, timeout)
+}
+
+pub fn pulled_each_since(
+    http: &reqwest::blocking::Client,
+    base: &str,
+    since: &BTreeMap<String, String>,
+    timeout: Duration,
+) -> BTreeMap<String, f64> {
+    let start = Instant::now();
+    let mut pulled = BTreeMap::new();
+    let mut pending: Vec<(&String, &String)> = since.iter().collect();
+    loop {
+        pending.retain(|(host, since)| {
+            let done = fetch_status(http, base, host).is_some_and(|v| {
+                v["rejections"].as_array().is_some_and(|r| {
+                    r.iter().all(|rejection| {
+                        PULL_REPORTS_ALLOWED.contains(&rejection["code"].as_str().unwrap_or(""))
+                    })
+                }) && v["last_pull_at"]
+                    .as_str()
+                    .is_some_and(|t| t > since.as_str())
+            });
+            if done {
+                pulled.insert((*host).clone(), start.elapsed().as_secs_f64());
+            }
+            !done
+        });
+        if pending.is_empty() || start.elapsed() >= timeout {
+            return pulled;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+pub fn wait_all_pulled(
+    http: &reqwest::blocking::Client,
+    base: &str,
+    hosts: &[String],
+    since: &str,
+    timeout: Duration,
+) -> BTreeMap<String, f64> {
+    let pulled = pulled_within(http, base, hosts, since, timeout);
+    assert!(
+        pulled.len() == hosts.len(),
+        "{} of {} domains were not pulled cleanly within {timeout:?}",
+        hosts.len() - pulled.len(),
+        hosts.len()
+    );
+    pulled
+}
+
+pub fn reports_since(
+    http: &reqwest::blocking::Client,
+    base: &str,
+    hosts: &[String],
+    since: &str,
+    code: &str,
+) -> usize {
+    hosts
+        .iter()
+        .filter_map(|host| fetch_status(http, base, host))
+        .map(|status| {
+            status["rejections"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|rejection| {
+                    rejection["code"] == code
+                        && rejection["at"].as_str().is_some_and(|at| at > since)
+                })
+                .count()
+        })
+        .sum()
+}
+
+pub fn request_kind(path: &str) -> &'static str {
+    let Some(rest) = path.strip_prefix(".well-known/wist/") else {
+        return "other";
+    };
+    if rest == "publisher.json" {
+        return "declaration";
+    }
+    if rest == "label-feed.json" || rest.starts_with("label-feed/") {
+        return "label_feed";
+    }
+    let Some((_, object)) = rest
+        .strip_prefix("collections/")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return "other";
+    };
+    match object
+        .split_once('/')
+        .map_or(object, |(directory, _)| directory)
+    {
+        "catalog.json" => "catalog",
+        "changes" => "change_list",
+        "tree" => "tree_file",
+        "payloads" => "payload",
+        _ => "other",
+    }
+}
+
+pub fn requests_report(requests: &[LoggedRequest], hosts: &[String], items: usize) -> Value {
+    let hosts: BTreeSet<&str> = hosts.iter().map(String::as_str).collect();
+    let mut by_kind: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+    for request in requests
+        .iter()
+        .filter(|request| hosts.contains(request.host.as_str()))
+    {
+        let counted = by_kind.entry(request_kind(&request.path)).or_default();
+        counted.0 += 1;
+        counted.1 += request.octets;
+    }
+    let (count, octets) = by_kind
+        .values()
+        .fold((0, 0), |(count, octets), (c, o)| (count + c, octets + o));
+    let per_item = |total: u64| (items > 0).then(|| total as f64 / items as f64);
+    json!({
+        "domains": hosts.len(),
+        "items": items,
+        "site_requests": count,
+        "response_octets": octets,
+        "requests_per_item": per_item(count),
+        "octets_per_item": per_item(octets),
+        "by_kind": by_kind
+            .iter()
+            .map(|(kind, (count, octets))| {
+                (kind.to_string(), json!({ "requests": count, "octets": octets }))
+            })
+            .collect::<serde_json::Map<_, _>>(),
+    })
+}
+
+pub fn round_report(
+    requests: &[LoggedRequest],
+    hosts: &[String],
+    items: usize,
+    pulled: &BTreeMap<String, f64>,
+) -> Value {
+    let mut report = requests_report(requests, hosts, items);
+    report["seconds_until_all_pulled"] = json!(hosts
+        .iter()
+        .filter_map(|host| pulled.get(host))
+        .copied()
+        .fold(0.0, f64::max));
+    report
+}
+
+pub fn reset_peak_rss(pid: u32) {
+    // Linux: writing 5 to clear_refs resets the process's peak resident set size (VmHWM).
+    std::fs::write(format!("/proc/{pid}/clear_refs"), "5")
+        .unwrap_or_else(|e| panic!("reset the peak resident set size of {pid}: {e}"));
+}
+
+pub fn peak_rss_kb(pid: u32) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|status| vm_hwm_kb(&status))
+}
+
+fn vm_hwm_kb(status: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        line.strip_prefix("VmHWM:")?
+            .trim()
+            .strip_suffix("kB")?
+            .trim()
+            .parse()
+            .ok()
+    })
+}
+
+pub fn log_tree_size(data: &Path) -> u64 {
+    let latest = std::fs::read_dir(data.join("log/checkpoints"))
+        .expect("list the archived Checkpoints")
+        .flatten()
+        .map(|entry| entry.path())
+        .max();
+    latest.map_or(0, |path| {
+        let note = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        wist_core::checkpoint::Checkpoint::parse(&note)
+            .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+            .tree_size()
+    })
+}
+
+pub fn entry_leaves(data: &Path, from: u64, to: u64) -> Vec<Vec<u8>> {
+    let mut leaves = Vec::new();
+    for bundle in wist_core::tiles::entry_bundles_for_range(from, to, to) {
+        let path = bundle.path();
+        let file = data.join(path.trim_start_matches('/'));
+        let octets =
+            std::fs::read(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        let decoded = wist_core::tiles::decode_entry_bundle_at(&path, &octets)
+            .unwrap_or_else(|e| panic!("decode the entry bundle {path}: {e}"));
+        let (start, _) = bundle.leaf_range();
+        leaves.extend(
+            decoded
+                .into_iter()
+                .enumerate()
+                .filter(|(offset, _)| (from..to).contains(&(start + *offset as u64)))
+                .map(|(_, leaf)| leaf),
+        );
+    }
+    leaves
+}
+
+pub fn log_entries_report(data: &Path, from: u64, to: u64) -> Value {
+    let mut by_type: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for leaf in entry_leaves(data, from, to) {
+        let entry_type = serde_json::from_slice::<Value>(&leaf)
+            .ok()
+            .and_then(|entry| entry["type"].as_str().map(str::to_string))
+            .unwrap_or_else(|| "unparsed".into());
+        let counted = by_type.entry(entry_type).or_default();
+        counted.0 += 1;
+        counted.1 += leaf.len() as u64;
+    }
+    let row = |(entries, octets): (u64, u64)| {
+        json!({
+            "entries": entries,
+            "octets": octets,
+            "octets_per_entry": (entries > 0).then(|| octets as f64 / entries as f64),
+        })
+    };
+    let total = by_type.values().fold((0, 0), |(entries, octets), (e, o)| {
+        (entries + e, octets + o)
+    });
+    let mut report: serde_json::Map<String, Value> = by_type
+        .into_iter()
+        .map(|(entry_type, counted)| (entry_type, row(counted)))
+        .collect();
+    report.insert("all".into(), row(total));
+    report.insert("from".into(), json!(from));
+    report.insert("to".into(), json!(to));
+    Value::Object(report)
+}
+
+pub fn sealed_stage(
+    clave: &Path,
+    data: &Path,
+    at: &str,
+    compare_rebuild: bool,
+    sealed: &mut u64,
+) -> Value {
+    let mut report = SealStage::run(clave, data, at, compare_rebuild).report(data);
+    let size = log_tree_size(data);
+    report["log_entries"] = log_entries_report(data, *sealed, size);
+    *sealed = size;
+    report
+}
+
+pub fn after_this_second() -> String {
+    let since = now_rfc3339();
+    while now_rfc3339() == since {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    since
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PingOutcome {
+    Admitted,
+    Refused(String),
+    Failed(String),
+}
+
+pub fn ping_once(spake: &Path, clave_base: &str, host: &str) -> PingOutcome {
+    let output = Command::new(spake)
+        .args([
+            "ping",
+            "--log",
+            clave_base,
+            "--domain",
+            host,
+            "--allow-http",
+            "--no-retry",
+        ])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", spake.display()));
+    if output.status.success() {
+        return PingOutcome::Admitted;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if stderr.contains("503") {
+        PingOutcome::Refused(stderr)
+    } else {
+        PingOutcome::Failed(stderr)
+    }
+}
+
+pub fn retry_after_seconds(message: &str) -> Option<u64> {
+    let lower = message.to_ascii_lowercase();
+    let (_, rest) = lower.split_once("retry-after")?;
+    let digits: String = rest
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+// WIST-2 §4: a refused Ping is retried after its Retry-After.
+pub fn ping_until_admitted(spake: &Path, clave_base: &str, host: &str) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut refused = 0;
+    loop {
+        let stderr = match ping_once(spake, clave_base, host) {
+            PingOutcome::Admitted => return refused,
+            PingOutcome::Refused(stderr) => stderr,
+            PingOutcome::Failed(stderr) => panic!("ping {host} failed: {stderr}"),
+        };
+        assert!(Instant::now() < deadline, "ping {host} failed: {stderr}");
+        refused += 1;
+        std::thread::sleep(
+            retry_after_seconds(&stderr).map_or(Duration::from_millis(250), Duration::from_secs),
+        );
+    }
+}
+
+pub fn write_changed_pages(site: &Site, changed: &[usize], body_words: usize, revision: u64) {
+    for &j in changed {
+        site.write_page(
+            &format!("p{j}.html"),
+            &page(&site.host, j, body_words, revision),
+        );
+    }
+}
+
+pub fn host_name(i: usize) -> String {
+    format!("127.0.{}.{}", 1 + i / 250, 1 + i % 250)
+}
+
+pub fn sync_args<'a>(anchor: &'a Path, log: &'a str, dir: &'a Path, tier1: bool) -> Vec<&'a str> {
+    let mut args = vec![
+        "sync",
+        "--anchor",
+        s(anchor),
+        "--log",
+        log,
+        "--dir",
+        s(dir),
+        "--allow-http",
+    ];
+    if tier1 {
+        args.push("--tier1");
+    }
+    args
+}
+
+pub fn consumer_report(run: &Measured, dir: &Path) -> Value {
+    json!({
+        "seconds": run.seconds,
+        "peak_rss_kb": run.peak_rss_kb,
+        "store_bytes": dir_bytes(dir),
+    })
+}
+
+pub struct LogKey {
+    pub key_id: String,
+    pub note_key_id: String,
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+}
+
+pub fn log_keys(clave: &Path, data: &Path) -> Vec<LogKey> {
+    let output = run(clave, &["log-key", "list", "--data", s(data)]);
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            assert!(
+                fields.len() >= 6 && fields[2] == "added" && fields[4] == "removed",
+                "unexpected log-key list line {line:?}"
+            );
+            LogKey {
+                key_id: fields[0].to_string(),
+                note_key_id: fields[1].to_string(),
+                added: fields[3].parse().ok(),
+                removed: fields[5].parse().ok(),
+            }
+        })
+        .collect()
+}
+
+pub fn label_command(spake: &Path, labeler: &Site, args: &[&str]) -> String {
+    let mut full = vec![
+        "label",
+        "--out",
+        s(&labeler.out),
+        "--state",
+        s(&labeler.state),
+    ];
+    full.extend_from_slice(args);
+    let output = run(spake, &full);
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+pub fn change_parameter(
+    clave: &Path,
+    aggregator: &Aggregator,
+    parameter: &str,
+    value: i64,
+    at: &str,
+) {
+    run(
+        clave,
+        &[
+            "param-change",
+            "--data",
+            s(&aggregator.data),
+            "--parameter",
+            parameter,
+            "--value",
+            &value.to_string(),
+            "--effective-at",
+            at,
+        ],
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1520,5 +2325,458 @@ mod tests {
             site.item_id("https://example.localhost/b.html"),
             wist_core::item::item_id(&wanted).expect("Item ID")
         );
+    }
+
+    const BUILT: &str =
+        "snapshot built at epoch 7 for 2026-09-23 in 412 ms, 3 of 256 shards rebuilt
+snapshot bytes written 1000
+snapshot bytes reused 2000
+snapshot cache bytes written 300
+snapshot payloads read 40
+snapshot payload bytes read 5000
+snapshot took 450 ms
+";
+
+    fn measured(stdout: &str) -> Measured {
+        Measured {
+            seconds: 0.5,
+            peak_rss_kb: Some(1234),
+            stdout: stdout.into(),
+        }
+    }
+
+    #[test]
+    fn built_snapshot_output_parses_every_counter() {
+        assert_eq!(
+            snapshot_report(&measured(BUILT)),
+            json!({
+                "outcome": "built",
+                "seconds": 0.5,
+                "reported_seconds": 0.45,
+                "peak_rss_kb": 1234,
+                "shards_rebuilt": 3,
+                "shard_count": 256,
+                "bytes_written": 1000,
+                "bytes_reused": 2000,
+                "cache_bytes_written": 300,
+                "payloads_read": 40,
+                "payload_bytes_read": 5000,
+            })
+        );
+    }
+
+    #[test]
+    fn current_snapshot_output_reports_missing_lines_as_null() {
+        let report = snapshot_report(&measured(
+            "snapshot current at epoch 7\nsnapshot took 2 ms\n",
+        ));
+        assert_eq!(report["outcome"], "current");
+        assert_eq!(report["reported_seconds"], json!(0.002));
+        for key in [
+            "shards_rebuilt",
+            "shard_count",
+            "bytes_written",
+            "bytes_reused",
+            "cache_bytes_written",
+            "payloads_read",
+            "payload_bytes_read",
+        ] {
+            assert_eq!(report[key], Value::Null, "{key}");
+        }
+    }
+
+    #[test]
+    fn storage_bytes_counts_sqlite_wal_and_snapshot_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("clave.sqlite"), [0u8; 10]).expect("sqlite");
+        std::fs::write(dir.path().join("clave.sqlite-wal"), [0u8; 20]).expect("wal");
+        for (name, len) in [
+            ("snapshots", 30),
+            ("snapshot-shards", 40),
+            ("snapshot-build", 50),
+        ] {
+            std::fs::create_dir_all(dir.path().join(name).join("nested")).expect("dir");
+            std::fs::write(dir.path().join(name).join("nested/f"), vec![0u8; len]).expect("file");
+        }
+        assert_eq!(
+            storage_bytes(dir.path()),
+            json!({
+                "sqlite_bytes": 10,
+                "sqlite_wal_bytes": 20,
+                "snapshots_bytes": 30,
+                "snapshot_shards_bytes": 40,
+                "snapshot_build_bytes": 50,
+            })
+        );
+    }
+
+    #[test]
+    fn a_page_carries_the_marker_and_one_whole_content_region() {
+        let html = page("127.0.1.1", 3, 5, 1);
+        assert!(
+            html.contains("<meta name=\"wist\" content=\"publish\">"),
+            "{html}"
+        );
+        assert_eq!(html.matches("<!--wist:content-->").count(), 1, "{html}");
+        assert_eq!(html.matches("<!--/wist:content-->").count(), 1, "{html}");
+        assert!(
+            html.find("<!--wist:content-->") < html.find("<!--/wist:content-->"),
+            "{html}"
+        );
+        assert_ne!(
+            html,
+            page("127.0.1.1", 3, 5, 2),
+            "a revision changes the page"
+        );
+    }
+
+    #[test]
+    fn request_kind_names_each_published_object() {
+        for (path, kind) in [
+            (".well-known/wist/publisher.json", "declaration"),
+            (
+                ".well-known/wist/collections/default/catalog.json",
+                "catalog",
+            ),
+            (
+                ".well-known/wist/collections/default/changes/ab.json",
+                "change_list",
+            ),
+            (".well-known/wist/collections/default/tree/ab", "tree_file"),
+            (
+                ".well-known/wist/collections/default/payloads/ab.json",
+                "payload",
+            ),
+            (".well-known/wist/label-feed.json", "label_feed"),
+            (".well-known/wist/label-feed/2.json", "label_feed"),
+            ("p0.html", "other"),
+            (".well-known/wist/collections/default", "other"),
+        ] {
+            assert_eq!(request_kind(path), kind, "{path}");
+        }
+    }
+
+    fn logged(host: &str, path: &str, octets: u64) -> LoggedRequest {
+        LoggedRequest {
+            host: host.into(),
+            path: path.into(),
+            octets,
+        }
+    }
+
+    #[test]
+    fn requests_report_sums_requests_and_octets_by_kind_for_the_named_hosts() {
+        let requests = [
+            logged("a", ".well-known/wist/publisher.json", 100),
+            logged("a", ".well-known/wist/collections/c/tree/ff", 30),
+            logged("a", ".well-known/wist/collections/c/tree/ee", 10),
+            logged("b", ".well-known/wist/collections/c/catalog.json", 500),
+        ];
+        let report = requests_report(&requests, &["a".to_string()], 4);
+        assert_eq!(report["site_requests"], 3);
+        assert_eq!(report["response_octets"], 140);
+        assert_eq!(report["requests_per_item"], 0.75);
+        assert_eq!(report["octets_per_item"], 35.0);
+        assert_eq!(
+            report["by_kind"],
+            json!({
+                "declaration": { "requests": 1, "octets": 100 },
+                "tree_file": { "requests": 2, "octets": 40 },
+            })
+        );
+    }
+
+    #[test]
+    fn round_report_takes_the_slowest_named_host() {
+        let pulled = BTreeMap::from([
+            ("a".to_string(), 1.5),
+            ("b".to_string(), 9.0),
+            ("c".to_string(), 3.0),
+        ]);
+        let report = round_report(&[], &["a".to_string(), "c".to_string()], 0, &pulled);
+        assert_eq!(report["seconds_until_all_pulled"], 3.0);
+        assert_eq!(report["requests_per_item"], Value::Null);
+    }
+
+    #[test]
+    fn vm_hwm_line_reads_as_kilobytes() {
+        let status = "Name:\tclave\nVmPeak:\t  900 kB\nVmHWM:\t   12345 kB\nVmRSS:\t  100 kB\n";
+        assert_eq!(vm_hwm_kb(status), Some(12_345));
+        assert_eq!(vm_hwm_kb("Name:\tclave\n"), None);
+    }
+
+    #[test]
+    fn log_entries_report_counts_only_the_sealed_range_by_entry_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaves: Vec<Vec<u8>> = [
+            "publisher_declaration",
+            "publisher_catalog",
+            "publisher_item",
+            "publisher_item",
+        ]
+        .iter()
+        .map(|entry_type| {
+            json!({ "type": entry_type, "body": {} })
+                .to_string()
+                .into_bytes()
+        })
+        .collect();
+        for bundle in wist_core::tiles::entry_bundles_for_range(0, 4, 4) {
+            let file = dir.path().join(bundle.path().trim_start_matches('/'));
+            std::fs::create_dir_all(file.parent().expect("bundle directory")).expect("dir");
+            let (start, end) = bundle.leaf_range();
+            std::fs::write(
+                file,
+                wist_core::tiles::encode_entry_bundle(&leaves[start as usize..end as usize])
+                    .expect("encode"),
+            )
+            .expect("bundle");
+        }
+        let report = log_entries_report(dir.path(), 1, 4);
+        let item_octets = leaves[2].len() as u64;
+        assert_eq!(report["publisher_declaration"], Value::Null);
+        assert_eq!(report["publisher_catalog"]["entries"], 1);
+        assert_eq!(report["publisher_item"]["entries"], 2);
+        assert_eq!(report["publisher_item"]["octets"], 2 * item_octets);
+        assert_eq!(
+            report["publisher_item"]["octets_per_entry"],
+            item_octets as f64
+        );
+        assert_eq!(report["all"]["entries"], 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn measured_child_reports_stdout_wall_time_and_peak_rss() {
+        let run = run_measured(Path::new("/bin/sh"), &["-c", "echo seal took 5 ms"]);
+        assert_eq!(reported_seconds(&run.stdout, "seal took "), Some(0.005));
+        assert!(run.seconds > 0.0);
+        assert!(run.peak_rss_kb.is_some_and(|kb| kb > 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "stderr=boom")]
+    fn failing_child_panics_with_its_stderr() {
+        run_measured(Path::new("/bin/sh"), &["-c", "echo boom >&2; exit 3"]);
+    }
+
+    fn proxied_get(addr: &str, host: &str, path: &str) -> std::io::Result<String> {
+        let mut stream = TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        write!(
+            stream,
+            "GET http://{host}/{path} HTTP/1.1\r\nHost: {host}\r\n\r\n"
+        )?;
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer)?;
+        Ok(answer)
+    }
+
+    fn behaving_proxy() -> (
+        tempfile::TempDir,
+        String,
+        BTreeMap<String, SiteCounters>,
+        Behaviors,
+    ) {
+        let (dir, addr, counters, _, behaviors) = recorded_proxy();
+        (dir, addr, counters, behaviors)
+    }
+
+    fn recorded_proxy() -> (
+        tempfile::TempDir,
+        String,
+        BTreeMap<String, SiteCounters>,
+        RequestLog,
+        Behaviors,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("page.html"), "hello").expect("page");
+        let (addr, counters, log, behaviors) = serve_sites_with_behaviors(BTreeMap::from([(
+            "site.test".to_string(),
+            dir.path().to_path_buf(),
+        )]));
+        (dir, addr, counters, log, behaviors)
+    }
+
+    #[test]
+    fn proxy_records_every_injected_failure_as_a_request_without_octets() {
+        let (_dir, addr, counters, log, behaviors) = recorded_proxy();
+        for failure in [
+            Failure::Unavailable,
+            Failure::Close,
+            Failure::Hang(Duration::from_millis(50)),
+        ] {
+            behaviors.set(
+                "site.test",
+                HostBehavior {
+                    delay: None,
+                    failure: Some(failure),
+                },
+            );
+            let _ = proxied_get(&addr, "site.test", "page.html");
+        }
+        assert_eq!(counters["site.test"].requests.load(Ordering::Relaxed), 3);
+        assert_eq!(counters["site.test"].failures.load(Ordering::Relaxed), 3);
+        assert_eq!(counters["site.test"].octets.load(Ordering::Relaxed), 0);
+        let expected = LoggedRequest {
+            host: "site.test".into(),
+            path: "page.html".into(),
+            octets: 0,
+        };
+        assert_eq!(log.requests(), vec![expected; 3]);
+    }
+
+    #[test]
+    fn retry_after_is_read_from_a_refusal_message_that_carries_it() {
+        assert_eq!(
+            retry_after_seconds("HTTP 503 Service Unavailable, Retry-After: 30"),
+            Some(30)
+        );
+        assert_eq!(retry_after_seconds("retry-after=7 seconds"), Some(7));
+        assert_eq!(
+            retry_after_seconds("ping failed after retries: HTTP 503"),
+            None
+        );
+    }
+
+    #[test]
+    fn proxy_serves_a_host_without_a_behavior_unchanged() {
+        let (_dir, addr, counters, _) = behaving_proxy();
+        let answer = proxied_get(&addr, "site.test", "page.html").expect("answer");
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert!(answer.ends_with("hello"), "{answer}");
+        assert_eq!(counters["site.test"].requests.load(Ordering::Relaxed), 1);
+        assert_eq!(counters["site.test"].delays.load(Ordering::Relaxed), 0);
+        assert_eq!(counters["site.test"].failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn proxy_delays_every_request_of_a_delayed_host_and_counts_each_delay() {
+        let (_dir, addr, counters, behaviors) = behaving_proxy();
+        behaviors.set(
+            "site.test",
+            HostBehavior {
+                delay: Some(Duration::from_millis(300)),
+                failure: None,
+            },
+        );
+        for _ in 0..2 {
+            let start = Instant::now();
+            let answer = proxied_get(&addr, "site.test", "page.html").expect("answer");
+            assert!(start.elapsed() >= Duration::from_millis(300));
+            assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        }
+        assert_eq!(counters["site.test"].delays.load(Ordering::Relaxed), 2);
+        assert_eq!(counters["site.test"].requests.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn proxy_answers_503_for_an_unavailable_host_and_counts_the_failure() {
+        let (_dir, addr, counters, behaviors) = behaving_proxy();
+        behaviors.set(
+            "site.test",
+            HostBehavior {
+                delay: None,
+                failure: Some(Failure::Unavailable),
+            },
+        );
+        let answer = proxied_get(&addr, "site.test", "page.html").expect("answer");
+        assert!(
+            answer.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{answer}"
+        );
+        assert_eq!(counters["site.test"].failures.load(Ordering::Relaxed), 1);
+        assert_eq!(counters["site.test"].requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn proxy_closes_a_closing_host_without_answering() {
+        let (_dir, addr, counters, behaviors) = behaving_proxy();
+        behaviors.set(
+            "site.test",
+            HostBehavior {
+                delay: None,
+                failure: Some(Failure::Close),
+            },
+        );
+        let answer = proxied_get(&addr, "site.test", "page.html").unwrap_or_default();
+        assert_eq!(answer, "");
+        assert_eq!(counters["site.test"].failures.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn proxy_holds_a_hanging_host_for_its_duration_then_closes_without_answering() {
+        let (_dir, addr, _counters, behaviors) = behaving_proxy();
+        behaviors.set(
+            "site.test",
+            HostBehavior {
+                delay: None,
+                failure: Some(Failure::Hang(Duration::from_millis(500))),
+            },
+        );
+        let start = Instant::now();
+        let answer = proxied_get(&addr, "site.test", "page.html").unwrap_or_default();
+        assert!(start.elapsed() >= Duration::from_millis(500));
+        assert_eq!(answer, "");
+    }
+
+    #[test]
+    fn proxy_serves_normally_again_once_a_behavior_is_reset() {
+        let (_dir, addr, _counters, behaviors) = behaving_proxy();
+        behaviors.set(
+            "site.test",
+            HostBehavior {
+                delay: None,
+                failure: Some(Failure::Unavailable),
+            },
+        );
+        behaviors.set("site.test", HostBehavior::default());
+        let answer = proxied_get(&addr, "site.test", "page.html").expect("answer");
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        behaviors.set(
+            "site.test",
+            HostBehavior {
+                delay: None,
+                failure: Some(Failure::Unavailable),
+            },
+        );
+        behaviors.clear();
+        let answer = proxied_get(&addr, "site.test", "page.html").expect("answer");
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+    }
+
+    #[test]
+    fn write_changed_pages_rewrites_only_the_named_pages() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let site = Site::new(root.path(), "127.0.9.9", "default");
+        write_pages(&site, 3, 5, 1);
+        write_changed_pages(&site, &[1], 5, 2);
+        let read = |j: usize| {
+            std::fs::read_to_string(site.pages.join(format!("p{j}.html"))).expect("page")
+        };
+        assert_eq!(read(0), page("127.0.9.9", 0, 5, 1));
+        assert_eq!(read(1), page("127.0.9.9", 1, 5, 2));
+        assert_eq!(read(2), page("127.0.9.9", 2, 5, 1));
+    }
+
+    #[test]
+    fn entry_leaves_returns_only_the_leaves_from_the_given_index_to_the_tree_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaves: Vec<Vec<u8>> = (0..5)
+            .map(|n| format!("{{\"n\":{n}}}").into_bytes())
+            .collect();
+        for bundle in wist_core::tiles::entry_bundles_for_range(0, 5, 5) {
+            let file = dir.path().join(bundle.path().trim_start_matches('/'));
+            std::fs::create_dir_all(file.parent().expect("bundle directory")).expect("dir");
+            let (start, end) = bundle.leaf_range();
+            std::fs::write(
+                file,
+                wist_core::tiles::encode_entry_bundle(&leaves[start as usize..end as usize])
+                    .expect("encode"),
+            )
+            .expect("bundle");
+        }
+        assert_eq!(entry_leaves(dir.path(), 2, 5), leaves[2..5].to_vec());
     }
 }

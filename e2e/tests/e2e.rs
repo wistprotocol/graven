@@ -1,9 +1,10 @@
 use e2e::{
-    checkpoint_verifier_key, epoch_entries, fetch_status, graven_bin, grid_instant,
-    head_snapshot_state, log_entries, marked_page, now_rfc3339, read_json, resolve_sibling_bin,
-    run, run_with_env, s, seal_epoch, serve_sites, serve_sites_logged, start_aggregator,
-    synced_heads, wait_until_after, wait_until_status_active, wait_until_unreachable,
-    workspace_root, Aggregator, McpClient, RequestLog, Site, SyncedHead,
+    change_parameter, checkpoint_verifier_key, epoch_entries, fetch_status, graven_bin,
+    grid_instant, head_snapshot_state, label_command, log_entries, log_keys, marked_page,
+    now_rfc3339, read_json, resolve_sibling_bin, run, run_with_env, s, seal_epoch, serve_sites,
+    serve_sites_logged, start_aggregator, synced_heads, wait_until_after, wait_until_status_active,
+    wait_until_unreachable, workspace_root, Aggregator, LogKey, McpClient, RequestLog, Site,
+    SyncedHead,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -340,34 +341,6 @@ fn log_signature_key_ids(note: &str, log_id: &str) -> Vec<String> {
         .iter()
         .filter(|line| line.name == log_id)
         .map(|line| wist_core::crypto::hex_encode(&line.key_id))
-        .collect()
-}
-
-struct LogKey {
-    key_id: String,
-    note_key_id: String,
-    added: Option<u64>,
-    removed: Option<u64>,
-}
-
-fn log_keys(clave: &Path, data: &Path) -> Vec<LogKey> {
-    let output = run(clave, &["log-key", "list", "--data", s(data)]);
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            assert!(
-                fields.len() >= 6 && fields[2] == "added" && fields[4] == "removed",
-                "unexpected log-key list line {line:?}"
-            );
-            LogKey {
-                key_id: fields[0].to_string(),
-                note_key_id: fields[1].to_string(),
-                added: fields[3].parse().ok(),
-                removed: fields[5].parse().ok(),
-            }
-        })
         .collect()
 }
 
@@ -729,19 +702,6 @@ fn a_publication_reaches_the_consumer_through_two_logs_with_updates_removals_and
     verify_with_external_tlog_client(&first_log.base_url, &first_log.verifier_key);
     record.write();
     eprintln!("completed in {:?}", started.elapsed());
-}
-
-fn label_command(spake: &Path, labeler: &Site, args: &[&str]) -> String {
-    let mut full = vec![
-        "label",
-        "--out",
-        s(&labeler.out),
-        "--state",
-        s(&labeler.state),
-    ];
-    full.extend_from_slice(args);
-    let output = run(spake, &full);
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 fn urls(hits: &[Value]) -> Vec<&str> {
@@ -3929,23 +3889,6 @@ fn a_withdrawal_filed_with_two_logs_under_one_legal_basis_is_sealed_by_each() {
     validate_artifacts(&site.out, &first_log.data);
     record.write();
     eprintln!("completed in {:?}", started.elapsed());
-}
-
-fn change_parameter(clave: &Path, aggregator: &Aggregator, parameter: &str, value: i64, at: &str) {
-    run(
-        clave,
-        &[
-            "param-change",
-            "--data",
-            s(&aggregator.data),
-            "--parameter",
-            parameter,
-            "--value",
-            &value.to_string(),
-            "--effective-at",
-            at,
-        ],
-    );
 }
 
 #[test]
