@@ -35,6 +35,15 @@ peak resident set size over the round, and the latency of
 a failed or timed-out request counts as the 30 s client timeout, and a
 round without samples fails its latency check).
 
+Every round and seal also reports `longest_write_lock_ms`: the longest hold
+of the store's write lock, in milliseconds, across the aggregator
+(`write lock held N ms` lines on `clave serve`'s standard error) and the
+seal process (the same line on `clave seal`'s standard output) since the
+previous round or seal ended; it is `null` when neither reports a hold, as
+with an aggregator that prints no such line. The report's top-level
+`longest_write_lock_ms` is the maximum over the whole run, extra seals
+included. No check applies to it.
+
 ### Common flags
 
 | Flag | Default | Meaning |

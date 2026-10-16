@@ -4,8 +4,8 @@ use e2e::{
     ping_once, ping_until_admitted, pulled_each_since, pulled_within, requests_report,
     reset_peak_rss, resolve_sibling_bin, revisions, round_report, run, run_measured, s,
     serve_sites_with_behaviors, snapshot_report, start_aggregator, sync_args, timed,
-    wait_until_after, write_changed_pages, write_pages, Aggregator, Behaviors, Failure,
-    HostBehavior, PingOutcome, RequestLog, SealStage, Site, SiteCounters,
+    wait_until_after, write_changed_pages, write_pages, Aggregator, AppendedText, Behaviors,
+    Failure, HostBehavior, PingOutcome, RequestLog, SealStage, Site, SiteCounters, WRITE_LOCK_HELD,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -390,6 +390,7 @@ struct Sealed {
     entries: Vec<Value>,
     seconds: f64,
     octets: u64,
+    longest_write_lock_ms: Option<u64>,
 }
 
 fn epoch_octets(entries: &[Value]) -> u64 {
@@ -447,6 +448,8 @@ struct Harness {
     sealed: u64,
     body_words: usize,
     round_bound: Duration,
+    serve_stderr: AppendedText,
+    longest_write_lock_ms: Option<u64>,
 }
 
 struct RoundStart {
@@ -465,6 +468,7 @@ impl Harness {
         );
         let proxy = format!("http://{proxy_addr}");
         let aggregator = start_aggregator(&bins.clave, root.join("clave-data"), None, Some(&proxy));
+        let serve_stderr = AppendedText::new(&aggregator.stderr);
         Harness {
             bins: bins.clone(),
             proxy,
@@ -477,7 +481,25 @@ impl Harness {
             sealed: 0,
             body_words: args.body_words(),
             round_bound: args.round_bound(),
+            serve_stderr,
+            longest_write_lock_ms: None,
         }
+    }
+
+    fn write_lock_window(&mut self, seal_stdout: Option<&str>) -> Option<u64> {
+        let serve = self.serve_stderr.follow(&self.aggregator.stderr);
+        let longest = [Some(serve.as_str()), seal_stdout]
+            .into_iter()
+            .flatten()
+            .filter_map(|text| e2e::longest_reported_millis(text, WRITE_LOCK_HELD))
+            .max();
+        self.longest_write_lock_ms = self.longest_write_lock_ms.max(longest);
+        longest
+    }
+
+    fn run_longest_write_lock_ms(&mut self) -> Option<u64> {
+        self.write_lock_window(None);
+        self.longest_write_lock_ms
     }
 
     fn base(&self) -> &str {
@@ -533,7 +555,9 @@ impl Harness {
         let at = self.clock.next();
         let data = self.aggregator.data.clone();
         let stage = SealStage::run(&self.bins.clave, &data, &at, false);
+        let longest_write_lock_ms = self.write_lock_window(Some(&stage.seal.stdout));
         let mut report = stage.report(&data);
+        report["longest_write_lock_ms"] = json!(longest_write_lock_ms);
         let size = log_tree_size(&data);
         let entries: Vec<Value> = e2e::entry_leaves(&data, self.sealed, size)
             .iter()
@@ -551,6 +575,7 @@ impl Harness {
             entries,
             seconds: stage.seal_seconds().unwrap_or(stage.seal.seconds),
             octets,
+            longest_write_lock_ms,
         }
     }
 
@@ -694,6 +719,7 @@ fn run_round(
         "status_latency": status,
         "governance": governance,
         "seal": sealed.report,
+        "longest_write_lock_ms": sealed.longest_write_lock_ms,
         "seconds": seconds,
     });
     e2e::merge(&mut report, outcome_report);
@@ -791,6 +817,7 @@ impl Harness {
                 "aggregator_peak_rss_kb": aggregator_peak,
                 "status_latency": status,
                 "seal": sealed.report,
+                "longest_write_lock_ms": sealed.longest_write_lock_ms,
                 "seconds": round.started.elapsed().as_secs_f64(),
             }),
         );
@@ -1058,6 +1085,7 @@ fn skew(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec<C
         "heavy_pages_per_domain": layout.heavy_pages,
         "rounds": outcomes.iter().map(|o| o.report.clone()).collect::<Vec<_>>(),
     });
+    report["longest_write_lock_ms"] = json!(h.run_longest_write_lock_ms());
     checks
 }
 
@@ -1224,6 +1252,7 @@ fn backfill(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> V
         "expected_epochs": expected_epochs,
         "rounds": outcomes.iter().map(|o| o.report.clone()).collect::<Vec<_>>(),
     });
+    report["longest_write_lock_ms"] = json!(h.run_longest_write_lock_ms());
     checks
 }
 
@@ -1471,6 +1500,7 @@ fn hosts(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec<
             "aggregator_peak_rss_kb": aggregator_peak,
             "status_latency": status,
             "seal": sealed.report,
+            "longest_write_lock_ms": sealed.longest_write_lock_ms,
             "seconds": round.started.elapsed().as_secs_f64(),
         }),
     );
@@ -1522,6 +1552,7 @@ fn hosts(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec<
         ),
     ];
     report["stages"]["hosts"] = json!({ "rounds": [round_report_value] });
+    report["longest_write_lock_ms"] = json!(h.run_longest_write_lock_ms());
     checks
 }
 
@@ -1666,6 +1697,7 @@ fn flood_round(
     let aggregator_peak = peak_rss_kb(h.pid());
     let seconds = round.started.elapsed().as_secs_f64();
     let status = round.sampler.finish();
+    let longest_write_lock_ms = h.write_lock_window(None);
     let items = participants
         .iter()
         .map(|participant| participant.items)
@@ -1688,6 +1720,7 @@ fn flood_round(
             "unpulled_domains": hosts.len() - pulled.len(),
             "aggregator_peak_rss_kb": aggregator_peak,
             "status_latency": status,
+            "longest_write_lock_ms": longest_write_lock_ms,
             "seconds": seconds,
         }),
     );
@@ -1934,6 +1967,7 @@ fn saturation(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) ->
             "status_latency": seal_status,
         },
     });
+    report["longest_write_lock_ms"] = json!(h.run_longest_write_lock_ms());
     checks
 }
 
@@ -2154,6 +2188,7 @@ fn drainage(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> V
         },
         "recovery_rounds": recovery_outcomes.iter().map(|o| o.report.clone()).collect::<Vec<_>>(),
     });
+    report["longest_write_lock_ms"] = json!(h.run_longest_write_lock_ms());
     checks
 }
 
@@ -2172,7 +2207,7 @@ fn rss_kb(pid: u32) -> Option<u64> {
 }
 
 fn measure_probe_pull(
-    h: &Harness,
+    h: &mut Harness,
     probe: &Site,
     changed: usize,
     round: usize,
@@ -2195,6 +2230,7 @@ fn measure_probe_pull(
         .zip(rss_before)
         .map(|(peak, before)| peak.saturating_sub(before));
     let status = start.sampler.finish();
+    let longest_write_lock_ms = h.write_lock_window(None);
     let mut report = round_report(&h.requests.requests(), &hosts, changed.len(), &pulled);
     e2e::merge(
         &mut report,
@@ -2205,6 +2241,7 @@ fn measure_probe_pull(
             "aggregator_peak_rss_kb": peak,
             "aggregator_rss_increase_kb": increase,
             "status_latency": status,
+            "longest_write_lock_ms": longest_write_lock_ms,
         }),
     );
     (report, increase)
@@ -2228,6 +2265,7 @@ fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec
         "round_bound_seconds": args.round_bound().as_secs(),
     });
     let mut cells = Vec::new();
+    let mut longest_write_lock_ms = None;
     let mut peaks: BTreeMap<(usize, usize), (Option<u64>, Option<u64>)> = BTreeMap::new();
     for &record_count in &records {
         for &epoch_count in &epochs {
@@ -2248,15 +2286,16 @@ fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec
             let clave = &bins.clave;
             for _ in 1..epoch_count {
                 let at = h.clock.next();
-                run_measured(
+                let extra = run_measured(
                     clave,
                     &["seal", "--data", s(&data), "--at", &at, "--no-snapshot"],
                 );
+                h.write_lock_window(Some(&extra.stdout));
             }
             h.sealed = log_tree_size(&data);
 
             let changed = changed_count(PROBE_PAGES, percent);
-            let (probe_pull, pull_increase) = measure_probe_pull(&h, &probe, changed, 1);
+            let (probe_pull, pull_increase) = measure_probe_pull(&mut h, &probe, changed, 1);
             let probe_seal = h.seal();
             let empty_seal = run_measured(
                 clave,
@@ -2269,13 +2308,15 @@ fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec
                     "--no-snapshot",
                 ],
             );
+            let empty_seal_write_lock_ms = h.write_lock_window(Some(&empty_seal.stdout));
             let snapshot = run_measured(clave, &["snapshot", "--data", s(&data)]);
             let store = cell_root.join("graven-store");
             let anchor = data.join("anchor.json");
             let consumer = run_measured(&bins.graven, &sync_args(&anchor, h.base(), &store, true));
             h.aggregator.stop();
             h.aggregator.start(clave, Some(&h.proxy));
-            let (restarted_pull, _) = measure_probe_pull(&h, &probe, changed, 2);
+            let (restarted_pull, _) = measure_probe_pull(&mut h, &probe, changed, 2);
+            longest_write_lock_ms = longest_write_lock_ms.max(h.run_longest_write_lock_ms());
             println!(
                 "memory cell {record_count} records x {epoch_count} Epochs: pull peak {} kB, increase {pull_increase:?} kB ({} kB after a restart), empty seal peak {:?} kB, snapshot peak {:?} kB, consumer cold start peak {:?} kB",
                 probe_pull["aggregator_peak_rss_kb"], restarted_pull["aggregator_rss_increase_kb"], empty_seal.peak_rss_kb, snapshot.peak_rss_kb, consumer.peak_rss_kb
@@ -2298,6 +2339,7 @@ fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec
                     "seconds": empty_seal.seconds,
                     "seal_seconds": e2e::reported_seconds(&empty_seal.stdout, "seal took "),
                     "peak_rss_kb": empty_seal.peak_rss_kb,
+                    "longest_write_lock_ms": empty_seal_write_lock_ms,
                 },
                 "unchanged_snapshot": snapshot_report(&snapshot),
                 "consumer_cold_start": consumer_report(&consumer, &store),
@@ -2340,6 +2382,7 @@ fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec
         }
     }
     report["stages"]["memory"] = json!({ "cells": cells });
+    report["longest_write_lock_ms"] = json!(longest_write_lock_ms);
     checks
 }
 

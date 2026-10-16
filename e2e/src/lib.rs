@@ -1739,6 +1739,50 @@ pub fn reported_seconds(stdout: &str, prefix: &str) -> Option<f64> {
     })
 }
 
+pub const WRITE_LOCK_HELD: &str = "write lock held ";
+
+pub fn longest_reported_millis(text: &str, prefix: &str) -> Option<u64> {
+    text.lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix(prefix)?
+                .strip_suffix(" ms")?
+                .parse()
+                .ok()
+        })
+        .max()
+}
+
+pub struct AppendedText {
+    buffer: Arc<Mutex<String>>,
+    read: usize,
+}
+
+impl AppendedText {
+    pub fn new(buffer: &Arc<Mutex<String>>) -> Self {
+        AppendedText {
+            buffer: buffer.clone(),
+            read: 0,
+        }
+    }
+
+    pub fn follow(&mut self, buffer: &Arc<Mutex<String>>) -> String {
+        let mut appended = self.take();
+        if !Arc::ptr_eq(&self.buffer, buffer) {
+            *self = AppendedText::new(buffer);
+            appended.push_str(&self.take());
+        }
+        appended
+    }
+
+    fn take(&mut self) -> String {
+        let text = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+        let appended = text[self.read..].to_string();
+        self.read = text.len();
+        appended
+    }
+}
+
 pub fn reported_count(stdout: &str, prefix: &str) -> Option<u64> {
     stdout
         .lines()
@@ -2328,6 +2372,52 @@ pub fn change_parameter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn longest_reported_millis_reads_the_seal_stdout_figure() {
+        let stdout =
+            "sealed epoch 3 at 2026-01-01T01:00:00Z\nseal took 12 ms\nwrite lock held 7 ms\n";
+        assert_eq!(longest_reported_millis(stdout, WRITE_LOCK_HELD), Some(7));
+    }
+
+    #[test]
+    fn longest_reported_millis_takes_the_largest_serve_line() {
+        let stderr =
+            "write lock held 3 ms\npull of a.localhost failed: timeout\nwrite lock held 41 ms\n";
+        assert_eq!(longest_reported_millis(stderr, WRITE_LOCK_HELD), Some(41));
+    }
+
+    #[test]
+    fn longest_reported_millis_is_absent_without_a_figure() {
+        let text = "pull of a.localhost failed: timeout\nwrite lock held soon ms\n";
+        assert_eq!(longest_reported_millis(text, WRITE_LOCK_HELD), None);
+        assert_eq!(longest_reported_millis("", WRITE_LOCK_HELD), None);
+    }
+
+    #[test]
+    fn appended_text_returns_only_what_was_appended_since_the_last_read() {
+        let buffer = Arc::new(Mutex::new("write lock held 9 ms\n".to_string()));
+        let mut appended = AppendedText::new(&buffer);
+        assert_eq!(appended.follow(&buffer), "write lock held 9 ms\n");
+        assert_eq!(appended.follow(&buffer), "");
+        buffer.lock().unwrap().push_str("write lock held 12 ms\n");
+        assert_eq!(appended.follow(&buffer), "write lock held 12 ms\n");
+    }
+
+    #[test]
+    fn appended_text_finishes_a_replaced_buffer_before_the_new_one() {
+        let first = Arc::new(Mutex::new("write lock held 4 ms\n".to_string()));
+        let mut appended = AppendedText::new(&first);
+        appended.follow(&first);
+        first.lock().unwrap().push_str("write lock held 30 ms\n");
+        let second = Arc::new(Mutex::new("write lock held 2 ms\n".to_string()));
+        assert_eq!(
+            appended.follow(&second),
+            "write lock held 30 ms\nwrite lock held 2 ms\n"
+        );
+        first.lock().unwrap().push_str("write lock held 99 ms\n");
+        assert_eq!(appended.follow(&second), "");
+    }
 
     #[test]
     fn a_served_item_is_found_through_inner_tree_nodes() {
