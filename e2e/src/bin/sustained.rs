@@ -67,6 +67,7 @@ impl Scenario {
 struct Args {
     scenario: Option<Scenario>,
     quick: bool,
+    seal_during_pulls: bool,
     domains: Option<usize>,
     pages: Option<usize>,
     rounds: Option<usize>,
@@ -124,6 +125,7 @@ fn parse_args(flags: impl IntoIterator<Item = String>) -> Args {
         match flag.as_str() {
             "--scenario" => args.scenario = Some(Scenario::parse(&value())),
             "--quick" => args.quick = true,
+            "--seal-during-pulls" => args.seal_during_pulls = true,
             "--domains" => number!(domains),
             "--pages" => number!(pages),
             "--rounds" => number!(rounds),
@@ -389,8 +391,15 @@ struct Sealed {
     report: Value,
     entries: Vec<Value>,
     seconds: f64,
+    wall_seconds: f64,
     octets: u64,
     longest_write_lock_ms: Option<u64>,
+}
+
+struct SealRun {
+    at: String,
+    started: Instant,
+    thread: std::thread::JoinHandle<SealStage>,
 }
 
 fn epoch_octets(entries: &[Value]) -> u64 {
@@ -448,6 +457,7 @@ struct Harness {
     sealed: u64,
     body_words: usize,
     round_bound: Duration,
+    seal_during_pulls: bool,
     serve_stderr: AppendedText,
     longest_write_lock_ms: Option<u64>,
 }
@@ -481,6 +491,7 @@ impl Harness {
             sealed: 0,
             body_words: args.body_words(),
             round_bound: args.round_bound(),
+            seal_during_pulls: args.seal_during_pulls,
             serve_stderr,
             longest_write_lock_ms: None,
         }
@@ -551,10 +562,24 @@ impl Harness {
         (refused, seconds)
     }
 
-    fn seal(&mut self) -> Sealed {
+    fn seal_start(&mut self) -> SealRun {
         let at = self.clock.next();
+        let bins = self.bins.clone();
         let data = self.aggregator.data.clone();
-        let stage = SealStage::run(&self.bins.clave, &data, &at, false);
+        let seal_at = at.clone();
+        let thread =
+            std::thread::spawn(move || SealStage::run(&bins.clave, &data, &seal_at, false));
+        SealRun {
+            at,
+            started: Instant::now(),
+            thread,
+        }
+    }
+
+    fn seal_finish(&mut self, run: SealRun) -> Sealed {
+        let stage = run.thread.join().expect("the seal thread panicked");
+        let at = run.at;
+        let data = self.aggregator.data.clone();
         let longest_write_lock_ms = self.write_lock_window(Some(&stage.seal.stdout));
         let mut report = stage.report(&data);
         report["longest_write_lock_ms"] = json!(longest_write_lock_ms);
@@ -574,9 +599,15 @@ impl Harness {
             report,
             entries,
             seconds: stage.seal_seconds().unwrap_or(stage.seal.seconds),
+            wall_seconds: stage.seal.seconds,
             octets,
             longest_write_lock_ms,
         }
+    }
+
+    fn seal(&mut self) -> Sealed {
+        let run = self.seal_start();
+        self.seal_finish(run)
     }
 
     fn label(
@@ -681,12 +712,30 @@ fn run_round(
     }
     settle(&since);
     let (refused, ping_seconds) = h.ping_all(&hosts);
+    let pinged = Instant::now();
+    let mut before_seal = Some(before_seal);
+    let mut governance = Value::Null;
+    let mut seal = None;
+    if h.seal_during_pulls {
+        governance = before_seal.take().expect("the governance step runs once")(h);
+        seal = Some((StatusSampler::start(h.base(), status_host), h.seal_start()));
+    }
+    let pull_origin = pinged.elapsed().as_secs_f64();
     let pulled = pulled_each_since(&h.http, h.base(), &since, h.round_bound);
     let aggregator_peak = peak_rss_kb(h.pid());
-    let governance = before_seal(h);
-    let seal_sampler = StatusSampler::start(h.base(), status_host);
-    let sealed = h.seal();
+    if let Some(before_seal) = before_seal.take() {
+        governance = before_seal(h);
+    }
+    let (seal_sampler, seal_run) =
+        seal.unwrap_or_else(|| (StatusSampler::start(h.base(), status_host), h.seal_start()));
+    let seal_started = seal_run.started.duration_since(pinged).as_secs_f64();
+    let sealed = h.seal_finish(seal_run);
     let seal_status = seal_sampler.finish();
+    let pulls_during_seal = pulled
+        .values()
+        .map(|seconds| seconds + pull_origin)
+        .filter(|&at| at >= seal_started && at <= seal_started + sealed.wall_seconds)
+        .count();
     let seconds = round.started.elapsed().as_secs_f64();
     let status = round.sampler.finish();
     let requests = h.requests.requests();
@@ -721,6 +770,8 @@ fn run_round(
         "status_latency": status,
         "seal_status_latency": seal_status,
         "governance": governance,
+        "seal_started_after_last_ping_seconds": seal_started,
+        "pulls_during_seal": pulls_during_seal,
         "seal": sealed.report,
         "longest_write_lock_ms": sealed.longest_write_lock_ms,
         "seconds": seconds,
@@ -747,7 +798,7 @@ fn summary(label: &str, outcome: &RoundOutcome) -> String {
     let report = &outcome.report;
     let entries = &report["seal"]["log_entries"]["all"];
     format!(
-        "round {label}: {} items in {} domains, pulled in {:.1} s ({} unpulled), {} pings refused, seal {:.2} s at {} kB, Epoch {} entries {} octets, aggregator {} kB, status p99 {} ms",
+        "round {label}: {} items in {} domains, pulled in {:.1} s ({} unpulled), {} pings refused, seal {:.2} s at {} kB replanned {} with {} pulls during it, Epoch {} entries {} octets, aggregator {} kB, status p99 {} ms",
         report["changed_items"],
         report["participating_domains"],
         outcome.pulled_seconds(),
@@ -755,6 +806,8 @@ fn summary(label: &str, outcome: &RoundOutcome) -> String {
         report["pings_refused"],
         outcome.sealed.seconds,
         report["seal"]["seal_peak_rss_kb"],
+        report["seal"]["replanned"],
+        report["pulls_during_seal"],
         entries["entries"],
         entries["octets"],
         report["aggregator_peak_rss_kb"],
@@ -957,6 +1010,7 @@ fn skew(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec<C
         "changed_percent": percent,
         "labelers": labeler_count,
         "labels_per_round": args.labels_per_round(),
+        "seal_during_pulls": args.seal_during_pulls,
         "round_bound_seconds": args.round_bound().as_secs(),
         "status_bound_ms": args.status_bound_ms(),
     });
@@ -2411,6 +2465,10 @@ fn ratio_check(
 fn main() {
     let args = args();
     let scenario = args.scenario();
+    assert!(
+        !args.seal_during_pulls || matches!(scenario, Scenario::Skew),
+        "--seal-during-pulls applies to skew only"
+    );
     let bins = Arc::new(Bins {
         spake: resolve_sibling_bin("SPAKE_BIN", "spake"),
         clave: resolve_sibling_bin("CLAVE_BIN", "clave"),

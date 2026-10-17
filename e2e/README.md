@@ -34,7 +34,13 @@ peak resident set size over the round, and the latency of
 `/status/<host>` for one healthy host sampled every 250 ms (p50, p99, max;
 a failed or timed-out request counts as the 30 s client timeout, and a
 round without samples fails its latency check), over the whole round and,
-as `seal_status_latency`, over its seal and Snapshot alone.
+as `seal_status_latency`, over its seal and Snapshot alone. Every seal
+report carries `replanned`, how many times the seal re-planned because a
+write changed its inputs between its plan and its commit (`replanned N
+times` on `clave seal`'s standard output; 0 without the line). Every round
+also reports `seal_started_after_last_ping_seconds` and
+`pulls_during_seal`, the domains whose pull completed between the seal's
+start and its exit.
 
 Every round and seal also reports `longest_write_lock_ms`: the longest hold
 of the store's write lock, in milliseconds, across the aggregator
@@ -55,6 +61,7 @@ included. No check applies to it.
 | `--round-bound-seconds` | 300 | How long a round waits for its pulls, and the pull bound its checks apply |
 | `--status-bound-ms` | 500 | Bound on the status endpoint's p99 latency |
 | `--labelers` | 0 (2 in `skew`) | Labeler sites, each publishing `--labels-per-round` (20) `wist:spam` Labels on random pages per round |
+| `--seal-during-pulls` | off | `skew` only: start each round's seal right after its pings, while its pulls run, instead of after every pinged domain is pulled; the governance acts of the middle rounds run before that seal. Measures the seal's re-plan rate under concurrent pulls |
 | `--work-dir DIR`, `--keep` | | Place, and keep, the temporary directory; a run whose data exceeds the temporary filesystem (a 200 000-page backfill writes several GB) needs a directory on disk |
 | `--out PATH` | | Write the JSON report there; without it the report goes to standard output |
 

@@ -1741,6 +1741,19 @@ pub fn reported_seconds(stdout: &str, prefix: &str) -> Option<f64> {
 
 pub const WRITE_LOCK_HELD: &str = "write lock held ";
 
+pub fn reported_replans(stdout: &str) -> u64 {
+    stdout
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("replanned ")?
+                .strip_suffix(" times")?
+                .parse()
+                .ok()
+        })
+        .unwrap_or(0)
+}
+
 pub fn longest_reported_millis(text: &str, prefix: &str) -> Option<u64> {
     text.lines()
         .filter_map(|line| {
@@ -1868,6 +1881,7 @@ impl SealStage {
             "seconds": self.seal.seconds + self.snapshot.seconds,
             "seal_seconds": self.seal_seconds(),
             "seal_peak_rss_kb": self.seal.peak_rss_kb,
+            "replanned": reported_replans(&self.seal.stdout),
             "snapshot_seconds": reported_seconds(&self.snapshot.stdout, "snapshot took "),
             "snapshot": snapshot_report(&self.snapshot),
             "snapshot_rebuild": self.rebuild_report(),
@@ -2392,6 +2406,13 @@ mod tests {
         let text = "pull of a.localhost failed: timeout\nwrite lock held soon ms\n";
         assert_eq!(longest_reported_millis(text, WRITE_LOCK_HELD), None);
         assert_eq!(longest_reported_millis("", WRITE_LOCK_HELD), None);
+    }
+
+    #[test]
+    fn reported_replans_reads_the_seal_line_and_is_zero_without_one() {
+        let stdout = "replanned 2 times\nsealed epoch 3 at 2026-01-01T01:00:00Z\nseal took 12 ms\n";
+        assert_eq!(reported_replans(stdout), 2);
+        assert_eq!(reported_replans("seal took 12 ms\n"), 0);
     }
 
     #[test]
