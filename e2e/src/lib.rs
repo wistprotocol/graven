@@ -1754,6 +1754,14 @@ pub fn reported_replans(stdout: &str) -> u64 {
         .unwrap_or(0)
 }
 
+pub fn reported_conflicts(stdout: &str) -> Vec<Vec<String>> {
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("plan conflict: "))
+        .map(|changed| changed.split(", ").map(str::to_owned).collect())
+        .collect()
+}
+
 pub fn longest_reported_millis(text: &str, prefix: &str) -> Option<u64> {
     text.lines()
         .filter_map(|line| {
@@ -1882,6 +1890,7 @@ impl SealStage {
             "seal_seconds": self.seal_seconds(),
             "seal_peak_rss_kb": self.seal.peak_rss_kb,
             "replanned": reported_replans(&self.seal.stdout),
+            "replan_conflicts": reported_conflicts(&self.seal.stdout),
             "snapshot_seconds": reported_seconds(&self.snapshot.stdout, "snapshot took "),
             "snapshot": snapshot_report(&self.snapshot),
             "snapshot_rebuild": self.rebuild_report(),
@@ -2413,6 +2422,19 @@ mod tests {
         let stdout = "replanned 2 times\nsealed epoch 3 at 2026-01-01T01:00:00Z\nseal took 12 ms\n";
         assert_eq!(reported_replans(stdout), 2);
         assert_eq!(reported_replans("seal took 12 ms\n"), 0);
+    }
+
+    #[test]
+    fn reported_conflicts_reads_one_publisher_list_per_discarded_plan() {
+        let stdout = "replanned 2 times\nplan conflict: a.example, b.example\nplan conflict: <epoch>\nseal took 12 ms\n";
+        assert_eq!(
+            reported_conflicts(stdout),
+            vec![
+                vec!["a.example".to_owned(), "b.example".to_owned()],
+                vec!["<epoch>".to_owned()]
+            ]
+        );
+        assert!(reported_conflicts("seal took 12 ms\n").is_empty());
     }
 
     #[test]
