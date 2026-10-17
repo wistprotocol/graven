@@ -33,7 +33,8 @@ by Entry type (governance and Label Entries also apart), the aggregator's
 peak resident set size over the round, and the latency of
 `/status/<host>` for one healthy host sampled every 250 ms (p50, p99, max;
 a failed or timed-out request counts as the 30 s client timeout, and a
-round without samples fails its latency check).
+round without samples fails its latency check), over the whole round and,
+as `seal_status_latency`, over its seal and Snapshot alone.
 
 Every round and seal also reports `longest_write_lock_ms`: the longest hold
 of the store's write lock, in milliseconds, across the aggregator

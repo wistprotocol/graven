@@ -684,7 +684,9 @@ fn run_round(
     let pulled = pulled_each_since(&h.http, h.base(), &since, h.round_bound);
     let aggregator_peak = peak_rss_kb(h.pid());
     let governance = before_seal(h);
+    let seal_sampler = StatusSampler::start(h.base(), status_host);
     let sealed = h.seal();
+    let seal_status = seal_sampler.finish();
     let seconds = round.started.elapsed().as_secs_f64();
     let status = round.sampler.finish();
     let requests = h.requests.requests();
@@ -717,6 +719,7 @@ fn run_round(
         "by_class": by_class,
         "aggregator_peak_rss_kb": aggregator_peak,
         "status_latency": status,
+        "seal_status_latency": seal_status,
         "governance": governance,
         "seal": sealed.report,
         "longest_write_lock_ms": sealed.longest_write_lock_ms,
