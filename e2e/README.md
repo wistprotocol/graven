@@ -33,7 +33,9 @@ by Entry type (governance and Label Entries also apart), the aggregator's
 peak resident set size over the round, and the latency of
 `/status/<host>` for one healthy host sampled every 250 ms (p50, p99, max;
 a failed or timed-out request counts as the 30 s client timeout, and a
-round without samples fails its latency check), over the whole round and,
+round without samples fails its latency check; the ingest stage pings the
+sampled host first and samples once its status exists, since the endpoint
+answers 404 for a domain never pulled), over the whole round and,
 as `seal_status_latency`, over its seal and Snapshot alone. Every seal
 report carries `replanned`, how many times the seal re-planned because a
 write changed its inputs between its plan and its commit (`replanned N

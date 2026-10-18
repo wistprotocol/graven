@@ -1,7 +1,7 @@
 use e2e::{
     after_this_second, change_parameter, consumer_report, fetch_status, graven_bin, host_name,
     label_command, log_entries_report, log_keys, log_tree_size, now_rfc3339, peak_rss_kb,
-    ping_once, ping_until_admitted, pulled_each_since, pulled_within, requests_report,
+    ping_once, ping_until_admitted, poll_until, pulled_each_since, pulled_within, requests_report,
     reset_peak_rss, resolve_sibling_bin, revisions, round_report, run, run_measured, s,
     serve_sites_with_behaviors, snapshot_report, start_aggregator, sync_args, timed,
     wait_until_after, write_changed_pages, write_pages, Aggregator, AppendedText, Behaviors,
@@ -841,13 +841,32 @@ impl Harness {
             "domains": sites.len(),
             "labelers": labelers.len(),
         });
-        let round = self.begin(status_host);
-        let hosts: Vec<String> = sites
-            .iter()
-            .map(|site| site.host.clone())
+        self.requests.clear();
+        reset_peak_rss(self.pid());
+        let since = after_this_second();
+        let started = Instant::now();
+        let hosts: Vec<String> = std::iter::once(status_host.to_string())
+            .chain(
+                sites
+                    .iter()
+                    .map(|site| site.host.clone())
+                    .filter(|host| host != status_host),
+            )
             .chain(labelers.iter().map(|labeler| labeler.host.clone()))
             .collect();
-        let (refused, ping_seconds) = self.ping_all(&hosts);
+        let (first_refused, first_seconds) = self.ping_all(&hosts[..1]);
+        poll_until(
+            Duration::from_secs(3600),
+            Duration::from_millis(100),
+            || fetch_status(&self.http, self.base(), status_host).map(|_| ()),
+        );
+        let round = RoundStart {
+            started,
+            since,
+            sampler: StatusSampler::start(self.base(), status_host),
+        };
+        let (rest_refused, rest_seconds) = self.ping_all(&hosts[1..]);
+        let (refused, ping_seconds) = (first_refused + rest_refused, first_seconds + rest_seconds);
         let pulled = pulled_within(
             &self.http,
             self.base(),
