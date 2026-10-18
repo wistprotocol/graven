@@ -1762,6 +1762,14 @@ pub fn reported_conflicts(stdout: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+pub fn reported_merged(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("plan merged: "))
+        .flat_map(|merged| merged.split(", ").map(str::to_owned))
+        .collect()
+}
+
 pub fn longest_reported_millis(text: &str, prefix: &str) -> Option<u64> {
     text.lines()
         .filter_map(|line| {
@@ -1891,6 +1899,7 @@ impl SealStage {
             "seal_peak_rss_kb": self.seal.peak_rss_kb,
             "replanned": reported_replans(&self.seal.stdout),
             "replan_conflicts": reported_conflicts(&self.seal.stdout),
+            "merged_publishers": reported_merged(&self.seal.stdout).len(),
             "snapshot_seconds": reported_seconds(&self.snapshot.stdout, "snapshot took "),
             "snapshot": snapshot_report(&self.snapshot),
             "snapshot_rebuild": self.rebuild_report(),
@@ -2435,6 +2444,16 @@ mod tests {
             ]
         );
         assert!(reported_conflicts("seal took 12 ms\n").is_empty());
+    }
+
+    #[test]
+    fn reported_merged_reads_the_publishers_merged_at_commit() {
+        let stdout = "plan merged: a.example, b.example\nseal took 12 ms\n";
+        assert_eq!(
+            reported_merged(stdout),
+            vec!["a.example".to_owned(), "b.example".to_owned()]
+        );
+        assert!(reported_merged("seal took 12 ms\n").is_empty());
     }
 
     #[test]

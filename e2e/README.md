@@ -40,7 +40,9 @@ write changed its inputs between its plan and its commit (`replanned N
 times` on `clave seal`'s standard output; 0 without the line) and
 `replan_conflicts`, per discarded plan the publishers whose waiting state
 changed under it (`plan conflict: a, b` lines; `<epoch>` and `<local
-bounds>` name the other two inputs the check reads). Every round
+bounds>` name the other two inputs the check reads), and
+`merged_publishers`, how many publishers' concurrent pulls the seal merged
+into its plan at commit instead of re-planning (`plan merged: a, b`). Every round
 also reports `seal_started_after_last_ping_seconds` and
 `pulls_during_seal`, the domains whose pull completed between the seal's
 start and its exit.
