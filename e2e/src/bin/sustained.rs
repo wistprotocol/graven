@@ -18,9 +18,13 @@ const CADENCE_SECONDS: i64 = 3600;
 // WIST-3 §3.2: `domain_epoch_entries_max` defaults to 10 000; the aggregator serves no endpoint
 // stating the parameters in force.
 const DOMAIN_EPOCH_ENTRIES_DEFAULT: usize = 10_000;
+// WIST-3 §3.2: `labeler_epoch_entries_max` defaults to 1 000 Label and dispute Entries per
+// Labeler per Epoch.
+const LABELER_EPOCH_ENTRIES_DEFAULT: usize = 1000;
 // WIST-4 §5: the Parameter Registry floor of `epoch_cap_bytes`.
 const EPOCH_CAP_FLOOR: u64 = 65_537;
 const PROBE_PAGES: usize = 10;
+const RATIO_FLOOR_KB: u64 = 8192;
 const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 // WIST-4 §5: a parameter change's effective_at is at least `param_grace_days` (default 7) after
 // the sealed_at of the Epoch sealing it.
@@ -91,6 +95,7 @@ struct Args {
     recovery_rounds: Option<usize>,
     records: Option<Vec<usize>>,
     epochs: Option<Vec<usize>>,
+    labels: Option<Vec<usize>>,
     domains_per_cell: Option<usize>,
     work_dir: Option<PathBuf>,
     keep: bool,
@@ -149,6 +154,7 @@ fn parse_args(flags: impl IntoIterator<Item = String>) -> Args {
             "--recovery-rounds" => number!(recovery_rounds),
             "--records" => args.records = Some(list(&value(), "--records")),
             "--epochs" => args.epochs = Some(list(&value(), "--epochs")),
+            "--labels" => args.labels = Some(list(&value(), "--labels")),
             "--domains-per-cell" => number!(domains_per_cell),
             "--work-dir" => args.work_dir = Some(PathBuf::from(value())),
             "--keep" => args.keep = true,
@@ -621,30 +627,54 @@ impl Harness {
         let mut issued = 0;
         let mut finished = Since::new();
         for labeler in labelers {
-            let mut chosen = BTreeSet::new();
-            while chosen.len() < per_labeler.min(subjects.len()) {
-                chosen.insert(rng.below(subjects.len()));
-            }
-            for subject in chosen {
-                let value = rng.below(1_000_001).to_string();
-                label_command(
-                    &self.bins.spake,
-                    labeler,
-                    &[
-                        "--subject",
-                        &subjects[subject],
-                        "--name",
-                        "wist:spam",
-                        "--value",
-                        &value,
-                    ],
-                );
-                issued += 1;
-            }
+            issued += issue_labels(
+                &self.bins.spake,
+                labeler,
+                subjects,
+                per_labeler.min(subjects.len()),
+                &mut rng,
+            );
             finished.insert(labeler.host.clone(), now_rfc3339());
         }
         (issued, finished)
     }
+}
+
+fn issue_labels(
+    spake: &Path,
+    labeler: &Site,
+    subjects: &[String],
+    count: usize,
+    rng: &mut Rng,
+) -> usize {
+    let mut issued = BTreeSet::new();
+    while issued.len() < count && !subjects.is_empty() {
+        let mut chosen = BTreeSet::new();
+        while chosen.len() < (count - issued.len()).min(subjects.len()) {
+            chosen.insert(rng.below(subjects.len()));
+        }
+        for subject in chosen {
+            let value = loop {
+                let value = rng.below(1_000_001);
+                if issued.insert((subject, value)) {
+                    break value;
+                }
+            };
+            label_command(
+                spake,
+                labeler,
+                &[
+                    "--subject",
+                    &subjects[subject],
+                    "--name",
+                    "wist:spam",
+                    "--value",
+                    &value.to_string(),
+                ],
+            );
+        }
+    }
+    issued.len()
 }
 
 type Since = BTreeMap<String, String>;
@@ -738,6 +768,13 @@ fn run_round(
         .count();
     let seconds = round.started.elapsed().as_secs_f64();
     let status = round.sampler.finish();
+    let rejected: Vec<Option<usize>> = hosts
+        .iter()
+        .map(|host| {
+            fetch_status(&h.http, h.base(), host)
+                .map(|status| rejections_after(&status, &round.since))
+        })
+        .collect();
     let requests = h.requests.requests();
     let changed: usize = plan.participants.iter().map(|p| p.items).sum();
     let mut by_class = serde_json::Map::new();
@@ -772,6 +809,9 @@ fn run_round(
         "governance": governance,
         "seal_started_after_last_ping_seconds": seal_started,
         "pulls_during_seal": pulls_during_seal,
+        "rejected_pulls": rejected.iter().flatten().sum::<usize>(),
+        "domains_rejected": rejected.iter().flatten().filter(|&&count| count > 0).count(),
+        "rejection_status_unread": rejected.iter().filter(|count| count.is_none()).count(),
         "seal": sealed.report,
         "longest_write_lock_ms": sealed.longest_write_lock_ms,
         "seconds": seconds,
@@ -798,7 +838,7 @@ fn summary(label: &str, outcome: &RoundOutcome) -> String {
     let report = &outcome.report;
     let entries = &report["seal"]["log_entries"]["all"];
     format!(
-        "round {label}: {} items in {} domains, pulled in {:.1} s ({} unpulled), {} pings refused, seal {:.2} s at {} kB replanned {} with {} pulls during it, Epoch {} entries {} octets, aggregator {} kB, status p99 {} ms",
+        "round {label}: {} items in {} domains, pulled in {:.1} s ({} unpulled), {} pings refused, seal {:.2} s at {} kB replanned {} with {} pulls during it, Epoch {} entries {} octets, aggregator {} kB, status p99 {} ms, {} rejected pulls in {} domains",
         report["changed_items"],
         report["participating_domains"],
         outcome.pulled_seconds(),
@@ -814,7 +854,41 @@ fn summary(label: &str, outcome: &RoundOutcome) -> String {
         outcome
             .status_p99_ms
             .map_or("n/a".to_string(), |ms| format!("{ms:.1}")),
+        report["rejected_pulls"],
+        report["domains_rejected"],
     )
+}
+
+fn over_rounds(outcomes: &[RoundOutcome]) -> (Value, u64) {
+    let peaks: Vec<u64> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.report["aggregator_peak_rss_kb"].as_u64())
+        .collect();
+    let mean = (!peaks.is_empty()).then(|| peaks.iter().sum::<u64>() as f64 / peaks.len() as f64);
+    let rejected = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.report["rejected_pulls"].as_u64())
+        .sum();
+    (
+        json!({
+            "min": peaks.iter().min(),
+            "max": peaks.iter().max(),
+            "mean": mean,
+        }),
+        rejected,
+    )
+}
+
+fn stage_over_rounds(scenario: &str, stage: &mut Value, outcomes: &[RoundOutcome]) {
+    let (peaks, rejected) = over_rounds(outcomes);
+    println!(
+        "{scenario}: aggregator peak over rounds min {} kB, max {} kB, mean {} kB, {rejected} rejected pulls",
+        peaks["min"],
+        peaks["max"],
+        peaks["mean"].as_f64().map_or("n/a".to_string(), |kb| format!("{kb:.0}")),
+    );
+    stage["aggregator_peak_rss_kb_over_rounds"] = peaks;
+    stage["rejected_pulls_total"] = json!(rejected);
 }
 
 impl Harness {
@@ -903,6 +977,72 @@ impl Harness {
             sealed.seconds
         );
         report["stages"]["ingest"] = ingest;
+    }
+}
+
+impl Harness {
+    fn label_and_seal(&mut self, labelers: &[Site], subjects: &[String], labels: usize) -> Value {
+        let spake = self.bins.spake.clone();
+        let work: Vec<(&Site, usize, u64)> = labelers
+            .iter()
+            .zip(spread(labels, labelers.len(), 0))
+            .zip(1..)
+            .map(|((labeler, count), seed)| (labeler, count, seed))
+            .collect();
+        let issued = AtomicUsize::new(0);
+        let finished = Mutex::new(Since::new());
+        let ((), label_seconds) = timed(|| {
+            parallel(&work, |&(labeler, count, seed)| {
+                let done = issue_labels(&spake, labeler, subjects, count, &mut Rng::new(seed));
+                issued.fetch_add(done, Ordering::Relaxed);
+                finished
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(labeler.host.clone(), now_rfc3339());
+            })
+        });
+        let since = finished.into_inner().unwrap_or_else(|e| e.into_inner());
+        settle(&since);
+        let hosts: Vec<String> = labelers
+            .iter()
+            .map(|labeler| labeler.host.clone())
+            .collect();
+        let (refused, ping_seconds) = self.ping_all(&hosts);
+        let pulled = pulled_each_since(&self.http, self.base(), &since, Duration::from_secs(3600));
+        assert_eq!(
+            pulled.len(),
+            hosts.len(),
+            "the labelers' pulls left domains unpulled or rejected"
+        );
+        let issued = issued.into_inner();
+        let most_per_labeler = work.iter().map(|&(_, count, _)| count).max().unwrap_or(0);
+        let epoch_bound = most_per_labeler.div_ceil(LABELER_EPOCH_ENTRIES_DEFAULT) + 1;
+        let mut seals = Vec::new();
+        let mut labels_sealed = 0;
+        let mut longest_write_lock_ms = None;
+        while (labels_sealed as usize) < issued && seals.len() < epoch_bound {
+            let sealed = self.seal();
+            labels_sealed += sealed.report["log_entries"]["label"]["entries"]
+                .as_u64()
+                .unwrap_or(0);
+            longest_write_lock_ms = longest_write_lock_ms.max(sealed.longest_write_lock_ms);
+            seals.push(sealed.report);
+        }
+        assert_eq!(
+            labels_sealed as usize, issued,
+            "the Labels did not seal within {epoch_bound} Epochs"
+        );
+        json!({
+            "labels": issued,
+            "label_seconds": label_seconds,
+            "ping_seconds": ping_seconds,
+            "pings_refused": refused,
+            "seconds_until_all_pulled": pulled.values().copied().fold(0.0, f64::max),
+            "labels_sealed": labels_sealed,
+            "label_epochs": seals.len(),
+            "seals": seals,
+            "longest_write_lock_ms": longest_write_lock_ms,
+        })
     }
 }
 
@@ -1161,6 +1301,7 @@ fn skew(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec<C
         "heavy_pages_per_domain": layout.heavy_pages,
         "rounds": outcomes.iter().map(|o| o.report.clone()).collect::<Vec<_>>(),
     });
+    stage_over_rounds("skew", &mut report["stages"]["skew"], &outcomes);
     report["longest_write_lock_ms"] = json!(h.run_longest_write_lock_ms());
     checks
 }
@@ -1328,8 +1469,18 @@ fn backfill(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> V
         "expected_epochs": expected_epochs,
         "rounds": outcomes.iter().map(|o| o.report.clone()).collect::<Vec<_>>(),
     });
+    stage_over_rounds("backfill", &mut report["stages"]["backfill"], &outcomes);
     report["longest_write_lock_ms"] = json!(h.run_longest_write_lock_ms());
     checks
+}
+
+fn rejections_after(status: &Value, since: &str) -> usize {
+    status["rejections"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|rejection| rejection["at"].as_str().is_some_and(|at| at > since))
+        .count()
 }
 
 fn rejected_since(status: &Value, code: &str, since: &str) -> bool {
@@ -2326,15 +2477,23 @@ fn measure_probe_pull(
 fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec<Check> {
     let records = args.sizes(&args.records, &[1000, 10_000]);
     let epochs = args.sizes(&args.epochs, &[1, 20]);
+    let labels = args.sizes(&args.labels, &[0, 10_000]);
+    let labeler_count = args.labelers.unwrap_or(2);
     let domains = args.size(args.domains_per_cell, 100);
     let percent = args.changed_percent(10);
     assert!(
         epochs.iter().all(|&count| count >= 1),
         "--epochs counts the ingest Epoch, so each value is at least 1"
     );
+    assert!(
+        labeler_count > 0 || labels.iter().all(|&count| count == 0),
+        "--labels above 0 needs at least one labeler"
+    );
     report["parameters"] = json!({
         "records": records,
         "epochs": epochs,
+        "labels": labels,
+        "labelers": labeler_count,
         "domains_per_cell": domains,
         "probe_pages": PROBE_PAGES,
         "changed_percent": percent,
@@ -2342,98 +2501,127 @@ fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec
     });
     let mut cells = Vec::new();
     let mut longest_write_lock_ms = None;
-    let mut peaks: BTreeMap<(usize, usize), (Option<u64>, Option<u64>)> = BTreeMap::new();
-    for &record_count in &records {
-        for &epoch_count in &epochs {
-            let cell_root = root.join(format!("cell-{record_count}-{epoch_count}"));
-            std::fs::create_dir_all(&cell_root).expect("create the cell directory");
-            let pages = record_count.div_ceil(domains);
-            let sites = make_sites(&cell_root, 0, domains);
-            let probe = Site::new(&cell_root, &host_name(domains), "default");
-            for site in &sites {
-                write_pages(site, pages, args.body_words(), 1);
-            }
-            write_pages(&probe, PROBE_PAGES, args.body_words(), 1);
-            let served: Vec<&Site> = sites.iter().chain(std::iter::once(&probe)).collect();
-            let mut h = Harness::start(bins, &cell_root, &served, args);
-            let mut cell_report = json!({ "stages": {} });
-            h.establish(&served, &[], &probe.host, &mut cell_report);
-            let data = h.aggregator.data.clone();
-            let clave = &bins.clave;
-            for _ in 1..epoch_count {
-                let at = h.clock.next();
-                let extra = run_measured(
-                    clave,
-                    &["seal", "--data", s(&data), "--at", &at, "--no-snapshot"],
-                );
-                h.write_lock_window(Some(&extra.stdout));
-            }
-            h.sealed = log_tree_size(&data);
-
-            let changed = changed_count(PROBE_PAGES, percent);
-            let (probe_pull, pull_increase) = measure_probe_pull(&mut h, &probe, changed, 1);
-            let probe_seal = h.seal();
-            let empty_seal = run_measured(
+    let mut peaks: BTreeMap<MemoryCell, (Option<u64>, Option<u64>)> = BTreeMap::new();
+    for (record_count, epoch_count, label_count) in memory_cells(&records, &epochs, &labels) {
+        let cell_root = root.join(format!("cell-{record_count}-{epoch_count}-{label_count}"));
+        std::fs::create_dir_all(&cell_root).expect("create the cell directory");
+        let pages = record_count.div_ceil(domains);
+        let sites = make_sites(&cell_root, 0, domains);
+        let probe = Site::new(&cell_root, &host_name(domains), "default");
+        let labelers = if label_count > 0 {
+            make_sites(&cell_root, domains + 1, labeler_count)
+        } else {
+            Vec::new()
+        };
+        for site in &sites {
+            write_pages(site, pages, args.body_words(), 1);
+        }
+        write_pages(&probe, PROBE_PAGES, args.body_words(), 1);
+        for labeler in &labelers {
+            write_pages(labeler, 1, args.body_words(), 1);
+        }
+        let served: Vec<&Site> = sites
+            .iter()
+            .chain(std::iter::once(&probe))
+            .chain(&labelers)
+            .collect();
+        let mut h = Harness::start(bins, &cell_root, &served, args);
+        let mut cell_report = json!({ "stages": {} });
+        let subjects: Vec<String> = sites
+            .iter()
+            .flat_map(|site| page_urls(site, pages))
+            .collect();
+        let domain_sites: Vec<&Site> = sites.iter().chain(std::iter::once(&probe)).collect();
+        h.establish(&domain_sites, &labelers, &probe.host, &mut cell_report);
+        let labeling = if label_count > 0 {
+            h.label_and_seal(&labelers, &subjects, label_count)
+        } else {
+            Value::Null
+        };
+        let labels_sealed = labeling["labels_sealed"].as_u64().unwrap_or(0);
+        let label_epochs = labeling["label_epochs"].as_u64().unwrap_or(0) as usize;
+        let data = h.aggregator.data.clone();
+        let clave = &bins.clave;
+        for _ in 1..epoch_count {
+            let at = h.clock.next();
+            let extra = run_measured(
                 clave,
-                &[
-                    "seal",
-                    "--data",
-                    s(&data),
-                    "--at",
-                    &h.clock.next(),
-                    "--no-snapshot",
-                ],
+                &["seal", "--data", s(&data), "--at", &at, "--no-snapshot"],
             );
-            let empty_seal_write_lock_ms = h.write_lock_window(Some(&empty_seal.stdout));
-            let snapshot = run_measured(clave, &["snapshot", "--data", s(&data)]);
-            let store = cell_root.join("graven-store");
-            let anchor = data.join("anchor.json");
-            let consumer = run_measured(&bins.graven, &sync_args(&anchor, h.base(), &store, true));
-            h.aggregator.stop();
-            h.aggregator.start(clave, Some(&h.proxy));
-            let (restarted_pull, _) = measure_probe_pull(&mut h, &probe, changed, 2);
-            longest_write_lock_ms = longest_write_lock_ms.max(h.run_longest_write_lock_ms());
-            println!(
-                "memory cell {record_count} records x {epoch_count} Epochs: pull peak {} kB, increase {pull_increase:?} kB ({} kB after a restart), empty seal peak {:?} kB, snapshot peak {:?} kB, consumer cold start peak {:?} kB",
+            h.write_lock_window(Some(&extra.stdout));
+        }
+        h.sealed = log_tree_size(&data);
+
+        let changed = changed_count(PROBE_PAGES, percent);
+        let (probe_pull, pull_increase) = measure_probe_pull(&mut h, &probe, changed, 1);
+        let probe_seal = h.seal();
+        let empty_seal = run_measured(
+            clave,
+            &[
+                "seal",
+                "--data",
+                s(&data),
+                "--at",
+                &h.clock.next(),
+                "--no-snapshot",
+            ],
+        );
+        let empty_seal_write_lock_ms = h.write_lock_window(Some(&empty_seal.stdout));
+        let snapshot = run_measured(clave, &["snapshot", "--data", s(&data)]);
+        let store = cell_root.join("graven-store");
+        let anchor = data.join("anchor.json");
+        let consumer = run_measured(&bins.graven, &sync_args(&anchor, h.base(), &store, true));
+        h.aggregator.stop();
+        h.aggregator.start(clave, Some(&h.proxy));
+        let (restarted_pull, _) = measure_probe_pull(&mut h, &probe, changed, 2);
+        longest_write_lock_ms = longest_write_lock_ms.max(h.run_longest_write_lock_ms());
+        println!(
+                "memory cell {record_count} records x {epoch_count} Epochs x {label_count} Labels ({labels_sealed} sealed over {label_epochs} more Epochs): pull peak {} kB, increase {pull_increase:?} kB ({} kB after a restart), empty seal peak {:?} kB, snapshot peak {:?} kB, consumer cold start peak {:?} kB",
                 probe_pull["aggregator_peak_rss_kb"], restarted_pull["aggregator_rss_increase_kb"], empty_seal.peak_rss_kb, snapshot.peak_rss_kb, consumer.peak_rss_kb
             );
-            peaks.insert(
-                (record_count, epoch_count),
-                (pull_increase, empty_seal.peak_rss_kb),
-            );
-            cells.push(json!({
-                "records": pages * domains,
-                "epochs": epoch_count,
-                "domains": domains,
-                "pages_per_domain": pages,
-                "publish": cell_report["stages"]["publish"],
-                "ingest": cell_report["stages"]["ingest"],
-                "probe_pull": probe_pull,
-                "probe_pull_after_restart": restarted_pull,
-                "probe_seal": probe_seal.report,
-                "empty_seal": {
-                    "seconds": empty_seal.seconds,
-                    "seal_seconds": e2e::reported_seconds(&empty_seal.stdout, "seal took "),
-                    "peak_rss_kb": empty_seal.peak_rss_kb,
-                    "longest_write_lock_ms": empty_seal_write_lock_ms,
-                },
-                "unchanged_snapshot": snapshot_report(&snapshot),
-                "consumer_cold_start": consumer_report(&consumer, &store),
-            }));
-        }
+        peaks.insert(
+            (record_count, epoch_count, label_count),
+            (pull_increase, empty_seal.peak_rss_kb),
+        );
+        cells.push(json!({
+            "records": pages * domains,
+            "epochs": epoch_count,
+            "labels": label_count,
+            "labels_sealed": labels_sealed,
+            "labelers": labelers.len(),
+            "epochs_before_probe": epoch_count + label_epochs,
+            "labeling": labeling,
+            "domains": domains,
+            "pages_per_domain": pages,
+            "publish": cell_report["stages"]["publish"],
+            "ingest": cell_report["stages"]["ingest"],
+            "probe_pull": probe_pull,
+            "probe_pull_after_restart": restarted_pull,
+            "probe_seal": probe_seal.report,
+            "empty_seal": {
+                "seconds": empty_seal.seconds,
+                "seal_seconds": e2e::reported_seconds(&empty_seal.stdout, "seal took "),
+                "peak_rss_kb": empty_seal.peak_rss_kb,
+                "longest_write_lock_ms": empty_seal_write_lock_ms,
+            },
+            "unchanged_snapshot": snapshot_report(&snapshot),
+            "consumer_cold_start": consumer_report(&consumer, &store),
+        }));
     }
     let mut checks = Vec::new();
+    let fewest_labels = labels.iter().min().copied().unwrap_or(0);
     let (fewest, most) = (records.iter().min(), records.iter().max());
     if let (Some(&fewest), Some(&most)) = (fewest, most) {
         if fewest != most {
             for &epoch_count in &epochs {
-                let low = peaks[&(fewest, epoch_count)].0;
-                let high = peaks[&(most, epoch_count)].0;
+                let low = peaks[&(fewest, epoch_count, fewest_labels)].0;
+                let high = peaks[&(most, epoch_count, fewest_labels)].0;
                 checks.push(ratio_check(
                     &format!("one_domain_pull_increase_flat_in_records_at_{epoch_count}_epochs"),
                     low,
                     high,
                     1.5,
+                    RATIO_FLOOR_KB,
                     &format!("the aggregator's resident size increase over the pull (peak minus the size before it) at {most} records against {fewest}, no full-state replication in a pull (meta ADR-0005, Per-worker resources: memory independent of U, B and R)"),
                 ));
             }
@@ -2443,13 +2631,14 @@ fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec
     if let (Some(&fewest), Some(&most)) = (fewest, most) {
         if fewest != most {
             for &record_count in &records {
-                let low = peaks[&(record_count, fewest)].1;
-                let high = peaks[&(record_count, most)].1;
+                let low = peaks[&(record_count, fewest, fewest_labels)].1;
+                let high = peaks[&(record_count, most, fewest_labels)].1;
                 checks.push(ratio_check(
                     &format!("empty_seal_peak_flat_in_epochs_at_{record_count}_records"),
                     low,
                     high,
                     1.1,
+                    0,
                     &format!(
                         "the empty seal's peak resident set size at {most} Epochs against {fewest}"
                     ),
@@ -2457,9 +2646,85 @@ fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec
             }
         }
     }
+    let fewest_cell = records.iter().min().zip(epochs.iter().min());
+    let most_labels = labels.iter().max().copied().unwrap_or(0);
+    if let Some((&record_count, &epoch_count)) = fewest_cell {
+        if most_labels != fewest_labels {
+            let low = peaks[&(record_count, epoch_count, fewest_labels)];
+            let high = peaks[&(record_count, epoch_count, most_labels)];
+            checks.push(ratio_check(
+                "one_domain_pull_increase_flat_in_labels",
+                low.0,
+                high.0,
+                1.5,
+                RATIO_FLOOR_KB,
+                &format!("the aggregator's resident size increase over the probe pull (peak minus the size before it) at {most_labels} Labels against {fewest_labels}, at {record_count} records and {epoch_count} Epochs; a publisher's pull loads only its own publishers' sealed Label IDs (WIST-2 §3.3), not the Log's"),
+            ));
+            checks.push(per_label_check(
+                "empty_seal_peak_per_label_bounded",
+                low.1,
+                high.1,
+                most_labels - fewest_labels,
+                10.0,
+                &format!("the empty seal's peak resident set size growth from {fewest_labels} to {most_labels} Labels, at {record_count} records and {epoch_count} Epochs, per Label; the seal's judgment holds the Log's sealed Labels (ID set and subject map), about 2–3 kB per Label measured for an empty seal"),
+            ));
+        }
+    }
     report["stages"]["memory"] = json!({ "cells": cells });
     report["longest_write_lock_ms"] = json!(longest_write_lock_ms);
     checks
+}
+
+type MemoryCell = (usize, usize, usize);
+
+fn memory_cells(records: &[usize], epochs: &[usize], labels: &[usize]) -> Vec<MemoryCell> {
+    let fewest_labels = labels.iter().min().copied().unwrap_or(0);
+    let mut cells: Vec<MemoryCell> = records
+        .iter()
+        .flat_map(|&record_count| {
+            epochs
+                .iter()
+                .map(move |&epoch_count| (record_count, epoch_count, fewest_labels))
+        })
+        .collect();
+    if let (Some(&record_count), Some(&epoch_count)) = (records.iter().min(), epochs.iter().min()) {
+        let further: BTreeSet<usize> = labels
+            .iter()
+            .copied()
+            .filter(|&count| count != fewest_labels)
+            .collect();
+        cells.extend(
+            further
+                .into_iter()
+                .map(|label_count| (record_count, epoch_count, label_count)),
+        );
+    }
+    cells
+}
+
+fn per_label_check(
+    name: &str,
+    low: Option<u64>,
+    high: Option<u64>,
+    labels: usize,
+    bound_kb: f64,
+    compared: &str,
+) -> Check {
+    let per_label = low
+        .zip(high)
+        .filter(|_| labels > 0)
+        .map(|(low, high)| (high as f64 - low as f64) / labels as f64);
+    Check::new(
+        name,
+        per_label.is_some_and(|kb| kb <= bound_kb),
+        json!({
+            "smaller_kb": low,
+            "larger_kb": high,
+            "labels": labels,
+            "kb_per_label": per_label,
+        }),
+        format!("{compared} <= {bound_kb} kB per Label"),
+    )
 }
 
 fn ratio_check(
@@ -2467,17 +2732,26 @@ fn ratio_check(
     low: Option<u64>,
     high: Option<u64>,
     factor: f64,
+    floor_kb: u64,
     compared: &str,
 ) -> Check {
     let ratio = match (low, high) {
         (Some(low), Some(high)) => Some(high as f64 / low.max(1) as f64),
         _ => None,
     };
+    let within = low
+        .zip(high)
+        .is_some_and(|(low, high)| high as f64 <= factor * low as f64 + floor_kb as f64);
+    let bound = if floor_kb > 0 {
+        format!("{compared} <= {factor} x the smaller plus {floor_kb} kB")
+    } else {
+        format!("{compared} <= {factor} x the smaller")
+    };
     Check::new(
         name,
-        ratio.is_some_and(|ratio| ratio <= factor),
+        within,
         json!({ "smaller_kb": low, "larger_kb": high, "ratio": ratio }),
-        format!("{compared} <= {factor} x"),
+        bound,
     )
 }
 
@@ -2620,6 +2894,90 @@ mod tests {
         assert_eq!(args.status_bound_ms(), 250.5);
         assert_eq!(args.out, Some(PathBuf::from("report.json")));
         assert_eq!(args.round_bound(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn labels_parse_as_a_list_and_quick_halves_their_default() {
+        let given = parsed(&["--scenario", "memory", "--labels", "0,300"]);
+        assert_eq!(given.sizes(&given.labels, &[0, 10_000]), [0, 300]);
+        let quick = parsed(&["--scenario", "memory", "--quick"]);
+        assert_eq!(quick.sizes(&quick.labels, &[0, 10_000]), [0, 5000]);
+    }
+
+    #[test]
+    fn memory_cells_cross_records_and_epochs_at_the_fewest_labels_and_add_one_cell_per_further_label_count(
+    ) {
+        assert_eq!(
+            memory_cells(&[1000, 10_000], &[1, 20], &[0, 10_000]),
+            [
+                (1000, 1, 0),
+                (1000, 20, 0),
+                (10_000, 1, 0),
+                (10_000, 20, 0),
+                (1000, 1, 10_000),
+            ]
+        );
+        assert_eq!(
+            memory_cells(&[500], &[3, 1], &[200, 100, 200, 50]),
+            [(500, 3, 50), (500, 1, 50), (500, 1, 100), (500, 1, 200)]
+        );
+        assert_eq!(memory_cells(&[500], &[1], &[0]), [(500, 1, 0)]);
+    }
+
+    #[test]
+    fn per_label_check_bounds_the_growth_per_label_and_fails_without_a_peak() {
+        let check = per_label_check("p", Some(1000), Some(101_000), 10_000, 10.0, "x");
+        assert!(check.pass);
+        assert_eq!(check.observed["kb_per_label"], 10.0);
+        assert!(!per_label_check("p", Some(1000), Some(101_001), 10_000, 10.0, "x").pass);
+        assert!(per_label_check("p", Some(2000), Some(1000), 10, 10.0, "x").pass);
+        assert!(!per_label_check("p", None, Some(1000), 10, 10.0, "x").pass);
+        assert!(!per_label_check("p", Some(1000), Some(1000), 0, 10.0, "x").pass);
+    }
+
+    #[test]
+    fn rejections_after_counts_every_code_dated_after_the_instant() {
+        let status = json!({"rejections": [
+            {"code": "WIST2-E01", "at": "2026-10-14T10:00:00Z"},
+            {"code": "WIST2-E08", "at": "2026-10-14T10:00:01Z"},
+            {"code": "WIST2-E01", "at": "2026-10-14T12:00:00Z"},
+        ]});
+        assert_eq!(rejections_after(&status, "2026-10-14T10:00:00Z"), 2);
+        assert_eq!(rejections_after(&status, "2026-10-14T12:00:00Z"), 0);
+        assert_eq!(rejections_after(&json!({}), ""), 0);
+    }
+
+    fn outcome_with(peak: Option<u64>, rejected: u64) -> RoundOutcome {
+        RoundOutcome {
+            report: json!({ "aggregator_peak_rss_kb": peak, "rejected_pulls": rejected }),
+            sealed: Sealed {
+                report: Value::Null,
+                entries: Vec::new(),
+                seconds: 0.0,
+                wall_seconds: 0.0,
+                octets: 0,
+                longest_write_lock_ms: None,
+            },
+            pulled: BTreeMap::new(),
+            expected: Vec::new(),
+            seconds: 0.0,
+            status_p99_ms: None,
+        }
+    }
+
+    #[test]
+    fn over_rounds_states_the_peak_spread_and_totals_the_rejected_pulls() {
+        let outcomes = [
+            outcome_with(Some(100), 1),
+            outcome_with(None, 0),
+            outcome_with(Some(300), 2),
+        ];
+        let (peaks, rejected) = over_rounds(&outcomes);
+        assert_eq!(peaks, json!({"min": 100, "max": 300, "mean": 200.0}));
+        assert_eq!(rejected, 3);
+        let (peaks, rejected) = over_rounds(&[]);
+        assert_eq!(peaks, json!({"min": null, "max": null, "mean": null}));
+        assert_eq!(rejected, 0);
     }
 
     #[test]
@@ -2772,15 +3130,26 @@ mod tests {
     }
 
     #[test]
-    fn ratio_check_passes_within_the_factor_and_fails_without_a_peak() {
-        assert!(ratio_check("r", Some(100), Some(150), 1.5, "x").pass);
-        assert!(!ratio_check("r", Some(100), Some(151), 1.5, "x").pass);
-        assert!(!ratio_check("r", None, Some(1), 1.5, "x").pass);
-        assert!(ratio_check("r", Some(0), Some(1), 1.5, "x").pass);
-        assert!(!ratio_check("r", Some(0), Some(2), 1.5, "x").pass);
-        let report = ratio_check("r", Some(100), Some(110), 1.1, "x").report();
+    fn ratio_check_passes_within_the_factor_plus_the_floor_and_fails_without_a_peak() {
+        assert!(ratio_check("r", Some(100_000), Some(158_192), 1.5, 8192, "x").pass);
+        assert!(!ratio_check("r", Some(100_000), Some(158_193), 1.5, 8192, "x").pass);
+        assert!(!ratio_check("r", None, Some(1), 1.5, 8192, "x").pass);
+        assert!(!ratio_check("r", Some(1), None, 1.5, 8192, "x").pass);
+        assert!(ratio_check("r", Some(0), Some(8192), 1.5, 8192, "x").pass);
+        assert!(!ratio_check("r", Some(0), Some(8193), 1.5, 8192, "x").pass);
+        assert!(!ratio_check("r", Some(100), Some(111), 1.1, 0, "x").pass);
+        let report = ratio_check("r", Some(100), Some(110), 1.1, 0, "x").report();
         assert_eq!(report["name"], "r");
+        assert_eq!(report["observed"]["smaller_kb"], 100);
+        assert_eq!(report["observed"]["larger_kb"], 110);
         assert_eq!(report["observed"]["ratio"], 1.1);
+        assert!(report["bound"]
+            .as_str()
+            .is_some_and(|bound| bound.ends_with("<= 1.1 x the smaller")));
+        let floored = ratio_check("r", Some(0), Some(1), 1.5, 8192, "x").report();
+        assert!(floored["bound"]
+            .as_str()
+            .is_some_and(|bound| bound.ends_with("<= 1.5 x the smaller plus 8192 kB")));
     }
 
     fn admission_server(refusals: usize) -> (String, Arc<AtomicUsize>) {

@@ -62,12 +62,12 @@ included. No check applies to it.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--quick` | off | Halve every size default (domains, pages, rounds, Items, record and Epoch counts), rounding up; given flags are not halved |
+| `--quick` | off | Halve every size default (domains, pages, rounds, Items, record, Epoch and Label counts), rounding up; given flags are not halved |
 | `--changed-percent` | 10 (100 in `saturation`) | Share of a domain's pages changed per round |
 | `--body-words` | 200 | Words per page body |
 | `--round-bound-seconds` | 300 | How long a round waits for its pulls, and the pull bound its checks apply |
 | `--status-bound-ms` | 500 | Bound on the status endpoint's p99 latency |
-| `--labelers` | 0 (2 in `skew`) | Labeler sites, each publishing `--labels-per-round` (20) `wist:spam` Labels on random pages per round |
+| `--labelers` | 0 (2 in `skew` and `memory`) | Labeler sites, each publishing `--labels-per-round` (20) `wist:spam` Labels on random pages per round (`memory`: see `--labels`) |
 | `--seal-during-pulls` | off | `skew` only: start each round's seal right after its pings, while its pulls run, instead of after every pinged domain is pulled; the governance acts of the middle rounds run before that seal. Measures the seal's re-plan rate under concurrent pulls |
 | `--work-dir DIR`, `--keep` | | Place, and keep, the temporary directory; a run whose data exceeds the temporary filesystem (a 200 000-page backfill writes several GB) needs a directory on disk |
 | `--out PATH` | | Write the JSON report there; without it the report goes to standard output |
@@ -85,13 +85,19 @@ prints the failing checks on standard error.
 1 % of domains (at least one) make half the round's changed pages; they hold
 as many pages as that share needs. At the middle round the aggregator queues
 a `quota_base` parameter change and adds a Log key, and removes that key the
-round after. Checks: every round's domains pulled within the round bound;
+round after. Each round reports `rejected_pulls`, the rejections dated
+after the round's start on its participating domains' `/status/<host>`
+read once the round is sealed, and `domains_rejected`, the domains with one;
+the stage reports `aggregator_peak_rss_kb_over_rounds` (min, max, mean of
+the rounds' aggregator peaks) and `rejected_pulls_total`. Checks: every
+round's domains pulled within the round bound;
 every seal completes within one 3 600 s cadence; status p99 under the
 bound.
 
 **`backfill`**: `--domains` 100 × `--pages` 10, `--rounds` 3 at least, plus
 one domain of `--backfill-pages` 20 000 that first publishes in round 1.
-Rounds continue until the backfill is sealed. The capacity is
+Rounds continue until the backfill is sealed. Rounds and stage report the
+rejected pulls and aggregator peaks as in `skew`. The capacity is
 `domain_epoch_entries_max` at its specified default, 10 000, which counts
 the domain's Catalog Entry with its Items. Checks: every small domain's
 changed Items seal in the Epoch right after their round; the backfill's
@@ -136,17 +142,32 @@ Epoch right after it; status p99 under the bound. The first recovery round's
 report carries `backlog_overlap`, since backlog pulls inflate its request
 and per-Item figures.
 
-**`memory`**: one fresh Log per cell of `--records` 1000,10000 ×
-`--epochs` 1,20, the records spread over `--domains-per-cell` 100 domains
-plus one 10-page probe domain. After the ingest and the extra empty Epochs
+**`memory`**: one fresh Log per cell, the records spread over
+`--domains-per-cell` 100 domains plus one 10-page probe domain. The cells
+are every `--records` 1000,10000 × `--epochs` 1,20 pair at the fewest
+`--labels` 0,10000, plus one cell per further Label count at the fewest
+records and Epochs (5 cells by default; `--quick` gives 500,5000 × 1,10 and
+0,5000). A cell with Labels ingests `--labelers` 2 labeler sites with the
+record domains, since a sealed Label Feed Page verifies only once an Epoch
+carries its Labeler's Declaration (WIST-2 §3.2); its labelers then publish
+the Labels, split evenly, as `wist:spam` Labels on random pages of the
+record domains (a labeler labels a page again only once it has labelled
+every page, with another value; a Labeler Feed seals a Page per 1 000
+Labels), and it seals Epochs until all are sealed, at most 1 000 per
+labeler per Epoch (WIST-3 §3.2 `labeler_epoch_entries_max`), before the
+extra empty Epochs; `epochs_before_probe` counts these Epochs too. After
+the ingest and the extra empty Epochs
 it measures the aggregator's peak over one update pull of the probe domain,
 the peak of one empty seal, of one `clave snapshot` of the unchanged state
 and of a Consumer cold start, then restarts the aggregator and reports a
-second probe pull's peak beside the resident size it started from. Checks:
-the probe pull's increase (peak minus the resident size before the pull) at
-the most records at most 1.5 × its increase at the fewest, per Epoch count; the empty
-seal's peak at the most Epochs at most 1.1 × at the fewest, per record
-count.
+second probe pull's peak beside the resident size it started from. Checks
+at the fewest Labels: the probe pull's increase (peak minus the resident
+size before the pull) at the most records at most 1.5 × its increase at the
+fewest records plus 8 MB, per Epoch count; the empty seal's peak at the
+most Epochs at most 1.1 × at the fewest, per record count. Checks
+at the fewest records and Epochs: the probe pull's increase at the most
+Labels at most 1.5 × at the fewest plus 8 MB; the empty seal's peak growth from the fewest to the most Labels at
+most 10 kB per Label.
 
 ### Smoke runs
 
