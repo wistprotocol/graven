@@ -1,8 +1,8 @@
 use e2e::{
     after_this_second, consumer_report, consumer_state, copy_dir, dir_bytes, free_loopback_addr,
     graven_bin, grid_instant, host_name, log_tree_size, merge, now_rfc3339, page, peak_rss_kb,
-    ping_until_admitted, reports_since, reset_peak_rss, resolve_sibling_bin, revisions,
-    round_report, run, run_measured, s, seal_epoch, sealed_stage, serve_sites_counted,
+    ping_until_admitted, registered_sync_args, reports_since, reset_peak_rss, resolve_sibling_bin,
+    revisions, round_report, run, run_measured, s, seal_epoch, sealed_stage, serve_sites_counted,
     snapshot_report, spawn_clave_serve_with, storage_bytes, sync_args, timed, wait_all_pulled,
     wait_until_after, write_pages, RequestLog, SealStage, Site,
 };
@@ -598,7 +598,7 @@ fn main() {
     }
     let mut walked = None;
     if !args.skip_consumer && args.catch_up_by.walks() {
-        let catch_up = run_measured(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+        let catch_up = run_measured(&graven, &registered_sync_args(&gdir));
         report["stages"]["consumer_catch_up"] = consumer_report(&catch_up, &gdir);
         if by_snapshot {
             walked = Some(consumer_state(&gdir));
@@ -702,7 +702,7 @@ fn main() {
         next_seal += 1;
         sealed = log_tree_size(&clave_data);
         if !args.skip_consumer {
-            run(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+            run(&graven, &registered_sync_args(&gdir));
         }
 
         let template = site
@@ -772,7 +772,7 @@ fn main() {
             "seal": seal,
         });
         if !args.skip_consumer {
-            let catch_up = run_measured(&graven, &["sync", "--dir", s(&gdir), "--allow-http"]);
+            let catch_up = run_measured(&graven, &registered_sync_args(&gdir));
             tree_report["consumer_catch_up"] = consumer_report(&catch_up, &gdir);
         }
         report["stages"]["tree_bound"] = tree_report;

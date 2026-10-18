@@ -965,7 +965,8 @@ fn run_all_syncs_every_registered_log() {
     let new_url1 = common::extend_fixture(&fx1);
     let new_url2 = common::extend_fixture(&fx2);
 
-    let reports = graven::sync::run_all(dir.path(), true).unwrap();
+    let reports =
+        graven::sync::run_all(dir.path(), true, graven::sync::DEFAULT_PAYLOAD_FETCHES).unwrap();
     assert_eq!(reports.len(), 2);
     for report in &reports {
         assert_eq!(report.head, 2);
@@ -1007,7 +1008,8 @@ fn run_all_errors_clearly_on_unmigrated_legacy_dir() {
     )
     .unwrap();
 
-    let err = graven::sync::run_all(legacy.path(), true).unwrap_err();
+    let err = graven::sync::run_all(legacy.path(), true, graven::sync::DEFAULT_PAYLOAD_FETCHES)
+        .unwrap_err();
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("sync") && msg.contains("anchor"),
@@ -2199,6 +2201,7 @@ fn follow_catching_up(
             tier1: false,
             allow_http: true,
             catch_up_epochs,
+            payload_fetches: graven::sync::DEFAULT_PAYLOAD_FETCHES,
         },
         target,
     )

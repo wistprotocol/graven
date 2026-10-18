@@ -148,7 +148,10 @@ pub struct Follow<'a> {
     pub tier1: bool,
     pub allow_http: bool,
     pub catch_up_epochs: Option<u64>,
+    pub payload_fetches: usize,
 }
+
+pub const DEFAULT_PAYLOAD_FETCHES: usize = 4;
 
 pub fn run(
     anchor: &str,
@@ -166,6 +169,7 @@ pub fn run(
             tier1,
             allow_http,
             catch_up_epochs: None,
+            payload_fetches: DEFAULT_PAYLOAD_FETCHES,
         },
         dir,
     )
@@ -268,7 +272,7 @@ pub fn replayed_records(log_dir: &Path) -> Result<Vec<RecordRow>> {
         .collect()
 }
 
-pub fn run_all(dir: &Path, allow_http: bool) -> Result<Vec<SyncReport>> {
+pub fn run_all(dir: &Path, allow_http: bool, payload_fetches: usize) -> Result<Vec<SyncReport>> {
     registry::check_not_legacy(dir)?;
     let reg = registry::load(dir)?;
     reg.logs
@@ -283,6 +287,7 @@ pub fn run_all(dir: &Path, allow_http: bool) -> Result<Vec<SyncReport>> {
                     tier1: entry.tier1,
                     allow_http,
                     catch_up_epochs: entry.catch_up_epochs,
+                    payload_fetches,
                 },
                 dir,
             )
@@ -411,6 +416,7 @@ fn run_registered(
         log_dir: &log_dir,
         sync_path: &sync_path,
         tier1: entry.tier1,
+        payload_fetches: config.payload_fetches,
         subscriptions: &subscriptions,
     };
     if synced {
@@ -433,6 +439,7 @@ struct SyncContext<'a> {
     log_dir: &'a Path,
     sync_path: &'a Path,
     tier1: bool,
+    payload_fetches: usize,
     subscriptions: &'a std::collections::BTreeSet<String>,
 }
 
@@ -793,6 +800,7 @@ fn walk_incremental(
             sources: context.sources,
             chain: &chain,
             tier1: context.tier1,
+            payload_fetches: context.payload_fetches,
         },
     )?;
     fetch_definitions(
@@ -1155,6 +1163,7 @@ fn cold_start_at(context: &SyncContext, held: Option<&Held>, from: usize) -> Res
             sources: context.sources,
             chain: &installed.chain,
             tier1: context.tier1,
+            payload_fetches: context.payload_fetches,
         },
     )?;
     fetch_definitions(

@@ -2294,7 +2294,30 @@ pub fn sync_args<'a>(anchor: &'a Path, log: &'a str, dir: &'a Path, tier1: bool)
     if tier1 {
         args.push("--tier1");
     }
+    args.extend(payload_fetches_args());
     args
+}
+
+pub fn registered_sync_args(dir: &Path) -> Vec<&str> {
+    let mut args = vec!["sync", "--dir", s(dir), "--allow-http"];
+    args.extend(payload_fetches_args());
+    args
+}
+
+pub fn payload_fetches_args() -> Vec<&'static str> {
+    static FETCHES: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    fetches_flag(
+        FETCHES
+            .get_or_init(|| std::env::var("WIST_PAYLOAD_FETCHES").ok())
+            .as_deref(),
+    )
+}
+
+fn fetches_flag(fetches: Option<&str>) -> Vec<&str> {
+    match fetches {
+        Some(fetches) => vec!["--payload-fetches", fetches],
+        None => Vec::new(),
+    }
 }
 
 pub fn consumer_report(run: &Measured, dir: &Path) -> Value {
@@ -3015,5 +3038,11 @@ snapshot took 450 ms
             .expect("bundle");
         }
         assert_eq!(entry_leaves(dir.path(), 2, 5), leaves[2..5].to_vec());
+    }
+
+    #[test]
+    fn payload_fetches_flag_is_passed_only_when_set() {
+        assert_eq!(fetches_flag(None), Vec::<&str>::new());
+        assert_eq!(fetches_flag(Some("1")), vec!["--payload-fetches", "1"]);
     }
 }

@@ -57,6 +57,15 @@ enum Command {
         /// stands at least N Epochs above the verified head; default 720.
         #[arg(long = "catch-up-epochs", value_name = "N", requires = "anchor")]
         catch_up_epochs: Option<u64>,
+        /// Payloads of a batch fetched concurrently, each verified on its
+        /// own; 1 fetches them one at a time.
+        #[arg(
+            long = "payload-fetches",
+            value_name = "N",
+            default_value_t = graven::sync::DEFAULT_PAYLOAD_FETCHES,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+        )]
+        payload_fetches: usize,
     },
     Serve {
         #[arg(long)]
@@ -149,6 +158,7 @@ fn main() -> Result<(), graven::Error> {
                     tier1,
                     allow_http,
                     catch_up_epochs,
+                    payload_fetches: graven::sync::DEFAULT_PAYLOAD_FETCHES,
                 },
                 &dir,
             )?;
@@ -163,6 +173,7 @@ fn main() -> Result<(), graven::Error> {
             mirrors,
             witnesses,
             catch_up_epochs,
+            payload_fetches,
         } => match (anchor, log_base) {
             (Some(anchor), Some(log_base)) => {
                 let report = graven::sync::follow(
@@ -174,13 +185,14 @@ fn main() -> Result<(), graven::Error> {
                         tier1,
                         allow_http,
                         catch_up_epochs,
+                        payload_fetches,
                     },
                     &dir,
                 )?;
                 print_report(&report);
             }
             _ => {
-                let reports = graven::sync::run_all(&dir, allow_http)?;
+                let reports = graven::sync::run_all(&dir, allow_http, payload_fetches)?;
                 for report in &reports {
                     print_report(report);
                 }
@@ -243,4 +255,30 @@ fn main() -> Result<(), graven::Error> {
         },
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload_fetches(args: &[&str]) -> Result<usize, clap::Error> {
+        let cli = Cli::try_parse_from(["graven", "sync", "--dir", "d"].iter().chain(args))?;
+        match cli.command {
+            Command::Sync {
+                payload_fetches, ..
+            } => Ok(payload_fetches),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn payload_fetches_defaults_to_four() {
+        assert_eq!(payload_fetches(&[]).unwrap(), 4);
+    }
+
+    #[test]
+    fn payload_fetches_accepts_one_and_rejects_zero() {
+        assert_eq!(payload_fetches(&["--payload-fetches", "1"]).unwrap(), 1);
+        assert!(payload_fetches(&["--payload-fetches", "0"]).is_err());
+    }
 }

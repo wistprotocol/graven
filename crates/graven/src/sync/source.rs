@@ -35,25 +35,7 @@ impl<'a> Sources<'a> {
         limit: u64,
         check: impl Fn(&[u8]) -> Result<()>,
     ) -> Result<Vec<u8>> {
-        let mut last: Option<Error> = None;
-        for base in &self.bases {
-            let url = match resolve(base, path) {
-                Ok(url) => url,
-                Err(error) => {
-                    last = Some(error);
-                    continue;
-                }
-            };
-            match self
-                .client
-                .get_bounded(&url, limit)
-                .and_then(|bytes| check(&bytes).map(|()| bytes))
-            {
-                Ok(bytes) => return Ok(bytes),
-                Err(error) => last = Some(error),
-            }
-        }
-        Err(last.unwrap_or_else(|| Error::Fetch(format!("WIST3-E01 no source holds {path}"))))
+        verified_from(self.client, &self.bases, path, limit, check)
     }
 
     /// Files that only verify together are re-fetched from one source at a time.
@@ -149,4 +131,35 @@ impl<'a> Sources<'a> {
     pub fn client(&self) -> &Client {
         self.client
     }
+
+    pub fn bases(&self) -> &[Url] {
+        &self.bases
+    }
+}
+
+pub fn verified_from(
+    client: &Client,
+    bases: &[Url],
+    path: &str,
+    limit: u64,
+    check: impl Fn(&[u8]) -> Result<()>,
+) -> Result<Vec<u8>> {
+    let mut last: Option<Error> = None;
+    for base in bases {
+        let url = match resolve(base, path) {
+            Ok(url) => url,
+            Err(error) => {
+                last = Some(error);
+                continue;
+            }
+        };
+        match client
+            .get_bounded(&url, limit)
+            .and_then(|bytes| check(&bytes).map(|()| bytes))
+        {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| Error::Fetch(format!("WIST3-E01 no source holds {path}"))))
 }

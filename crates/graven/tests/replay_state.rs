@@ -17,6 +17,7 @@ fn sync(fx: &common::Fixture, target: &Path, witnesses: &[String]) -> graven::sy
             tier1: false,
             allow_http: true,
             catch_up_epochs: None,
+            payload_fetches: graven::sync::DEFAULT_PAYLOAD_FETCHES,
         },
         target,
     )

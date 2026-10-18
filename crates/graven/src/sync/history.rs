@@ -1,5 +1,5 @@
 use super::persist::{record_sealed, record_withdrawal, save_history, save_state_tuples};
-use super::source::Sources;
+use super::source::{verified_from, Sources};
 use super::tree::Tree;
 use super::SyncState;
 use crate::error::{Error, Result};
@@ -8,6 +8,8 @@ use crate::store::{table_exists, CREATE_TIER1};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 use wist_core::aggregator_keys::Registry;
 use wist_core::checkpoint::{self, check_consistency, Adoption, Checkpoint, WitnessKey};
 use wist_core::declaration::url_host;
@@ -845,6 +847,54 @@ pub struct Materializer<'a> {
     pub sources: &'a Sources<'a>,
     pub chain: &'a ChainState,
     pub tier1: bool,
+    pub payload_fetches: usize,
+}
+
+struct PayloadRequest {
+    path: String,
+    bound: u64,
+    caps: SizeCaps,
+    page: PageItem,
+}
+
+struct Prefetched {
+    url: String,
+    publisher: String,
+    item: Value,
+    path: String,
+    bound: u64,
+    caps: SizeCaps,
+    fetched: Result<Vec<u8>>,
+}
+
+impl Prefetched {
+    fn serves(&self, url: &str, row: &MaterializedRow, request: &PayloadRequest) -> bool {
+        self.url == url
+            && self.publisher == row.publisher
+            && self.item == row.item
+            && self.path == request.path
+            && self.bound == request.bound
+            && self.caps == request.caps
+    }
+}
+
+const PREFETCH_WINDOW: usize = 256;
+
+fn judge_payload<'a>(
+    url: &'a str,
+    request: &'a PayloadRequest,
+) -> impl Fn(&[u8]) -> Result<()> + 'a {
+    move |octets| {
+        judge_payload_octets(&request.page, octets, &request.caps)
+            .map_err(|code| Error::Verify(format!("{code} the Payload of {url}")))
+    }
+}
+
+fn reaches_insert(stored: &[StoredRow], row: &MaterializedRow) -> bool {
+    if single_key(stored) == Some(Some(row.key())) {
+        return false;
+    }
+    !matches!(stored, [held] if held.key.publisher == row.publisher && held.key.item_id == row.item_id)
 }
 
 impl Materializer<'_> {
@@ -863,8 +913,7 @@ impl Materializer<'_> {
             .unwrap_or_else(SizeCaps::suite)
     }
 
-    /// WIST-3 §6.1 and §8.
-    fn content(&self, conn: &Connection, url: &str, row: &MaterializedRow) -> Option<Content> {
+    fn request(&self, conn: &Connection, row: &MaterializedRow) -> Option<PayloadRequest> {
         let caps = self.caps(conn, row);
         let page: PageItem = serde_json::from_value(row.item.clone()).ok()?;
         let hex = row.item_id.strip_prefix("sha256:")?;
@@ -872,12 +921,85 @@ impl Materializer<'_> {
             + caps.links_cap_bytes()
             + caps.summary_cap_bytes()
             + PAYLOAD_FRAMING_BYTES;
-        let fetched = self
-            .sources
-            .verified(&format!("/payloads/{hex}.json"), bound, |octets| {
-                judge_payload_octets(&page, octets, &caps)
-                    .map_err(|code| Error::Verify(format!("{code} the Payload of {url}")))
-            });
+        Some(PayloadRequest {
+            path: format!("/payloads/{hex}.json"),
+            bound,
+            caps,
+            page,
+        })
+    }
+
+    fn prefetch(
+        &self,
+        conn: &Connection,
+        window: &[(&String, &(Option<MaterializedRow>, u64))],
+    ) -> Result<BTreeMap<String, Prefetched>> {
+        if self.payload_fetches <= 1 {
+            return Ok(BTreeMap::new());
+        }
+        let mut jobs = Vec::new();
+        for (url, (row, _)) in window {
+            let Some(row) = row else {
+                continue;
+            };
+            if !reaches_insert(&stored_rows(conn, url)?, row) {
+                continue;
+            }
+            if let Some(request) = self.request(conn, row) {
+                jobs.push((url.as_str(), row, request));
+            }
+        }
+        let next = AtomicUsize::new(0);
+        let done = Mutex::new(BTreeMap::new());
+        let (client, bases) = (self.sources.client(), self.sources.bases());
+        std::thread::scope(|scope| {
+            for _ in 0..self.payload_fetches.min(jobs.len()) {
+                scope.spawn(|| {
+                    while let Some((url, row, request)) =
+                        jobs.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        let fetched = verified_from(
+                            client,
+                            bases,
+                            &request.path,
+                            request.bound,
+                            judge_payload(url, request),
+                        );
+                        done.lock().unwrap_or_else(PoisonError::into_inner).insert(
+                            row.item_id.clone(),
+                            Prefetched {
+                                url: (*url).to_owned(),
+                                publisher: row.publisher.clone(),
+                                item: row.item.clone(),
+                                path: request.path.clone(),
+                                bound: request.bound,
+                                caps: request.caps,
+                                fetched,
+                            },
+                        );
+                    }
+                });
+            }
+        });
+        Ok(done.into_inner().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// WIST-3 §6.1 and §8.
+    fn content(
+        &self,
+        conn: &Connection,
+        url: &str,
+        row: &MaterializedRow,
+        held: Option<Prefetched>,
+    ) -> Option<Content> {
+        let request = self.request(conn, row)?;
+        let fetched = match held.filter(|held| held.serves(url, row, &request)) {
+            Some(held) => held.fetched,
+            None => {
+                self.sources
+                    .verified(&request.path, request.bound, judge_payload(url, &request))
+            }
+        };
         let octets = match fetched {
             Ok(octets) => octets,
             Err(error) => {
@@ -971,6 +1093,7 @@ impl Materializer<'_> {
         url: &str,
         row: &MaterializedRow,
         height: u64,
+        prefetched: &mut BTreeMap<String, Prefetched>,
     ) -> Result<()> {
         conn.execute(
             "INSERT INTO records(url, publisher, item_id, observed_at, attested_at, title, abstract, lang, collection, generated_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?8)",
@@ -986,7 +1109,7 @@ impl Materializer<'_> {
             ),
         )?;
         record_height(conn, url, &row.publisher, height)?;
-        let content = self.content(conn, url, row);
+        let content = self.content(conn, url, row, prefetched.remove(&row.item_id));
         self.write_content(conn, url, row, content.as_ref(), height)
     }
 
@@ -1032,38 +1155,42 @@ impl Materializer<'_> {
             }
         }
         let mut written = BTreeSet::new();
-        for (url, (row, height)) in &decided {
-            let (url, row, height) = (url.as_str(), row.as_ref(), *height);
-            let stored = stored_rows(conn, url)?;
-            let wanted = row.map(MaterializedRow::key);
-            if single_key(&stored) == Some(wanted.clone()) {
-                continue;
-            }
-            written.insert(url.to_owned());
-            let same_item = |held: &StoredRow| {
-                row.is_some_and(|row| {
-                    held.key.publisher == row.publisher && held.key.item_id == row.item_id
-                })
-            };
-            for held in &stored {
-                if !(same_item(held) && stored.len() == 1) {
-                    self.remove(conn, replay, url, held, row, height)?;
-                    if replay.withdrawals().is_withdrawn(&held.key.item_id) {
-                        stats.withdrawn += 1;
+        let decided: Vec<_> = decided.iter().collect();
+        for window in decided.chunks(PREFETCH_WINDOW) {
+            let mut prefetched = self.prefetch(conn, window)?;
+            for (url, (row, height)) in window {
+                let (url, row, height) = (url.as_str(), row.as_ref(), *height);
+                let stored = stored_rows(conn, url)?;
+                let wanted = row.map(MaterializedRow::key);
+                if single_key(&stored) == Some(wanted.clone()) {
+                    continue;
+                }
+                written.insert(url.to_owned());
+                let same_item = |held: &StoredRow| {
+                    row.is_some_and(|row| {
+                        held.key.publisher == row.publisher && held.key.item_id == row.item_id
+                    })
+                };
+                for held in &stored {
+                    if !(same_item(held) && stored.len() == 1) {
+                        self.remove(conn, replay, url, held, row, height)?;
+                        if replay.withdrawals().is_withdrawn(&held.key.item_id) {
+                            stats.withdrawn += 1;
+                        }
                     }
                 }
-            }
-            let Some(row) = row else {
-                continue;
-            };
-            match stored.as_slice() {
-                [held] if same_item(held) => {
-                    self.reattest(conn, url, row, height)?;
-                    if !held.content {
-                        written.remove(url);
+                let Some(row) = row else {
+                    continue;
+                };
+                match stored.as_slice() {
+                    [held] if same_item(held) => {
+                        self.reattest(conn, url, row, height)?;
+                        if !held.content {
+                            written.remove(url);
+                        }
                     }
+                    _ => self.insert(conn, url, row, height, &mut prefetched)?,
                 }
-                _ => self.insert(conn, url, row, height)?,
             }
         }
         Ok(written)
@@ -1095,7 +1222,7 @@ impl Materializer<'_> {
             else {
                 continue;
             };
-            if let Some(content) = self.content(conn, &url, &row) {
+            if let Some(content) = self.content(conn, &url, &row, None) {
                 let height = height.map_or(0, |height| height.max(0) as u64);
                 self.write_content(conn, &url, &row, Some(&content), height)?;
             }

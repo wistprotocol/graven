@@ -246,7 +246,10 @@ extract and links — comes from `/payloads/<item-id-hex>.json`, verified
 against its Item's commitment under the size caps of the Epoch that first
 sealed the Item (WIST-1 §3.6). A Payload no source serves or that fails
 verification leaves the row without content and never fails the sync;
-every later sync retries it. A row that leaves or changes Item takes its
+every later sync retries it. `--payload-fetches <N>` on `sync` (default 4)
+fetches the Payloads of a batch N at a time, concurrently; each is verified
+individually and the rows are written in the same order as with N = 1.
+A row that leaves or changes Item takes its
 extracts, links and embeddings with it.
 
 A Publisher's chain of Declarations, which supplies the keys its
@@ -544,7 +547,8 @@ update pull, so the Aggregator walks each tree; `chain`, the default,
 keeps them. `--tree-bound` adds one site whose Collection serves a
 hand-built tree with buckets filled to `tree_file_cap_bytes` and I Items
 (1 024 by default) held singly at `tree_depth_max`, reported under
-`tree_bound`.
+`tree_bound`. With `WIST_PAYLOAD_FETCHES=<N>` set, every Consumer sync the
+`baseline` and `sustained` binaries run passes `--payload-fetches <N>`.
 
 ## Verification
 
