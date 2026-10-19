@@ -246,9 +246,15 @@ extract and links — comes from `/payloads/<item-id-hex>.json`, verified
 against its Item's commitment under the size caps of the Epoch that first
 sealed the Item (WIST-1 §3.6). A Payload no source serves or that fails
 verification leaves the row without content and never fails the sync;
-every later sync retries it. `--payload-fetches <N>` on `sync` (default 4)
+every later sync retries it. `--payload-fetches <N>` on `sync` (default 16)
 fetches the Payloads of a batch N at a time, concurrently; each is verified
-individually and the rows are written in the same order as with N = 1.
+individually and the rows are written in the same order as with N = 1. A
+fetch costs one round trip to the Log, so the default is set for a Consumer
+far from it: measured at about 220 ms per round trip, a catch-up of 1 000
+Items took 257 s one at a time, 55 s at 4, 18.5 s at 16 and 13.7 s at 32;
+in the Log's own datacenter it took 3.1 s at 1 and 1.1–1.8 s at 4 and
+above. Beyond 16 the gain is small and each Consumer holds that many
+connections open against the Log.
 A row that leaves or changes Item takes its
 extracts, links and embeddings with it.
 

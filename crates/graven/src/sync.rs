@@ -151,7 +151,7 @@ pub struct Follow<'a> {
     pub payload_fetches: usize,
 }
 
-pub const DEFAULT_PAYLOAD_FETCHES: usize = 4;
+pub const DEFAULT_PAYLOAD_FETCHES: usize = 16;
 
 pub fn run(
     anchor: &str,

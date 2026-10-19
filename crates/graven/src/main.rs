@@ -272,8 +272,8 @@ mod tests {
     }
 
     #[test]
-    fn payload_fetches_defaults_to_four() {
-        assert_eq!(payload_fetches(&[]).unwrap(), 4);
+    fn payload_fetches_defaults_to_sixteen() {
+        assert_eq!(payload_fetches(&[]).unwrap(), 16);
     }
 
     #[test]
