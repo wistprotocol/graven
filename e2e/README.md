@@ -58,6 +58,18 @@ with an aggregator that prints no such line. The report's top-level
 `longest_write_lock_ms` is the maximum over the whole run, extra seals
 included. No check applies to it.
 
+Beside each `longest_write_lock_ms`, `longest_write_lock_wait_ms` reports
+the longest wait to acquire the write lock over the same window, read from
+`write lock waited N ms` lines on the same two streams, and the top level
+carries its maximum over the run. Every seal report carries `seal_phases`,
+the object of the `seal phases {json}` line on `clave seal`'s standard
+output, which maps each phase name to `{"ms": N, "sqlite_ms": N,
+"rss_kb": N, "hwm_kb": N}`; the top-level `seal_phases_max` holds, per phase
+name, the largest `ms`, `sqlite_ms` and `hwm_kb` over every seal of the
+run, extra seals included. Each
+figure is `null` when the aggregator prints no such line. No check applies
+to them.
+
 ### Common flags
 
 | Flag | Default | Meaning |
@@ -164,6 +176,9 @@ second probe pull's peak beside the resident size it started from. Checks
 at the fewest Labels: the probe pull's increase (peak minus the resident
 size before the pull) at the most records at most 1.5 × its increase at the
 fewest records plus 8 MB, per Epoch count; the empty seal's peak at the
+most records at most 1.1 × its peak at the fewest records plus 8 MB, per
+Epoch count, since a seal loads the state of the publishers it plans, not
+the Log's sealed records; the empty seal's peak at the
 most Epochs at most 1.1 × at the fewest, per record count. Checks
 at the fewest records and Epochs: the probe pull's increase at the most
 Labels at most 1.5 × at the fewest plus 8 MB; the empty seal's peak growth from the fewest to the most Labels at

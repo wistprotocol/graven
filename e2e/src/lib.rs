@@ -1741,6 +1741,34 @@ pub fn reported_seconds(stdout: &str, prefix: &str) -> Option<f64> {
 
 pub const WRITE_LOCK_HELD: &str = "write lock held ";
 
+pub const WRITE_LOCK_WAITED: &str = "write lock waited ";
+
+pub fn seal_phases(stdout: &str) -> Option<Value> {
+    stdout.lines().find_map(|line| {
+        let phases: Value = serde_json::from_str(line.trim().strip_prefix("seal phases ")?).ok()?;
+        phases.is_object().then_some(phases)
+    })
+}
+
+pub fn fold_seal_phases_max(max: &mut Value, phases: &Value) {
+    let Some(phases) = phases.as_object() else {
+        return;
+    };
+    if !max.is_object() {
+        *max = json!({});
+    }
+    let max = max.as_object_mut().expect("the maximum is an object");
+    for (name, phase) in phases {
+        let entry = max.entry(name.clone()).or_insert_with(|| json!({}));
+        for field in ["ms", "sqlite_ms", "hwm_kb"] {
+            if let Some(ms) = phase[field].as_u64() {
+                let largest = entry[field].as_u64().map_or(ms, |seen| seen.max(ms));
+                entry[field] = json!(largest);
+            }
+        }
+    }
+}
+
 pub fn reported_replans(stdout: &str) -> u64 {
     stdout
         .lines()
@@ -1900,6 +1928,7 @@ impl SealStage {
             "replanned": reported_replans(&self.seal.stdout),
             "replan_conflicts": reported_conflicts(&self.seal.stdout),
             "merged_publishers": reported_merged(&self.seal.stdout).len(),
+            "seal_phases": seal_phases(&self.seal.stdout),
             "snapshot_seconds": reported_seconds(&self.snapshot.stdout, "snapshot took "),
             "snapshot": snapshot_report(&self.snapshot),
             "snapshot_rebuild": self.rebuild_report(),
@@ -2447,6 +2476,60 @@ mod tests {
         let text = "pull of a.localhost failed: timeout\nwrite lock held soon ms\n";
         assert_eq!(longest_reported_millis(text, WRITE_LOCK_HELD), None);
         assert_eq!(longest_reported_millis("", WRITE_LOCK_HELD), None);
+    }
+
+    #[test]
+    fn longest_reported_millis_reads_write_lock_waits_apart_from_holds() {
+        let stderr = "write lock waited 9 ms\nwrite lock held 41 ms\nwrite lock waited 13 ms\n";
+        assert_eq!(longest_reported_millis(stderr, WRITE_LOCK_WAITED), Some(13));
+        assert_eq!(longest_reported_millis(stderr, WRITE_LOCK_HELD), Some(41));
+        assert_eq!(
+            longest_reported_millis("write lock held 41 ms\n", WRITE_LOCK_WAITED),
+            None
+        );
+    }
+
+    #[test]
+    fn seal_phases_reads_the_phase_object_of_any_names() {
+        let stdout = "sealed epoch 3 at 2026-01-01T01:00:00Z\nseal phases {\"catch_up\":{\"ms\":4,\"sqlite_ms\":3},\"novel\":{\"ms\":1,\"sqlite_ms\":0}}\nseal took 12 ms\n";
+        assert_eq!(
+            seal_phases(stdout),
+            Some(json!({
+                "catch_up": {"ms": 4, "sqlite_ms": 3},
+                "novel": {"ms": 1, "sqlite_ms": 0},
+            }))
+        );
+    }
+
+    #[test]
+    fn seal_phases_is_absent_without_a_line_or_an_object() {
+        assert_eq!(seal_phases("seal took 12 ms\n"), None);
+        assert_eq!(seal_phases("seal phases soon\n"), None);
+        assert_eq!(seal_phases("seal phases [1]\n"), None);
+        assert_eq!(seal_phases(""), None);
+    }
+
+    #[test]
+    fn fold_seal_phases_max_takes_each_field_maximum_per_phase() {
+        let mut max = Value::Null;
+        fold_seal_phases_max(&mut max, &Value::Null);
+        assert_eq!(max, Value::Null);
+        fold_seal_phases_max(
+            &mut max,
+            &json!({"merge": {"ms": 5, "sqlite_ms": 1}, "commit": {"ms": 2, "sqlite_ms": 2}}),
+        );
+        fold_seal_phases_max(
+            &mut max,
+            &json!({"merge": {"ms": 3, "sqlite_ms": 4}, "witness": {"ms": 7, "sqlite_ms": 0}}),
+        );
+        assert_eq!(
+            max,
+            json!({
+                "merge": {"ms": 5, "sqlite_ms": 4},
+                "commit": {"ms": 2, "sqlite_ms": 2},
+                "witness": {"ms": 7, "sqlite_ms": 0},
+            })
+        );
     }
 
     #[test]

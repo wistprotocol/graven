@@ -6,6 +6,7 @@ use e2e::{
     serve_sites_with_behaviors, snapshot_report, start_aggregator, sync_args, timed,
     wait_until_after, write_changed_pages, write_pages, Aggregator, AppendedText, Behaviors,
     Failure, HostBehavior, PingOutcome, RequestLog, SealStage, Site, SiteCounters, WRITE_LOCK_HELD,
+    WRITE_LOCK_WAITED,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -399,7 +400,49 @@ struct Sealed {
     seconds: f64,
     wall_seconds: f64,
     octets: u64,
-    longest_write_lock_ms: Option<u64>,
+    write_lock: WriteLock,
+}
+
+#[derive(Clone, Copy, Default)]
+struct WriteLock {
+    held: Option<u64>,
+    waited: Option<u64>,
+}
+
+impl WriteLock {
+    fn longest(&self, other: WriteLock) -> WriteLock {
+        WriteLock {
+            held: self.held.max(other.held),
+            waited: self.waited.max(other.waited),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RunTotals {
+    write_lock: WriteLock,
+    seal_phases_max: Value,
+}
+
+impl RunTotals {
+    fn absorb(&mut self, other: &RunTotals) {
+        self.write_lock = self.write_lock.longest(other.write_lock);
+        e2e::fold_seal_phases_max(&mut self.seal_phases_max, &other.seal_phases_max);
+    }
+
+    fn write(&self, report: &mut Value) {
+        report["longest_write_lock_ms"] = json!(self.write_lock.held);
+        report["longest_write_lock_wait_ms"] = json!(self.write_lock.waited);
+        report["seal_phases_max"] = self.seal_phases_max.clone();
+    }
+}
+
+fn longest_in(texts: &[Option<&str>], prefix: &str) -> Option<u64> {
+    texts
+        .iter()
+        .flatten()
+        .filter_map(|text| e2e::longest_reported_millis(text, prefix))
+        .max()
 }
 
 struct SealRun {
@@ -465,7 +508,7 @@ struct Harness {
     round_bound: Duration,
     seal_during_pulls: bool,
     serve_stderr: AppendedText,
-    longest_write_lock_ms: Option<u64>,
+    run: RunTotals,
 }
 
 struct RoundStart {
@@ -499,24 +542,27 @@ impl Harness {
             round_bound: args.round_bound(),
             seal_during_pulls: args.seal_during_pulls,
             serve_stderr,
-            longest_write_lock_ms: None,
+            run: RunTotals::default(),
         }
     }
 
-    fn write_lock_window(&mut self, seal_stdout: Option<&str>) -> Option<u64> {
+    fn write_lock_window(&mut self, seal_stdout: Option<&str>) -> WriteLock {
         let serve = self.serve_stderr.follow(&self.aggregator.stderr);
-        let longest = [Some(serve.as_str()), seal_stdout]
-            .into_iter()
-            .flatten()
-            .filter_map(|text| e2e::longest_reported_millis(text, WRITE_LOCK_HELD))
-            .max();
-        self.longest_write_lock_ms = self.longest_write_lock_ms.max(longest);
-        longest
+        let texts = [Some(serve.as_str()), seal_stdout];
+        let window = WriteLock {
+            held: longest_in(&texts, WRITE_LOCK_HELD),
+            waited: longest_in(&texts, WRITE_LOCK_WAITED),
+        };
+        self.run.write_lock = self.run.write_lock.longest(window);
+        if let Some(phases) = seal_stdout.and_then(e2e::seal_phases) {
+            e2e::fold_seal_phases_max(&mut self.run.seal_phases_max, &phases);
+        }
+        window
     }
 
-    fn run_longest_write_lock_ms(&mut self) -> Option<u64> {
+    fn run_totals(&mut self) -> &RunTotals {
         self.write_lock_window(None);
-        self.longest_write_lock_ms
+        &self.run
     }
 
     fn base(&self) -> &str {
@@ -586,9 +632,10 @@ impl Harness {
         let stage = run.thread.join().expect("the seal thread panicked");
         let at = run.at;
         let data = self.aggregator.data.clone();
-        let longest_write_lock_ms = self.write_lock_window(Some(&stage.seal.stdout));
+        let write_lock = self.write_lock_window(Some(&stage.seal.stdout));
         let mut report = stage.report(&data);
-        report["longest_write_lock_ms"] = json!(longest_write_lock_ms);
+        report["longest_write_lock_ms"] = json!(write_lock.held);
+        report["longest_write_lock_wait_ms"] = json!(write_lock.waited);
         let size = log_tree_size(&data);
         let entries: Vec<Value> = e2e::entry_leaves(&data, self.sealed, size)
             .iter()
@@ -607,7 +654,7 @@ impl Harness {
             seconds: stage.seal_seconds().unwrap_or(stage.seal.seconds),
             wall_seconds: stage.seal.seconds,
             octets,
-            longest_write_lock_ms,
+            write_lock,
         }
     }
 
@@ -813,7 +860,8 @@ fn run_round(
         "domains_rejected": rejected.iter().flatten().filter(|&&count| count > 0).count(),
         "rejection_status_unread": rejected.iter().filter(|count| count.is_none()).count(),
         "seal": sealed.report,
-        "longest_write_lock_ms": sealed.longest_write_lock_ms,
+        "longest_write_lock_ms": sealed.write_lock.held,
+            "longest_write_lock_wait_ms": sealed.write_lock.waited,
         "seconds": seconds,
     });
     e2e::merge(&mut report, outcome_report);
@@ -966,7 +1014,8 @@ impl Harness {
                 "aggregator_peak_rss_kb": aggregator_peak,
                 "status_latency": status,
                 "seal": sealed.report,
-                "longest_write_lock_ms": sealed.longest_write_lock_ms,
+                "longest_write_lock_ms": sealed.write_lock.held,
+            "longest_write_lock_wait_ms": sealed.write_lock.waited,
                 "seconds": round.started.elapsed().as_secs_f64(),
             }),
         );
@@ -1019,13 +1068,13 @@ impl Harness {
         let epoch_bound = most_per_labeler.div_ceil(LABELER_EPOCH_ENTRIES_DEFAULT) + 1;
         let mut seals = Vec::new();
         let mut labels_sealed = 0;
-        let mut longest_write_lock_ms = None;
+        let mut write_lock = WriteLock::default();
         while (labels_sealed as usize) < issued && seals.len() < epoch_bound {
             let sealed = self.seal();
             labels_sealed += sealed.report["log_entries"]["label"]["entries"]
                 .as_u64()
                 .unwrap_or(0);
-            longest_write_lock_ms = longest_write_lock_ms.max(sealed.longest_write_lock_ms);
+            write_lock = write_lock.longest(sealed.write_lock);
             seals.push(sealed.report);
         }
         assert_eq!(
@@ -1041,7 +1090,8 @@ impl Harness {
             "labels_sealed": labels_sealed,
             "label_epochs": seals.len(),
             "seals": seals,
-            "longest_write_lock_ms": longest_write_lock_ms,
+            "longest_write_lock_ms": write_lock.held,
+            "longest_write_lock_wait_ms": write_lock.waited,
         })
     }
 }
@@ -1302,7 +1352,7 @@ fn skew(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec<C
         "rounds": outcomes.iter().map(|o| o.report.clone()).collect::<Vec<_>>(),
     });
     stage_over_rounds("skew", &mut report["stages"]["skew"], &outcomes);
-    report["longest_write_lock_ms"] = json!(h.run_longest_write_lock_ms());
+    h.run_totals().write(report);
     checks
 }
 
@@ -1470,7 +1520,7 @@ fn backfill(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> V
         "rounds": outcomes.iter().map(|o| o.report.clone()).collect::<Vec<_>>(),
     });
     stage_over_rounds("backfill", &mut report["stages"]["backfill"], &outcomes);
-    report["longest_write_lock_ms"] = json!(h.run_longest_write_lock_ms());
+    h.run_totals().write(report);
     checks
 }
 
@@ -1727,7 +1777,8 @@ fn hosts(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec<
             "aggregator_peak_rss_kb": aggregator_peak,
             "status_latency": status,
             "seal": sealed.report,
-            "longest_write_lock_ms": sealed.longest_write_lock_ms,
+            "longest_write_lock_ms": sealed.write_lock.held,
+            "longest_write_lock_wait_ms": sealed.write_lock.waited,
             "seconds": round.started.elapsed().as_secs_f64(),
         }),
     );
@@ -1779,7 +1830,7 @@ fn hosts(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec<
         ),
     ];
     report["stages"]["hosts"] = json!({ "rounds": [round_report_value] });
-    report["longest_write_lock_ms"] = json!(h.run_longest_write_lock_ms());
+    h.run_totals().write(report);
     checks
 }
 
@@ -1924,7 +1975,7 @@ fn flood_round(
     let aggregator_peak = peak_rss_kb(h.pid());
     let seconds = round.started.elapsed().as_secs_f64();
     let status = round.sampler.finish();
-    let longest_write_lock_ms = h.write_lock_window(None);
+    let write_lock = h.write_lock_window(None);
     let items = participants
         .iter()
         .map(|participant| participant.items)
@@ -1947,7 +1998,8 @@ fn flood_round(
             "unpulled_domains": hosts.len() - pulled.len(),
             "aggregator_peak_rss_kb": aggregator_peak,
             "status_latency": status,
-            "longest_write_lock_ms": longest_write_lock_ms,
+            "longest_write_lock_ms": write_lock.held,
+            "longest_write_lock_wait_ms": write_lock.waited,
             "seconds": seconds,
         }),
     );
@@ -2194,7 +2246,7 @@ fn saturation(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) ->
             "status_latency": seal_status,
         },
     });
-    report["longest_write_lock_ms"] = json!(h.run_longest_write_lock_ms());
+    h.run_totals().write(report);
     checks
 }
 
@@ -2415,7 +2467,7 @@ fn drainage(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> V
         },
         "recovery_rounds": recovery_outcomes.iter().map(|o| o.report.clone()).collect::<Vec<_>>(),
     });
-    report["longest_write_lock_ms"] = json!(h.run_longest_write_lock_ms());
+    h.run_totals().write(report);
     checks
 }
 
@@ -2457,7 +2509,7 @@ fn measure_probe_pull(
         .zip(rss_before)
         .map(|(peak, before)| peak.saturating_sub(before));
     let status = start.sampler.finish();
-    let longest_write_lock_ms = h.write_lock_window(None);
+    let write_lock = h.write_lock_window(None);
     let mut report = round_report(&h.requests.requests(), &hosts, changed.len(), &pulled);
     e2e::merge(
         &mut report,
@@ -2468,7 +2520,8 @@ fn measure_probe_pull(
             "aggregator_peak_rss_kb": peak,
             "aggregator_rss_increase_kb": increase,
             "status_latency": status,
-            "longest_write_lock_ms": longest_write_lock_ms,
+            "longest_write_lock_ms": write_lock.held,
+            "longest_write_lock_wait_ms": write_lock.waited,
         }),
     );
     (report, increase)
@@ -2500,7 +2553,7 @@ fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec
         "round_bound_seconds": args.round_bound().as_secs(),
     });
     let mut cells = Vec::new();
-    let mut longest_write_lock_ms = None;
+    let mut run = RunTotals::default();
     let mut peaks: BTreeMap<MemoryCell, (Option<u64>, Option<u64>)> = BTreeMap::new();
     for (record_count, epoch_count, label_count) in memory_cells(&records, &epochs, &labels) {
         let cell_root = root.join(format!("cell-{record_count}-{epoch_count}-{label_count}"));
@@ -2566,7 +2619,7 @@ fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec
                 "--no-snapshot",
             ],
         );
-        let empty_seal_write_lock_ms = h.write_lock_window(Some(&empty_seal.stdout));
+        let empty_seal_write_lock = h.write_lock_window(Some(&empty_seal.stdout));
         let snapshot = run_measured(clave, &["snapshot", "--data", s(&data)]);
         let store = cell_root.join("graven-store");
         let anchor = data.join("anchor.json");
@@ -2574,7 +2627,7 @@ fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec
         h.aggregator.stop();
         h.aggregator.start(clave, Some(&h.proxy));
         let (restarted_pull, _) = measure_probe_pull(&mut h, &probe, changed, 2);
-        longest_write_lock_ms = longest_write_lock_ms.max(h.run_longest_write_lock_ms());
+        run.absorb(h.run_totals());
         println!(
                 "memory cell {record_count} records x {epoch_count} Epochs x {label_count} Labels ({labels_sealed} sealed over {label_epochs} more Epochs): pull peak {} kB, increase {pull_increase:?} kB ({} kB after a restart), empty seal peak {:?} kB, snapshot peak {:?} kB, consumer cold start peak {:?} kB",
                 probe_pull["aggregator_peak_rss_kb"], restarted_pull["aggregator_rss_increase_kb"], empty_seal.peak_rss_kb, snapshot.peak_rss_kb, consumer.peak_rss_kb
@@ -2602,7 +2655,9 @@ fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec
                 "seconds": empty_seal.seconds,
                 "seal_seconds": e2e::reported_seconds(&empty_seal.stdout, "seal took "),
                 "peak_rss_kb": empty_seal.peak_rss_kb,
-                "longest_write_lock_ms": empty_seal_write_lock_ms,
+                "seal_phases": e2e::seal_phases(&empty_seal.stdout),
+                "longest_write_lock_ms": empty_seal_write_lock.held,
+                "longest_write_lock_wait_ms": empty_seal_write_lock.waited,
             },
             "unchanged_snapshot": snapshot_report(&snapshot),
             "consumer_cold_start": consumer_report(&consumer, &store),
@@ -2623,6 +2678,14 @@ fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec
                     1.5,
                     RATIO_FLOOR_KB,
                     &format!("the aggregator's resident size increase over the pull (peak minus the size before it) at {most} records against {fewest}, no full-state replication in a pull (meta ADR-0005, Per-worker resources: memory independent of U, B and R)"),
+                ));
+                checks.push(ratio_check(
+                    &format!("empty_seal_peak_flat_in_records_at_{epoch_count}_epochs"),
+                    peaks[&(fewest, epoch_count, fewest_labels)].1,
+                    peaks[&(most, epoch_count, fewest_labels)].1,
+                    1.1,
+                    RATIO_FLOOR_KB,
+                    &format!("the empty seal's peak resident set size at {most} records against {fewest}; a seal loads the state of the publishers it plans, not the Log's sealed records (meta ADR-0009 attributes the per-record term to a whole-Log replay in every seal)"),
                 ));
             }
         }
@@ -2666,12 +2729,12 @@ fn memory(args: &Args, bins: &Arc<Bins>, root: &Path, report: &mut Value) -> Vec
                 high.1,
                 most_labels - fewest_labels,
                 10.0,
-                &format!("the empty seal's peak resident set size growth from {fewest_labels} to {most_labels} Labels, at {record_count} records and {epoch_count} Epochs, per Label; the seal's judgment holds the Log's sealed Labels (ID set and subject map), about 2–3 kB per Label measured for an empty seal"),
+                &format!("the empty seal's peak resident set size growth from {fewest_labels} to {most_labels} Labels, at {record_count} records and {epoch_count} Epochs, per Label; the seal's judgment holds only the sealed Label IDs of the labelers it plans and the subjects of the Labels its waiting disputes name, not the Log's Labels"),
             ));
         }
     }
     report["stages"]["memory"] = json!({ "cells": cells });
-    report["longest_write_lock_ms"] = json!(longest_write_lock_ms);
+    run.write(report);
     checks
 }
 
@@ -2956,7 +3019,7 @@ mod tests {
                 seconds: 0.0,
                 wall_seconds: 0.0,
                 octets: 0,
-                longest_write_lock_ms: None,
+                write_lock: WriteLock::default(),
             },
             pulled: BTreeMap::new(),
             expected: Vec::new(),
@@ -3127,6 +3190,52 @@ mod tests {
             "2026-10-14T10:00:00Z"
         ));
         assert!(!rejected_since(&json!({}), "WIST2-E01", ""));
+    }
+
+    #[test]
+    fn longest_in_reads_holds_and_waits_apart_across_serve_and_seal_text() {
+        let serve = "write lock held 30 ms\nwrite lock waited 4 ms\n";
+        let seal = "write lock waited 11 ms\nwrite lock held 2 ms\n";
+        let texts = [Some(serve), Some(seal)];
+        assert_eq!(longest_in(&texts, WRITE_LOCK_HELD), Some(30));
+        assert_eq!(longest_in(&texts, WRITE_LOCK_WAITED), Some(11));
+        assert_eq!(longest_in(&[Some(serve), None], WRITE_LOCK_WAITED), Some(4));
+        assert_eq!(
+            longest_in(&[Some("seal took 3 ms\n"), None], WRITE_LOCK_WAITED),
+            None
+        );
+    }
+
+    #[test]
+    fn run_totals_report_nulls_without_lines_and_maxima_after_absorbing() {
+        let mut report = json!({});
+        let mut run = RunTotals::default();
+        run.write(&mut report);
+        assert_eq!(report["longest_write_lock_ms"], Value::Null);
+        assert_eq!(report["longest_write_lock_wait_ms"], Value::Null);
+        assert_eq!(report["seal_phases_max"], Value::Null);
+        let cell = RunTotals {
+            write_lock: WriteLock {
+                held: Some(9),
+                waited: Some(3),
+            },
+            seal_phases_max: json!({"merge": {"ms": 5, "sqlite_ms": 2}}),
+        };
+        run.absorb(&cell);
+        run.absorb(&RunTotals {
+            write_lock: WriteLock {
+                held: Some(4),
+                waited: None,
+            },
+            seal_phases_max: json!({"merge": {"ms": 1, "sqlite_ms": 6}}),
+        });
+        run.write(&mut report);
+        assert_eq!(report["longest_write_lock_ms"], json!(9));
+        assert_eq!(report["longest_write_lock_wait_ms"], json!(3));
+        assert_eq!(
+            report["seal_phases_max"],
+            json!({"merge": {"ms": 5, "sqlite_ms": 6}})
+        );
     }
 
     #[test]
