@@ -28,7 +28,10 @@ waits until every pinged domain is pulled by a pull that started after its
 republish finished, and seals one Epoch. Each round
 reports the seconds until all domains were pulled after the last ping, ping
 refusals, site requests and octets per changed Item by domain class, the
-seal's seconds and peak resident set size, the Epoch's Entries and octets
+seal's seconds and peak resident set size (a measured process's peak is
+its VmHWM sampled every 2 ms until it exits, never the rusage figure, which
+carries the harness's own resident size into a child spawned with a shared
+address space), the Epoch's Entries and octets
 by Entry type (governance and Label Entries also apart), the aggregator's
 peak resident set size over the round, and the latency of
 `/status/<host>` for one healthy host sampled every 250 ms (p50, p99, max;

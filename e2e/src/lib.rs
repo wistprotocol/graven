@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1667,34 +1667,29 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<St
     })
 }
 
+// A child spawned with a shared address space until exec carries the parent's resident size
+// into its ru_maxrss, so the peak is read from the child's own VmHWM while it runs.
 #[cfg(unix)]
 fn reap(child: &mut Child) -> (ExitStatus, Option<u64>) {
-    use std::os::unix::process::ExitStatusExt;
-    let pid = child.id() as libc::pid_t;
-    let mut status = 0;
-    // SAFETY: rusage is plain old data, so the all-zero value is valid.
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    loop {
-        // SAFETY: pid is this process's unreaped child and both out-pointers are live locals.
-        let reaped = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
-        if reaped == pid {
-            break;
-        }
-        let err = std::io::Error::last_os_error();
-        assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::Interrupted,
-            "wait4 {pid}: {err}"
-        );
-    }
-    let max_rss = u64::try_from(usage.ru_maxrss).unwrap_or(0);
-    // ru_maxrss is in bytes on Apple platforms and in kilobytes elsewhere.
-    let kb = if cfg!(target_vendor = "apple") {
-        max_rss / 1024
-    } else {
-        max_rss
+    let pid = child.id();
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut peak = None;
+            while !stop.load(Ordering::Relaxed) {
+                if let Some(kb) = peak_rss_kb(pid) {
+                    peak = peak.max(Some(kb));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            peak
+        })
     };
-    (ExitStatus::from_raw(status), Some(kb))
+    let status = child.wait().expect("wait for child");
+    stop.store(true, Ordering::Relaxed);
+    let peak = sampler.join().expect("peak sampler");
+    (status, peak)
 }
 
 #[cfg(not(unix))]
